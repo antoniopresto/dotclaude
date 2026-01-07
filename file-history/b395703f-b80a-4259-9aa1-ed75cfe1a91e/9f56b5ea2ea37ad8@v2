@@ -1,0 +1,135 @@
+/**
+ * Critical Path Calculator
+ *
+ * Calculates the longest path through the DAG to determine
+ * minimum completion time and prioritize high-impact tasks.
+ */
+
+import type { DependencyGraph } from './DependencyGraph.js';
+
+export interface PathInfo {
+  taskId: string;
+  distance: number; // Distance from start (longest path)
+  onCriticalPath: boolean;
+}
+
+export class CriticalPath {
+  private distances: Map<string, number> = new Map();
+  private criticalPathNodes: Set<string> = new Set();
+
+  constructor(private graph: DependencyGraph) {
+    this.calculate();
+  }
+
+  /**
+   * Calculate critical path distances
+   */
+  private calculate(): void {
+    const sorted = this.graph.topologicalSort();
+
+    // Initialize distances
+    for (const id of sorted) {
+      this.distances.set(id, 0);
+    }
+
+    // Forward pass: calculate longest path to each node
+    for (const id of sorted) {
+      const feature = this.graph.getFeature(id);
+      if (!feature) continue;
+
+      const deps = Array.isArray(feature.blockedBy)
+        ? feature.blockedBy
+        : feature.blockedBy
+          ? [feature.blockedBy]
+          : [];
+
+      let maxDist = 0;
+      for (const dep of deps) {
+        const depDist = this.distances.get(dep) || 0;
+        maxDist = Math.max(maxDist, depDist + 1);
+      }
+
+      this.distances.set(id, maxDist);
+    }
+
+    // Find critical path (longest path)
+    let maxDistance = 0;
+    let endNode = '';
+
+    for (const [id, dist] of this.distances) {
+      if (dist > maxDistance) {
+        maxDistance = dist;
+        endNode = id;
+      }
+    }
+
+    // Backtrack to find all critical path nodes
+    this.traceCriticalPath(endNode);
+  }
+
+  /**
+   * Trace back the critical path from end node
+   */
+  private traceCriticalPath(nodeId: string): void {
+    this.criticalPathNodes.add(nodeId);
+
+    const feature = this.graph.getFeature(nodeId);
+    if (!feature) return;
+
+    const deps = Array.isArray(feature.blockedBy)
+      ? feature.blockedBy
+      : feature.blockedBy
+        ? [feature.blockedBy]
+        : [];
+
+    const currentDist = this.distances.get(nodeId) || 0;
+
+    for (const dep of deps) {
+      const depDist = this.distances.get(dep) || 0;
+      if (depDist === currentDist - 1) {
+        this.traceCriticalPath(dep);
+      }
+    }
+  }
+
+  /**
+   * Get path info for a task
+   */
+  getPathInfo(taskId: string): PathInfo {
+    return {
+      taskId,
+      distance: this.distances.get(taskId) || 0,
+      onCriticalPath: this.criticalPathNodes.has(taskId),
+    };
+  }
+
+  /**
+   * Get all tasks on the critical path
+   */
+  getCriticalPath(): string[] {
+    const sorted = this.graph.topologicalSort();
+    return sorted.filter((id) => this.criticalPathNodes.has(id));
+  }
+
+  /**
+   * Get priority score for a task (higher = more important)
+   */
+  getPriorityScore(taskId: string): number {
+    const distance = this.distances.get(taskId) || 0;
+    const isCritical = this.criticalPathNodes.has(taskId) ? 100 : 0;
+    const dependents = this.graph.getDependents(taskId).length * 10;
+
+    return isCritical + dependents + (100 - distance);
+  }
+
+  /**
+   * Get tasks sorted by priority
+   */
+  getTasksByPriority(): string[] {
+    const pending = this.graph.getPendingFeatures();
+    return pending
+      .map((f) => ({ id: f.id, score: this.getPriorityScore(f.id) }))
+      .sort((a, b) => b.score - a.score)
+      .map((t) => t.id);
+  }
+}

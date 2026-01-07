@@ -1,0 +1,115 @@
+import react from '@vitejs/plugin-react-swc';
+import { execSync } from 'child_process';
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { basename, resolve } from 'path';
+import nodeExternals from 'rollup-plugin-node-externals';
+import { defineConfig, UserConfig } from 'vite';
+import dts from 'vite-plugin-dts';
+import { externalizeDeps } from 'vite-plugin-externalize-deps';
+import tsconfigPaths from 'vite-tsconfig-paths';
+
+function discoverEntries(srcDir: string): Record<string, string> {
+  const entries: Record<string, string> = {};
+
+  if (!existsSync(srcDir)) {
+    return entries;
+  }
+
+  const items = readdirSync(srcDir);
+
+  for (const item of items) {
+    const itemPath = resolve(srcDir, item);
+    const stat = statSync(itemPath);
+
+    if (stat.isFile() && item.endsWith('.ts') && !item.endsWith('.d.ts')) {
+      const name = basename(item, '.ts');
+      entries[name] = itemPath;
+    } else if (stat.isDirectory()) {
+      const indexPath = resolve(itemPath, 'index.ts');
+      if (existsSync(indexPath)) {
+        entries[item] = indexPath;
+      }
+    }
+  }
+
+  return entries;
+}
+
+function generateExports(entries: Record<string, string>): Record<string, unknown> {
+  const exports: Record<string, unknown> = {};
+
+  for (const name of Object.keys(entries)) {
+    const subpath = name === 'index' ? '.' : `./${name}`;
+    exports[subpath] = {
+      types: `./dist/${name}.d.ts`,
+      import: `./dist/${name}.mjs`,
+      require: `./dist/${name}.cjs`,
+    };
+  }
+
+  return exports;
+}
+
+function updatePackageJson(entries: Record<string, string>, pkgPath: string): void {
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+
+  pkg.type = 'module';
+  pkg.sideEffects = false;
+  pkg.main = './dist/index.cjs';
+  pkg.module = './dist/index.mjs';
+  pkg.types = './dist/index.d.ts';
+  pkg.exports = generateExports(entries);
+  pkg.files = ['dist'];
+
+  writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+
+  try {
+    execSync(`bunx prettier --write "${pkgPath}"`, { stdio: 'inherit' });
+  } catch {
+    console.warn('Prettier not available, skipping format');
+  }
+}
+
+export default defineConfig(() => {
+  const srcDir = resolve(__dirname, 'src');
+  const pkgPath = resolve(__dirname, 'package.json');
+  const entries = discoverEntries(srcDir);
+
+  updatePackageJson(entries, pkgPath);
+
+  console.log('Discovered entries:', Object.keys(entries));
+
+  const config: UserConfig = {
+    build: {
+      lib: {
+        entry: entries,
+        name: 'belt-ai',
+        formats: ['es', 'cjs'],
+        fileName: (format, entryName) => {
+          const ext = format === 'es' ? 'mjs' : 'cjs';
+          return `${entryName}.${ext}`;
+        },
+      },
+      rollupOptions: {
+        external: ['react', 'react-dom'],
+      },
+      sourcemap: true,
+      minify: 'terser',
+    },
+    plugins: [
+      externalizeDeps(),
+      dts({
+        rollupTypes: false,
+        tsconfigPath: 'tsconfig.prod.json',
+      }),
+      {
+        enforce: 'pre',
+        ...nodeExternals(),
+      },
+      react({}),
+      tsconfigPaths(),
+    ],
+  };
+
+  return config;
+});

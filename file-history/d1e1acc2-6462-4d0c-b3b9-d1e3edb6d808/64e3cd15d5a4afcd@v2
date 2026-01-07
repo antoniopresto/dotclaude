@@ -1,0 +1,579 @@
+# Débito Técnico - Belt Monorepo
+
+## Sumário Executivo
+
+**Projeto**: Belt v0.1.0 (pré-release)
+**Estado**: Arquitetura sólida, mas com gaps críticos antes de publicação NPM
+**Total de Issues**: 47 itens identificados
+
+| Severidade | Quantidade | Ação |
+|------------|-----------|------|
+| Crítico | 8 | Bloqueia publicação |
+| Alto | 15 | Deve resolver antes v1.0 |
+| Médio | 16 | Melhorias importantes |
+| Baixo | 8 | Nice-to-have |
+
+---
+
+## 1. ANÁLISE MICRO (Problemas Pontuais)
+
+### 1.1 Bugs Confirmados
+
+| Arquivo | Linha | Severidade | Descrição |
+|---------|-------|------------|-----------|
+| `apps/cli/src/app.tsx` | 60 | **CRÍTICO** | UI executa `belt.check()` ao invés do comando selecionado |
+| `packages/plugins/sync-types/src/generate.ts` | 102-103 | **CRÍTICO** | Gera sintaxe inválida para default exports: `export default {} as Type` |
+| `packages/tools/src/helpers/logs.ts` | 14 | **ALTO** | Assignment em expression: `return (LOG_MODE = mode)` |
+| `packages/plugins/sync-types/src/discover.ts` | 68-74 | **ALTO** | Regex para pattern matching é ingênua - `**` vira `.*` incorretamente |
+
+### 1.2 Erros de Handling Ausentes
+
+| Arquivo | Linhas | Problema |
+|---------|--------|----------|
+| `apps/cli/src/cli.ts` | 63-64, 78, 88 | Async calls sem try-catch - crashes silenciosos |
+| `packages/core/src/belt.ts` | 78-80, 105 | Plugin initialization e command execution sem error handling |
+| `packages/plugins/sync-types/src/discover.ts` | 16, 40 | Não valida se sourceDir existe antes de `readdirSync` |
+| `packages/plugins/sync-types/src/write.ts` | 16 | `mkdirSync` pode falhar silenciosamente |
+| `packages/plugins/typecheck/src/typecheck.ts` | 25-36 | Falha silenciosa quando tsconfig.json não encontrado |
+
+### 1.3 Type Safety Issues
+
+| Arquivo | Linha | Problema |
+|---------|-------|----------|
+| `packages/tools/src/helpers/compose.ts` | 19, 29, 40 | Múltiplos `any` em overloads |
+| `packages/tools/src/helpers/function.ts` | 1 | Usa `Function` type (banned) |
+| `packages/tools/src/helpers/object-utils.ts` | 131 | `objectHasOwnProperty` não valida tipo de key |
+| `packages/tools/src/helpers/mask-data.ts` | 8-9 | `any` em função recursiva |
+
+### 1.4 Hardcoded Values
+
+| Arquivo | Linha | Valor | Deveria Ser |
+|---------|-------|-------|-------------|
+| `packages/plugins/sync-types/src/plugin.ts` | 34 | `'src'` | Configurável |
+| `packages/plugins/typecheck/src/typecheck.ts` | 14-15 | `['src']` include default | Documentado/configurável |
+| `packages/core/src/belt.ts` | 48-53 | ANSI color codes | Respeitar NO_COLOR env |
+
+### 1.5 Resource Leaks
+
+| Arquivo | Linha | Problema |
+|---------|-------|----------|
+| `packages/plugins/typecheck/src/typecheck.ts` | 48-51 | TypeScript program nunca disposed - memory leak em long-running |
+
+---
+
+## 2. ANÁLISE MACRO (Problemas por Módulo)
+
+### 2.1 @belt/core
+
+**Estado**: Funcional, mas frágil
+
+| Issue | Severidade | Descrição |
+|-------|------------|-----------|
+| Sem validação de plugin duplicado | Médio | Plugins com mesmo nome podem causar colisão de command IDs |
+| Sem validação de rootDir | Médio | Não verifica se diretório existe/acessível |
+| Sem timeout para commands | Baixo | Long-running commands podem travar processo |
+| Logging hardcoded | Baixo | Cores ANSI não desligáveis |
+
+### 2.2 @belt/plugin-typecheck
+
+**Estado**: Básico mas funcional
+
+| Issue | Severidade | Descrição |
+|-------|------------|-----------|
+| Path matching vulnerável | Alto | `startsWith()` causa false positives (`/src-backup/` match `/src/`) |
+| Exclude patterns simples demais | Médio | Não usa minimatch ou similar |
+| Categoria de diagnóstico inconsistente | Médio | `errorCount > messages.length` possível |
+| Sem validação de include/exclude | Baixo | Conflitos silenciosos |
+
+### 2.3 @belt/plugin-sync-types
+
+**Estado**: Básico - precisa refinamentos (documentado em CLAUDE.md)
+
+| Issue | Severidade | Descrição |
+|-------|------------|-----------|
+| Default export quebrado | **CRÍTICO** | Sintaxe `.d.ts` inválida |
+| Pattern matching ingênuo | **ALTO** | Glob patterns não funcionam corretamente |
+| Import discovery incompleto | Alto | Só pega imports top-level, ignora nested/dynamic |
+| Circular deps não tratadas | Médio | Pode hit maxDepth desnecessariamente |
+| Type generation simplista | Médio | Perde dependências transitivas |
+| Hardcoded `'src'` directory | Médio | Não funciona com estruturas diferentes |
+
+### 2.4 @belt/tools
+
+**Estado**: Robusto, minor issues
+
+| Issue | Severidade | Descrição |
+|-------|------------|-----------|
+| Lint warnings (127) | Médio | Principalmente `any` types justificados mas flagged |
+| Unused typebox import em DTS | Baixo | Warning em build output |
+| Error handling inconsistente em objectKeys | Baixo | Non-Error throws ignorados |
+
+### 2.5 @belt/cli
+
+**Estado**: Funcional com bugs críticos
+
+| Issue | Severidade | Descrição |
+|-------|------------|-----------|
+| UI executa comando errado | **CRÍTICO** | Sempre roda `belt.check()` ignorando seleção |
+| Async sem error handling | Alto | Crashes silenciosos |
+| Sem validação de --cwd | Médio | Erro tardio se path inválido |
+| Sem error boundary no UI | Médio | Pode travar |
+| Exit codes inconsistentes | Baixo | runCommand não sai em erro |
+
+---
+
+## 3. ANÁLISE HOLÍSTICA (Problemas Arquiteturais)
+
+### 3.1 Cobertura de Testes
+
+**CRÍTICO - Gap maior do projeto**
+
+```
+Atual:
+  packages/tools/src/schema/lib/__tests__/type.spec.ts (1 arquivo)
+
+Faltando:
+  - Testes para @belt/core (0%)
+  - Testes para @belt/plugin-typecheck (0%)
+  - Testes para @belt/plugin-sync-types (0%)
+  - Testes para @belt/cli (0%)
+  - Testes de integração (0%)
+  - Testes E2E (0%)
+```
+
+**Impacto**: Alto risco de regressões durante publicação e uso por consumers.
+
+### 3.2 CI/CD
+
+**CRÍTICO - Inexistente**
+
+- Nenhum `.github/workflows/`
+- Apenas Husky hooks locais (insuficientes)
+- Pre-commit roda lint (que tem 7 erros = **bloqueia commits**)
+- Pre-push não roda testes
+
+### 3.3 Configuração de Build
+
+**Inconsistências encontradas**:
+
+| Config | Problema |
+|--------|----------|
+| `packages/tools/tsconfig.json` L8-9 | `module: ESNext` + `moduleResolution: Bundler` incompatíveis |
+| `packages/tools/tsup.config.ts` | Build ESM+CJS mas tsconfig é diferente |
+| `.npmrc` L4 | `link-workspace-packages=false` incomum para monorepo |
+
+### 3.4 Documentação
+
+**Gaps identificados**:
+
+1. **Outdated/Inconsistente**:
+   - CLI README menciona `--output` que não existe
+   - sync-types README pattern format diferente do CLI real
+   - Exemplos programáticos não correspondem a exports reais
+
+2. **Faltando**:
+   - API reference para BeltContext e hooks
+   - Troubleshooting guide
+   - Migration guide
+   - ADRs (Architecture Decision Records)
+
+### 3.5 Error Handling Strategy
+
+**Ausente como padrão arquitetural**
+
+- Só existe `InvariantError` em tools
+- Sem structured error classes para outros contextos
+- Sem error context propagation
+- Sem recovery patterns estabelecidos
+
+---
+
+## 4. MATRIZ DE PRIORIZAÇÃO
+
+### 4.1 Bloqueia Publicação NPM (Resolver Agora)
+
+| # | Issue | Arquivo | Esforço |
+|---|-------|---------|---------|
+| 1 | Bug: UI executa comando errado | `app.tsx:60` | 5min |
+| 2 | Bug: Default export sintaxe inválida | `generate.ts:102-103` | 15min |
+| 3 | Lint error bloqueando commits | `logs.ts:14` | 2min |
+| 4 | Async error handling CLI | `cli.ts` | 30min |
+| 5 | Validar sourceDir existe | `discover.ts:16` | 10min |
+| 6 | Adicionar testes mínimos core | novo | 2h |
+| 7 | Criar GitHub Actions básico | novo | 1h |
+| 8 | Fix tsconfig/tsup mismatch tools | `tools/tsconfig.json` | 15min |
+
+### 4.2 Antes de v1.0 (Alto Impacto)
+
+| # | Issue | Módulo | Esforço |
+|---|-------|--------|---------|
+| 9 | Pattern matching com minimatch | sync-types | 1h |
+| 10 | Path matching seguro | typecheck | 30min |
+| 11 | Error handling completo plugins | core + plugins | 2h |
+| 12 | Validação de plugin duplicado | core | 30min |
+| 13 | Import discovery completo | sync-types | 2h |
+| 14 | Testes de integração | novo | 4h |
+| 15 | Documentação API | docs | 3h |
+| 16 | Dispose TypeScript program | typecheck | 15min |
+
+### 4.3 Melhorias Importantes (Médio Prazo)
+
+| # | Issue | Módulo | Esforço |
+|---|-------|--------|---------|
+| 17 | Respeitar NO_COLOR env | core | 30min |
+| 18 | Configurabilidade de paths | sync-types | 1h |
+| 19 | Error boundary UI | cli | 30min |
+| 20 | Structured error classes | tools | 2h |
+| 21 | Circular deps handling | sync-types | 1h |
+| 22 | Validação de configs | core + plugins | 1h |
+| 23 | Loading state durante init | cli | 30min |
+
+### 4.4 Nice-to-Have (Baixa Prioridade)
+
+| # | Issue | Esforço |
+|---|-------|---------|
+| 24 | Timeout para commands | 30min |
+| 25 | Storybook para UI | 2h |
+| 26 | E2E tests com Playwright | 4h |
+| 27 | ADRs documentados | 2h |
+| 28 | Coverage reporting | 1h |
+
+---
+
+## 5. DEPENDÊNCIAS DO TRABALHO
+
+```mermaid
+graph TD
+    A[Fix lint errors] --> B[Pre-commit funciona]
+    B --> C[Adicionar testes]
+    C --> D[GitHub Actions]
+    D --> E[Publicar NPM]
+
+    F[Fix UI bug] --> E
+    G[Fix sync-types default export] --> E
+    H[Fix tsconfig mismatch] --> E
+
+    I[Pattern matching] --> J[sync-types confiável]
+    K[Error handling] --> L[Produção robusta]
+```
+
+---
+
+## 6. QUICK WINS (< 30min cada)
+
+1. **`logs.ts:14`** - Trocar `return (LOG_MODE = mode)` por duas linhas
+2. **`app.tsx:60`** - Usar `belt.runCommand(command.id)` ao invés de `belt.check()`
+3. **`generate.ts:102-103`** - Corrigir sintaxe de default export
+4. **`tools/tsconfig.json`** - Alinhar module/moduleResolution
+5. **`.npmrc:4`** - Avaliar se `link-workspace-packages=false` é intencional
+
+---
+
+## 7. RECOMENDAÇÃO DE ABORDAGEM
+
+### Fase 1: Desbloqueio (1-2 horas)
+- Corrigir os 5 quick wins
+- Adicionar try-catch básico no CLI
+- Verificar se build/lint/typecheck passam
+
+### Fase 2: Estabilização (4-6 horas)
+- Adicionar testes unitários mínimos para core e plugins
+- Criar GitHub Actions para test/lint/build
+- Corrigir pattern matching no sync-types
+
+### Fase 3: Robustez (8-12 horas)
+- Error handling completo
+- Documentação atualizada
+- Testes de integração
+- Validações de config
+
+### Fase 4: Polish (ongoing)
+- E2E tests
+- Structured errors
+- Performance optimizations
+- Feature completeness
+
+---
+
+## 8. ARQUIVOS CRÍTICOS PARA MODIFICAR
+
+```
+apps/cli/src/app.tsx                           # Bug crítico UI
+apps/cli/src/cli.ts                            # Error handling
+packages/tools/src/helpers/logs.ts             # Lint error
+packages/plugins/sync-types/src/generate.ts    # Default export
+packages/plugins/sync-types/src/discover.ts    # Pattern matching + validation
+packages/plugins/typecheck/src/typecheck.ts    # Path matching + dispose
+packages/tools/tsconfig.json                   # Module mismatch
+packages/core/src/belt.ts                      # Error handling + validation
+```
+
+---
+
+---
+
+# ROADMAP DE RESOLUÇÃO COMPLETA
+
+## Fase 0: Quick Wins Imediatos (~30 min)
+> Desbloqueia commits e corrige bugs críticos
+
+- [ ] **QW-1** `packages/tools/src/helpers/logs.ts:14` - Fix lint error (assignment em expression)
+- [ ] **QW-2** `apps/cli/src/app.tsx:60` - Fix bug UI (executa comando errado)
+- [ ] **QW-3** `packages/plugins/sync-types/src/generate.ts:102-103` - Fix default export syntax
+- [ ] **QW-4** `packages/tools/tsconfig.json:8-9` - Alinhar module/moduleResolution
+- [ ] **QW-5** `.npmrc:4` - Avaliar/documentar link-workspace-packages=false
+
+## Fase 1: Error Handling CLI (~1h)
+> Estabiliza execução do CLI
+
+- [ ] **EH-1** `apps/cli/src/cli.ts:63-64` - try-catch em runTypecheck
+- [ ] **EH-2** `apps/cli/src/cli.ts:78` - try-catch em runSyncTypes
+- [ ] **EH-3** `apps/cli/src/cli.ts:88` - try-catch em runCommand
+- [ ] **EH-4** `apps/cli/src/bin.ts` - Wrapper global de error handling
+- [ ] **EH-5** `apps/cli/src/app.tsx` - Error boundary para UI mode
+- [ ] **EH-6** Validar --cwd existe antes de usar
+
+## Fase 2: Error Handling Core + Plugins (~1.5h)
+> Robustez na camada de plugins
+
+- [ ] **EHP-1** `packages/core/src/belt.ts:78-80` - try-catch plugin.apply()
+- [ ] **EHP-2** `packages/core/src/belt.ts:105` - try-catch command.handler()
+- [ ] **EHP-3** `packages/core/src/belt.ts` - Validar rootDir existe
+- [ ] **EHP-4** `packages/plugins/sync-types/src/discover.ts:16` - Validar sourceDir
+- [ ] **EHP-5** `packages/plugins/sync-types/src/write.ts:16` - try-catch mkdirSync
+- [ ] **EHP-6** `packages/plugins/sync-types/src/generate.ts:15-24` - try-catch TS operations
+- [ ] **EHP-7** `packages/plugins/typecheck/src/typecheck.ts:25-36` - Diferenciar config not found
+
+## Fase 3: Sync-Types Refinement (~3h)
+> Torna sync-types production-ready
+
+- [ ] **ST-1** `discover.ts:68-74` - Usar minimatch para pattern matching
+- [ ] **ST-2** `discover.ts:23-31` - Implementar import discovery recursivo
+- [ ] **ST-3** `discover.ts` - Suportar dynamic imports
+- [ ] **ST-4** `generate.ts:28-42` - Melhorar circular deps handling
+- [ ] **ST-5** `generate.ts:89-108` - Preservar dependências transitivas
+- [ ] **ST-6** `generate.ts:98` - Não truncar tipos complexos
+- [ ] **ST-7** `plugin.ts:34` - Tornar source dir configurável
+- [ ] **ST-8** `write.ts:23-26` - Fix indentação multi-line types
+- [ ] **ST-9** Adicionar opção --output ao CLI
+- [ ] **ST-10** Consultar branch `feature/SPMAIS-31425-quality-clean` para refinamentos
+
+## Fase 4: Typecheck Improvements (~1h)
+> Corrige vulnerabilidades e leaks
+
+- [ ] **TC-1** `typecheck.ts:64-67` - Path matching seguro (não usar startsWith)
+- [ ] **TC-2** `typecheck.ts:65` - Usar minimatch para exclude patterns
+- [ ] **TC-3** `typecheck.ts:57-59` - Consistência errorCount vs messages.length
+- [ ] **TC-4** `typecheck.ts:48-51` - Dispose TypeScript program (memory leak)
+- [ ] **TC-5** Validar include/exclude não conflitam
+
+## Fase 5: Core Improvements (~1h)
+> Melhora plugin system
+
+- [ ] **CO-1** `belt.ts` - Validação de plugin duplicado (por nome)
+- [ ] **CO-2** `belt.ts:48-53` - Respeitar NO_COLOR env var
+- [ ] **CO-3** `belt.ts` - Timeout opcional para commands
+- [ ] **CO-4** Reportar qual plugin falhou em initialization
+- [ ] **CO-5** Documentar BeltContext e hooks
+
+## Fase 6: Tools Package Cleanup (~1h)
+> Resolve lint warnings e type issues
+
+- [ ] **TL-1** `compose.ts:19,29,40` - Resolver any types ou adicionar biome-ignore justificado
+- [ ] **TL-2** `function.ts:1` - Trocar Function por tipo seguro
+- [ ] **TL-3** `object-utils.ts:131` - Validar tipo de key em objectHasOwnProperty
+- [ ] **TL-4** `object-utils.ts:42-47` - Documentar comportamento de non-Error throws
+- [ ] **TL-5** `mask-data.ts:8-9` - Tipar recursão ou justificar any
+- [ ] **TL-6** `error-utils.ts:36-43` - Adicionar version check para Bun workaround
+- [ ] **TL-7** Resolver restante dos 127 lint warnings
+
+## Fase 7: Test Infrastructure (~2h)
+> Cria base para testes
+
+- [ ] **TST-1** Adicionar vitest config em @belt/core
+- [ ] **TST-2** Adicionar vitest config em @belt/plugin-typecheck
+- [ ] **TST-3** Adicionar vitest config em @belt/plugin-sync-types
+- [ ] **TST-4** Adicionar vitest config em @belt/cli
+- [ ] **TST-5** Criar script `pnpm test` no root
+- [ ] **TST-6** Criar script `pnpm test:watch`
+- [ ] **TST-7** Atualizar pre-push hook para incluir testes
+
+## Fase 8: Core Tests (~2h)
+> Cobertura básica do core
+
+- [ ] **CT-1** Test: Belt class initialization
+- [ ] **CT-2** Test: Plugin registration
+- [ ] **CT-3** Test: Plugin duplicate detection
+- [ ] **CT-4** Test: Command registration
+- [ ] **CT-5** Test: Command execution
+- [ ] **CT-6** Test: Hook system (tapable)
+- [ ] **CT-7** Test: Error propagation
+
+## Fase 9: Plugin Tests (~2h)
+> Cobertura dos plugins
+
+- [ ] **PT-1** Test: typecheck com tsconfig válido
+- [ ] **PT-2** Test: typecheck com tsconfig inválido
+- [ ] **PT-3** Test: typecheck path filtering
+- [ ] **PT-4** Test: sync-types pattern matching
+- [ ] **PT-5** Test: sync-types import discovery
+- [ ] **PT-6** Test: sync-types declaration generation
+- [ ] **PT-7** Test: sync-types edge cases (circular deps, complex types)
+
+## Fase 10: CLI Tests (~1.5h)
+> Cobertura do CLI
+
+- [ ] **CLT-1** Test: command parsing
+- [ ] **CLT-2** Test: --cwd validation
+- [ ] **CLT-3** Test: error exit codes
+- [ ] **CLT-4** Test: help output
+- [ ] **CLT-5** Test: UI rendering (snapshot ou visual)
+
+## Fase 11: CI/CD Setup (~1.5h)
+> Automação no GitHub
+
+- [ ] **CI-1** Criar `.github/workflows/test.yml` (lint, build, typecheck, test)
+- [ ] **CI-2** Criar `.github/workflows/publish.yml` (manual trigger)
+- [ ] **CI-3** Adicionar badge de status no README
+- [ ] **CI-4** Configurar Codecov ou similar para coverage
+- [ ] **CI-5** Criar workflow para releases automáticas
+
+## Fase 12: Documentation (~2h)
+> Atualiza toda documentação
+
+- [ ] **DOC-1** Fix: CLI README --output inconsistency
+- [ ] **DOC-2** Fix: sync-types README pattern format
+- [ ] **DOC-3** Fix: exemplos programáticos corresponderem aos exports
+- [ ] **DOC-4** Add: API reference para BeltContext
+- [ ] **DOC-5** Add: API reference para hooks
+- [ ] **DOC-6** Add: Troubleshooting guide
+- [ ] **DOC-7** Add: Error codes documentation
+- [ ] **DOC-8** Add: ADR-001 (Why tapable?)
+- [ ] **DOC-9** Add: ADR-002 (Why Ink?)
+- [ ] **DOC-10** Revisar CLAUDE.md para accuracy
+
+## Fase 13: Final Polish (~1h)
+> Preparação final para publicação
+
+- [ ] **FP-1** Rodar full build e verificar zero erros
+- [ ] **FP-2** Rodar full lint e verificar zero warnings críticos
+- [ ] **FP-3** Rodar full test suite e verificar 100% pass
+- [ ] **FP-4** Verificar package.json files arrays
+- [ ] **FP-5** Testar publicação com --dry-run
+- [ ] **FP-6** Atualizar CHANGELOG.md
+- [ ] **FP-7** Tag git v0.1.0
+- [ ] **FP-8** Publicar no NPM
+
+---
+
+## Estimativa Total
+
+| Fase | Tempo | Acumulado |
+|------|-------|-----------|
+| 0. Quick Wins | 30min | 30min |
+| 1. Error Handling CLI | 1h | 1h30 |
+| 2. Error Handling Plugins | 1.5h | 3h |
+| 3. Sync-Types Refinement | 3h | 6h |
+| 4. Typecheck Improvements | 1h | 7h |
+| 5. Core Improvements | 1h | 8h |
+| 6. Tools Cleanup | 1h | 9h |
+| 7. Test Infrastructure | 2h | 11h |
+| 8. Core Tests | 2h | 13h |
+| 9. Plugin Tests | 2h | 15h |
+| 10. CLI Tests | 1.5h | 16.5h |
+| 11. CI/CD Setup | 1.5h | 18h |
+| 12. Documentation | 2h | 20h |
+| 13. Final Polish | 1h | **21h total** |
+
+---
+
+## Tracking no Harness
+
+Após aprovação, o `claude-progress.txt` será atualizado com:
+
+```markdown
+## Technical Debt Resolution
+- Current Phase: 0 (Quick Wins)
+- Progress: 0/92 items
+- Started: [date]
+- Estimated Completion: ~21h of work
+
+### Phase Status
+- [ ] Phase 0: Quick Wins (0/5)
+- [ ] Phase 1: Error Handling CLI (0/6)
+- [ ] Phase 2: Error Handling Plugins (0/7)
+- [ ] Phase 3: Sync-Types (0/10)
+- [ ] Phase 4: Typecheck (0/5)
+- [ ] Phase 5: Core (0/5)
+- [ ] Phase 6: Tools (0/7)
+- [ ] Phase 7: Test Infra (0/7)
+- [ ] Phase 8: Core Tests (0/7)
+- [ ] Phase 9: Plugin Tests (0/7)
+- [ ] Phase 10: CLI Tests (0/5)
+- [ ] Phase 11: CI/CD (0/5)
+- [ ] Phase 12: Docs (0/10)
+- [ ] Phase 13: Polish (0/8)
+```
+
+---
+
+## Arquivos Críticos (Ordem de Modificação)
+
+### Fase 0-2 (Desbloqueio)
+```
+packages/tools/src/helpers/logs.ts
+apps/cli/src/app.tsx
+packages/plugins/sync-types/src/generate.ts
+packages/tools/tsconfig.json
+apps/cli/src/cli.ts
+apps/cli/src/bin.ts
+packages/core/src/belt.ts
+packages/plugins/sync-types/src/discover.ts
+packages/plugins/sync-types/src/write.ts
+packages/plugins/typecheck/src/typecheck.ts
+```
+
+### Fase 3-6 (Refinamento)
+```
+packages/plugins/sync-types/src/discover.ts
+packages/plugins/sync-types/src/generate.ts
+packages/plugins/sync-types/src/plugin.ts
+packages/plugins/sync-types/src/write.ts
+packages/plugins/typecheck/src/typecheck.ts
+packages/core/src/belt.ts
+packages/tools/src/helpers/compose.ts
+packages/tools/src/helpers/function.ts
+packages/tools/src/helpers/object-utils.ts
+packages/tools/src/helpers/mask-data.ts
+packages/tools/src/helpers/error-utils.ts
+```
+
+### Fase 7-11 (Testes e CI)
+```
+packages/core/vitest.config.ts (novo)
+packages/core/src/__tests__/*.spec.ts (novos)
+packages/plugins/typecheck/vitest.config.ts (novo)
+packages/plugins/typecheck/src/__tests__/*.spec.ts (novos)
+packages/plugins/sync-types/vitest.config.ts (novo)
+packages/plugins/sync-types/src/__tests__/*.spec.ts (novos)
+apps/cli/vitest.config.ts (novo)
+apps/cli/src/__tests__/*.spec.ts (novos)
+.github/workflows/test.yml (novo)
+.github/workflows/publish.yml (novo)
+.husky/pre-push
+package.json (scripts)
+```
+
+### Fase 12-13 (Docs e Polish)
+```
+apps/cli/README.md
+packages/plugins/sync-types/README.md
+packages/core/README.md
+docs/api-reference.md (novo)
+docs/troubleshooting.md (novo)
+docs/adr/001-tapable.md (novo)
+docs/adr/002-ink.md (novo)
+CLAUDE.md
+CHANGELOG.md
+claude-progress.txt
+```

@@ -1,0 +1,450 @@
+import { useState, useMemo } from "react";
+import type { MetaFunction } from "react-router";
+import ContentLayout from "@cloudscape-design/components/content-layout";
+import Header from "@cloudscape-design/components/header";
+import Container from "@cloudscape-design/components/container";
+import SpaceBetween from "@cloudscape-design/components/space-between";
+import Grid from "@cloudscape-design/components/grid";
+import Box from "@cloudscape-design/components/box";
+import Button from "@cloudscape-design/components/button";
+import ButtonDropdown from "@cloudscape-design/components/button-dropdown";
+import Badge from "@cloudscape-design/components/badge";
+import Modal from "@cloudscape-design/components/modal";
+import Table from "@cloudscape-design/components/table";
+import ProgressBar from "@cloudscape-design/components/progress-bar";
+import Select from "@cloudscape-design/components/select";
+import type { SolverOutput, EventAssignment } from "@uptime/types";
+import { generateFleet, generateEvents, maintenanceTypes, TOTAL_FLEET, defaultConstraints } from "~/lib/demo-data";
+import { generateExcelExport, downloadExcel, generateFilename, generateMaximoCSV, downloadCSV } from "~/lib/export-utils";
+
+export const meta: MetaFunction = () => {
+  return [
+    { title: "Maintenance Calendar - Fleet Maintenance" },
+    { name: "description", content: "View scheduled maintenance events" },
+  ];
+};
+
+// Generate demo schedule data with all info needed for export
+function generateDemoSchedule() {
+  const assets = generateFleet(TOTAL_FLEET);
+  const events = generateEvents(assets, 52);
+
+  // Create a map for quick event lookup
+  const eventMap = new Map(events.map(e => [e.id, { assetId: e.assetId, maintenanceTypeId: e.maintenanceTypeId, manHours: e.manHours }]));
+
+  // Simulate solver assignments (spread events across periods)
+  const assignments: EventAssignment[] = events.map((event, index) => ({
+    eventId: event.id,
+    assignedPeriod: Math.min(event.latestPeriod, Math.max(event.earliestPeriod, event.targetPeriod + (index % 3) - 1)),
+    deviation: 0,
+  }));
+
+  // Calculate metrics for export
+  const workloadByWeek = new Map<number, number>();
+  for (const assignment of assignments) {
+    const event = eventMap.get(assignment.eventId);
+    if (!event) continue;
+    const current = workloadByWeek.get(assignment.assignedPeriod) || 0;
+    workloadByWeek.set(assignment.assignedPeriod, current + event.manHours);
+  }
+  const workloads = Array.from(workloadByWeek.values());
+  const peakWorkload = workloads.length > 0 ? Math.max(...workloads) : 0;
+  const averageWorkload = workloads.length > 0 ? Math.round(workloads.reduce((a, b) => a + b, 0) / workloads.length) : 0;
+
+  return {
+    assets,
+    assignments,
+    events: eventMap,
+    metrics: {
+      peakWorkload,
+      averageWorkload,
+      complianceRate: 0.985,
+      totalCost: 3156000,
+    },
+  };
+}
+
+// Maintenance type colors
+const typeColors: Record<string, string> = {
+  "mt-a": "#2ea043", // Green - A-Check
+  "mt-b": "#d29922", // Yellow - B-Check
+  "mt-c": "#cf222e", // Red - C-Check
+  "mt-d": "#8250df", // Purple - D-Overhaul
+};
+
+const typeLabels: Record<string, string> = {
+  "mt-a": "A-Check",
+  "mt-b": "B-Check",
+  "mt-c": "C-Check",
+  "mt-d": "D-Overhaul",
+};
+
+interface DayEvents {
+  date: Date;
+  week: number;
+  events: Array<{
+    eventId: string;
+    assetId: string;
+    maintenanceTypeId: string;
+    manHours: number;
+  }>;
+}
+
+interface WeekData {
+  weekNumber: number;
+  startDate: Date;
+  endDate: Date;
+  totalManHours: number;
+  eventCount: number;
+  events: DayEvents["events"];
+}
+
+export default function Calendar() {
+  const [currentMonth, setCurrentMonth] = useState(new Date(2025, 0, 1)); // January 2025
+  const [selectedDay, setSelectedDay] = useState<DayEvents | null>(null);
+  const [viewMode, setViewMode] = useState<"month" | "week">("month");
+  const [filterType, setFilterType] = useState<{ label: string; value: string } | null>(null);
+
+  // Generate schedule data
+  const scheduleData = useMemo(() => generateDemoSchedule(), []);
+  const { assignments, events, assets, metrics } = scheduleData;
+
+  // Export handlers
+  const handleExport = (exportType: string) => {
+    const weeklyCapacity = defaultConstraints.weeklyManHours;
+
+    if (exportType === "excel") {
+      const workbook = generateExcelExport({
+        assets,
+        assignments,
+        events,
+        metrics,
+        horizonWeeks: 52,
+        weeklyCapacity,
+      });
+      downloadExcel(workbook, generateFilename("dubai_metro_schedule", "xlsx"));
+    } else if (exportType === "maximo") {
+      const csv = generateMaximoCSV(assignments, events);
+      downloadCSV(csv, generateFilename("maximo_import", "csv"));
+    } else if (exportType === "pdf") {
+      // PDF export - for now just alert
+      alert("PDF export coming soon! Use Excel export for now.");
+    }
+  };
+
+  // Group events by week
+  const eventsByWeek = useMemo(() => {
+    const byWeek = new Map<number, DayEvents["events"]>();
+
+    for (const assignment of assignments) {
+      const event = events.get(assignment.eventId);
+      if (!event) continue;
+
+      // Apply filter
+      if (filterType && event.maintenanceTypeId !== filterType.value) continue;
+
+      const week = assignment.assignedPeriod;
+      if (!byWeek.has(week)) {
+        byWeek.set(week, []);
+      }
+      byWeek.get(week)!.push({
+        eventId: assignment.eventId,
+        ...event,
+      });
+    }
+
+    return byWeek;
+  }, [assignments, events, filterType]);
+
+  // Get week data for the current view
+  const weeksInView = useMemo(() => {
+    const weeks: WeekData[] = [];
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+
+    // Get first day of month and find which week it falls in
+    const firstDay = new Date(year, month, 1);
+    const startWeek = Math.floor((firstDay.getTime() - new Date(year, 0, 1).getTime()) / (7 * 24 * 60 * 60 * 1000));
+
+    // Get last day of month
+    const lastDay = new Date(year, month + 1, 0);
+    const endWeek = Math.floor((lastDay.getTime() - new Date(year, 0, 1).getTime()) / (7 * 24 * 60 * 60 * 1000));
+
+    for (let w = startWeek; w <= endWeek && w < 52; w++) {
+      const weekEvents = eventsByWeek.get(w) || [];
+      const startDate = new Date(year, 0, 1 + w * 7);
+      const endDate = new Date(year, 0, 7 + w * 7);
+
+      weeks.push({
+        weekNumber: w + 1,
+        startDate,
+        endDate,
+        totalManHours: weekEvents.reduce((sum, e) => sum + e.manHours, 0),
+        eventCount: weekEvents.length,
+        events: weekEvents,
+      });
+    }
+
+    return weeks;
+  }, [currentMonth, eventsByWeek]);
+
+  // Calculate capacity utilization
+  const weeklyCapacity = 5200;
+
+  // Navigation handlers
+  const previousMonth = () => {
+    setCurrentMonth(new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1));
+  };
+
+  const nextMonth = () => {
+    setCurrentMonth(new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1));
+  };
+
+  const monthName = currentMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+
+  // Count events by type for legend
+  const eventCounts = useMemo(() => {
+    const counts: Record<string, number> = { "mt-a": 0, "mt-b": 0, "mt-c": 0, "mt-d": 0 };
+    for (const week of weeksInView) {
+      for (const event of week.events) {
+        counts[event.maintenanceTypeId] = (counts[event.maintenanceTypeId] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [weeksInView]);
+
+  return (
+    <ContentLayout
+      header={
+        <Header
+          variant="h1"
+          description="View and validate scheduled maintenance events"
+          actions={
+            <SpaceBetween direction="horizontal" size="xs">
+              <Select
+                selectedOption={filterType}
+                onChange={({ detail }) => setFilterType(detail.selectedOption as { label: string; value: string } | null)}
+                options={[
+                  { label: "All Types", value: "" },
+                  { label: "A-Check", value: "mt-a" },
+                  { label: "B-Check", value: "mt-b" },
+                  { label: "C-Check", value: "mt-c" },
+                  { label: "D-Overhaul", value: "mt-d" },
+                ]}
+                placeholder="Filter by type"
+              />
+              <ButtonDropdown
+                items={[
+                  { text: "Export to Excel", id: "excel" },
+                  { text: "Export to PDF", id: "pdf" },
+                  { text: "Export for Maximo", id: "maximo" },
+                ]}
+                onItemClick={({ detail }) => handleExport(detail.id)}
+              >
+                Export
+              </ButtonDropdown>
+            </SpaceBetween>
+          }
+        >
+          Maintenance Calendar
+        </Header>
+      }
+    >
+      <SpaceBetween size="l">
+        {/* Legend */}
+        <Container>
+          <SpaceBetween direction="horizontal" size="l">
+            <Box variant="span" fontWeight="bold">Legend:</Box>
+            {Object.entries(typeLabels).map(([id, label]) => (
+              <SpaceBetween key={id} direction="horizontal" size="xxs">
+                <div style={{
+                  width: 16,
+                  height: 16,
+                  backgroundColor: typeColors[id],
+                  borderRadius: 4,
+                  display: "inline-block",
+                }} />
+                <Box variant="span">{label}</Box>
+                <Badge color="blue">{eventCounts[id]}</Badge>
+              </SpaceBetween>
+            ))}
+          </SpaceBetween>
+        </Container>
+
+        {/* Calendar Navigation */}
+        <Container
+          header={
+            <Header
+              variant="h2"
+              actions={
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button iconName="angle-left" variant="icon" onClick={previousMonth} />
+                  <Box variant="h3" padding={{ horizontal: "l" }}>{monthName}</Box>
+                  <Button iconName="angle-right" variant="icon" onClick={nextMonth} />
+                </SpaceBetween>
+              }
+            >
+              Weekly Schedule
+            </Header>
+          }
+        >
+          <SpaceBetween size="m">
+            {weeksInView.map((week) => {
+              const utilization = (week.totalManHours / weeklyCapacity) * 100;
+              const utilizationStatus = utilization > 90 ? "error" : utilization > 70 ? "in-progress" : "success";
+
+              return (
+                <div
+                  key={week.weekNumber}
+                  style={{
+                    padding: "12px 16px",
+                    border: "1px solid #e9ebed",
+                    borderRadius: 8,
+                    cursor: "pointer",
+                    transition: "background-color 0.2s",
+                  }}
+                  onClick={() => setSelectedDay({
+                    date: week.startDate,
+                    week: week.weekNumber,
+                    events: week.events,
+                  })}
+                  onMouseOver={(e) => e.currentTarget.style.backgroundColor = "#f4f4f4"}
+                  onMouseOut={(e) => e.currentTarget.style.backgroundColor = "transparent"}
+                >
+                  <Grid gridDefinition={[{ colspan: 2 }, { colspan: 3 }, { colspan: 5 }, { colspan: 2 }]}>
+                    <Box variant="h4">Week {week.weekNumber}</Box>
+                    <Box color="text-body-secondary">
+                      {week.startDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - {week.endDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                    </Box>
+                    <div>
+                      <ProgressBar
+                        value={Math.min(utilization, 100)}
+                        status={utilizationStatus}
+                        additionalInfo={`${week.totalManHours.toLocaleString()} / ${weeklyCapacity.toLocaleString()} man-hours`}
+                      />
+                    </div>
+                    <SpaceBetween direction="horizontal" size="xxs">
+                      {Object.entries(typeColors).map(([typeId, color]) => {
+                        const count = week.events.filter(e => e.maintenanceTypeId === typeId).length;
+                        if (count === 0) return null;
+                        return (
+                          <div
+                            key={typeId}
+                            style={{
+                              backgroundColor: color,
+                              color: "white",
+                              borderRadius: 4,
+                              padding: "2px 8px",
+                              fontSize: 12,
+                              fontWeight: "bold",
+                            }}
+                          >
+                            {count}
+                          </div>
+                        );
+                      })}
+                    </SpaceBetween>
+                  </Grid>
+                </div>
+              );
+            })}
+          </SpaceBetween>
+        </Container>
+
+        {/* Summary Stats */}
+        <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
+          <Container>
+            <Box variant="h3" textAlign="center">Total Events</Box>
+            <Box variant="h1" textAlign="center" color="text-status-info">
+              {weeksInView.reduce((sum, w) => sum + w.eventCount, 0)}
+            </Box>
+            <Box variant="small" textAlign="center" color="text-body-secondary">this month</Box>
+          </Container>
+          <Container>
+            <Box variant="h3" textAlign="center">Total Man-Hours</Box>
+            <Box variant="h1" textAlign="center" color="text-status-info">
+              {weeksInView.reduce((sum, w) => sum + w.totalManHours, 0).toLocaleString()}
+            </Box>
+            <Box variant="small" textAlign="center" color="text-body-secondary">this month</Box>
+          </Container>
+          <Container>
+            <Box variant="h3" textAlign="center">Avg Utilization</Box>
+            <Box variant="h1" textAlign="center" color="text-status-info">
+              {Math.round(weeksInView.reduce((sum, w) => sum + (w.totalManHours / weeklyCapacity), 0) / weeksInView.length * 100)}%
+            </Box>
+            <Box variant="small" textAlign="center" color="text-body-secondary">of capacity</Box>
+          </Container>
+          <Container>
+            <Box variant="h3" textAlign="center">Peak Week</Box>
+            <Box variant="h1" textAlign="center" color="text-status-warning">
+              {Math.max(...weeksInView.map(w => w.totalManHours)).toLocaleString()}
+            </Box>
+            <Box variant="small" textAlign="center" color="text-body-secondary">man-hours</Box>
+          </Container>
+        </Grid>
+      </SpaceBetween>
+
+      {/* Event Detail Modal */}
+      <Modal
+        visible={selectedDay !== null}
+        onDismiss={() => setSelectedDay(null)}
+        header={selectedDay ? `Week ${selectedDay.week} - ${selectedDay.events.length} Events` : ""}
+        size="large"
+      >
+        {selectedDay && (
+          <SpaceBetween size="l">
+            <Box>
+              <strong>Date Range:</strong> {selectedDay.date.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}
+            </Box>
+            <Box>
+              <strong>Total Man-Hours:</strong> {selectedDay.events.reduce((sum, e) => sum + e.manHours, 0).toLocaleString()}
+            </Box>
+            <Table
+              columnDefinitions={[
+                {
+                  id: "asset",
+                  header: "Train",
+                  cell: (item) => <strong>{item.assetId}</strong>,
+                  sortingField: "assetId",
+                },
+                {
+                  id: "type",
+                  header: "Maintenance Type",
+                  cell: (item) => (
+                    <SpaceBetween direction="horizontal" size="xs">
+                      <div style={{
+                        width: 12,
+                        height: 12,
+                        backgroundColor: typeColors[item.maintenanceTypeId],
+                        borderRadius: 2,
+                      }} />
+                      {typeLabels[item.maintenanceTypeId]}
+                    </SpaceBetween>
+                  ),
+                },
+                {
+                  id: "hours",
+                  header: "Man-Hours",
+                  cell: (item) => item.manHours,
+                },
+                {
+                  id: "fleet",
+                  header: "Fleet",
+                  cell: (item) => item.assetId.startsWith("ALT") ? "Alstom" : "Kinki Sharyo",
+                },
+              ]}
+              items={selectedDay.events}
+              sortingDisabled
+              variant="embedded"
+              empty={
+                <Box textAlign="center" color="text-body-secondary">
+                  No events scheduled for this week
+                </Box>
+              }
+            />
+          </SpaceBetween>
+        )}
+      </Modal>
+    </ContentLayout>
+  );
+}

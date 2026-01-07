@@ -1,0 +1,225 @@
+/**
+ * uPlot TimeScrubber POC
+ *
+ * Uses uPlot with Canvas 2D rendering for high-performance time scrubber.
+ * Grafana's choice for time series - handles 100,000+ points/ms.
+ *
+ * Pros:
+ * - Exceptional performance (~100K points/ms after cold start)
+ * - Tiny bundle size (~50KB)
+ * - Native zoom/selection support
+ * - Canvas 2D rendering (much faster than SVG)
+ *
+ * Cons:
+ * - Less React-idiomatic
+ * - Steeper learning curve
+ * - Less community compared to Recharts
+ */
+
+import React, { useRef, useEffect, useMemo, useCallback } from 'react';
+import uPlot from 'uplot';
+import 'uplot/dist/uPlot.min.css';
+import type { TimeSeriesPoint } from './mockData';
+
+interface UplotTimeScrubberProps {
+  /** Time series data for density visualization */
+  data: TimeSeriesPoint[];
+  /** Width of the component */
+  width: number;
+  /** Height of the component */
+  height: number;
+  /** Callback when selection changes */
+  onSelectionChange?: (range: [number, number] | null) => void;
+  /** Fill color for the area */
+  fillColor?: string;
+  /** Stroke color for the line */
+  strokeColor?: string;
+  /** Show grid */
+  showGrid?: boolean;
+}
+
+export const UplotTimeScrubber: React.FC<UplotTimeScrubberProps> = ({
+  data,
+  width,
+  height,
+  onSelectionChange,
+  fillColor = 'rgba(99, 102, 241, 0.3)',
+  strokeColor = '#4f46e5',
+  showGrid = true,
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<uPlot | null>(null);
+  const onSelectionChangeRef = useRef(onSelectionChange);
+
+  // Keep callback ref updated
+  useEffect(() => {
+    onSelectionChangeRef.current = onSelectionChange;
+  }, [onSelectionChange]);
+
+  // Transform data to uPlot format: [timestamps[], values[]]
+  const chartData = useMemo((): uPlot.AlignedData => {
+    const timestamps = data.map((d) => d.timestamp / 1000); // uPlot uses seconds
+    const values = data.map((d) => d.value);
+    return [timestamps, values];
+  }, [data]);
+
+  // Create uPlot options
+  const options = useMemo((): uPlot.Options => {
+    return {
+      width,
+      height,
+      cursor: {
+        drag: {
+          x: true,
+          y: false,
+        },
+        sync: {
+          key: 'mms-sync',
+        },
+      },
+      select: {
+        show: true,
+        over: true,
+        left: 0,
+        top: 0,
+        width: 0,
+        height: height,
+      },
+      scales: {
+        x: {
+          time: true,
+        },
+        y: {
+          auto: true,
+          range: (u, min, max) => [0, max * 1.1],
+        },
+      },
+      axes: [
+        {
+          // X axis (time)
+          stroke: '#666',
+          grid: { show: showGrid, stroke: '#e5e7eb', width: 1 },
+          ticks: { show: true, stroke: '#e5e7eb', width: 1, size: 5 },
+          values: (u, vals) =>
+            vals.map((v) => {
+              const date = new Date(v * 1000);
+              return date.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+            }),
+          size: 30,
+          font: '10px system-ui',
+        },
+        {
+          // Y axis
+          stroke: '#666',
+          grid: { show: showGrid, stroke: '#e5e7eb', width: 1 },
+          ticks: { show: true, stroke: '#e5e7eb', width: 1, size: 5 },
+          size: 40,
+          font: '10px system-ui',
+        },
+      ],
+      series: [
+        {}, // x-axis series (timestamps)
+        {
+          label: 'Tasks',
+          stroke: strokeColor,
+          width: 2,
+          fill: fillColor,
+          paths: (u, seriesIdx, idx0, idx1) => {
+            // Custom area path
+            const serie = u.series[seriesIdx];
+            const xdata = u.data[0];
+            const ydata = u.data[seriesIdx];
+            const scaleX = u.scales.x;
+            const scaleY = u.scales.y;
+
+            const path = new Path2D();
+            const fillPath = new Path2D();
+
+            let x0 = 0,
+              y0 = 0;
+            for (let i = idx0; i <= idx1; i++) {
+              const xVal = xdata[i];
+              const yVal = ydata[i];
+              if (xVal == null || yVal == null) continue;
+
+              const x = u.valToPos(xVal, 'x', true);
+              const y = u.valToPos(yVal, 'y', true);
+
+              if (i === idx0) {
+                path.moveTo(x, y);
+                fillPath.moveTo(x, u.valToPos(0, 'y', true));
+                fillPath.lineTo(x, y);
+                x0 = x;
+              } else {
+                path.lineTo(x, y);
+                fillPath.lineTo(x, y);
+              }
+              y0 = y;
+            }
+
+            // Close fill path
+            const lastX = u.valToPos(xdata[idx1], 'x', true);
+            fillPath.lineTo(lastX, u.valToPos(0, 'y', true));
+            fillPath.closePath();
+
+            return {
+              stroke: path,
+              fill: fillPath,
+            };
+          },
+        },
+      ],
+      hooks: {
+        setSelect: [
+          (u) => {
+            const { left, width: selWidth } = u.select;
+            if (selWidth > 0 && onSelectionChangeRef.current) {
+              const min = u.posToVal(left, 'x') * 1000; // Convert back to ms
+              const max = u.posToVal(left + selWidth, 'x') * 1000;
+              onSelectionChangeRef.current([min, max]);
+            }
+          },
+        ],
+      },
+    };
+  }, [width, height, fillColor, strokeColor, showGrid]);
+
+  // Initialize and update chart
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    // Destroy existing chart
+    if (chartRef.current) {
+      chartRef.current.destroy();
+    }
+
+    // Create new chart
+    chartRef.current = new uPlot(options, chartData, containerRef.current);
+
+    return () => {
+      if (chartRef.current) {
+        chartRef.current.destroy();
+        chartRef.current = null;
+      }
+    };
+  }, [options, chartData]);
+
+  // Handle resize
+  useEffect(() => {
+    if (chartRef.current) {
+      chartRef.current.setSize({ width, height });
+    }
+  }, [width, height]);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{
+        width,
+        height,
+      }}
+    />
+  );
+};
+
+export default UplotTimeScrubber;

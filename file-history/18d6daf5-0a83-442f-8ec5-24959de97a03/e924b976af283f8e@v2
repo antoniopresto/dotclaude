@@ -1,0 +1,193 @@
+/**
+ * MMS Data Types
+ *
+ * Architecture: Persistence vs Rendering
+ *
+ * Data flows through two distinct layers:
+ *
+ * Persistent (JSON/API) → Runtime (in memory) → Rendering (canvas)
+ *   startDate: string      (Date objects)       startDay: 74
+ *   "2024-03-15"           for logic            trainIndex: 5
+ *
+ * Why this separation?
+ * - Date objects cannot be serialized to JSON (become {})
+ * - Canvas needs numeric offsets for position calculations
+ * - Domain logic needs semantic dates for business rules
+ */
+
+// ─────────────────────────────────────────────────────────────
+// ENUMS & CONSTANTS
+// ─────────────────────────────────────────────────────────────
+
+export type AssetType = 'ALSTOM' | 'KINKI';
+export type TaskType = 'maintenance' | 'overhaul' | 'inspection';
+export type MaintenanceLevel = 'A' | 'B' | 'C' | 'D';
+
+// ─────────────────────────────────────────────────────────────
+// DOMAIN TYPES (Persistent/Serializable)
+// These types can be saved to JSON, sent via API, or stored in localStorage.
+// ─────────────────────────────────────────────────────────────
+
+export interface Train {
+  id: string;              // "TRAIN-001" or "ALT-001"
+  name: string;            // Display name
+  assetType: AssetType;    // Fleet type
+}
+
+export interface Task {
+  id: string;              // Unique identifier
+  trainId: string;         // Reference to Train.id
+  startDate: string;       // ISO 8601 date: "2024-03-15"
+  endDate: string;         // ISO 8601 date: "2024-03-20"
+  type: TaskType;          // Visual category
+  hasConflict: boolean;    // Conflict indicator
+}
+
+export interface DatasetMeta {
+  startDate: string;       // ISO 8601: "2024-01-01"
+  trainCount: number;      // Number of trains
+  years: number;           // Time range in years
+}
+
+export interface GeneratedData {
+  trains: Train[];
+  tasks: Task[];
+  meta: DatasetMeta;
+}
+
+// ─────────────────────────────────────────────────────────────
+// RENDERING TYPES (Runtime/Calculated)
+// These types are computed when data loads and used by the canvas.
+// Never persisted.
+// ─────────────────────────────────────────────────────────────
+
+export type TaskColor = 'blue' | 'orange' | 'gray';
+
+export interface TaskRender {
+  id: string;              // Same as Task.id
+  trainIndex: number;      // Y position (0-based index in trains array)
+  startDay: number;        // X position (days since meta.startDate)
+  duration: number;        // Width (days)
+  color: TaskColor;        // Derived from Task.type
+  hasConflict: boolean;    // Passthrough from Task
+  type: TaskType;          // For label display in MicroLayer
+}
+
+export const TYPE_TO_COLOR: Record<TaskType, TaskColor> = {
+  maintenance: 'blue',
+  overhaul: 'orange',
+  inspection: 'gray',
+};
+
+// ─────────────────────────────────────────────────────────────
+// WORLD BOUNDS (Navigation limits)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Defines the navigable world boundaries.
+ * Camera will be clamped to these bounds.
+ *
+ * Coordinate system:
+ * - X: 0 = first day, positive = future
+ * - Y: 0 = top (TRAIN-001), negative = down (more trains)
+ */
+export interface WorldBounds {
+  minX: number;  // 0 (first day)
+  maxX: number;  // totalDays * pxPerDay
+  minY: number;  // -trainCount * pxPerTrain (bottom)
+  maxY: number;  // 0 (top)
+}
+
+// ─────────────────────────────────────────────────────────────
+// CANVAS CONFIGURATION
+// ─────────────────────────────────────────────────────────────
+
+export interface ViewConfig {
+  pxPerDay: number;        // Pixels per day (X scale)
+  pxPerTrain: number;      // Pixels per train row (Y scale)
+  minZoom: number;         // Minimum zoom level
+  maxZoom: number;         // Maximum zoom level
+  zoomSensitivity: number; // Scroll sensitivity
+  lodThresholds: {
+    macro: number;         // Below this → MACRO view
+    micro: number;         // Above this → MICRO view
+  };
+}
+
+export type LODLevel = 'MACRO' | 'MESO' | 'MICRO';
+
+export interface ViewportState {
+  zoom: number;
+  panX: number;
+  panY: number;
+  lod: LODLevel;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DEFAULT VALUES
+// ─────────────────────────────────────────────────────────────
+
+export const DEFAULT_VIEW_CONFIG: ViewConfig = {
+  pxPerDay: 10,
+  pxPerTrain: 24,
+  minZoom: 0.1,
+  maxZoom: 5,
+  zoomSensitivity: 0.002,
+  lodThresholds: {
+    macro: 0.5,
+    micro: 2.0,
+  },
+};
+
+export const DEFAULT_DATASET_META: DatasetMeta = {
+  startDate: '2024-01-01',
+  trainCount: 50,
+  years: 10,
+};
+
+/**
+ * Calculate world bounds from dataset metadata
+ */
+export function calculateWorldBounds(
+  trainCount: number,
+  totalDays: number,
+  config: ViewConfig = DEFAULT_VIEW_CONFIG
+): WorldBounds {
+  return {
+    minX: 0,
+    maxX: totalDays * config.pxPerDay,
+    minY: -trainCount * config.pxPerTrain,
+    maxY: 0,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// FUTURE EXTENSIONS (Optional Fields)
+// These fields can be added without breaking existing code.
+// ─────────────────────────────────────────────────────────────
+
+// Extended Train (future)
+export interface TrainExtended extends Train {
+  carsCount?: number;
+  currentMileageKm?: number;
+  avgDailyMileageKm?: number;
+  status?: 'operational' | 'maintenance' | 'out-of-service';
+}
+
+// Extended Task (future)
+export interface TaskExtended extends Task {
+  maintenanceLevel?: MaintenanceLevel;
+  manHours?: number;
+  estimatedCost?: number;
+  dependencies?: string[];
+  status?: 'scheduled' | 'in-progress' | 'completed';
+}
+
+// Conflict as separate entity (future)
+export interface Conflict {
+  id: string;
+  taskIds: [string, string];
+  type: 'overlap' | 'resource' | 'dependency';
+  severity: 'low' | 'medium' | 'high';
+  description?: string;
+}

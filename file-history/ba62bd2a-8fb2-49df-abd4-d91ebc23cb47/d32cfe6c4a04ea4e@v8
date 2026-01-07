@@ -1,0 +1,275 @@
+# HQ - Harness Orchestrator & Dashboard
+
+## Visão Geral
+
+**HQ** é uma aplicação desktop nativa (Tauri + React + BlueprintJS v6) que substitui o terminal para gerenciamento de desenvolvimento com AI agents. Implementa o padrão **Anthropic Harness** para trabalho de longa duração em múltiplas sessões.
+
+### O que é um Harness?
+
+> **Problema:** Cada nova sessão de AI começa com ZERO memória do que aconteceu antes.
+> **Solução:** Arquivos de estado (`progress.txt`, `features.json`) persistem contexto entre sessões.
+
+**Fonte:** [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) - Anthropic Engineering, Nov 2025
+
+---
+
+## Stack Tecnológico
+
+| Camada | Tecnologia | Versão | Justificativa |
+|--------|-----------|--------|---------------|
+| **Runtime** | Tauri | 2.x | App nativo, leve, Rust backend |
+| **Frontend** | React | 18.3.x | BlueprintJS 6 requer React 18 |
+| **UI** | BlueprintJS | 6.x | Enterprise UI, Kanban components |
+| **State** | @zazcart/toolkit | local | `createMachine`, validação, helpers |
+| **Build** | Vite | 5.x | Fast HMR, Tauri plugin |
+| **Package** | Bun | 1.2+ | Workspace, scripts |
+
+**Dependência crítica:**
+```json
+"@zazcart/toolkit": "file:/usr/local/packages/toolkit"
+```
+
+---
+
+## Estrutura do Projeto
+
+```
+~/antonio/HQ/
+├── .claude/
+│   ├── hooks/                    # Hooks reutilizados do MMS
+│   │   ├── session-start.sh      # Context injection
+│   │   ├── after-write.sh        # Contextual warnings
+│   │   ├── end-of-turn-check.sh  # Quality gate
+│   │   └── protect-package-json.sh
+│   ├── settings.json             # Hook configuration
+│   └── settings.local.json       # Permissions
+│
+├── .harness/
+│   ├── progress.txt              # Session history
+│   └── features.json             # Features com status
+│
+├── src-tauri/                    # Rust backend
+│   ├── src/
+│   │   ├── main.rs               # Entry point
+│   │   ├── commands/             # Tauri commands
+│   │   │   ├── harness.rs        # Read/write harness files
+│   │   │   ├── claude.rs         # Spawn Claude sessions
+│   │   │   └── logs.rs           # Real-time log streaming
+│   │   └── lib.rs
+│   ├── Cargo.toml
+│   └── tauri.conf.json
+│
+├── src/                          # React frontend
+│   ├── main.tsx                  # Entry point
+│   ├── App.tsx                   # Root component
+│   ├── state/                    # @zazcart/toolkit machine
+│   │   ├── machine.ts            # Main state machine
+│   │   ├── slices/
+│   │   │   ├── harness.ts        # Harness state (features, progress)
+│   │   │   ├── sessions.ts       # Active Claude sessions
+│   │   │   └── logs.ts           # Real-time logs
+│   │   └── index.ts
+│   ├── components/
+│   │   ├── KanbanBoard.tsx       # Feature cards (pending/in_progress/done)
+│   │   ├── SessionPanel.tsx      # Active sessions list
+│   │   ├── LogViewer.tsx         # Real-time log stream
+│   │   ├── FeatureCard.tsx       # Individual feature card
+│   │   └── HarnessSelector.tsx   # Select project/harness
+│   ├── hooks/
+│   │   └── useTauriEvents.ts     # Tauri event subscriptions
+│   └── styles/
+│       └── index.scss            # BlueprintJS overrides
+│
+├── index.html
+├── vite.config.ts
+├── package.json
+├── CLAUDE.md                     # Project instructions
+└── tsconfig.json
+```
+
+---
+
+## Features (MVP)
+
+### F001: Project Scaffolding
+- Tauri 2.x + React 18 + BlueprintJS 6 + Vite
+- @zazcart/toolkit integration
+- Basic window with dark theme
+
+### F002: Harness State Machine
+```typescript
+import { createMachine, createSlice, createAsyncSlice } from '@zazcart/toolkit';
+
+const harnessSlice = createAsyncSlice({
+  id: 'harness',
+  cache: { policy: 'session' },
+  context: { tauriInvoke: {} as typeof invoke },
+  async load(projectPath: string, { tauriInvoke }) {
+    const features = await tauriInvoke('read_features', { path: projectPath });
+    const progress = await tauriInvoke('read_progress', { path: projectPath });
+    return { features, progress };
+  },
+});
+
+const hqMachine = createMachine({
+  id: 'hq',
+  slices: { harness: harnessSlice, sessions: sessionsSlice, logs: logsSlice },
+  context: { userID: null },
+  trackMetadata: false, // Performance for logs
+});
+```
+
+### F003: Kanban Board UI
+- 3 colunas: `pending` | `in_progress` | `completed`
+- BlueprintJS Card components
+- Drag-and-drop (muda status em features.json)
+- Color coding por categoria (core, ui, polish)
+
+### F004: Tauri Commands (Rust)
+```rust
+#[tauri::command]
+fn read_features(path: String) -> Result<Vec<Feature>, String> {
+    let content = fs::read_to_string(format!("{}/.harness/features.json", path))?;
+    serde_json::from_str(&content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn spawn_claude_session(harness_path: String, feature_id: String) -> Result<u32, String> {
+    // Spawn `claude` CLI with isolation prompt
+}
+
+#[tauri::command]
+fn watch_logs(session_id: u32, window: Window) -> Result<(), String> {
+    // Stream logs via Tauri events
+}
+```
+
+### F005: Real-time Log Viewer
+- WebSocket/Tauri events do processo Claude
+- Scroll automático
+- Syntax highlighting para code blocks
+- Filter por level (info/warn/error)
+
+### F006: Session Management
+- Start/Stop Claude sessions
+- Ver sessão ativa por feature
+- Kill session button
+
+---
+
+## Schemas (@zazcart/toolkit)
+
+```typescript
+import { createModel, InferType } from '@zazcart/toolkit';
+
+export const FeatureSchema = createModel({
+  id: 'string',
+  category: 'string',
+  priority: 'number',
+  description: 'string',
+  passes: 'boolean',
+  blockedBy: 'string?',
+  steps: 'string[]?',
+  notes: 'string?',
+});
+
+export type Feature = InferType<typeof FeatureSchema>;
+
+export const SessionSchema = createModel({
+  id: 'string',
+  featureId: 'string',
+  pid: 'number',
+  status: { enum: ['running', 'stopped', 'completed', 'failed'] as const },
+  startedAt: 'date',
+  logs: 'string[]',
+});
+
+export type Session = InferType<typeof SessionSchema>;
+```
+
+---
+
+## Hooks Reutilizados do MMS
+
+| Hook | Reusar? | Adaptação |
+|------|---------|-----------|
+| `session-start.sh` | ✅ | Remover refs específicas do MMS |
+| `after-write.sh` | ✅ | Generalizar avisos |
+| `end-of-turn-check.sh` | ✅ | Remover typecheck específico |
+| `protect-package-json.sh` | ✅ | Sem alteração |
+| `task-type-detector.py` | ❌ | Muito específico ao MMS |
+
+---
+
+## Plano de Implementação
+
+### Fase 1: Scaffolding (F001)
+
+1. **Criar diretório e iniciar projeto:**
+   ```bash
+   mkdir -p ~/antonio/HQ
+   cd ~/antonio/HQ
+   bun create tauri-app . --template react-ts
+   ```
+
+2. **Configurar BlueprintJS 6 + toolkit:**
+   ```bash
+   cd ~/antonio/HQ
+   bun add @blueprintjs/core@6 @blueprintjs/icons@6
+   bun add "@zazcart/toolkit@file:/usr/local/packages/toolkit"
+   ```
+
+3. **Copiar hooks do MMS:**
+   ```bash
+   cp -r /Users/anotonio.silva/antonio/mms/system/.claude ~/antonio/HQ/
+   # Adaptar hooks para serem genéricos
+   ```
+
+4. **Criar .harness/ inicial:**
+   ```bash
+   mkdir -p ~/antonio/HQ/.harness
+   # Criar features.json inicial com F001-F006
+   # Criar progress.txt vazio
+   ```
+
+### Fase 2: Core State (F002)
+
+1. Implementar `src/state/machine.ts` com @zazcart/toolkit
+2. Criar slices: harness, sessions, logs
+3. Definir schemas com createModel
+
+### Fase 3: UI (F003)
+
+1. Kanban board com BlueprintJS Cards
+2. Feature cards com status visual
+3. Dark theme integration
+
+### Fase 4: Tauri Backend (F004-F006)
+
+1. Rust commands para ler/escrever harness files
+2. Spawn Claude CLI subprocess
+3. Event streaming para logs real-time
+
+---
+
+## Arquivos Críticos a Criar
+
+| Arquivo | Propósito |
+|---------|-----------|
+| `~/antonio/HQ/package.json` | Deps: React 18, BlueprintJS 6, toolkit |
+| `~/antonio/HQ/src-tauri/Cargo.toml` | Deps Rust: serde_json, tokio |
+| `~/antonio/HQ/src/state/machine.ts` | State machine principal |
+| `~/antonio/HQ/.harness/features.json` | Features iniciais |
+| `~/antonio/HQ/CLAUDE.md` | Instruções do projeto |
+| `~/antonio/HQ/.claude/hooks/*` | Hooks adaptados |
+
+---
+
+## Próximos Passos Após Aprovação
+
+1. Criar estrutura de diretórios
+2. Iniciar projeto Tauri com template React
+3. Instalar dependências (BlueprintJS 6, toolkit)
+4. Copiar e adaptar hooks
+5. Criar .harness/ com features iniciais
+6. Iniciar harness (primeira sessão documenta setup)

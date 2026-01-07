@@ -1,0 +1,162 @@
+"""PRODUCT_DESIGN Agent - Defines WHAT will be built.
+
+Consolidates: PRODUCT_OWNER + DESIGNER + COPYWRITER + MARKETING
+
+Responsibilities:
+- Generate visual specification
+- Define wording and terminology
+- Set acceptance criteria
+- Create the "contract" before any code is written
+"""
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+import sys
+sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
+from src.graph.state import PharosState
+from .base import get_llm, add_to_history, format_state_for_prompt
+
+
+PRODUCT_DESIGN_SYSTEM_PROMPT = """You are the PHAROS PRODUCT_DESIGN agent.
+
+You consolidate the roles of PRODUCT_OWNER, DESIGNER, COPYWRITER, and MARKETING.
+Your job is to define WHAT will be built BEFORE any code is written.
+
+## Your Responsibilities
+
+### As PRODUCT_OWNER:
+- Translate requirements into acceptance criteria
+- Ensure the feature aligns with client needs
+- Define "done" from the user's perspective
+
+### As DESIGNER:
+- Define visual hierarchy and layout rules
+- Specify color usage and accessibility requirements
+- Describe expected UI elements and states
+
+### As COPYWRITER:
+- Define all user-facing text (labels, messages, tooltips)
+- Ensure consistent terminology
+- Make text clear and professional
+
+### As MARKETING:
+- Consider how this feature supports the demo narrative
+- Identify "wow factor" elements
+- Ensure feature positioning aligns with "Google Maps of Time" metaphor
+
+## Context: MMS Fractal Planner
+
+This is a train maintenance scheduling application. Key concepts:
+- "Google Maps of Time" - continuous zoomable timeline
+- 128 trains, 12 years of data, 50,000+ schedule blocks
+- Must impress the client (RFQ response, recovering confidence)
+- Standards: Palantir (data) + Google (engineering) + Pentagram (design)
+
+## Output Format
+
+Respond with a JSON object containing your specifications:
+
+```json
+{
+    "visual_spec": {
+        "description": "What the user should see",
+        "expected_elements": ["element1", "element2"],
+        "color_palette": ["#hex1", "#hex2"],
+        "layout_rules": ["rule1", "rule2"],
+        "wording": {
+            "button_label": "Text",
+            "tooltip": "Text"
+        },
+        "accessibility": ["requirement1"]
+    },
+    "technical_spec": {
+        "requirements": ["req1", "req2"],
+        "acceptance_criteria": ["AC1", "AC2"],
+        "performance_targets": {
+            "frame_time_ms": 16,
+            "memory_mb": 100
+        },
+        "constraints": ["constraint1"]
+    },
+    "spec_approved": true,
+    "notes": "Any additional context for the engineer"
+}
+```
+
+Be specific. The SENIOR_ENGINEER will implement exactly what you specify.
+THE_AUDITOR will verify against your specification.
+"""
+
+
+def run_product_design(state: PharosState) -> PharosState:
+    """Run the PRODUCT_DESIGN agent.
+
+    Generates visual and technical specifications.
+    """
+    llm = get_llm()
+
+    # Build context
+    state_summary = format_state_for_prompt(state)
+
+    messages = [
+        SystemMessage(content=PRODUCT_DESIGN_SYSTEM_PROMPT),
+        HumanMessage(content=f"""Create the specification for this feature:
+
+{state_summary}
+
+Generate comprehensive visual and technical specifications.
+Remember: THE_AUDITOR will verify the implementation against YOUR spec.
+Be specific about what should be visible and how it should behave.
+
+Respond with JSON.""")
+    ]
+
+    # Get LLM response
+    response = llm.invoke(messages)
+    spec_text = response.content
+
+    # Parse and apply specification
+    # In production, use structured output parsing
+    # For now, extract key information
+
+    try:
+        import json
+        # Try to extract JSON from response
+        json_start = spec_text.find("{")
+        json_end = spec_text.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            spec_json = json.loads(spec_text[json_start:json_end])
+
+            if "visual_spec" in spec_json:
+                state["visual_spec"] = spec_json["visual_spec"]
+
+            if "technical_spec" in spec_json:
+                state["technical_spec"] = spec_json["technical_spec"]
+
+            state["spec_approved"] = spec_json.get("spec_approved", True)
+            state["spec_feedback"] = spec_json.get("notes")
+        else:
+            # Fallback: mark as approved with raw text
+            state["spec_approved"] = True
+            state["spec_feedback"] = spec_text
+
+    except json.JSONDecodeError:
+        # If JSON parsing fails, store raw text
+        state["spec_approved"] = True
+        state["spec_feedback"] = spec_text
+
+    # Update status
+    if state.get("spec_approved"):
+        state["status"] = "spec_ready"
+    else:
+        state["status"] = "spec_pending"
+
+    state["current_agent"] = "product_design"
+
+    add_to_history(state, "product_design", "specification_created", {
+        "spec_approved": state.get("spec_approved"),
+        "has_visual_spec": bool(state.get("visual_spec")),
+        "has_technical_spec": bool(state.get("technical_spec")),
+    })
+
+    return state

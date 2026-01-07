@@ -1,0 +1,225 @@
+/**
+ * BlueprintJS RangeSlider with Density Overlay POC
+ *
+ * Combines BlueprintJS RangeSlider with a Canvas-based density visualization.
+ * This approach leverages our existing UI library while adding a visual density
+ * indicator behind the slider.
+ *
+ * Pros:
+ * - Uses existing BlueprintJS components (consistency)
+ * - Native keyboard support and accessibility
+ * - Easy to integrate with existing UI
+ * - Canvas density is performant
+ *
+ * Cons:
+ * - Slider and density are separate elements (positioning challenges)
+ * - Less flexibility than pure d3-brush
+ * - Slider styling is more constrained
+ */
+
+import React, { useRef, useEffect, useMemo, useCallback } from 'react';
+import { RangeSlider, Card, Tag, Intent } from '@blueprintjs/core';
+import type { TimeSeriesPoint } from './mockData';
+
+interface BlueprintRangeSliderProps {
+  /** Time series data for density visualization */
+  data: TimeSeriesPoint[];
+  /** Width of the component */
+  width: number;
+  /** Height of the density chart */
+  densityHeight?: number;
+  /** Callback when range changes */
+  onRangeChange?: (range: [Date, Date]) => void;
+  /** Current selection (controlled) */
+  selection?: [Date, Date] | null;
+  /** Show density overlay */
+  showDensity?: boolean;
+  /** Density fill color */
+  densityColor?: string;
+}
+
+export const BlueprintRangeSlider: React.FC<BlueprintRangeSliderProps> = ({
+  data,
+  width,
+  densityHeight = 60,
+  onRangeChange,
+  selection,
+  showDensity = true,
+  densityColor = 'rgba(99, 102, 241, 0.4)',
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Calculate time bounds
+  const bounds = useMemo(() => {
+    const dates = data.map((d) => d.date.getTime());
+    return {
+      min: Math.min(...dates),
+      max: Math.max(...dates),
+    };
+  }, [data]);
+
+  // Convert selection to slider values (0-100 range)
+  const sliderValue = useMemo((): [number, number] => {
+    if (!selection) {
+      return [20, 80];
+    }
+    const range = bounds.max - bounds.min;
+    const start = ((selection[0].getTime() - bounds.min) / range) * 100;
+    const end = ((selection[1].getTime() - bounds.min) / range) * 100;
+    return [Math.max(0, Math.min(100, start)), Math.max(0, Math.min(100, end))];
+  }, [selection, bounds]);
+
+  // Handle slider change
+  const handleSliderChange = useCallback(
+    (values: [number, number]) => {
+      if (!onRangeChange) return;
+      const range = bounds.max - bounds.min;
+      const startTime = bounds.min + (values[0] / 100) * range;
+      const endTime = bounds.min + (values[1] / 100) * range;
+      onRangeChange([new Date(startTime), new Date(endTime)]);
+    },
+    [bounds, onRangeChange]
+  );
+
+  // Draw density chart on canvas
+  useEffect(() => {
+    if (!canvasRef.current || !showDensity) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Set canvas resolution
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = densityHeight * dpr;
+    ctx.scale(dpr, dpr);
+
+    // Clear
+    ctx.clearRect(0, 0, width, densityHeight);
+
+    // Calculate max value for scaling
+    const maxValue = Math.max(...data.map((d) => d.value));
+    const range = bounds.max - bounds.min;
+
+    // Draw area chart
+    ctx.beginPath();
+    ctx.moveTo(0, densityHeight);
+
+    data.forEach((point, i) => {
+      const x = ((point.date.getTime() - bounds.min) / range) * width;
+      const y = densityHeight - (point.value / maxValue) * (densityHeight - 10);
+
+      if (i === 0) {
+        ctx.lineTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+
+    // Close path
+    ctx.lineTo(width, densityHeight);
+    ctx.closePath();
+
+    // Fill
+    ctx.fillStyle = densityColor;
+    ctx.fill();
+
+    // Draw line on top
+    ctx.beginPath();
+    data.forEach((point, i) => {
+      const x = ((point.date.getTime() - bounds.min) / range) * width;
+      const y = densityHeight - (point.value / maxValue) * (densityHeight - 10);
+
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    ctx.strokeStyle = densityColor.replace('0.4', '0.8');
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }, [data, width, densityHeight, bounds, showDensity, densityColor]);
+
+  // Format date for label
+  const formatDate = (value: number) => {
+    const range = bounds.max - bounds.min;
+    const time = bounds.min + (value / 100) * range;
+    return new Date(time).toLocaleDateString('en-US', {
+      month: 'short',
+      year: '2-digit',
+    });
+  };
+
+  return (
+    <Card style={{ padding: 16, width }}>
+      {/* Header */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 12,
+        }}
+      >
+        <span style={{ fontWeight: 600, fontSize: 14 }}>Time Range Selection</span>
+        <Tag intent={Intent.PRIMARY} minimal>
+          {formatDate(sliderValue[0])} - {formatDate(sliderValue[1])}
+        </Tag>
+      </div>
+
+      {/* Density overlay + Slider container */}
+      <div style={{ position: 'relative', marginBottom: 8 }}>
+        {/* Canvas density chart */}
+        {showDensity && (
+          <canvas
+            ref={canvasRef}
+            style={{
+              width,
+              height: densityHeight,
+              display: 'block',
+              borderRadius: 4,
+              background: '#f8fafc',
+            }}
+          />
+        )}
+
+        {/* Slider positioned over the density chart */}
+        <div
+          style={{
+            position: showDensity ? 'absolute' : 'relative',
+            bottom: showDensity ? 0 : 'auto',
+            left: 0,
+            right: 0,
+            padding: '0 2px',
+          }}
+        >
+          <RangeSlider
+            min={0}
+            max={100}
+            stepSize={0.5}
+            value={sliderValue}
+            onChange={handleSliderChange}
+            labelRenderer={false}
+          />
+        </div>
+      </div>
+
+      {/* Date labels */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          fontSize: 10,
+          color: '#64748b',
+        }}
+      >
+        <span>{new Date(bounds.min).toLocaleDateString()}</span>
+        <span>{new Date(bounds.max).toLocaleDateString()}</span>
+      </div>
+    </Card>
+  );
+};
+
+export default BlueprintRangeSlider;

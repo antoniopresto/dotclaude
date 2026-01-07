@@ -1,0 +1,274 @@
+/**
+ * MMS - Simulation Routes
+ *
+ * Endpoints for what-if scenario simulation
+ */
+
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { db, schema } from '../db/client';
+import { eq, sql, avg } from 'drizzle-orm';
+
+// In-memory scenario storage (for demo purposes)
+const scenarios = new Map<string, {
+  id: string;
+  name: string;
+  baseDate: string;
+  changes: AllocationChange[];
+  createdAt: Date;
+}>();
+
+interface CreateScenarioBody {
+  name: string;
+  baseDate: string;
+}
+
+interface AllocationChange {
+  serviceId: string;
+  originalTrainId: string | null;
+  newTrainId: string;
+}
+
+interface RunSimulationBody {
+  changes: AllocationChange[];
+}
+
+interface ApplyChange {
+  serviceId: string;
+  trainId: string;
+}
+
+export async function simulationRoutes(fastify: FastifyInstance) {
+  // POST /api/simulation/create
+  fastify.post('/create', async (request: FastifyRequest<{ Body: CreateScenarioBody }>, reply: FastifyReply) => {
+    try {
+      const { name, baseDate } = request.body;
+
+      const id = crypto.randomUUID();
+      const scenario = {
+        id,
+        name,
+        baseDate,
+        changes: [],
+        createdAt: new Date(),
+      };
+
+      scenarios.set(id, scenario);
+
+      return { scenarioId: id, ...scenario };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to create scenario' });
+    }
+  });
+
+  // POST /api/simulation/:id/run
+  fastify.post('/:id/run', async (request: FastifyRequest<{ Params: { id: string }; Body: RunSimulationBody }>, reply: FastifyReply) => {
+    try {
+      const { id } = request.params;
+      const { changes } = request.body;
+
+      const scenario = scenarios.get(id);
+      if (!scenario) {
+        return reply.status(404).send({ error: 'Scenario not found' });
+      }
+
+      // Store changes
+      scenario.changes = changes;
+
+      // Get service details for each change
+      const changesWithKm = await Promise.all(
+        changes.map(async (change) => {
+          const service = await db.query.services.findFirst({
+            where: eq(schema.services.id, change.serviceId),
+          });
+          return {
+            service_id: change.serviceId,
+            service_code: service?.serviceCode || 'Unknown',
+            original_train_id: change.originalTrainId,
+            new_train_id: change.newTrainId,
+            service_km: service?.distanceKm || 0,
+          };
+        })
+      );
+
+      // Call Python solver for simulation
+      const solverUrl = process.env.SOLVER_URL || 'http://localhost:8000';
+
+      try {
+        const response = await fetch(`${solverUrl}/simulate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scenario_id: id,
+            changes: changesWithKm,
+            projection_days: 30,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          return {
+            scenarioId: id,
+            projectedVariance: data.projected_variance,
+            projectedDeadRunning: data.projected_dead_running,
+            comparison: data.comparison,
+            solverTimeMs: data.solver_time_ms,
+          };
+        }
+      } catch (solverError) {
+        request.log.warn('Solver unavailable, using fallback');
+      }
+
+      // Fallback calculation if solver unavailable
+      const currentStats = await db.execute(sql`
+        SELECT
+          AVG(current_km) as avg_km,
+          STDDEV(current_km) as stddev_km
+        FROM trains
+      `);
+
+      const currentAvg = Number((currentStats as any)[0]?.avg_km) || 0;
+      const currentVariance = Number((currentStats as any)[0]?.stddev_km) / currentAvg * 100 || 0;
+
+      const varianceReduction = Math.min(5, changes.length * 0.5);
+      const projectedVariance = Math.max(5, currentVariance - varianceReduction);
+      const projectedDeadRunning = changes.length * 15;
+
+      const comparison = [
+        {
+          metric: 'Km Variance',
+          current: Math.round(currentVariance * 10) / 10,
+          projected: Math.round(projectedVariance * 10) / 10,
+          change: Math.round((projectedVariance - currentVariance) * 10) / 10,
+          improved: projectedVariance < currentVariance,
+        },
+        {
+          metric: 'Dead Running (km)',
+          current: 0,
+          projected: projectedDeadRunning,
+          change: projectedDeadRunning,
+          improved: false,
+        },
+        {
+          metric: 'Affected Trains',
+          current: 0,
+          projected: changes.length,
+          change: changes.length,
+          improved: true,
+        },
+      ];
+
+      return {
+        scenarioId: id,
+        projectedVariance: Math.round(projectedVariance * 10) / 10,
+        projectedDeadRunning,
+        comparison,
+        fallback: true,
+      };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to run simulation' });
+    }
+  });
+
+  // GET /api/simulation/:id/compare
+  fastify.get('/:id/compare', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    try {
+      const { id } = request.params;
+
+      const scenario = scenarios.get(id);
+      if (!scenario) {
+        return reply.status(404).send({ error: 'Scenario not found' });
+      }
+
+      // Get current state metrics
+      const currentStats = await db.execute(sql`
+        SELECT
+          AVG(current_km) as avg_km,
+          STDDEV(current_km) as stddev_km,
+          MIN(current_km) as min_km,
+          MAX(current_km) as max_km
+        FROM trains
+      `);
+
+      const stats = (currentStats as any)[0];
+
+      return {
+        scenario: {
+          id: scenario.id,
+          name: scenario.name,
+          changeCount: scenario.changes.length,
+        },
+        currentState: {
+          averageKm: Math.round(stats.avg_km),
+          variancePercent: Math.round((stats.stddev_km / stats.avg_km) * 100 * 10) / 10,
+          minKm: Math.round(stats.min_km),
+          maxKm: Math.round(stats.max_km),
+        },
+      };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to compare scenarios' });
+    }
+  });
+
+  // GET /api/simulation/list
+  fastify.get('/list', async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const scenarioList = Array.from(scenarios.values()).map(s => ({
+        id: s.id,
+        name: s.name,
+        baseDate: s.baseDate,
+        changeCount: s.changes.length,
+        createdAt: s.createdAt,
+      }));
+
+      return { scenarios: scenarioList };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to list scenarios' });
+    }
+  });
+
+  // POST /api/simulation/:id/apply - Apply scenario changes to live allocations
+  fastify.post('/:id/apply', async (request: FastifyRequest<{ Params: { id: string }; Body: { changes: ApplyChange[] } }>, reply: FastifyReply) => {
+    try {
+      const { id } = request.params;
+      const { changes } = request.body;
+
+      const scenario = scenarios.get(id);
+      if (!scenario) {
+        return reply.status(404).send({ error: 'Scenario not found' });
+      }
+
+      // Create real allocations in the database
+      let appliedCount = 0;
+      const today = new Date().toISOString().split('T')[0];
+
+      for (const change of changes) {
+        try {
+          await db.insert(schema.allocations).values({
+            serviceId: change.serviceId,
+            trainId: change.trainId,
+            allocationDate: today,
+            status: 'confirmed',
+            score: null,
+            justifications: null,
+          });
+          appliedCount++;
+        } catch (err) {
+          // Skip if allocation already exists or other constraint violation
+          request.log.warn({ serviceId: change.serviceId, err }, 'Failed to create allocation');
+        }
+      }
+
+      // Remove scenario after applying
+      scenarios.delete(id);
+
+      return { applied: appliedCount, scenarioId: id };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to apply scenario' });
+    }
+  });
+}

@@ -1,0 +1,69 @@
+     1→# FIXME: State Machine Audit & Performance Analysis
+     2→
+     3→## Overview
+     4→The `@mms/toolkit` state machine is architecturally sound for standard enterprise applications (forms, dashboards, low-frequency updates) but **critically inefficient** for high-frequency scenarios like 3D Game Loops (60FPS+).
+     5→
+     6→## Critical Issues (Performance Killers)
+     7→
+     8→### 1. Garbage Collection Thrashing (`machine.ts`)
+     9→- **Location:** `UpsertStateMetadata` function.
+    10→- **Problem:** Every single action dispatch creates a NEW metadata object:
+    11→  ```typescript
+    12→  [METADATA_FIELD_NAME]: { ...previousMetadata, changes: changes + 1, ... }
+    13→  ```
+    14→- **Impact:** In a game loop (e.g., `MOUSE_MOVE`), this allocates ~60 objects/second just for metadata. This triggers frequent GC pauses ("stuttering").
+    15→- **Fix:** Implement an opt-out mechanism (`metadata: false`) for high-frequency slices.
+    16→
+    17→### 2. Validation on Hot Path (`context.ts` / `hooks.ts`)
+    18→- **Location:** `context.get()` calls `check()` -> `Assert()`.
+    19→- **Problem:** Every action dispatch validates the Context schema.
+    20→- **Impact:** Unnecessary CPU cycles spent checking invariants that rarely change.
+    21→- **Fix:**
+    22→  - Wrap validations in `if (process.env.NODE_ENV !== 'production')`.
+    23→  - Disable context checks entirely for specific "Game Mode" machines.
+    24→
+    25→### 3. V8 De-optimization (`hooks.ts`)
+    26→- **Location:** `useMachine` return value.
+    27→- **Code:**
+    28→  ```typescript
+    29→  return Object.assign([selection, actions], actions, selection);
+    30→  ```
+    31→- **Problem:** Returning a "Hybrid Object" (Array + Object properties) changes the internal "Hidden Class" (Map) of the object in V8. This severely de-optimizes property access and prevents efficient JIT compilation.
+    32→- **Fix:** Return a standard Tuple or Object.
+    33→  ```typescript
+    34→  return { state, actions }; // OR [state, actions]
+    35→  ```
+    36→
+    37→### 4. Double Proxying Overhead
+    38→- **Location:** `RootReducer` + `GetSelectorsWrapper`.
+    39→- **Problem:** `Immer` (Proxies) is used in the reducer, and then potentially again in selectors.
+    40→- **Impact:** Proxy wrapping/unwrapping is expensive.
+    41→- **Fix:** Ensure selectors run on raw objects where possible, or use memoized selectors (like `reselect`) to avoid re-computation on every dispatch.
+    42→
+    43→### 5. Unsafe Listener Unsubscription (`store.ts`)
+    44→- **Location:** `dispatch` loop vs `unsubscribe`.
+    45→- **Problem:** The `dispatch` function iterates over `currentListeners` directly. If a listener unsubscribes itself during execution, `currentListeners.splice` mutates the array *while* it is being iterated.
+    46→- **Impact:** Can cause listeners to be skipped or runtime errors.
+    47→- **Fix:** Copy the array before iterating, or use a linked list.
+    48→  ```typescript
+    49→  const listeners = currentListeners.slice();
+    50→  for (const listener of listeners) { ... }
+    51→  ```
+    52→
+    53→## Architectural Recommendations
+    54→
+    55→### "Anti-Hooks" Doctrine
+    56→- **Keep:** Using this Store for "Slow" State (UI, Inventory, Profile, Settings).
+    57→- **Discard:** Using this Store for "Fast" State (Entity Transforms, Physics, Camera).
+    58→- **Strategy:** For the 3D Engine, use `Float32Array`, `Three.js` objects, or simple Mutable Classes. Do **NOT** route frame-by-frame logic through `dispatch()`.
+    59→
+    60→## Action Plan
+    61→- [ ] Add `metadata: boolean` flag to `MachineConfig`.
+    62→- [ ] Strip `context.ts` validation in Production builds.
+    63→- [ ] Refactor `useMachine` to return a stable shape (Object or Tuple).
+    64→- [ ] Optimize `selector` implementation to avoid running on every unrelated action.
+    65→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

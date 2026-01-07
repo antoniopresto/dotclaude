@@ -1,0 +1,349 @@
+/**
+ * Visual Testing Integration for Harness CLI
+ *
+ * Implements the QA Protocol for visual testing using Playwright MCP.
+ * This is MANDATORY for marking features as complete.
+ *
+ * Based on: docs/QA_PROTOCOL.md
+ */
+
+export interface VisualTestConfig {
+  /** URL to test (default: http://localhost:5173) */
+  url: string;
+  /** Screenshot directory (default: screenshots/) */
+  screenshotDir: string;
+  /** Dev server command (default: bun run dev) */
+  devServerCommand: string;
+  /** Timeout for dev server startup in ms (default: 10000) */
+  devServerTimeout: number;
+  /** Timeout for page load in ms (default: 30000) */
+  pageTimeout: number;
+}
+
+export interface VisualTestResult {
+  passed: boolean;
+  featureId: string;
+  timestamp: string;
+  checks: VisualTestCheck[];
+  screenshotPath?: string;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface VisualTestCheck {
+  name: string;
+  passed: boolean;
+  details?: string;
+}
+
+export const DEFAULT_VISUAL_CONFIG: VisualTestConfig = {
+  url: 'http://localhost:5173',
+  screenshotDir: 'screenshots',
+  devServerCommand: 'bun run dev',
+  devServerTimeout: 10000,
+  pageTimeout: 30000,
+};
+
+/**
+ * Generate Playwright MCP commands for visual testing
+ */
+export function generateVisualTestCommands(
+  featureId: string,
+  config: VisualTestConfig = DEFAULT_VISUAL_CONFIG
+): string {
+  const timestamp = new Date().toISOString().split('T')[0];
+  const screenshotName = `${featureId.toLowerCase()}-${timestamp}.png`;
+
+  return `# Visual Testing Commands for ${featureId}
+# Execute these commands in order to verify the feature
+
+# Step 1: Navigate to the app
+mcp__playwright__browser_navigate url="${config.url}"
+
+# Step 2: Wait for page to load (if needed)
+# mcp__playwright__browser_wait_for time=2
+
+# Step 3: Check console for errors
+mcp__playwright__browser_console_messages level="error"
+
+# Step 4: Take screenshot for visual verification
+mcp__playwright__browser_take_screenshot filename="${config.screenshotDir}/${screenshotName}"
+
+# Step 5: Get accessibility snapshot (optional, for debugging)
+# mcp__playwright__browser_snapshot
+
+# Step 6: Close browser
+mcp__playwright__browser_close
+
+# APPROVAL CRITERIA:
+# ✅ Page loads without errors
+# ✅ Content is visible (not blank screen)
+# ✅ No red errors in console
+# ✅ Screenshot shows expected content
+# ✅ Layout matches design expectations
+`;
+}
+
+/**
+ * Generate QA checklist for a feature
+ */
+export function generateQAChecklist(featureId: string, featureDescription: string): string {
+  return `# QA Checklist for ${featureId}
+# Feature: ${featureDescription}
+
+## Pre-Test Setup
+□ Development server is running (bun run dev)
+□ Browser is accessible
+
+## Visual Tests (Playwright MCP)
+□ Navigate to http://localhost:5173
+□ Page loads without blank screen
+□ Screenshot captured
+□ Content matches expected design
+
+## Console Tests
+□ No JavaScript errors (red)
+□ No WebGL errors
+□ No React errors
+□ Warnings evaluated (acceptable or need fix)
+
+## Interaction Tests (if applicable)
+□ Pan (drag) works correctly
+□ Zoom (scroll) works correctly
+□ Sidebar syncs with viewport
+□ Timeline syncs with viewport
+□ LOD transitions are smooth
+
+## Performance Tests (if applicable)
+□ No visible lag during interactions
+□ Smooth animations
+□ Labels appear without delay
+
+## Final Verification
+□ All checks above pass
+□ Screenshot saved to screenshots/${featureId.toLowerCase()}.png
+□ claude-progress.txt updated with test results
+□ features.json ready to mark passes: true
+
+# RESULT: [ ] PASS  [ ] FAIL
+# If FAIL, describe issues:
+#
+`;
+}
+
+/**
+ * Parse console messages and determine if test passes
+ */
+export function evaluateConsoleMessages(
+  messages: Array<{ level: string; message: string }>
+): { passed: boolean; errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  for (const msg of messages) {
+    if (msg.level === 'error') {
+      errors.push(msg.message);
+    } else if (msg.level === 'warning') {
+      warnings.push(msg.message);
+    }
+  }
+
+  // Filter out acceptable warnings
+  const criticalWarnings = warnings.filter(w => {
+    // Common acceptable warnings
+    if (w.includes('DevTools') || w.includes('extension')) return false;
+    if (w.includes('Tailwind CDN')) return false;
+    if (w.includes('deprecated') && !w.includes('critical')) return false;
+    return true;
+  });
+
+  return {
+    passed: errors.length === 0,
+    errors,
+    warnings: criticalWarnings,
+  };
+}
+
+/**
+ * Generate visual test result documentation for progress file
+ */
+export function formatTestResultForProgress(result: VisualTestResult): string {
+  const statusIcon = result.passed ? '✅' : '❌';
+
+  let output = `### Visual Test Results - ${result.featureId}\n`;
+  output += `**Status:** ${statusIcon} ${result.passed ? 'PASSED' : 'FAILED'}\n`;
+  output += `**Timestamp:** ${result.timestamp}\n\n`;
+
+  output += '**Checks:**\n';
+  for (const check of result.checks) {
+    const icon = check.passed ? '✅' : '❌';
+    output += `- ${icon} ${check.name}`;
+    if (check.details) {
+      output += ` - ${check.details}`;
+    }
+    output += '\n';
+  }
+
+  if (result.errors.length > 0) {
+    output += '\n**Errors:**\n';
+    for (const error of result.errors) {
+      output += `- ❌ ${error}\n`;
+    }
+  }
+
+  if (result.warnings.length > 0) {
+    output += '\n**Warnings:**\n';
+    for (const warning of result.warnings) {
+      output += `- ⚠️ ${warning}\n`;
+    }
+  }
+
+  if (result.screenshotPath) {
+    output += `\n**Screenshot:** ${result.screenshotPath}\n`;
+  }
+
+  return output;
+}
+
+/**
+ * Check if a feature requires visual testing
+ */
+export function requiresVisualTesting(featureCategory: string, featureSteps?: string[]): boolean {
+  // Categories that always require visual testing
+  const visualCategories = ['ui', 'canvas', 'rendering', 'layout', 'styling', 'visualization'];
+
+  if (visualCategories.some(cat => featureCategory.toLowerCase().includes(cat))) {
+    return true;
+  }
+
+  // Check if any step mentions UI-related keywords
+  if (featureSteps) {
+    const visualKeywords = ['render', 'display', 'show', 'visual', 'ui', 'canvas', 'layout', 'style', 'css', 'color', 'animation'];
+    for (const step of featureSteps) {
+      if (visualKeywords.some(kw => step.toLowerCase().includes(kw))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Generate hook script for visual testing reminder
+ */
+export function getVisualTestingHook(): string {
+  return `#!/bin/bash
+# Hook: Visual Testing Reminder
+# Purpose: Remind about visual testing before feature completion
+# Exit 0 = informational only
+
+echo ""
+echo "┌──────────────────────────────────────────────────────────────┐"
+echo "│ 📸 VISUAL TESTING REQUIRED                                   │"
+echo "├──────────────────────────────────────────────────────────────┤"
+echo "│                                                              │"
+echo "│ Before marking feature complete:                            │"
+echo "│                                                              │"
+echo "│ 1. Start dev server (if not running):                       │"
+echo "│    cd apps/canvas && bun run dev                            │"
+echo "│                                                              │"
+echo "│ 2. Run Playwright MCP tests:                                │"
+echo "│    mcp__playwright__browser_navigate url=http://localhost:5173│"
+echo "│    mcp__playwright__browser_console_messages level=error    │"
+echo "│    mcp__playwright__browser_take_screenshot filename=test.png│"
+echo "│    mcp__playwright__browser_close                           │"
+echo "│                                                              │"
+echo "│ 3. Verify:                                                  │"
+echo "│    □ Page loads (not blank)                                 │"
+echo "│    □ No console errors                                      │"
+echo "│    □ Content matches expectations                           │"
+echo "│                                                              │"
+echo "│ ALL PASS? → Update features.json (passes: true)             │"
+echo "│ ANY FAIL? → Fix issue, repeat test                          │"
+echo "│                                                              │"
+echo "└──────────────────────────────────────────────────────────────┘"
+
+exit 0
+`;
+}
+
+/**
+ * Integration with the harness workflow
+ *
+ * Visual testing should be triggered:
+ * 1. Before marking a feature as complete
+ * 2. After implementing UI changes
+ * 3. As part of the verify command
+ * 4. Through the 'harness test' command
+ */
+export interface VisualTestingWorkflow {
+  /** Whether visual testing is enabled */
+  enabled: boolean;
+  /** Auto-start dev server if not running */
+  autoStartDevServer: boolean;
+  /** Take screenshot on every test */
+  captureScreenshots: boolean;
+  /** Directory for screenshots */
+  screenshotDir: string;
+  /** Features that require visual testing (by category) */
+  requiredCategories: string[];
+}
+
+export const DEFAULT_WORKFLOW: VisualTestingWorkflow = {
+  enabled: true,
+  autoStartDevServer: true,
+  captureScreenshots: true,
+  screenshotDir: 'screenshots',
+  requiredCategories: ['ui', 'canvas', 'rendering', 'layout', 'styling', 'visualization'],
+};
+
+/**
+ * Generate .mcp.json configuration for Playwright
+ */
+export function getMcpConfig(): object {
+  return {
+    mcpServers: {
+      playwright: {
+        command: 'npx',
+        args: ['@playwright/mcp@latest', '--headless'],
+      },
+    },
+  };
+}
+
+/**
+ * Generate harness settings with visual testing hooks
+ */
+export function getHarnessSettingsWithVisualTesting(): object {
+  return {
+    hooks: {
+      'session-start': ['.claude/hooks/session-start.sh'],
+      'stop': ['.claude/hooks/end-of-turn-check.sh'],
+      'pre-tool-use': {
+        'Edit': ['.claude/hooks/protect-package-json.sh'],
+        'Write': ['.claude/hooks/protect-package-json.sh'],
+      },
+      'post-tool-use': {
+        'Write': ['.claude/hooks/after-write.sh'],
+        'Edit': ['.claude/hooks/after-write.sh'],
+      },
+    },
+    permissions: {
+      allow: [
+        'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
+        'WebSearch', 'WebFetch',
+        // Playwright MCP permissions
+        'mcp__playwright__browser_navigate',
+        'mcp__playwright__browser_console_messages',
+        'mcp__playwright__browser_take_screenshot',
+        'mcp__playwright__browser_snapshot',
+        'mcp__playwright__browser_click',
+        'mcp__playwright__browser_close',
+        'mcp__playwright__browser_wait_for',
+      ],
+      deny: [],
+    },
+    visualTesting: DEFAULT_WORKFLOW,
+  };
+}

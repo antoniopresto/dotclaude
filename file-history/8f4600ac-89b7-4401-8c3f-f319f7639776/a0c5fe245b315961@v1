@@ -1,0 +1,154 @@
+import { useRef, useEffect, useCallback } from 'react';
+import Box from '@mui/material/Box';
+import { FractalRenderer } from './FractalRenderer';
+import { attachScrollerEvents } from '../engine/physics/virtualScroller';
+
+/**
+ * PixiCanvas - React component that hosts the PixiJS renderer.
+ *
+ * Handles:
+ * - Lifecycle management (init/destroy)
+ * - Resize observer for responsive canvas
+ * - Input event delegation to virtual scroller
+ */
+
+export interface PixiCanvasProps {
+  /** Enable debug overlay */
+  debug?: boolean;
+  /** Callback when renderer is ready */
+  onReady?: (renderer: FractalRenderer) => void;
+}
+
+export function PixiCanvas({ debug = false, onReady }: PixiCanvasProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const rendererRef = useRef<FractalRenderer | null>(null);
+  const cleanupScrollerRef = useRef<(() => void) | null>(null);
+
+  /**
+   * Initialize PixiJS when component mounts.
+   */
+  const initRenderer = useCallback(async () => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    // Avoid double initialization in StrictMode
+    if (rendererRef.current) {
+      console.warn('[PixiCanvas] Renderer already exists, skipping init');
+      return;
+    }
+
+    // Create renderer with config
+    const renderer = new FractalRenderer({ debug });
+    rendererRef.current = renderer;
+
+    try {
+      await renderer.init(container);
+
+      // Attach virtual scroller events
+      cleanupScrollerRef.current = attachScrollerEvents(container);
+
+      // Notify parent
+      onReady?.(renderer);
+    } catch (error) {
+      console.error('[PixiCanvas] Failed to initialize:', error);
+      // Clean up on error
+      rendererRef.current = null;
+    }
+  }, [debug, onReady]);
+
+  /**
+   * Handle container resize.
+   */
+  const handleResize = useCallback(() => {
+    const container = containerRef.current;
+    const renderer = rendererRef.current;
+
+    if (!container || !renderer || !renderer.isReady()) return;
+
+    const { width, height } = container.getBoundingClientRect();
+    renderer.resize(width, height);
+  }, []);
+
+  /**
+   * Setup and cleanup effects.
+   */
+  useEffect(() => {
+    // Track if this effect instance is still active (for StrictMode)
+    let isActive = true;
+
+    // Capture container ref at effect start (ESLint react-hooks/exhaustive-deps)
+    const container = containerRef.current;
+
+    // Initialize renderer
+    const init = async () => {
+      if (isActive) {
+        await initRenderer();
+      }
+    };
+    init();
+
+    // Setup resize observer
+    let resizeObserver: ResizeObserver | null = null;
+
+    if (container) {
+      resizeObserver = new ResizeObserver(() => {
+        if (isActive) {
+          handleResize();
+        }
+      });
+      resizeObserver.observe(container);
+    }
+
+    // Cleanup on unmount
+    return () => {
+      isActive = false;
+
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+        resizeObserver = null;
+      }
+
+      if (cleanupScrollerRef.current) {
+        cleanupScrollerRef.current();
+        cleanupScrollerRef.current = null;
+      }
+
+      // Only destroy if renderer exists and is initialized
+      const renderer = rendererRef.current;
+      if (renderer) {
+        if (renderer.isReady()) {
+          renderer.destroy();
+        }
+        rendererRef.current = null;
+      }
+
+      // Clean up any leftover canvas elements in container (captured at effect start)
+      if (container) {
+        const canvases = container.querySelectorAll('canvas');
+        canvases.forEach((canvas) => canvas.remove());
+      }
+    };
+  }, [initRenderer, handleResize]);
+
+  return (
+    <Box
+      ref={containerRef}
+      sx={{
+        width: '100%',
+        height: '100%',
+        position: 'relative',
+        overflow: 'hidden',
+        touchAction: 'none', // Prevent browser gestures
+        cursor: 'grab',
+        '&:active': {
+          cursor: 'grabbing',
+        },
+      }}
+      tabIndex={0}
+      role="application"
+      aria-label="Fractal Planner Canvas"
+    />
+  );
+}
+
+export default PixiCanvas;

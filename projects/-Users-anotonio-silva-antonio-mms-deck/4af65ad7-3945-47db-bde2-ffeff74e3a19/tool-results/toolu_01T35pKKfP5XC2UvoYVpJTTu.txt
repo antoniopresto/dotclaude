@@ -1,0 +1,504 @@
+     1→/**
+     2→ * DeckCanvas - deck.gl-based canvas for semantic zoom visualization
+     3→ *
+     4→ * Replaces InfiniteCanvas (R3F-based) with deck.gl for:
+     5→ * - Native semantic zoom via CompositeLayer
+     6→ * - Built-in aggregation layers for heatmaps
+     7→ * - OrthographicView for non-geo timeline visualization
+     8→ * - Better bundle size and performance
+     9→ *
+    10→ * DECK-MIGRATE-001: Foundation component
+    11→ * DECK-MIGRATE-002: Layer implementations with LOD
+    12→ */
+    13→
+    14→import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+    15→import DeckGL from '@deck.gl/react';
+    16→import { OrthographicView } from '@deck.gl/core';
+    17→import type { PickingInfo } from '@deck.gl/core';
+    18→import type { Layer } from '@deck.gl/core';
+    19→import type { LODLevel } from '../data/types';
+    20→import { DEFAULT_VIEW_CONFIG, calculateWorldBounds } from '../data/types';
+    21→import { getRenderData } from '../data/generator';
+    22→import { useCanvasSelector, canvasStore, canvasActions } from '../state';
+    23→import {
+    24→  createMacroLayers,
+    25→  createMesoLayers,
+    26→  createMicroLayers,
+    27→} from './layers';
+    28→
+    29→// ─────────────────────────────────────────────────────────────
+    30→// EXPORTED TYPES (matching InfiniteCanvas)
+    31→// ─────────────────────────────────────────────────────────────
+    32→
+    33→/**
+    34→ * Viewport information passed to parent component
+    35→ */
+    36→export interface ViewportInfo {
+    37→  /** Y coordinate of the TOP of the viewport in world space */
+    38→  topY: number;
+    39→  /** Left edge of the viewport in world X coordinates */
+    40→  leftX: number;
+    41→  /** Right edge of the viewport in world X coordinates */
+    42→  rightX: number;
+    43→}
+    44→
+    45→/**
+    46→ * Navigation target for programmatic navigation
+    47→ * Can specify trainIndex, dayOffset, or both
+    48→ */
+    49→export interface NavigationTarget {
+    50→  /** Train index (0-based) to center on vertically */
+    51→  trainIndex?: number;
+    52→  /** Day offset from start date to center on horizontally */
+    53→  dayOffset?: number;
+    54→  /** Optional zoom level to set (defaults to current zoom) */
+    55→  zoom?: number;
+    56→}
+    57→
+    58→// ─────────────────────────────────────────────────────────────
+    59→// PROPS INTERFACE (matching InfiniteCanvas)
+    60→// ─────────────────────────────────────────────────────────────
+    61→
+    62→export interface DeckCanvasProps {
+    63→  zoom: number;
+    64→  lod: LODLevel;
+    65→  onZoomChange: (zoom: number) => void;
+    66→  onViewportChange?: (viewport: ViewportInfo) => void;
+    67→  onMinZoomChange?: (minZoom: number) => void;
+    68→  animatedZoomTarget?: number | null;
+    69→  onAnimatedZoomComplete?: () => void;
+    70→  navigationTarget?: NavigationTarget | null;
+    71→  onNavigationComplete?: () => void;
+    72→  perfVisible?: boolean;
+    73→  perfEvent?: string;
+    74→}
+    75→
+    76→// ─────────────────────────────────────────────────────────────
+    77→// CONSTANTS
+    78→// ─────────────────────────────────────────────────────────────
+    79→
+    80→const { pxPerDay, pxPerTrain, minZoom: configMinZoom, maxZoom: configMaxZoom, lodThresholds } = DEFAULT_VIEW_CONFIG;
+    81→
+    82→// Animation constants
+    83→const ZOOM_ANIMATION_DURATION = 250; // ms
+    84→const NAVIGATION_ANIMATION_DURATION = 300; // ms
+    85→
+    86→// Data constants
+    87→const TRAIN_COUNT = 50;
+    88→const TOTAL_YEARS = 10;
+    89→const TOTAL_DAYS = TOTAL_YEARS * 365;
+    90→
+    91→// LOD transition constants (hysteresis to prevent flickering)
+    92→const LOD_HYSTERESIS = 0.15; // 15% overlap zone for crossfade
+    93→
+    94→// ─────────────────────────────────────────────────────────────
+    95→// ZOOM CONVERSIONS
+    96→// deck.gl uses log2 scale: zoom 0 = 1x, zoom 1 = 2x, zoom -1 = 0.5x
+    97→// ─────────────────────────────────────────────────────────────
+    98→
+    99→function linearToDeckZoom(linearZoom: number): number {
+   100→  return Math.log2(linearZoom);
+   101→}
+   102→
+   103→function deckToLinearZoom(deckZoom: number): number {
+   104→  return Math.pow(2, deckZoom);
+   105→}
+   106→
+   107→// ─────────────────────────────────────────────────────────────
+   108→// DECK.GL VIEW STATE TYPE
+   109→// ─────────────────────────────────────────────────────────────
+   110→
+   111→interface DeckViewState {
+   112→  target: [number, number];
+   113→  zoom: number;
+   114→  minZoom: number;
+   115→  maxZoom: number;
+   116→}
+   117→
+   118→// ─────────────────────────────────────────────────────────────
+   119→// COMPONENT
+   120→// ─────────────────────────────────────────────────────────────
+   121→
+   122→/**
+   123→ * DeckCanvas Component
+   124→ *
+   125→ * Main deck.gl canvas with OrthographicView for timeline visualization.
+   126→ * Compatible interface with InfiniteCanvas for seamless migration.
+   127→ */
+   128→export function DeckCanvas({
+   129→  zoom,
+   130→  lod,
+   131→  onZoomChange,
+   132→  onViewportChange,
+   133→  onMinZoomChange,
+   134→  animatedZoomTarget,
+   135→  onAnimatedZoomComplete,
+   136→  navigationTarget,
+   137→  onNavigationComplete,
+   138→  perfVisible,
+   139→  perfEvent,
+   140→}: DeckCanvasProps) {
+   141→  // Container ref for size tracking
+   142→  const containerRef = useRef<HTMLDivElement>(null);
+   143→  const [containerSize, setContainerSize] = useState({ width: 800, height: 600 });
+   144→
+   145→  // Get render data
+   146→  const { tasks, trains } = useMemo(() => getRenderData(), []);
+   147→
+   148→  // Calculate world bounds (trainCount, totalDays)
+   149→  const worldBounds = useMemo(
+   150→    () => calculateWorldBounds(TRAIN_COUNT, TOTAL_DAYS),
+   151→    []
+   152→  );
+   153→
+   154→  // Calculate effective minimum zoom based on canvas size
+   155→  const effectiveMinZoom = useMemo(() => {
+   156→    const worldWidth = worldBounds.maxX - worldBounds.minX;
+   157→    const worldHeight = Math.abs(worldBounds.maxY - worldBounds.minY);
+   158→    const zoomToFitWidth = containerSize.width / worldWidth;
+   159→    const zoomToFitHeight = containerSize.height / worldHeight;
+   160→    return Math.max(0.05, Math.min(zoomToFitWidth, zoomToFitHeight) * 0.9);
+   161→  }, [worldBounds, containerSize]);
+   162→
+   163→  // Report effective min zoom to parent
+   164→  useEffect(() => {
+   165→    onMinZoomChange?.(effectiveMinZoom);
+   166→  }, [effectiveMinZoom, onMinZoomChange]);
+   167→
+   168→  // Initialize deck.gl view state from props
+   169→  const [viewState, setViewState] = useState<DeckViewState>(() => ({
+   170→    target: [worldBounds.maxX / 4, worldBounds.minY / 4], // Start near top-left
+   171→    zoom: linearToDeckZoom(zoom),
+   172→    minZoom: linearToDeckZoom(effectiveMinZoom),
+   173→    maxZoom: linearToDeckZoom(configMaxZoom),
+   174→  }));
+   175→
+   176→  // Sync external zoom changes to internal view state
+   177→  useEffect(() => {
+   178→    const newDeckZoom = linearToDeckZoom(zoom);
+   179→    if (Math.abs(viewState.zoom - newDeckZoom) > 0.01) {
+   180→      setViewState(prev => ({
+   181→        ...prev,
+   182→        zoom: newDeckZoom,
+   183→      }));
+   184→    }
+   185→  }, [zoom]);
+   186→
+   187→  // Update min zoom when effective min changes
+   188→  useEffect(() => {
+   189→    setViewState(prev => ({
+   190→      ...prev,
+   191→      minZoom: linearToDeckZoom(effectiveMinZoom),
+   192→    }));
+   193→  }, [effectiveMinZoom]);
+   194→
+   195→  // Handle animated zoom target
+   196→  useEffect(() => {
+   197→    if (animatedZoomTarget != null) {
+   198→      const targetDeckZoom = linearToDeckZoom(animatedZoomTarget);
+   199→      setViewState(prev => ({
+   200→        ...prev,
+   201→        zoom: targetDeckZoom,
+   202→      }));
+   203→      // Report completion after animation duration
+   204→      const timeout = setTimeout(() => {
+   205→        onAnimatedZoomComplete?.();
+   206→      }, ZOOM_ANIMATION_DURATION);
+   207→      return () => clearTimeout(timeout);
+   208→    }
+   209→  }, [animatedZoomTarget, onAnimatedZoomComplete]);
+   210→
+   211→  // Handle navigation target
+   212→  useEffect(() => {
+   213→    if (navigationTarget) {
+   214→      const newTarget: [number, number] = [...viewState.target];
+   215→
+   216→      if (navigationTarget.dayOffset !== undefined) {
+   217→        newTarget[0] = navigationTarget.dayOffset * pxPerDay;
+   218→      }
+   219→      if (navigationTarget.trainIndex !== undefined) {
+   220→        // Y is negative (trains go down)
+   221→        newTarget[1] = -navigationTarget.trainIndex * pxPerTrain - pxPerTrain / 2;
+   222→      }
+   223→
+   224→      setViewState(prev => ({
+   225→        ...prev,
+   226→        target: newTarget,
+   227→        zoom: navigationTarget.zoom !== undefined
+   228→          ? linearToDeckZoom(navigationTarget.zoom)
+   229→          : prev.zoom,
+   230→      }));
+   231→
+   232→      // Report completion
+   233→      const timeout = setTimeout(() => {
+   234→        onNavigationComplete?.();
+   235→      }, NAVIGATION_ANIMATION_DURATION);
+   236→      return () => clearTimeout(timeout);
+   237→    }
+   238→  }, [navigationTarget, onNavigationComplete]);
+   239→
+   240→  // Track container size with ResizeObserver
+   241→  useEffect(() => {
+   242→    if (!containerRef.current) return;
+   243→
+   244→    const observer = new ResizeObserver((entries) => {
+   245→      for (const entry of entries) {
+   246→        const { width, height } = entry.contentRect;
+   247→        setContainerSize({ width, height });
+   248→        // Also update toolkit store
+   249→        canvasStore.dispatch(canvasActions.viewport.setCanvasSize({ width, height }));
+   250→      }
+   251→    });
+   252→
+   253→    observer.observe(containerRef.current);
+   254→    return () => observer.disconnect();
+   255→  }, []);
+   256→
+   257→  // Get interaction state from @mms/toolkit
+   258→  const hoveredTaskId = useCanvasSelector(s => s.interaction.hoveredTaskId);
+   259→  const selectedTaskId = useCanvasSelector(s => s.interaction.selectedTaskId);
+   260→
+   261→  // Handle view state changes from deck.gl controller
+   262→  const handleViewStateChange = useCallback(
+   263→    ({ viewState: newViewState }: { viewState: DeckViewState }) => {
+   264→      setViewState(newViewState);
+   265→
+   266→      // Convert deck.gl zoom to linear and notify parent
+   267→      const linearZoom = deckToLinearZoom(newViewState.zoom);
+   268→      onZoomChange(linearZoom);
+   269→
+   270→      // Calculate viewport info for parent
+   271→      const halfWidth = containerSize.width / linearZoom / 2;
+   272→      const halfHeight = containerSize.height / linearZoom / 2;
+   273→
+   274→      const viewportInfo: ViewportInfo = {
+   275→        topY: newViewState.target[1] + halfHeight, // Top edge in world Y
+   276→        leftX: newViewState.target[0] - halfWidth,
+   277→        rightX: newViewState.target[0] + halfWidth,
+   278→      };
+   279→      onViewportChange?.(viewportInfo);
+   280→
+   281→      // Update @mms/toolkit state for sidebar/timeline sync
+   282→      canvasStore.dispatch(
+   283→        canvasActions.viewport.setCamera({
+   284→          x: newViewState.target[0],
+   285→          y: newViewState.target[1],
+   286→          zoom: linearZoom,
+   287→        })
+   288→      );
+   289→    },
+   290→    [onZoomChange, onViewportChange, containerSize]
+   291→  );
+   292→
+   293→  // Handle hover on tasks
+   294→  const handleHover = useCallback((info: PickingInfo) => {
+   295→    if (info.object && 'id' in info.object) {
+   296→      canvasStore.dispatch(canvasActions.interaction.setHoveredTask(info.object.id as string));
+   297→    } else {
+   298→      canvasStore.dispatch(canvasActions.interaction.clearHover());
+   299→    }
+   300→  }, []);
+   301→
+   302→  // Handle click on tasks
+   303→  const handleClick = useCallback((info: PickingInfo) => {
+   304→    if (info.object && 'id' in info.object) {
+   305→      const taskId = info.object.id as string;
+   306→      const currentSelected = canvasStore.getState().interaction.selectedTaskId;
+   307→      if (currentSelected === taskId) {
+   308→        // Toggle off if clicking same task
+   309→        canvasStore.dispatch(canvasActions.interaction.clearSelection());
+   310→      } else {
+   311→        canvasStore.dispatch(canvasActions.interaction.setSelectedTask(taskId));
+   312→      }
+   313→    } else {
+   314→      // Click on background clears selection
+   315→      canvasStore.dispatch(canvasActions.interaction.clearSelection());
+   316→    }
+   317→  }, []);
+   318→
+   319→  // Calculate LOD level from zoom (for debug display)
+   320→  const currentLinearZoom = deckToLinearZoom(viewState.zoom);
+   321→  const lodLevel = currentLinearZoom < 0.5 ? 'MACRO' : currentLinearZoom > 2.0 ? 'MICRO' : 'MESO';
+   322→
+   323→  // Calculate viewport bounds for culling
+   324→  const viewportBounds = useMemo(() => {
+   325→    const halfWidth = containerSize.width / currentLinearZoom / 2;
+   326→    const halfHeight = containerSize.height / currentLinearZoom / 2;
+   327→    return {
+   328→      minX: viewState.target[0] - halfWidth,
+   329→      maxX: viewState.target[0] + halfWidth,
+   330→      minY: viewState.target[1] - halfHeight,
+   331→      maxY: viewState.target[1] + halfHeight,
+   332→    };
+   333→  }, [viewState.target, currentLinearZoom, containerSize]);
+   334→
+   335→  // Calculate LOD opacities for smooth crossfade transitions
+   336→  const lodOpacities = useMemo(() => {
+   337→    const z = currentLinearZoom;
+   338→    const { macro: macroThreshold, micro: microThreshold } = lodThresholds;
+   339→    const h = LOD_HYSTERESIS;
+   340→
+   341→    // Macro: Full below 0.5, fade out 0.35-0.5
+   342→    const macroOpacity = z < macroThreshold - h
+   343→      ? 1
+   344→      : z > macroThreshold
+   345→        ? 0
+   346→        : 1 - (z - (macroThreshold - h)) / h;
+   347→
+   348→    // Micro: Full above 2.0, fade in 1.85-2.0
+   349→    const microOpacity = z > microThreshold + h
+   350→      ? 1
+   351→      : z < microThreshold
+   352→        ? 0
+   353→        : (z - microThreshold) / h;
+   354→
+   355→    // Meso: Full in the middle, fade at boundaries
+   356→    const mesoOpacity = Math.min(
+   357→      z >= macroThreshold - h ? 1 : 0, // Fade in with macro fade out
+   358→      z <= microThreshold + h ? 1 : 0   // Fade out with micro fade in
+   359→    );
+   360→
+   361→    return {
+   362→      macro: Math.max(0, Math.min(1, macroOpacity)),
+   363→      meso: Math.max(0, Math.min(1, mesoOpacity)),
+   364→      micro: Math.max(0, Math.min(1, microOpacity)),
+   365→    };
+   366→  }, [currentLinearZoom]);
+   367→
+   368→  // Create the OrthographicView
+   369→  const views = useMemo(() => new OrthographicView({
+   370→    id: 'timeline',
+   371→    flipY: false,
+   372→    controller: {
+   373→      scrollZoom: true,
+   374→      dragPan: true,
+   375→      doubleClickZoom: true,
+   376→      touchRotate: false,
+   377→      keyboard: true,
+   378→    },
+   379→  }), []);
+   380→
+   381→  // Get focused task ID from state
+   382→  const focusedTaskId = useCanvasSelector(s => s.interaction.focusedTaskId);
+   383→
+   384→  // Create layers based on LOD level with crossfade
+   385→  const layers = useMemo((): Layer[] => {
+   386→    const allLayers: Layer[] = [];
+   387→
+   388→    // MacroLayer - visible when zoom < 0.5
+   389→    if (lodOpacities.macro > 0) {
+   390→      allLayers.push(
+   391→        ...createMacroLayers({
+   392→          tasks,
+   393→          trainCount: TRAIN_COUNT,
+   394→          totalYears: TOTAL_YEARS,
+   395→          visible: true,
+   396→          opacity: lodOpacities.macro,
+   397→        })
+   398→      );
+   399→    }
+   400→
+   401→    // MesoLayer - visible when 0.5 <= zoom <= 2.0
+   402→    if (lodOpacities.meso > 0) {
+   403→      allLayers.push(
+   404→        ...createMesoLayers({
+   405→          tasks,
+   406→          trainCount: TRAIN_COUNT,
+   407→          totalDays: TOTAL_DAYS,
+   408→          visible: true,
+   409→          opacity: lodOpacities.meso,
+   410→          hoveredTaskId,
+   411→          selectedTaskId,
+   412→          focusedTaskId,
+   413→        })
+   414→      );
+   415→    }
+   416→
+   417→    // MicroLayer - visible when zoom > 2.0
+   418→    if (lodOpacities.micro > 0) {
+   419→      allLayers.push(
+   420→        ...createMicroLayers({
+   421→          tasks,
+   422→          trainCount: TRAIN_COUNT,
+   423→          totalDays: TOTAL_DAYS,
+   424→          visible: true,
+   425→          opacity: lodOpacities.micro,
+   426→          linearZoom: currentLinearZoom,
+   427→          viewportBounds,
+   428→          hoveredTaskId,
+   429→          selectedTaskId,
+   430→          focusedTaskId,
+   431→        })
+   432→      );
+   433→    }
+   434→
+   435→    return allLayers;
+   436→  }, [
+   437→    tasks,
+   438→    lodOpacities,
+   439→    currentLinearZoom,
+   440→    viewportBounds,
+   441→    hoveredTaskId,
+   442→    selectedTaskId,
+   443→    focusedTaskId,
+   444→  ]);
+   445→
+   446→  return (
+   447→    <div
+   448→      ref={containerRef}
+   449→      style={{
+   450→        width: '100%',
+   451→        height: '100%',
+   452→        position: 'relative',
+   453→        background: '#f4f4f5', // zinc-100, matching original
+   454→      }}
+   455→    >
+   456→      <DeckGL
+   457→        views={views}
+   458→        viewState={viewState}
+   459→        onViewStateChange={handleViewStateChange}
+   460→        controller={true}
+   461→        layers={layers}
+   462→        onHover={handleHover}
+   463→        onClick={handleClick}
+   464→        width={containerSize.width}
+   465→        height={containerSize.height}
+   466→        style={{ position: 'absolute', top: 0, left: 0 }}
+   467→        getCursor={({ isDragging, isHovering }) =>
+   468→          isDragging ? 'grabbing' : isHovering ? 'pointer' : 'grab'
+   469→        }
+   470→      />
+   471→
+   472→      {/* Debug overlay - shows deck.gl status */}
+   473→      <div
+   474→        style={{
+   475→          position: 'absolute',
+   476→          bottom: 8,
+   477→          right: 8,
+   478→          background: 'rgba(0,0,0,0.75)',
+   479→          color: '#00ff00',
+   480→          padding: '6px 10px',
+   481→          borderRadius: 4,
+   482→          fontSize: 11,
+   483→          fontFamily: 'monospace',
+   484→          pointerEvents: 'none',
+   485→          display: 'flex',
+   486→          flexDirection: 'column',
+   487→          gap: 2,
+   488→        }}
+   489→      >
+   490→        <div>deck.gl | LOD: {lodLevel} | Zoom: {currentLinearZoom.toFixed(2)}x</div>
+   491→        <div style={{ fontSize: 10, color: '#888' }}>
+   492→          Target: [{viewState.target[0].toFixed(0)}, {viewState.target[1].toFixed(0)}]
+   493→        </div>
+   494→      </div>
+   495→    </div>
+   496→  );
+   497→}
+   498→
+   499→export default DeckCanvas;
+   500→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

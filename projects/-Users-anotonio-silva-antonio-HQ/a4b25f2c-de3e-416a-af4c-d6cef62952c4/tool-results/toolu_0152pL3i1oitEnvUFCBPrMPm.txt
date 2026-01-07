@@ -1,0 +1,1218 @@
+     1→//! Harness CLI - Database utility for AI agents and humans.
+     2→//!
+     3→//! This CLI provides programmatic access to the Harness storage layer,
+     4→//! enabling AI agents to manage tasks, progress, and sessions.
+     5→//!
+     6→//! ## Usage
+     7→//!
+     8→//! ```bash
+     9→//! harness init                              # Create .harness/harness.db
+    10→//! harness db status                         # Show DB info
+    11→//! harness task add "Title" [-d "desc"]      # Add a task
+    12→//! harness task list [--status=TODO]         # List tasks
+    13→//! harness session start                     # Start work session
+    14→//! ```
+    15→
+    16→use clap::{Parser, Subcommand, ValueEnum};
+    17→use hq_lib::db;
+    18→use std::path::PathBuf;
+    19→use std::process::ExitCode;
+    20→
+    21→// =============================================================================
+    22→// CLI STRUCTURE
+    23→// =============================================================================
+    24→
+    25→#[derive(Parser)]
+    26→#[command(name = "harness")]
+    27→#[command(author, version, about = "Harness CLI - Database utility for AI agents")]
+    28→#[command(propagate_version = true)]
+    29→struct Cli {
+    30→    /// Output format
+    31→    #[arg(long, value_enum, global = true, default_value = "text")]
+    32→    format: OutputFormat,
+    33→
+    34→    /// Project directory (defaults to current directory)
+    35→    #[arg(short = 'C', long, global = true)]
+    36→    dir: Option<PathBuf>,
+    37→
+    38→    #[command(subcommand)]
+    39→    command: Commands,
+    40→}
+    41→
+    42→#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+    43→enum OutputFormat {
+    44→    /// Human-readable text
+    45→    Text,
+    46→    /// JSON for programmatic use
+    47→    Json,
+    48→    /// IDs only (one per line)
+    49→    Quiet,
+    50→}
+    51→
+    52→#[derive(Subcommand)]
+    53→enum Commands {
+    54→    /// Initialize a new Harness project
+    55→    Init,
+    56→
+    57→    /// Database operations
+    58→    Db {
+    59→        #[command(subcommand)]
+    60→        command: DbCommands,
+    61→    },
+    62→
+    63→    /// Task management
+    64→    Task {
+    65→        #[command(subcommand)]
+    66→        command: TaskCommands,
+    67→    },
+    68→
+    69→    /// Task step management
+    70→    Step {
+    71→        #[command(subcommand)]
+    72→        command: StepCommands,
+    73→    },
+    74→
+    75→    /// Work session management
+    76→    Session {
+    77→        #[command(subcommand)]
+    78→        command: SessionCommands,
+    79→    },
+    80→
+    81→    /// Progress log management
+    82→    Progress {
+    83→        #[command(subcommand)]
+    84→        command: ProgressCommands,
+    85→    },
+    86→
+    87→    /// Show project status summary
+    88→    Status,
+    89→}
+    90→
+    91→// -----------------------------------------------------------------------------
+    92→// DB Subcommands
+    93→// -----------------------------------------------------------------------------
+    94→
+    95→#[derive(Subcommand)]
+    96→enum DbCommands {
+    97→    /// Show database status and statistics
+    98→    Status,
+    99→}
+   100→
+   101→// -----------------------------------------------------------------------------
+   102→// Task Subcommands
+   103→// -----------------------------------------------------------------------------
+   104→
+   105→#[derive(Subcommand)]
+   106→enum TaskCommands {
+   107→    /// Add a new task
+   108→    Add {
+   109→        /// Task title
+   110→        title: String,
+   111→
+   112→        /// Task description
+   113→        #[arg(short, long)]
+   114→        description: Option<String>,
+   115→
+   116→        /// Task category
+   117→        #[arg(short, long)]
+   118→        category: Option<String>,
+   119→
+   120→        /// Initial status
+   121→        #[arg(short, long, value_enum, default_value = "backlog")]
+   122→        status: TaskStatusArg,
+   123→    },
+   124→
+   125→    /// List tasks
+   126→    List {
+   127→        /// Filter by status
+   128→        #[arg(short, long, value_enum)]
+   129→        status: Option<TaskStatusArg>,
+   130→
+   131→        /// Maximum number of results
+   132→        #[arg(short, long, default_value = "20")]
+   133→        limit: usize,
+   134→
+   135→        /// Pagination cursor
+   136→        #[arg(long)]
+   137→        cursor: Option<String>,
+   138→    },
+   139→
+   140→    /// Search tasks using full-text search
+   141→    Search {
+   142→        /// Search query
+   143→        query: String,
+   144→
+   145→        /// Maximum number of results
+   146→        #[arg(short, long, default_value = "20")]
+   147→        limit: usize,
+   148→    },
+   149→
+   150→    /// Get a task by ID
+   151→    Get {
+   152→        /// Task ID (ULID)
+   153→        id: String,
+   154→    },
+   155→
+   156→    /// Update a task
+   157→    Update {
+   158→        /// Task ID (ULID)
+   159→        id: String,
+   160→
+   161→        /// New title
+   162→        #[arg(short, long)]
+   163→        title: Option<String>,
+   164→
+   165→        /// New description
+   166→        #[arg(short, long)]
+   167→        description: Option<String>,
+   168→
+   169→        /// New category
+   170→        #[arg(short, long)]
+   171→        category: Option<String>,
+   172→
+   173→        /// New status
+   174→        #[arg(long, value_enum)]
+   175→        status: Option<TaskStatusArg>,
+   176→
+   177→        /// Mark as passed (true/false)
+   178→        #[arg(long)]
+   179→        passed: Option<bool>,
+   180→    },
+   181→
+   182→    /// Delete a task
+   183→    Delete {
+   184→        /// Task ID (ULID)
+   185→        id: String,
+   186→    },
+   187→
+   188→    /// Reorder a task
+   189→    Reorder {
+   190→        /// Task ID to move
+   191→        id: String,
+   192→
+   193→        /// Place after this task ID
+   194→        #[arg(long)]
+   195→        after: String,
+   196→    },
+   197→}
+   198→
+   199→#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+   200→enum TaskStatusArg {
+   201→    Backlog,
+   202→    Todo,
+   203→    Doing,
+   204→    Review,
+   205→    Qa,
+   206→    Done,
+   207→}
+   208→
+   209→impl From<TaskStatusArg> for db::TaskStatus {
+   210→    fn from(arg: TaskStatusArg) -> Self {
+   211→        match arg {
+   212→            TaskStatusArg::Backlog => db::TaskStatus::Backlog,
+   213→            TaskStatusArg::Todo => db::TaskStatus::Todo,
+   214→            TaskStatusArg::Doing => db::TaskStatus::Doing,
+   215→            TaskStatusArg::Review => db::TaskStatus::Review,
+   216→            TaskStatusArg::Qa => db::TaskStatus::Qa,
+   217→            TaskStatusArg::Done => db::TaskStatus::Done,
+   218→        }
+   219→    }
+   220→}
+   221→
+   222→// -----------------------------------------------------------------------------
+   223→// Step Subcommands
+   224→// -----------------------------------------------------------------------------
+   225→
+   226→#[derive(Subcommand)]
+   227→enum StepCommands {
+   228→    /// Add a step to a task
+   229→    Add {
+   230→        /// Parent task ID
+   231→        task_id: String,
+   232→
+   233→        /// Step description
+   234→        description: String,
+   235→    },
+   236→
+   237→    /// List steps for a task
+   238→    List {
+   239→        /// Parent task ID
+   240→        task_id: String,
+   241→    },
+   242→
+   243→    /// Mark a step as complete
+   244→    Complete {
+   245→        /// Step ID
+   246→        id: String,
+   247→    },
+   248→
+   249→    /// Mark a step as incomplete
+   250→    Uncomplete {
+   251→        /// Step ID
+   252→        id: String,
+   253→    },
+   254→
+   255→    /// Toggle step completion
+   256→    Toggle {
+   257→        /// Step ID
+   258→        id: String,
+   259→    },
+   260→
+   261→    /// Delete a step
+   262→    Delete {
+   263→        /// Step ID
+   264→        id: String,
+   265→    },
+   266→}
+   267→
+   268→// -----------------------------------------------------------------------------
+   269→// Session Subcommands
+   270→// -----------------------------------------------------------------------------
+   271→
+   272→#[derive(Subcommand)]
+   273→enum SessionCommands {
+   274→    /// Start a new work session
+   275→    Start {
+   276→        /// Session summary
+   277→        #[arg(short, long)]
+   278→        summary: Option<String>,
+   279→    },
+   280→
+   281→    /// End the current session
+   282→    End {
+   283→        /// Final summary
+   284→        #[arg(short, long)]
+   285→        summary: Option<String>,
+   286→    },
+   287→
+   288→    /// Show current active session
+   289→    Current,
+   290→
+   291→    /// List sessions
+   292→    List {
+   293→        /// Maximum number of results
+   294→        #[arg(short, long, default_value = "20")]
+   295→        limit: usize,
+   296→
+   297→        /// Pagination cursor
+   298→        #[arg(long)]
+   299→        cursor: Option<String>,
+   300→    },
+   301→
+   302→    /// Get a session by ID
+   303→    Get {
+   304→        /// Session ID (ULID)
+   305→        id: String,
+   306→    },
+   307→}
+   308→
+   309→// -----------------------------------------------------------------------------
+   310→// Progress Subcommands
+   311→// -----------------------------------------------------------------------------
+   312→
+   313→#[derive(Subcommand)]
+   314→enum ProgressCommands {
+   315→    /// Add a progress entry
+   316→    Add {
+   317→        /// Progress content
+   318→        content: String,
+   319→
+   320→        /// Session ID (uses current session if not specified)
+   321→        #[arg(short, long)]
+   322→        session: Option<String>,
+   323→    },
+   324→
+   325→    /// List progress entries
+   326→    List {
+   327→        /// Filter by session ID
+   328→        #[arg(short, long)]
+   329→        session: Option<String>,
+   330→
+   331→        /// Maximum number of results
+   332→        #[arg(short, long, default_value = "20")]
+   333→        limit: usize,
+   334→
+   335→        /// Pagination cursor
+   336→        #[arg(long)]
+   337→        cursor: Option<String>,
+   338→    },
+   339→
+   340→    /// Search progress using full-text search
+   341→    Search {
+   342→        /// Search query
+   343→        query: String,
+   344→
+   345→        /// Maximum number of results
+   346→        #[arg(short, long, default_value = "20")]
+   347→        limit: usize,
+   348→    },
+   349→}
+   350→
+   351→// =============================================================================
+   352→// MAIN
+   353→// =============================================================================
+   354→
+   355→fn main() -> ExitCode {
+   356→    let cli = Cli::parse();
+   357→
+   358→    // Determine project directory
+   359→    let project_dir = cli.dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+   360→
+   361→    let result = match cli.command {
+   362→        Commands::Init => cmd_init(&project_dir, cli.format),
+   363→        Commands::Db { command } => match command {
+   364→            DbCommands::Status => cmd_db_status(&project_dir, cli.format),
+   365→        },
+   366→        Commands::Task { command } => cmd_task(&project_dir, command, cli.format),
+   367→        Commands::Step { command } => cmd_step(&project_dir, command, cli.format),
+   368→        Commands::Session { command } => cmd_session(&project_dir, command, cli.format),
+   369→        Commands::Progress { command } => cmd_progress(&project_dir, command, cli.format),
+   370→        Commands::Status => cmd_status(&project_dir, cli.format),
+   371→    };
+   372→
+   373→    match result {
+   374→        Ok(()) => ExitCode::SUCCESS,
+   375→        Err(e) => {
+   376→            eprintln!("Error: {}", e);
+   377→            match e {
+   378→                CliError::NotHarnessProject => ExitCode::from(2),
+   379→                CliError::Database(_) => ExitCode::from(3),
+   380→                _ => ExitCode::FAILURE,
+   381→            }
+   382→        }
+   383→    }
+   384→}
+   385→
+   386→// =============================================================================
+   387→// ERROR HANDLING
+   388→// =============================================================================
+   389→
+   390→#[derive(Debug)]
+   391→enum CliError {
+   392→    NotHarnessProject,
+   393→    Database(db::DbError),
+   394→    NotFound(String),
+   395→    NoActiveSession,
+   396→    Io(std::io::Error),
+   397→}
+   398→
+   399→impl std::fmt::Display for CliError {
+   400→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   401→        match self {
+   402→            CliError::NotHarnessProject => write!(f, "Not a Harness project (no .harness/ folder)"),
+   403→            CliError::Database(e) => write!(f, "Database error: {}", e),
+   404→            CliError::NotFound(what) => write!(f, "Not found: {}", what),
+   405→            CliError::NoActiveSession => write!(f, "No active session"),
+   406→            CliError::Io(e) => write!(f, "IO error: {}", e),
+   407→        }
+   408→    }
+   409→}
+   410→
+   411→impl From<db::DbError> for CliError {
+   412→    fn from(e: db::DbError) -> Self {
+   413→        CliError::Database(e)
+   414→    }
+   415→}
+   416→
+   417→impl From<std::io::Error> for CliError {
+   418→    fn from(e: std::io::Error) -> Self {
+   419→        CliError::Io(e)
+   420→    }
+   421→}
+   422→
+   423→type CliResult<T> = Result<T, CliError>;
+   424→
+   425→// =============================================================================
+   426→// COMMAND IMPLEMENTATIONS
+   427→// =============================================================================
+   428→
+   429→fn cmd_init(project_dir: &PathBuf, format: OutputFormat) -> CliResult<()> {
+   430→    let harness_dir = project_dir.join(db::HARNESS_FOLDER);
+   431→
+   432→    // Create .harness/ if it doesn't exist
+   433→    if !harness_dir.exists() {
+   434→        std::fs::create_dir_all(&harness_dir)?;
+   435→    }
+   436→
+   437→    // Open or create the database
+   438→    let conn = db::open_or_create(project_dir)?;
+   439→
+   440→    let db_path = db::get_db_path(project_dir);
+   441→
+   442→    match format {
+   443→        OutputFormat::Json => {
+   444→            println!(
+   445→                r#"{{"success":true,"path":"{}","version":"{}"}}"#,
+   446→                db_path.display(),
+   447→                db::SCHEMA_VERSION
+   448→            );
+   449→        }
+   450→        OutputFormat::Quiet => {
+   451→            println!("{}", db_path.display());
+   452→        }
+   453→        OutputFormat::Text => {
+   454→            println!("Initialized Harness database at {}", db_path.display());
+   455→            println!("Schema version: {}", db::SCHEMA_VERSION);
+   456→
+   457→            // Show stats
+   458→            let stats = db::DbStats::collect(&conn, Some(&db_path))?;
+   459→            println!("\nDatabase stats:");
+   460→            println!("  Tasks:    {}", stats.task_count);
+   461→            println!("  Steps:    {}", stats.step_count);
+   462→            println!("  Sessions: {}", stats.session_count);
+   463→            println!("  Progress: {}", stats.progress_count);
+   464→        }
+   465→    }
+   466→
+   467→    Ok(())
+   468→}
+   469→
+   470→fn cmd_db_status(project_dir: &PathBuf, format: OutputFormat) -> CliResult<()> {
+   471→    if !db::has_harness_folder(project_dir) {
+   472→        return Err(CliError::NotHarnessProject);
+   473→    }
+   474→
+   475→    let conn = db::open(project_dir)?;
+   476→    let db_path = db::get_db_path(project_dir);
+   477→    let stats = db::DbStats::collect(&conn, Some(&db_path))?;
+   478→    let version = db::get_schema_version(&conn)?.unwrap_or_else(|| "unknown".to_string());
+   479→
+   480→    match format {
+   481→        OutputFormat::Json => {
+   482→            println!(
+   483→                r#"{{"path":"{}","version":"{}","size_bytes":{},"tasks":{},"steps":{},"sessions":{},"progress":{}}}"#,
+   484→                db_path.display(),
+   485→                version,
+   486→                stats.file_size_bytes,
+   487→                stats.task_count,
+   488→                stats.step_count,
+   489→                stats.session_count,
+   490→                stats.progress_count
+   491→            );
+   492→        }
+   493→        OutputFormat::Quiet => {
+   494→            println!("{}", db_path.display());
+   495→        }
+   496→        OutputFormat::Text => {
+   497→            println!("Database: {}", db_path.display());
+   498→            println!("Schema version: {}", version);
+   499→            println!("Size: {} bytes", stats.file_size_bytes);
+   500→            println!();
+   501→            println!("Counts:");
+   502→            println!("  Tasks:    {}", stats.task_count);
+   503→            println!("  Steps:    {}", stats.step_count);
+   504→            println!("  Sessions: {}", stats.session_count);
+   505→            println!("  Progress: {}", stats.progress_count);
+   506→        }
+   507→    }
+   508→
+   509→    Ok(())
+   510→}
+   511→
+   512→fn cmd_task(project_dir: &PathBuf, command: TaskCommands, format: OutputFormat) -> CliResult<()> {
+   513→    if !db::has_harness_folder(project_dir) {
+   514→        return Err(CliError::NotHarnessProject);
+   515→    }
+   516→
+   517→    let conn = db::open(project_dir)?;
+   518→
+   519→    match command {
+   520→        TaskCommands::Add {
+   521→            title,
+   522→            description,
+   523→            category,
+   524→            status,
+   525→        } => {
+   526→            let mut task = db::ProjectTask::new(&title).with_status(status.into());
+   527→
+   528→            if let Some(ref desc) = description {
+   529→                task = task.with_description(desc);
+   530→            }
+   531→            if let Some(ref cat) = category {
+   532→                task = task.with_category(cat);
+   533→            }
+   534→
+   535→            db::create_task(&conn, &task)?;
+   536→
+   537→            match format {
+   538→                OutputFormat::Json => {
+   539→                    println!("{}", serde_json::to_string(&task).unwrap_or_default());
+   540→                }
+   541→                OutputFormat::Quiet => {
+   542→                    println!("{}", task.id);
+   543→                }
+   544→                OutputFormat::Text => {
+   545→                    println!("Created task: {}", task.id);
+   546→                    println!("  Title:  {}", task.title);
+   547→                    println!("  Status: {}", task.status.as_str());
+   548→                }
+   549→            }
+   550→        }
+   551→
+   552→        TaskCommands::List { status, limit, cursor } => {
+   553→            let result = if let Some(status) = status {
+   554→                db::list_tasks_by_status(&conn, status.into(), cursor.as_deref(), Some(limit))?
+   555→            } else {
+   556→                db::list_tasks(&conn, cursor.as_deref(), Some(limit))?
+   557→            };
+   558→
+   559→            match format {
+   560→                OutputFormat::Json => {
+   561→                    println!("{}", serde_json::to_string(&result).unwrap_or_default());
+   562→                }
+   563→                OutputFormat::Quiet => {
+   564→                    for task in &result.items {
+   565→                        println!("{}", task.id);
+   566→                    }
+   567→                }
+   568→                OutputFormat::Text => {
+   569→                    if result.items.is_empty() {
+   570→                        println!("No tasks found.");
+   571→                    } else {
+   572→                        println!("{:<26}  {:<8}  {}", "ID", "STATUS", "TITLE");
+   573→                        println!("{}", "-".repeat(70));
+   574→                        for task in &result.items {
+   575→                            println!(
+   576→                                "{:<26}  {:<8}  {}",
+   577→                                task.id,
+   578→                                task.status.as_str(),
+   579→                                truncate(&task.title, 32)
+   580→                            );
+   581→                        }
+   582→                        if result.has_next {
+   583→                            println!();
+   584→                            println!("More results available. Use --cursor={}", result.next_cursor.as_deref().unwrap_or(""));
+   585→                        }
+   586→                    }
+   587→                }
+   588→            }
+   589→        }
+   590→
+   591→        TaskCommands::Search { query, limit } => {
+   592→            let tasks = db::search_tasks(&conn, &query, Some(limit))?;
+   593→
+   594→            match format {
+   595→                OutputFormat::Json => {
+   596→                    println!("{}", serde_json::to_string(&tasks).unwrap_or_default());
+   597→                }
+   598→                OutputFormat::Quiet => {
+   599→                    for task in &tasks {
+   600→                        println!("{}", task.id);
+   601→                    }
+   602→                }
+   603→                OutputFormat::Text => {
+   604→                    if tasks.is_empty() {
+   605→                        println!("No tasks found matching '{}'.", query);
+   606→                    } else {
+   607→                        println!("Found {} task(s) matching '{}':", tasks.len(), query);
+   608→                        println!();
+   609→                        println!("{:<26}  {:<8}  {}", "ID", "STATUS", "TITLE");
+   610→                        println!("{}", "-".repeat(70));
+   611→                        for task in &tasks {
+   612→                            println!(
+   613→                                "{:<26}  {:<8}  {}",
+   614→                                task.id,
+   615→                                task.status.as_str(),
+   616→                                truncate(&task.title, 32)
+   617→                            );
+   618→                        }
+   619→                    }
+   620→                }
+   621→            }
+   622→        }
+   623→
+   624→        TaskCommands::Get { id } => {
+   625→            let task = db::get_task(&conn, &id)?
+   626→                .ok_or_else(|| CliError::NotFound(format!("Task {}", id)))?;
+   627→
+   628→            match format {
+   629→                OutputFormat::Json => {
+   630→                    println!("{}", serde_json::to_string(&task).unwrap_or_default());
+   631→                }
+   632→                OutputFormat::Quiet => {
+   633→                    println!("{}", task.id);
+   634→                }
+   635→                OutputFormat::Text => {
+   636→                    println!("ID:          {}", task.id);
+   637→                    println!("Title:       {}", task.title);
+   638→                    println!("Status:      {}", task.status.as_str());
+   639→                    println!("Category:    {}", task.category.as_deref().unwrap_or("-"));
+   640→                    println!("Description: {}", task.description.as_deref().unwrap_or("-"));
+   641→                    println!("Passed:      {}", task.is_passed);
+   642→                    println!("Order:       {:.2}", task.sort_order);
+   643→                    println!("Created:     {}", task.created_at);
+   644→                    println!("Updated:     {}", task.updated_at);
+   645→
+   646→                    // Show steps
+   647→                    let steps = db::list_steps(&conn, &id)?;
+   648→                    if !steps.is_empty() {
+   649→                        println!();
+   650→                        println!("Steps ({}):", steps.len());
+   651→                        for step in &steps {
+   652→                            let check = if step.is_completed { "[x]" } else { "[ ]" };
+   653→                            println!("  {} {}", check, step.description);
+   654→                        }
+   655→                    }
+   656→                }
+   657→            }
+   658→        }
+   659→
+   660→        TaskCommands::Update {
+   661→            id,
+   662→            title,
+   663→            description,
+   664→            category,
+   665→            status,
+   666→            passed,
+   667→        } => {
+   668→            let mut update = db::TaskUpdate::default();
+   669→            update.title = title;
+   670→            update.description = description.map(Some);
+   671→            update.category = category.map(Some);
+   672→            update.status = status.map(|s| s.into());
+   673→
+   674→            let updated = db::update_task(&conn, &id, update)?;
+   675→
+   676→            if let Some(p) = passed {
+   677→                db::set_task_passed(&conn, &id, p)?;
+   678→            }
+   679→
+   680→            if !updated && passed.is_none() {
+   681→                return Err(CliError::NotFound(format!("Task {}", id)));
+   682→            }
+   683→
+   684→            match format {
+   685→                OutputFormat::Json => {
+   686→                    if let Some(task) = db::get_task(&conn, &id)? {
+   687→                        println!("{}", serde_json::to_string(&task).unwrap_or_default());
+   688→                    }
+   689→                }
+   690→                OutputFormat::Quiet => {
+   691→                    println!("{}", id);
+   692→                }
+   693→                OutputFormat::Text => {
+   694→                    println!("Updated task: {}", id);
+   695→                }
+   696→            }
+   697→        }
+   698→
+   699→        TaskCommands::Delete { id } => {
+   700→            // Delete steps first
+   701→            db::delete_steps_for_task(&conn, &id)?;
+   702→
+   703→            let deleted = db::delete_task(&conn, &id)?;
+   704→            if !deleted {
+   705→                return Err(CliError::NotFound(format!("Task {}", id)));
+   706→            }
+   707→
+   708→            match format {
+   709→                OutputFormat::Json => {
+   710→                    println!(r#"{{"deleted":true,"id":"{}"}}"#, id);
+   711→                }
+   712→                OutputFormat::Quiet => {
+   713→                    println!("{}", id);
+   714→                }
+   715→                OutputFormat::Text => {
+   716→                    println!("Deleted task: {}", id);
+   717→                }
+   718→            }
+   719→        }
+   720→
+   721→        TaskCommands::Reorder { id, after } => {
+   722→            let new_order = db::get_order_after(&conn, Some(&after))?;
+   723→            let mut update = db::TaskUpdate::default();
+   724→            update.sort_order = Some(new_order);
+   725→
+   726→            let updated = db::update_task(&conn, &id, update)?;
+   727→            if !updated {
+   728→                return Err(CliError::NotFound(format!("Task {}", id)));
+   729→            }
+   730→
+   731→            match format {
+   732→                OutputFormat::Json => {
+   733→                    println!(r#"{{"id":"{}","sort_order":{}}}"#, id, new_order);
+   734→                }
+   735→                OutputFormat::Quiet => {
+   736→                    println!("{}", id);
+   737→                }
+   738→                OutputFormat::Text => {
+   739→                    println!("Reordered task {} after {}", id, after);
+   740→                }
+   741→            }
+   742→        }
+   743→    }
+   744→
+   745→    Ok(())
+   746→}
+   747→
+   748→fn cmd_step(project_dir: &PathBuf, command: StepCommands, format: OutputFormat) -> CliResult<()> {
+   749→    if !db::has_harness_folder(project_dir) {
+   750→        return Err(CliError::NotHarnessProject);
+   751→    }
+   752→
+   753→    let conn = db::open(project_dir)?;
+   754→
+   755→    match command {
+   756→        StepCommands::Add { task_id, description } => {
+   757→            let step = db::add_step(&conn, &task_id, &description)?;
+   758→
+   759→            match format {
+   760→                OutputFormat::Json => {
+   761→                    println!("{}", serde_json::to_string(&step).unwrap_or_default());
+   762→                }
+   763→                OutputFormat::Quiet => {
+   764→                    println!("{}", step.id);
+   765→                }
+   766→                OutputFormat::Text => {
+   767→                    println!("Added step: {}", step.id);
+   768→                    println!("  Task:        {}", task_id);
+   769→                    println!("  Description: {}", step.description);
+   770→                }
+   771→            }
+   772→        }
+   773→
+   774→        StepCommands::List { task_id } => {
+   775→            let steps = db::list_steps(&conn, &task_id)?;
+   776→
+   777→            match format {
+   778→                OutputFormat::Json => {
+   779→                    println!("{}", serde_json::to_string(&steps).unwrap_or_default());
+   780→                }
+   781→                OutputFormat::Quiet => {
+   782→                    for step in &steps {
+   783→                        println!("{}", step.id);
+   784→                    }
+   785→                }
+   786→                OutputFormat::Text => {
+   787→                    if steps.is_empty() {
+   788→                        println!("No steps for task {}.", task_id);
+   789→                    } else {
+   790→                        println!("Steps for task {} ({}):", task_id, steps.len());
+   791→                        println!();
+   792→                        for step in &steps {
+   793→                            let check = if step.is_completed { "[x]" } else { "[ ]" };
+   794→                            println!("{} {} - {}", check, step.id, step.description);
+   795→                        }
+   796→                    }
+   797→                }
+   798→            }
+   799→        }
+   800→
+   801→        StepCommands::Complete { id } => {
+   802→            let completed = db::complete_step(&conn, &id)?;
+   803→            if !completed {
+   804→                return Err(CliError::NotFound(format!("Step {}", id)));
+   805→            }
+   806→
+   807→            match format {
+   808→                OutputFormat::Json => {
+   809→                    println!(r#"{{"id":"{}","is_completed":true}}"#, id);
+   810→                }
+   811→                OutputFormat::Quiet => {
+   812→                    println!("{}", id);
+   813→                }
+   814→                OutputFormat::Text => {
+   815→                    println!("Completed step: {}", id);
+   816→                }
+   817→            }
+   818→        }
+   819→
+   820→        StepCommands::Uncomplete { id } => {
+   821→            let uncompleted = db::uncomplete_step(&conn, &id)?;
+   822→            if !uncompleted {
+   823→                return Err(CliError::NotFound(format!("Step {}", id)));
+   824→            }
+   825→
+   826→            match format {
+   827→                OutputFormat::Json => {
+   828→                    println!(r#"{{"id":"{}","is_completed":false}}"#, id);
+   829→                }
+   830→                OutputFormat::Quiet => {
+   831→                    println!("{}", id);
+   832→                }
+   833→                OutputFormat::Text => {
+   834→                    println!("Uncompleted step: {}", id);
+   835→                }
+   836→            }
+   837→        }
+   838→
+   839→        StepCommands::Toggle { id } => {
+   840→            // First get the step to check if it exists and get current state
+   841→            let step = db::get_step(&conn, &id)?
+   842→                .ok_or_else(|| CliError::NotFound(format!("Step {}", id)))?;
+   843→
+   844→            let new_state = !step.is_completed;
+   845→            db::set_step_completed(&conn, &id, new_state)?;
+   846→
+   847→            match format {
+   848→                OutputFormat::Json => {
+   849→                    println!(r#"{{"id":"{}","is_completed":{}}}"#, id, new_state);
+   850→                }
+   851→                OutputFormat::Quiet => {
+   852→                    println!("{}", id);
+   853→                }
+   854→                OutputFormat::Text => {
+   855→                    let state = if new_state { "completed" } else { "incomplete" };
+   856→                    println!("Step {} is now {}", id, state);
+   857→                }
+   858→            }
+   859→        }
+   860→
+   861→        StepCommands::Delete { id } => {
+   862→            let deleted = db::delete_step(&conn, &id)?;
+   863→            if !deleted {
+   864→                return Err(CliError::NotFound(format!("Step {}", id)));
+   865→            }
+   866→
+   867→            match format {
+   868→                OutputFormat::Json => {
+   869→                    println!(r#"{{"deleted":true,"id":"{}"}}"#, id);
+   870→                }
+   871→                OutputFormat::Quiet => {
+   872→                    println!("{}", id);
+   873→                }
+   874→                OutputFormat::Text => {
+   875→                    println!("Deleted step: {}", id);
+   876→                }
+   877→            }
+   878→        }
+   879→    }
+   880→
+   881→    Ok(())
+   882→}
+   883→
+   884→fn cmd_session(project_dir: &PathBuf, command: SessionCommands, format: OutputFormat) -> CliResult<()> {
+   885→    if !db::has_harness_folder(project_dir) {
+   886→        return Err(CliError::NotHarnessProject);
+   887→    }
+   888→
+   889→    let conn = db::open(project_dir)?;
+   890→
+   891→    match command {
+   892→        SessionCommands::Start { summary } => {
+   893→            let session = db::start_session(&conn, summary.as_deref())?;
+   894→
+   895→            match format {
+   896→                OutputFormat::Json => {
+   897→                    println!("{}", serde_json::to_string(&session).unwrap_or_default());
+   898→                }
+   899→                OutputFormat::Quiet => {
+   900→                    println!("{}", session.id);
+   901→                }
+   902→                OutputFormat::Text => {
+   903→                    println!("Started session: {}", session.id);
+   904→                    if let Some(s) = &session.summary {
+   905→                        println!("  Summary: {}", s);
+   906→                    }
+   907→                    println!("  Started: {}", session.started_at);
+   908→                }
+   909→            }
+   910→        }
+   911→
+   912→        SessionCommands::End { summary } => {
+   913→            let session_id = db::end_current_session(&conn, summary.as_deref())?
+   914→                .ok_or(CliError::NoActiveSession)?;
+   915→
+   916→            match format {
+   917→                OutputFormat::Json => {
+   918→                    if let Some(session) = db::get_session(&conn, &session_id)? {
+   919→                        println!("{}", serde_json::to_string(&session).unwrap_or_default());
+   920→                    }
+   921→                }
+   922→                OutputFormat::Quiet => {
+   923→                    println!("{}", session_id);
+   924→                }
+   925→                OutputFormat::Text => {
+   926→                    println!("Ended session: {}", session_id);
+   927→                }
+   928→            }
+   929→        }
+   930→
+   931→        SessionCommands::Current => {
+   932→            let session = db::get_current_session(&conn)?
+   933→                .ok_or(CliError::NoActiveSession)?;
+   934→
+   935→            match format {
+   936→                OutputFormat::Json => {
+   937→                    println!("{}", serde_json::to_string(&session).unwrap_or_default());
+   938→                }
+   939→                OutputFormat::Quiet => {
+   940→                    println!("{}", session.id);
+   941→                }
+   942→                OutputFormat::Text => {
+   943→                    println!("Current session: {}", session.id);
+   944→                    if let Some(s) = &session.summary {
+   945→                        println!("  Summary: {}", s);
+   946→                    }
+   947→                    println!("  Started: {}", session.started_at);
+   948→
+   949→                    // Show progress count
+   950→                    let count = db::count_progress_for_session(&conn, &session.id)?;
+   951→                    println!("  Progress entries: {}", count);
+   952→                }
+   953→            }
+   954→        }
+   955→
+   956→        SessionCommands::List { limit, cursor } => {
+   957→            let result = db::list_sessions(&conn, cursor.as_deref(), Some(limit))?;
+   958→
+   959→            match format {
+   960→                OutputFormat::Json => {
+   961→                    println!("{}", serde_json::to_string(&result).unwrap_or_default());
+   962→                }
+   963→                OutputFormat::Quiet => {
+   964→                    for session in &result.items {
+   965→                        println!("{}", session.id);
+   966→                    }
+   967→                }
+   968→                OutputFormat::Text => {
+   969→                    if result.items.is_empty() {
+   970→                        println!("No sessions found.");
+   971→                    } else {
+   972→                        println!("{:<26}  {:<20}  {}", "ID", "STARTED", "STATUS");
+   973→                        println!("{}", "-".repeat(60));
+   974→                        for session in &result.items {
+   975→                            let status = if session.ended_at.is_some() { "ended" } else { "active" };
+   976→                            println!(
+   977→                                "{:<26}  {:<20}  {}",
+   978→                                session.id,
+   979→                                truncate(&session.started_at.to_string(), 20),
+   980→                                status
+   981→                            );
+   982→                        }
+   983→                        if result.has_next {
+   984→                            println!();
+   985→                            println!("More results available. Use --cursor={}", result.next_cursor.as_deref().unwrap_or(""));
+   986→                        }
+   987→                    }
+   988→                }
+   989→            }
+   990→        }
+   991→
+   992→        SessionCommands::Get { id } => {
+   993→            let session = db::get_session(&conn, &id)?
+   994→                .ok_or_else(|| CliError::NotFound(format!("Session {}", id)))?;
+   995→
+   996→            match format {
+   997→                OutputFormat::Json => {
+   998→                    println!("{}", serde_json::to_string(&session).unwrap_or_default());
+   999→                }
+  1000→                OutputFormat::Quiet => {
+  1001→                    println!("{}", session.id);
+  1002→                }
+  1003→                OutputFormat::Text => {
+  1004→                    println!("ID:      {}", session.id);
+  1005→                    println!("Summary: {}", session.summary.as_deref().unwrap_or("-"));
+  1006→                    println!("Started: {}", session.started_at);
+  1007→                    println!("Ended:   {}", session.ended_at.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string()));
+  1008→
+  1009→                    // Show progress entries
+  1010→                    let progress = db::list_progress_for_session(&conn, &id)?;
+  1011→                    if !progress.is_empty() {
+  1012→                        println!();
+  1013→                        println!("Progress ({}):", progress.len());
+  1014→                        for entry in progress.iter().take(10) {
+  1015→                            println!("  - {}", truncate(&entry.content, 60));
+  1016→                        }
+  1017→                        if progress.len() > 10 {
+  1018→                            println!("  ... and {} more", progress.len() - 10);
+  1019→                        }
+  1020→                    }
+  1021→                }
+  1022→            }
+  1023→        }
+  1024→    }
+  1025→
+  1026→    Ok(())
+  1027→}
+  1028→
+  1029→fn cmd_progress(project_dir: &PathBuf, command: ProgressCommands, format: OutputFormat) -> CliResult<()> {
+  1030→    if !db::has_harness_folder(project_dir) {
+  1031→        return Err(CliError::NotHarnessProject);
+  1032→    }
+  1033→
+  1034→    let conn = db::open(project_dir)?;
+  1035→
+  1036→    match command {
+  1037→        ProgressCommands::Add { content, session } => {
+  1038→            // Use provided session or get current
+  1039→            let session_id = match session {
+  1040→                Some(id) => id,
+  1041→                None => db::get_current_session(&conn)?
+  1042→                    .ok_or(CliError::NoActiveSession)?
+  1043→                    .id,
+  1044→            };
+  1045→
+  1046→            let progress = db::add_progress(&conn, &session_id, &content)?;
+  1047→
+  1048→            match format {
+  1049→                OutputFormat::Json => {
+  1050→                    println!("{}", serde_json::to_string(&progress).unwrap_or_default());
+  1051→                }
+  1052→                OutputFormat::Quiet => {
+  1053→                    println!("{}", progress.id);
+  1054→                }
+  1055→                OutputFormat::Text => {
+  1056→                    println!("Added progress: {}", progress.id);
+  1057→                    println!("  Session: {}", session_id);
+  1058→                    println!("  Content: {}", truncate(&content, 60));
+  1059→                }
+  1060→            }
+  1061→        }
+  1062→
+  1063→        ProgressCommands::List { session, limit, cursor } => {
+  1064→            if let Some(session_id) = session {
+  1065→                // List for specific session
+  1066→                let entries = db::list_progress_for_session(&conn, &session_id)?;
+  1067→
+  1068→                match format {
+  1069→                    OutputFormat::Json => {
+  1070→                        println!("{}", serde_json::to_string(&entries).unwrap_or_default());
+  1071→                    }
+  1072→                    OutputFormat::Quiet => {
+  1073→                        for entry in &entries {
+  1074→                            println!("{}", entry.id);
+  1075→                        }
+  1076→                    }
+  1077→                    OutputFormat::Text => {
+  1078→                        if entries.is_empty() {
+  1079→                            println!("No progress entries for session {}.", session_id);
+  1080→                        } else {
+  1081→                            println!("Progress for session {} ({}):", session_id, entries.len());
+  1082→                            println!();
+  1083→                            for entry in &entries {
+  1084→                                println!("[{}] {}", entry.created_at.format("%H:%M:%S"), entry.content);
+  1085→                            }
+  1086→                        }
+  1087→                    }
+  1088→                }
+  1089→            } else {
+  1090→                // List all with pagination
+  1091→                let result = db::list_progress(&conn, cursor.as_deref(), Some(limit))?;
+  1092→
+  1093→                match format {
+  1094→                    OutputFormat::Json => {
+  1095→                        println!("{}", serde_json::to_string(&result).unwrap_or_default());
+  1096→                    }
+  1097→                    OutputFormat::Quiet => {
+  1098→                        for entry in &result.items {
+  1099→                            println!("{}", entry.id);
+  1100→                        }
+  1101→                    }
+  1102→                    OutputFormat::Text => {
+  1103→                        if result.items.is_empty() {
+  1104→                            println!("No progress entries found.");
+  1105→                        } else {
+  1106→                            for entry in &result.items {
+  1107→                                println!("[{}] {}", entry.created_at.format("%Y-%m-%d %H:%M"), entry.content);
+  1108→                            }
+  1109→                            if result.has_next {
+  1110→                                println!();
+  1111→                                println!("More results available. Use --cursor={}", result.next_cursor.as_deref().unwrap_or(""));
+  1112→                            }
+  1113→                        }
+  1114→                    }
+  1115→                }
+  1116→            }
+  1117→        }
+  1118→
+  1119→        ProgressCommands::Search { query, limit } => {
+  1120→            let entries = db::search_progress(&conn, &query, Some(limit))?;
+  1121→
+  1122→            match format {
+  1123→                OutputFormat::Json => {
+  1124→                    println!("{}", serde_json::to_string(&entries).unwrap_or_default());
+  1125→                }
+  1126→                OutputFormat::Quiet => {
+  1127→                    for entry in &entries {
+  1128→                        println!("{}", entry.id);
+  1129→                    }
+  1130→                }
+  1131→                OutputFormat::Text => {
+  1132→                    if entries.is_empty() {
+  1133→                        println!("No progress entries found matching '{}'.", query);
+  1134→                    } else {
+  1135→                        println!("Found {} entry(ies) matching '{}':", entries.len(), query);
+  1136→                        println!();
+  1137→                        for entry in &entries {
+  1138→                            println!("[{}] {}", entry.created_at.format("%Y-%m-%d %H:%M"), entry.content);
+  1139→                        }
+  1140→                    }
+  1141→                }
+  1142→            }
+  1143→        }
+  1144→    }
+  1145→
+  1146→    Ok(())
+  1147→}
+  1148→
+  1149→fn cmd_status(project_dir: &PathBuf, format: OutputFormat) -> CliResult<()> {
+  1150→    if !db::has_harness_folder(project_dir) {
+  1151→        return Err(CliError::NotHarnessProject);
+  1152→    }
+  1153→
+  1154→    let conn = db::open(project_dir)?;
+  1155→
+  1156→    // Collect counts by status using the HashMap
+  1157→    let status_counts = db::count_tasks_by_status(&conn)?;
+  1158→    let backlog = status_counts.get("BACKLOG").copied().unwrap_or(0);
+  1159→    let todo = status_counts.get("TODO").copied().unwrap_or(0);
+  1160→    let doing = status_counts.get("DOING").copied().unwrap_or(0);
+  1161→    let review = status_counts.get("REVIEW").copied().unwrap_or(0);
+  1162→    let qa = status_counts.get("QA").copied().unwrap_or(0);
+  1163→    let done = status_counts.get("DONE").copied().unwrap_or(0);
+  1164→    let total = backlog + todo + doing + review + qa + done;
+  1165→
+  1166→    let active_sessions = db::count_active_sessions(&conn)?;
+  1167→    let total_sessions = db::count_sessions(&conn)?;
+  1168→    let total_progress = db::count_progress(&conn)?;
+  1169→
+  1170→    match format {
+  1171→        OutputFormat::Json => {
+  1172→            println!(
+  1173→                r#"{{"tasks":{{"backlog":{},"todo":{},"doing":{},"review":{},"qa":{},"done":{},"total":{}}},"sessions":{{"active":{},"total":{}}},"progress":{}}}"#,
+  1174→                backlog, todo, doing, review, qa, done, total,
+  1175→                active_sessions, total_sessions,
+  1176→                total_progress
+  1177→            );
+  1178→        }
+  1179→        OutputFormat::Quiet => {
+  1180→            println!("{}/{}", done, total);
+  1181→        }
+  1182→        OutputFormat::Text => {
+  1183→            println!("Project Status");
+  1184→            println!("==============");
+  1185→            println!();
+  1186→            println!("Tasks: {}/{} complete", done, total);
+  1187→            println!();
+  1188→            println!("  BACKLOG:  {}", backlog);
+  1189→            println!("  TODO:     {}", todo);
+  1190→            println!("  DOING:    {}", doing);
+  1191→            println!("  REVIEW:   {}", review);
+  1192→            println!("  QA:       {}", qa);
+  1193→            println!("  DONE:     {}", done);
+  1194→            println!();
+  1195→            println!("Sessions: {} total ({} active)", total_sessions, active_sessions);
+  1196→            println!("Progress entries: {}", total_progress);
+  1197→        }
+  1198→    }
+  1199→
+  1200→    Ok(())
+  1201→}
+  1202→
+  1203→// =============================================================================
+  1204→// HELPERS
+  1205→// =============================================================================
+  1206→
+  1207→fn truncate(s: &str, max_len: usize) -> String {
+  1208→    if s.len() <= max_len {
+  1209→        s.to_string()
+  1210→    } else {
+  1211→        format!("{}...", &s[..max_len.saturating_sub(3)])
+  1212→    }
+  1213→}
+  1214→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

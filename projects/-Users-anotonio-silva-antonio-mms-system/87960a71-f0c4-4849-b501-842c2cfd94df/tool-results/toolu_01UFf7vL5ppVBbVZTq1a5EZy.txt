@@ -1,0 +1,322 @@
+     1→"""
+     2→MMS Solver - CP-SAT Train Allocator
+     3→
+     4→Uses Google OR-Tools CP-SAT solver to optimize train allocation
+     5→based on km balancing, dead running, and maintenance constraints.
+     6→"""
+     7→
+     8→import math
+     9→from datetime import date
+    10→from typing import Optional
+    11→from uuid import UUID
+    12→from ortools.sat.python import cp_model
+    13→
+    14→from ..models.schemas import TrainRecommendation
+    15→
+    16→
+    17→def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    18→    """
+    19→    Calculate the great circle distance between two points on earth (in km).
+    20→    """
+    21→    R = 6371  # Earth radius in km
+    22→
+    23→    lat1_rad = math.radians(lat1)
+    24→    lat2_rad = math.radians(lat2)
+    25→    delta_lat = math.radians(lat2 - lat1)
+    26→    delta_lon = math.radians(lon2 - lon1)
+    27→
+    28→    a = (math.sin(delta_lat / 2) ** 2 +
+    29→         math.cos(lat1_rad) * math.cos(lat2_rad) *
+    30→         math.sin(delta_lon / 2) ** 2)
+    31→    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    32→
+    33→    return R * c
+    34→
+    35→
+    36→class TrainAllocator:
+    37→    """
+    38→    CP-SAT based train allocator for km balancing optimization.
+    39→
+    40→    Objective: Minimize weighted sum of:
+    41→    1. Km deviation from target (HIGH weight: 1000)
+    42→    2. Dead running distance (MEDIUM weight: 100)
+    43→    3. Days until maintenance at destination (LOW weight: 10)
+    44→    """
+    45→
+    46→    # Weight constants for objective function
+    47→    WEIGHT_KM_BALANCE = 1000
+    48→    WEIGHT_DEAD_RUNNING = 100
+    49→    WEIGHT_MAINTENANCE_PROXIMITY = 10
+    50→
+    51→    def __init__(self, trains: list[dict], service: dict, fleet_avg_km: float):
+    52→        self.trains = trains
+    53→        self.service = service
+    54→        self.fleet_avg_km = fleet_avg_km
+    55→        self.model = cp_model.CpModel()
+    56→        self.solver = cp_model.CpSolver()
+    57→
+    58→        # Decision variables: x[i] = 1 if train i is selected
+    59→        self.x = {}
+    60→
+    61→        # Service origin/destination coordinates (for dead running calc)
+    62→        self.origin_coords = self._get_depot_coords(service['origin'])
+    63→        self.dest_coords = self._get_depot_coords(service['destination'])
+    64→
+    65→    def _get_depot_coords(self, location_name: str) -> tuple[float, float]:
+    66→        """
+    67→        Get coordinates for a location.
+    68→        In production, this would query the depots table.
+    69→        For now, uses train depot as proxy.
+    70→        """
+    71→        # Use first train's depot as reference if available
+    72→        for train in self.trains:
+    73→            if train.get('depot_lat') and train.get('depot_lon'):
+    74→                return (train['depot_lat'], train['depot_lon'])
+    75→        # Default: Lisbon coordinates
+    76→        return (38.7223, -9.1393)
+    77→
+    78→    def _calculate_km_penalty(self, train: dict) -> int:
+    79→        """
+    80→        Calculate km deviation penalty.
+    81→        Lower is better - trains below average should be prioritized.
+    82→        """
+    83→        current_km = train['current_km'] or 0
+    84→        target_km = train['target_km'] or self.fleet_avg_km
+    85→
+    86→        if target_km == 0:
+    87→            target_km = self.fleet_avg_km
+    88→
+    89→        # Calculate deviation percentage
+    90→        deviation_pct = abs(current_km - target_km) / max(target_km, 1) * 100
+    91→
+    92→        # Trains below target get bonus (negative penalty)
+    93→        # Trains above target get penalty (positive)
+    94→        if current_km < target_km:
+    95→            return -int(deviation_pct * 10)  # Bonus for underutilized
+    96→        else:
+    97→            return int(deviation_pct * 10)  # Penalty for overutilized
+    98→
+    99→    def _calculate_dead_running(self, train: dict) -> float:
+   100→        """
+   101→        Calculate dead running distance from train's current location
+   102→        to service origin.
+   103→        """
+   104→        train_lat = train.get('latitude') or train.get('depot_lat')
+   105→        train_lon = train.get('longitude') or train.get('depot_lon')
+   106→
+   107→        if not train_lat or not train_lon:
+   108→            return 50.0  # Default penalty if location unknown
+   109→
+   110→        if not self.origin_coords[0] or not self.origin_coords[1]:
+   111→            return 0.0
+   112→
+   113→        return haversine_distance(
+   114→            train_lat, train_lon,
+   115→            self.origin_coords[0], self.origin_coords[1]
+   116→        )
+   117→
+   118→    def solve(self, top_n: int = 5) -> list[tuple[dict, int, float]]:
+   119→        """
+   120→        Solve the allocation problem and return top N recommendations.
+   121→
+   122→        Returns list of (train_dict, score, dead_running_km) tuples.
+   123→        """
+   124→        if not self.trains:
+   125→            return []
+   126→
+   127→        # Create decision variables
+   128→        for i, train in enumerate(self.trains):
+   129→            self.x[i] = self.model.NewBoolVar(f"train_{i}")
+   130→
+   131→        # Constraint: Select at most top_n trains
+   132→        self.model.Add(sum(self.x[i] for i in range(len(self.trains))) <= top_n)
+   133→
+   134→        # Calculate costs for each train
+   135→        costs = []
+   136→        for i, train in enumerate(self.trains):
+   137→            km_penalty = self._calculate_km_penalty(train)
+   138→            dead_running = self._calculate_dead_running(train)
+   139→
+   140→            # Convert to integer for CP-SAT (scale by 100)
+   141→            total_cost = (
+   142→                self.WEIGHT_KM_BALANCE * km_penalty +
+   143→                self.WEIGHT_DEAD_RUNNING * int(dead_running * 100)
+   144→            )
+   145→            costs.append(total_cost)
+   146→
+   147→        # Objective: Minimize total weighted cost for selected trains
+   148→        # We want to select the trains with the LOWEST costs
+   149→        self.model.Minimize(
+   150→            sum(self.x[i] * costs[i] for i in range(len(self.trains)))
+   151→        )
+   152→
+   153→        # Solve
+   154→        status = self.solver.Solve(self.model)
+   155→
+   156→        if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+   157→            # Fallback: return trains sorted by cost
+   158→            sorted_trains = sorted(
+   159→                enumerate(self.trains),
+   160→                key=lambda x: costs[x[0]]
+   161→            )[:top_n]
+   162→            return [
+   163→                (
+   164→                    self.trains[i],
+   165→                    self._calculate_score(costs[i]),
+   166→                    self._calculate_dead_running(self.trains[i])
+   167→                )
+   168→                for i, _ in sorted_trains
+   169→            ]
+   170→
+   171→        # Collect selected trains
+   172→        results = []
+   173→        for i, train in enumerate(self.trains):
+   174→            if self.solver.Value(self.x[i]) == 1:
+   175→                score = self._calculate_score(costs[i])
+   176→                dead_running = self._calculate_dead_running(train)
+   177→                results.append((train, score, dead_running))
+   178→
+   179→        # Sort by score (highest first) and return top N
+   180→        results.sort(key=lambda x: x[1], reverse=True)
+   181→        return results[:top_n]
+   182→
+   183→    def _calculate_score(self, cost: int) -> int:
+   184→        """
+   185→        Convert cost to a 0-100 score.
+   186→        Lower cost = higher score.
+   187→        """
+   188→        # Normalize cost to score
+   189→        # Costs typically range from -100000 to +100000
+   190→        min_cost = -100000
+   191→        max_cost = 100000
+   192→
+   193→        normalized = (max_cost - cost) / (max_cost - min_cost)
+   194→        score = int(normalized * 100)
+   195→
+   196→        return max(0, min(100, score))
+   197→
+   198→    def get_solver_time_ms(self) -> int:
+   199→        """Get solver wall time in milliseconds."""
+   200→        return int(self.solver.WallTime() * 1000)
+   201→
+   202→
+   203→def generate_recommendations(
+   204→    trains: list[dict],
+   205→    service: dict,
+   206→    fleet_avg_km: float,
+   207→    upcoming_maintenance: dict[str, list[dict]],
+   208→    top_n: int = 5
+   209→) -> tuple[list[TrainRecommendation], int]:
+   210→    """
+   211→    Generate train recommendations using CP-SAT solver.
+   212→
+   213→    Args:
+   214→        trains: List of available trains
+   215→        service: Service to allocate
+   216→        fleet_avg_km: Average km for the fleet
+   217→        upcoming_maintenance: Dict mapping train_id to maintenance schedules
+   218→        top_n: Number of recommendations to return
+   219→
+   220→    Returns:
+   221→        Tuple of (recommendations list, solver time in ms)
+   222→    """
+   223→    allocator = TrainAllocator(trains, service, fleet_avg_km)
+   224→    results = allocator.solve(top_n)
+   225→    solver_time = allocator.get_solver_time_ms()
+   226→
+   227→    recommendations = []
+   228→    for train, score, dead_running in results:
+   229→        # Calculate km delta percentage
+   230→        current_km = train['current_km'] or 0
+   231→        target_km = train['target_km'] or fleet_avg_km
+   232→        if target_km > 0:
+   233→            km_delta_pct = ((current_km - target_km) / target_km) * 100
+   234→        else:
+   235→            km_delta_pct = 0.0
+   236→
+   237→        # Generate justifications
+   238→        justifications = generate_justifications(
+   239→            train, service, fleet_avg_km,
+   240→            km_delta_pct, dead_running,
+   241→            upcoming_maintenance.get(str(train['id']), [])
+   242→        )
+   243→
+   244→        recommendations.append(TrainRecommendation(
+   245→            train_id=train['train_id'],
+   246→            train_uuid=str(train['id']),
+   247→            score=score,
+   248→            justifications=justifications,
+   249→            dead_running_km=round(dead_running, 1),
+   250→            km_delta_percent=round(km_delta_pct, 1)
+   251→        ))
+   252→
+   253→    return recommendations, solver_time
+   254→
+   255→
+   256→def generate_justifications(
+   257→    train: dict,
+   258→    service: dict,
+   259→    fleet_avg_km: float,
+   260→    km_delta_pct: float,
+   261→    dead_running: float,
+   262→    upcoming_maint: list[dict]
+   263→) -> list[str]:
+   264→    """
+   265→    Generate human-readable justifications for a recommendation.
+   266→    """
+   267→    justifications = []
+   268→
+   269→    # Km balancing justification
+   270→    if km_delta_pct < -5:
+   271→        justifications.append(
+   272→            f"Km {abs(km_delta_pct):.0f}% below fleet average (balancing priority)"
+   273→        )
+   274→    elif km_delta_pct <= 5:
+   275→        justifications.append(
+   276→            "Km within target range (balanced utilization)"
+   277→        )
+   278→    else:
+   279→        justifications.append(
+   280→            f"Km {km_delta_pct:.0f}% above average (consider alternatives)"
+   281→        )
+   282→
+   283→    # Dead running justification
+   284→    if dead_running < 5:
+   285→        if dead_running == 0:
+   286→            justifications.append("Currently at service origin (no dead running)")
+   287→        else:
+   288→            justifications.append(f"Minimal dead running ({dead_running:.1f}km to origin)")
+   289→    elif dead_running < 20:
+   290→        justifications.append(f"Moderate dead running ({dead_running:.1f}km to origin)")
+   291→    else:
+   292→        justifications.append(f"High dead running ({dead_running:.1f}km to origin)")
+   293→
+   294→    # Maintenance proximity justification
+   295→    if upcoming_maint:
+   296→        next_maint = upcoming_maint[0]
+   297→        maint_type = next_maint['maintenance_type']
+   298→        depot_name = next_maint['depot_name']
+   299→        days_until = next_maint.get('days_until', 0)
+   300→
+   301→        if days_until <= 3:
+   302→            justifications.append(
+   303→                f"{maint_type} in {days_until} days at {depot_name}"
+   304→            )
+   305→        elif days_until <= 7:
+   306→            justifications.append(
+   307→                f"{maint_type} scheduled within a week"
+   308→            )
+   309→    else:
+   310→        justifications.append("No scheduled maintenance conflicts")
+   311→
+   312→    # Depot justification
+   313→    depot_name = train.get('depot_name', 'Unknown')
+   314→    if service['destination'].lower() in depot_name.lower():
+   315→        justifications.append(f"Service ends at home depot ({depot_name})")
+   316→
+   317→    return justifications[:4]  # Max 4 justifications
+   318→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

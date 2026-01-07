@@ -1,0 +1,367 @@
+     1→/**
+     2→ * Minimap Component (F025, BUG-004)
+     3→ *
+     4→ * A bird's eye view minimap showing the entire canvas at small scale.
+     5→ * Features:
+     6→ * - Shows simplified task density (heatmap-like visualization)
+     7→ * - Displays viewport rectangle indicating current visible area
+     8→ * - Click/drag on minimap to navigate
+     9→ * - Always visible (Google Maps style) - no toggle
+    10→ *
+    11→ * Positioned in the bottom-right corner of the canvas.
+    12→ *
+    13→ * D3-MIGRATE-001: Uses d3-scale for coordinate conversion and d3-interpolate for colors
+    14→ */
+    15→
+    16→import { useCallback, useMemo, useRef, useState, useEffect } from 'react';
+    17→import { Card } from '@blueprintjs/core';
+    18→import { scaleLinear } from 'd3-scale';
+    19→import { interpolateRgb } from 'd3-interpolate';
+    20→import type { TaskRender } from '../data/types';
+    21→import { DEFAULT_VIEW_CONFIG } from '../data/types';
+    22→
+    23→const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+    24→
+    25→// Minimap dimensions
+    26→const MINIMAP_WIDTH = 200;
+    27→const MINIMAP_HEIGHT = 80;
+    28→const MINIMAP_PADDING = 4;
+    29→
+    30→// Colors
+    31→const MINIMAP_BG = '#e8e8e8';
+    32→const VIEWPORT_RECT_COLOR = 'rgba(59, 130, 246, 0.3)'; // blue-500 with opacity
+    33→const VIEWPORT_RECT_BORDER = '#3b82f6'; // blue-500
+    34→const TASK_COLOR_LOW = '#fef3c7'; // amber-100
+    35→const TASK_COLOR_HIGH = '#dc2626'; // red-600
+    36→
+    37→interface MinimapProps {
+    38→  /** Total number of trains */
+    39→  trainCount: number;
+    40→  /** Total number of days in the timeline */
+    41→  totalDays: number;
+    42→  /** Tasks for rendering density visualization */
+    43→  tasks: TaskRender[];
+    44→  /** Current camera X position (world coordinates) */
+    45→  cameraX: number;
+    46→  /** Current camera Y position (world coordinates) */
+    47→  cameraY: number;
+    48→  /** Current zoom level */
+    49→  zoom: number;
+    50→  /** Canvas width in pixels */
+    51→  canvasWidth: number;
+    52→  /** Canvas height in pixels */
+    53→  canvasHeight: number;
+    54→  /** Callback when user clicks/drags on minimap to navigate */
+    55→  onNavigate: (worldX: number, worldY: number) => void;
+    56→  // BUG-004: Removed visible and onToggle - minimap is now always visible (Google Maps style)
+    57→}
+    58→
+    59→/**
+    60→ * Convert world coordinates to minimap coordinates
+    61→ * D3-MIGRATE-001: Uses d3-scale for coordinate conversion
+    62→ */
+    63→function worldToMinimap(
+    64→  worldX: number,
+    65→  worldY: number,
+    66→  worldWidth: number,
+    67→  worldHeight: number
+    68→): { x: number; y: number } {
+    69→  const scaleX = scaleLinear().domain([0, worldWidth]).range([0, MINIMAP_WIDTH]);
+    70→  // Y is negative in world (trains go down), convert to positive for minimap
+    71→  const scaleY = scaleLinear().domain([0, -worldHeight]).range([0, MINIMAP_HEIGHT]);
+    72→  return { x: scaleX(worldX), y: scaleY(worldY) };
+    73→}
+    74→
+    75→/**
+    76→ * Convert minimap coordinates to world coordinates
+    77→ * D3-MIGRATE-001: Uses d3-scale invert for coordinate conversion
+    78→ */
+    79→function minimapToWorld(
+    80→  minimapX: number,
+    81→  minimapY: number,
+    82→  worldWidth: number,
+    83→  worldHeight: number
+    84→): { worldX: number; worldY: number } {
+    85→  const scaleX = scaleLinear().domain([0, worldWidth]).range([0, MINIMAP_WIDTH]);
+    86→  const scaleY = scaleLinear().domain([0, -worldHeight]).range([0, MINIMAP_HEIGHT]);
+    87→  return { worldX: scaleX.invert(minimapX), worldY: scaleY.invert(minimapY) };
+    88→}
+    89→
+    90→/**
+    91→ * Generate heatmap data for minimap visualization
+    92→ * Groups tasks into grid cells and counts density
+    93→ */
+    94→function generateHeatmapData(
+    95→  tasks: TaskRender[],
+    96→  totalDays: number,
+    97→  trainCount: number,
+    98→  gridCols: number,
+    99→  gridRows: number
+   100→): number[][] {
+   101→  // Initialize grid with zeros
+   102→  const grid: number[][] = Array(gridRows)
+   103→    .fill(null)
+   104→    .map(() => Array(gridCols).fill(0));
+   105→
+   106→  const daysPerCell = totalDays / gridCols;
+   107→  const trainsPerCell = trainCount / gridRows;
+   108→
+   109→  // Count tasks in each cell
+   110→  for (const task of tasks) {
+   111→    const col = Math.floor(task.startDay / daysPerCell);
+   112→    const row = Math.floor(task.trainIndex / trainsPerCell);
+   113→
+   114→    // Clamp to grid bounds
+   115→    const clampedCol = Math.min(gridCols - 1, Math.max(0, col));
+   116→    const clampedRow = Math.min(gridRows - 1, Math.max(0, row));
+   117→
+   118→    grid[clampedRow][clampedCol]++;
+   119→  }
+   120→
+   121→  return grid;
+   122→}
+   123→
+   124→/**
+   125→ * Interpolate between two colors based on value (0-1)
+   126→ * D3-MIGRATE-001: Uses d3-interpolate for color interpolation
+   127→ */
+   128→const colorInterpolator = interpolateRgb(TASK_COLOR_LOW, TASK_COLOR_HIGH);
+   129→
+   130→function interpolateColor(value: number): string {
+   131→  // Clamp value to 0-1
+   132→  const t = Math.max(0, Math.min(1, value));
+   133→  return colorInterpolator(t);
+   134→}
+   135→
+   136→export function Minimap({
+   137→  trainCount,
+   138→  totalDays,
+   139→  tasks,
+   140→  cameraX,
+   141→  cameraY,
+   142→  zoom,
+   143→  canvasWidth,
+   144→  canvasHeight,
+   145→  onNavigate,
+   146→}: MinimapProps) {
+   147→  const minimapRef = useRef<HTMLDivElement>(null);
+   148→  const [isDragging, setIsDragging] = useState(false);
+   149→
+   150→  // Calculate world dimensions
+   151→  const worldWidth = totalDays * pxPerDay;
+   152→  const worldHeight = trainCount * pxPerTrain;
+   153→
+   154→  // Generate heatmap data (coarse grid for performance)
+   155→  const gridCols = 40; // Horizontal cells
+   156→  const gridRows = 10; // Vertical cells
+   157→  const heatmapData = useMemo(
+   158→    () => generateHeatmapData(tasks, totalDays, trainCount, gridCols, gridRows),
+   159→    [tasks, totalDays, trainCount, gridCols, gridRows]
+   160→  );
+   161→
+   162→  // Find max value for normalization
+   163→  const maxDensity = useMemo(() => {
+   164→    let max = 0;
+   165→    for (const row of heatmapData) {
+   166→      for (const val of row) {
+   167→        if (val > max) max = val;
+   168→      }
+   169→    }
+   170→    return max || 1; // Avoid division by zero
+   171→  }, [heatmapData]);
+   172→
+   173→  // Calculate viewport rectangle in minimap coordinates
+   174→  const viewportRect = useMemo(() => {
+   175→    // Viewport dimensions in world coordinates
+   176→    const viewWidth = canvasWidth / zoom;
+   177→    const viewHeight = canvasHeight / zoom;
+   178→
+   179→    // Viewport corners in world coordinates
+   180→    const viewLeft = cameraX - viewWidth / 2;
+   181→    const viewRight = cameraX + viewWidth / 2;
+   182→    const viewTop = cameraY + viewHeight / 2; // Y+ is up in world
+   183→    const viewBottom = cameraY - viewHeight / 2;
+   184→
+   185→    // Convert to minimap coordinates
+   186→    const left = worldToMinimap(viewLeft, 0, worldWidth, worldHeight);
+   187→    const right = worldToMinimap(viewRight, 0, worldWidth, worldHeight);
+   188→    const top = worldToMinimap(0, viewTop, worldWidth, worldHeight);
+   189→    const bottom = worldToMinimap(0, viewBottom, worldWidth, worldHeight);
+   190→
+   191→    // Calculate rectangle
+   192→    const x = Math.max(0, left.x);
+   193→    const y = Math.max(0, top.y);
+   194→    const width = Math.min(MINIMAP_WIDTH - x, right.x - left.x);
+   195→    const height = Math.min(MINIMAP_HEIGHT - y, bottom.y - top.y);
+   196→
+   197→    return { x, y, width: Math.max(4, width), height: Math.max(4, height) };
+   198→  }, [cameraX, cameraY, zoom, canvasWidth, canvasHeight, worldWidth, worldHeight]);
+   199→
+   200→  /**
+   201→   * Handle click/drag on minimap to navigate
+   202→   */
+   203→  const handleMinimapInteraction = useCallback(
+   204→    (clientX: number, clientY: number) => {
+   205→      if (!minimapRef.current) return;
+   206→
+   207→      const rect = minimapRef.current.getBoundingClientRect();
+   208→      const minimapX = clientX - rect.left;
+   209→      const minimapY = clientY - rect.top;
+   210→
+   211→      // Clamp to minimap bounds
+   212→      const clampedX = Math.max(0, Math.min(MINIMAP_WIDTH, minimapX));
+   213→      const clampedY = Math.max(0, Math.min(MINIMAP_HEIGHT, minimapY));
+   214→
+   215→      // Convert to world coordinates
+   216→      const { worldX, worldY } = minimapToWorld(clampedX, clampedY, worldWidth, worldHeight);
+   217→
+   218→      onNavigate(worldX, worldY);
+   219→    },
+   220→    [worldWidth, worldHeight, onNavigate]
+   221→  );
+   222→
+   223→  const handleMouseDown = useCallback(
+   224→    (e: React.MouseEvent) => {
+   225→      e.preventDefault();
+   226→      e.stopPropagation();
+   227→      setIsDragging(true);
+   228→      handleMinimapInteraction(e.clientX, e.clientY);
+   229→    },
+   230→    [handleMinimapInteraction]
+   231→  );
+   232→
+   233→  const handleMouseMove = useCallback(
+   234→    (e: React.MouseEvent) => {
+   235→      if (isDragging) {
+   236→        handleMinimapInteraction(e.clientX, e.clientY);
+   237→      }
+   238→    },
+   239→    [isDragging, handleMinimapInteraction]
+   240→  );
+   241→
+   242→  const handleMouseUp = useCallback(() => {
+   243→    setIsDragging(false);
+   244→  }, []);
+   245→
+   246→  // Global mouse up listener for drag release
+   247→  useEffect(() => {
+   248→    if (isDragging) {
+   249→      const handleGlobalMouseUp = () => setIsDragging(false);
+   250→      window.addEventListener('mouseup', handleGlobalMouseUp);
+   251→      return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
+   252→    }
+   253→  }, [isDragging]);
+   254→
+   255→  // Render heatmap cells
+   256→  const cellWidth = MINIMAP_WIDTH / gridCols;
+   257→  const cellHeight = MINIMAP_HEIGHT / gridRows;
+   258→
+   259→  // BUG-004: Minimap is now always visible (Google Maps style)
+   260→  return (
+   261→    <div
+   262→      style={{
+   263→        position: 'absolute',
+   264→        bottom: 16,
+   265→        right: 16,
+   266→        zIndex: 100,
+   267→      }}
+   268→    >
+   269→      <Card
+   270→        elevation={2}
+   271→        style={{
+   272→          padding: MINIMAP_PADDING,
+   273→          borderRadius: 6,
+   274→        }}
+   275→      >
+   276→        {/* Header - no close button (Google Maps style) */}
+   277→        <div
+   278→          style={{
+   279→            display: 'flex',
+   280→            justifyContent: 'center',
+   281→            alignItems: 'center',
+   282→            marginBottom: 4,
+   283→            fontSize: 11,
+   284→            color: '#666',
+   285→          }}
+   286→        >
+   287→          <span style={{ fontWeight: 500 }}>Minimap</span>
+   288→        </div>
+   289→
+   290→        {/* Minimap canvas */}
+   291→        <div
+   292→            ref={minimapRef}
+   293→            style={{
+   294→              width: MINIMAP_WIDTH,
+   295→              height: MINIMAP_HEIGHT,
+   296→              background: MINIMAP_BG,
+   297→              position: 'relative',
+   298→              cursor: isDragging ? 'grabbing' : 'pointer',
+   299→              borderRadius: 3,
+   300→              overflow: 'hidden',
+   301→            }}
+   302→            onMouseDown={handleMouseDown}
+   303→            onMouseMove={handleMouseMove}
+   304→            onMouseUp={handleMouseUp}
+   305→          >
+   306→            {/* Heatmap cells */}
+   307→            <svg
+   308→              width={MINIMAP_WIDTH}
+   309→              height={MINIMAP_HEIGHT}
+   310→              style={{ position: 'absolute', top: 0, left: 0 }}
+   311→            >
+   312→              {heatmapData.map((row, rowIndex) =>
+   313→                row.map((value, colIndex) => {
+   314→                  if (value === 0) return null;
+   315→                  const normalizedValue = value / maxDensity;
+   316→                  return (
+   317→                    <rect
+   318→                      key={`${rowIndex}-${colIndex}`}
+   319→                      x={colIndex * cellWidth}
+   320→                      y={rowIndex * cellHeight}
+   321→                      width={cellWidth}
+   322→                      height={cellHeight}
+   323→                      fill={interpolateColor(normalizedValue)}
+   324→                      opacity={0.8}
+   325→                    />
+   326→                  );
+   327→                })
+   328→              )}
+   329→            </svg>
+   330→
+   331→            {/* Viewport rectangle */}
+   332→            <div
+   333→              style={{
+   334→                position: 'absolute',
+   335→                left: viewportRect.x,
+   336→                top: viewportRect.y,
+   337→                width: viewportRect.width,
+   338→                height: viewportRect.height,
+   339→                background: VIEWPORT_RECT_COLOR,
+   340→                border: `2px solid ${VIEWPORT_RECT_BORDER}`,
+   341→                borderRadius: 2,
+   342→                pointerEvents: 'none',
+   343→                boxSizing: 'border-box',
+   344→              }}
+   345→            />
+   346→          </div>
+   347→
+   348→          {/* Scale indicator */}
+   349→          <div
+   350→            style={{
+   351→              marginTop: 4,
+   352→              fontSize: 10,
+   353→              color: '#999',
+   354→              textAlign: 'center',
+   355→            }}
+   356→          >
+   357→            10 years × {trainCount} trains
+   358→          </div>
+   359→        </Card>
+   360→    </div>
+   361→  );
+   362→}
+   363→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

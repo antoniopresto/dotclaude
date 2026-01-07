@@ -1,0 +1,324 @@
+     1→/**
+     2→ * MMS Data Types
+     3→ *
+     4→ * Architecture: Persistence vs Rendering
+     5→ *
+     6→ * Data flows through two distinct layers:
+     7→ *
+     8→ * Persistent (JSON/API) → Runtime (in memory) → Rendering (canvas)
+     9→ *   startDate: string      (Date objects)       startDay: 74
+    10→ *   "2024-03-15"           for logic            trainIndex: 5
+    11→ *
+    12→ * Why this separation?
+    13→ * - Date objects cannot be serialized to JSON (become {})
+    14→ * - Canvas needs numeric offsets for position calculations
+    15→ * - Domain logic needs semantic dates for business rules
+    16→ */
+    17→
+    18→import { extent, max } from 'd3-array';
+    19→
+    20→// ─────────────────────────────────────────────────────────────
+    21→// ENUMS & CONSTANTS
+    22→// ─────────────────────────────────────────────────────────────
+    23→
+    24→export type AssetType = 'ALSTOM' | 'KINKI';
+    25→export type TaskType = 'maintenance' | 'overhaul' | 'inspection';
+    26→export type MaintenanceLevel = 'A' | 'B' | 'C' | 'D';
+    27→
+    28→// ─────────────────────────────────────────────────────────────
+    29→// DOMAIN TYPES (Persistent/Serializable)
+    30→// These types can be saved to JSON, sent via API, or stored in localStorage.
+    31→// ─────────────────────────────────────────────────────────────
+    32→
+    33→export interface Train {
+    34→  id: string;              // "TRAIN-001" or "ALT-001"
+    35→  name: string;            // Display name
+    36→  assetType: AssetType;    // Fleet type
+    37→}
+    38→
+    39→export interface Task {
+    40→  id: string;              // Unique identifier
+    41→  trainId: string;         // Reference to Train.id
+    42→  startDate: string;       // ISO 8601 date: "2024-03-15"
+    43→  endDate: string;         // ISO 8601 date: "2024-03-20"
+    44→  type: TaskType;          // Visual category
+    45→  hasConflict: boolean;    // Conflict indicator
+    46→  predecessorId?: string;  // Optional: ID of task that must complete before this one (F023)
+    47→}
+    48→
+    49→export interface DatasetMeta {
+    50→  startDate: string;       // ISO 8601: "2024-01-01"
+    51→  trainCount: number;      // Number of trains
+    52→  years: number;           // Time range in years
+    53→}
+    54→
+    55→export interface GeneratedData {
+    56→  trains: Train[];
+    57→  tasks: Task[];
+    58→  meta: DatasetMeta;
+    59→}
+    60→
+    61→// ─────────────────────────────────────────────────────────────
+    62→// RENDERING TYPES (Runtime/Calculated)
+    63→// These types are computed when data loads and used by the canvas.
+    64→// Never persisted.
+    65→// ─────────────────────────────────────────────────────────────
+    66→
+    67→export type TaskColor = 'blue' | 'orange' | 'gray';
+    68→
+    69→export interface TaskRender {
+    70→  id: string;              // Same as Task.id
+    71→  trainIndex: number;      // Y position (0-based index in trains array)
+    72→  startDay: number;        // X position (days since meta.startDate)
+    73→  duration: number;        // Width (days)
+    74→  color: TaskColor;        // Derived from Task.type
+    75→  hasConflict: boolean;    // Passthrough from Task
+    76→  type: TaskType;          // For label display in MicroLayer
+    77→  predecessorId?: string;  // Optional: ID of predecessor task (F023)
+    78→}
+    79→
+    80→export const TYPE_TO_COLOR: Record<TaskType, TaskColor> = {
+    81→  maintenance: 'blue',
+    82→  overhaul: 'orange',
+    83→  inspection: 'gray',
+    84→};
+    85→
+    86→// ─────────────────────────────────────────────────────────────
+    87→// WORLD BOUNDS (Navigation limits)
+    88→// ─────────────────────────────────────────────────────────────
+    89→
+    90→/**
+    91→ * Defines the navigable world boundaries.
+    92→ * Camera will be clamped to these bounds.
+    93→ *
+    94→ * Coordinate system:
+    95→ * - X: 0 = first day, positive = future
+    96→ * - Y: 0 = top (TRAIN-001), negative = down (more trains)
+    97→ */
+    98→export interface WorldBounds {
+    99→  minX: number;  // 0 (first day)
+   100→  maxX: number;  // totalDays * pxPerDay
+   101→  minY: number;  // -trainCount * pxPerTrain (bottom)
+   102→  maxY: number;  // 0 (top)
+   103→}
+   104→
+   105→// ─────────────────────────────────────────────────────────────
+   106→// CANVAS CONFIGURATION
+   107→// ─────────────────────────────────────────────────────────────
+   108→
+   109→export interface ViewConfig {
+   110→  pxPerDay: number;        // Pixels per day (X scale)
+   111→  pxPerTrain: number;      // Pixels per train row (Y scale)
+   112→  minZoom: number;         // Minimum zoom level
+   113→  maxZoom: number;         // Maximum zoom level
+   114→  zoomSensitivity: number; // Scroll sensitivity
+   115→  lodThresholds: {
+   116→    macro: number;         // Below this → MACRO view
+   117→    micro: number;         // Above this → MICRO view
+   118→  };
+   119→}
+   120→
+   121→export type LODLevel = 'MACRO' | 'MESO' | 'MICRO';
+   122→
+   123→export interface ViewportState {
+   124→  zoom: number;
+   125→  panX: number;
+   126→  panY: number;
+   127→  lod: LODLevel;
+   128→}
+   129→
+   130→// ─────────────────────────────────────────────────────────────
+   131→// DEFAULT VALUES
+   132→// ─────────────────────────────────────────────────────────────
+   133→
+   134→export const DEFAULT_VIEW_CONFIG: ViewConfig = {
+   135→  pxPerDay: 10,
+   136→  pxPerTrain: 24,
+   137→  minZoom: 0.1,
+   138→  maxZoom: 5,
+   139→  zoomSensitivity: 0.002,
+   140→  lodThresholds: {
+   141→    macro: 0.5,
+   142→    micro: 2.0,
+   143→  },
+   144→};
+   145→
+   146→export const DEFAULT_DATASET_META: DatasetMeta = {
+   147→  startDate: '2024-01-01',
+   148→  trainCount: 50,
+   149→  years: 10,
+   150→};
+   151→
+   152→/**
+   153→ * Calculate world bounds from dataset metadata
+   154→ */
+   155→export function calculateWorldBounds(
+   156→  trainCount: number,
+   157→  totalDays: number,
+   158→  config: ViewConfig = DEFAULT_VIEW_CONFIG
+   159→): WorldBounds {
+   160→  return {
+   161→    minX: 0,
+   162→    maxX: totalDays * config.pxPerDay,
+   163→    minY: -trainCount * config.pxPerTrain,
+   164→    maxY: 0,
+   165→  };
+   166→}
+   167→
+   168→/**
+   169→ * Data bounds with padding for visualization
+   170→ */
+   171→export interface DataBounds {
+   172→  minX: number;
+   173→  maxX: number;
+   174→  minY: number;
+   175→  maxY: number;
+   176→  width: number;
+   177→  height: number;
+   178→  centerX: number;
+   179→  centerY: number;
+   180→}
+   181→
+   182→/**
+   183→ * Calculate actual data bounds from tasks (not theoretical world bounds)
+   184→ * This is used to fit the initial view to the actual data range.
+   185→ *
+   186→ * @param tasks - Array of rendered tasks with position data
+   187→ * @param trainCount - Total number of trains
+   188→ * @param config - View configuration
+   189→ * @param padding - Padding in pixels around the data bounds
+   190→ */
+   191→export function calculateDataBounds(
+   192→  tasks: TaskRender[],
+   193→  trainCount: number,
+   194→  config: ViewConfig = DEFAULT_VIEW_CONFIG,
+   195→  padding: number = 50
+   196→): DataBounds {
+   197→  if (tasks.length === 0) {
+   198→    // No tasks, return default bounds
+   199→    return {
+   200→      minX: 0,
+   201→      maxX: config.pxPerDay * 365,
+   202→      minY: -trainCount * config.pxPerTrain,
+   203→      maxY: 0,
+   204→      width: config.pxPerDay * 365,
+   205→      height: trainCount * config.pxPerTrain,
+   206→      centerX: (config.pxPerDay * 365) / 2,
+   207→      centerY: (-trainCount * config.pxPerTrain) / 2,
+   208→    };
+   209→  }
+   210→
+   211→  // Find min/max from actual task positions using d3-array (D3-MIGRATE-001)
+   212→  const [minStartDay, maxStartDay] = extent(tasks, (d) => d.startDay) as [number, number];
+   213→  const maxEndDay = max(tasks, (d) => d.startDay + d.duration) ?? maxStartDay;
+   214→  const [minTrainIndex, maxTrainIndex] = extent(tasks, (d) => d.trainIndex) as [number, number];
+   215→
+   216→  // Convert to pixel coordinates
+   217→  const minX = minStartDay * config.pxPerDay - padding;
+   218→  const maxX = maxEndDay * config.pxPerDay + padding;
+   219→  // Y is negative (trains go downward)
+   220→  const maxY = -minTrainIndex * config.pxPerTrain + padding;
+   221→  const minY = -(maxTrainIndex + 1) * config.pxPerTrain - padding;
+   222→
+   223→  const width = maxX - minX;
+   224→  const height = maxY - minY;
+   225→
+   226→  return {
+   227→    minX,
+   228→    maxX,
+   229→    minY,
+   230→    maxY,
+   231→    width,
+   232→    height,
+   233→    centerX: minX + width / 2,
+   234→    centerY: minY + height / 2,
+   235→  };
+   236→}
+   237→
+   238→/**
+   239→ * Calculate initial camera position and zoom to fit data bounds in viewport
+   240→ *
+   241→ * Follows the pattern used by D3.js fitExtent, Gantt chart zoomToFit, and pixi-viewport fitWorld
+   242→ *
+   243→ * Strategy:
+   244→ * - If data fits comfortably at reasonable zoom (0.5x - 1.5x), fit all data
+   245→ * - If data is too large (would require < 0.5x zoom), show starting portion at 0.5x zoom
+   246→ * - This provides a good initial UX while allowing users to zoom out for full overview
+   247→ *
+   248→ * @param dataBounds - The data bounds to fit
+   249→ * @param viewportWidth - Viewport width in pixels
+   250→ * @param viewportHeight - Viewport height in pixels
+   251→ * @param maxZoom - Maximum zoom level (for performance/UX)
+   252→ * @param minZoom - Minimum zoom level for initial view
+   253→ */
+   254→export function calculateFitToView(
+   255→  dataBounds: DataBounds,
+   256→  viewportWidth: number,
+   257→  viewportHeight: number,
+   258→  maxZoom: number = 1.5,
+   259→  minZoom: number = 0.5
+   260→): { cameraX: number; cameraY: number; zoom: number } {
+   261→  // Calculate zoom needed to fit all data in viewport
+   262→  const zoomX = viewportWidth / dataBounds.width;
+   263→  const zoomY = viewportHeight / dataBounds.height;
+   264→  const fitAllZoom = Math.min(zoomX, zoomY);
+   265→
+   266→  // Clamp zoom to reasonable initial range
+   267→  const zoom = Math.max(minZoom, Math.min(maxZoom, fitAllZoom));
+   268→
+   269→  // If we can fit all data at the calculated zoom, center on data
+   270→  if (fitAllZoom >= minZoom) {
+   271→    return {
+   272→      cameraX: dataBounds.centerX,
+   273→      cameraY: dataBounds.centerY,
+   274→      zoom,
+   275→    };
+   276→  }
+   277→
+   278→  // Data is too large - show starting portion (top-left of data bounds)
+   279→  // Calculate camera position to show left edge and top of data
+   280→  const halfViewX = viewportWidth / 2 / zoom;
+   281→  const halfViewY = viewportHeight / 2 / zoom;
+   282→
+   283→  return {
+   284→    cameraX: dataBounds.minX + halfViewX,
+   285→    cameraY: dataBounds.maxY - halfViewY, // maxY is the top (less negative)
+   286→    zoom,
+   287→  };
+   288→}
+   289→
+   290→// ─────────────────────────────────────────────────────────────
+   291→// FUTURE EXTENSIONS (Optional Fields)
+   292→// These fields can be added without breaking existing code.
+   293→// ─────────────────────────────────────────────────────────────
+   294→
+   295→// Extended Train (future)
+   296→export interface TrainExtended extends Train {
+   297→  carsCount?: number;
+   298→  currentMileageKm?: number;
+   299→  avgDailyMileageKm?: number;
+   300→  status?: 'operational' | 'maintenance' | 'out-of-service';
+   301→}
+   302→
+   303→// Extended Task (future)
+   304→export interface TaskExtended extends Task {
+   305→  maintenanceLevel?: MaintenanceLevel;
+   306→  manHours?: number;
+   307→  estimatedCost?: number;
+   308→  dependencies?: string[];
+   309→  status?: 'scheduled' | 'in-progress' | 'completed';
+   310→}
+   311→
+   312→// Conflict as separate entity (future)
+   313→export interface Conflict {
+   314→  id: string;
+   315→  taskIds: [string, string];
+   316→  type: 'overlap' | 'resource' | 'dependency';
+   317→  severity: 'low' | 'medium' | 'high';
+   318→  description?: string;
+   319→}
+   320→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

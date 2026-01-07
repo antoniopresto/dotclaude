@@ -1,0 +1,627 @@
+<!--
+  SEMANTIC ZOOM POC - Reference Only
+  ==================================
+  Standalone demo of the "Semantic Zoom" UX concept.
+  Open with: file:///path/to/semantic-zoom-poc.html
+
+  Use as:
+  - Visual reference for production implementation
+  - Algorithm reference (LOD logic, heatmap, rendering)
+
+  Production app: apps/canvas/ (React 18 + R3F + BlueprintJS)
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Zoom POC - Reference</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* Task gradients */
+        .task-block.blue { background: linear-gradient(135deg, #3b82f6, #2563eb); }
+        .task-block.orange { background: linear-gradient(135deg, #f59e0b, #d97706); }
+        .task-block.gray { background: linear-gradient(135deg, #9ca3af, #6b7280); }
+        .task-block.conflict { box-shadow: 0 0 0 2px #ef4444, 0 0 12px rgba(239, 68, 68, 0.4); }
+    </style>
+</head>
+<body class="font-sans bg-gray-100 text-gray-800 h-screen overflow-hidden">
+    <!-- Header -->
+    <div class="flex items-center justify-between px-4 py-2 bg-white border-b border-gray-200 h-12 shadow-sm">
+        <div class="flex items-center gap-3">
+            <span class="text-lg text-gray-500 cursor-pointer hover:text-gray-700">☰</span>
+            <span class="text-sm font-semibold text-gray-900">Interactive Canvas - Semantic Zoom</span>
+        </div>
+        <div class="flex items-center gap-4">
+            <div class="flex items-center gap-2 text-xs text-gray-500">
+                <span>Zoom:</span>
+                <span id="zoomLevel" class="font-mono font-semibold text-gray-700">1.00x</span>
+            </div>
+            <div class="flex items-center gap-2 text-xs text-gray-500">
+                <span>LOD:</span>
+                <span id="lodLevel" class="font-mono font-semibold px-2 py-0.5 rounded bg-blue-100 text-blue-700">MESO</span>
+            </div>
+            <button id="resetBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded text-xs cursor-pointer transition-colors">
+                Reset View
+            </button>
+        </div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="flex h-[calc(100vh-48px)]">
+        <!-- Sidebar - Train IDs -->
+        <div id="sidebar" class="w-16 bg-white border-r border-gray-200 flex flex-col overflow-hidden">
+            <div class="p-2 text-[10px] font-semibold text-gray-500 border-b border-gray-200 text-center">ID</div>
+            <div id="trainList" class="flex-1 overflow-hidden"></div>
+        </div>
+
+        <!-- Canvas Container -->
+        <div class="flex-1 relative overflow-hidden bg-gray-50">
+            <!-- Timeline Header -->
+            <div id="timelineHeader" class="absolute top-0 left-0 right-0 h-8 bg-white border-b border-gray-200 z-10 flex items-center overflow-hidden"></div>
+
+            <!-- Main Canvas -->
+            <canvas id="mainCanvas" class="absolute top-8 left-0 cursor-grab active:cursor-grabbing"></canvas>
+
+            <!-- Micro Layer HTML Overlay (visible at high zoom) -->
+            <div id="microOverlay" class="absolute top-8 left-0 pointer-events-none opacity-0 transition-opacity duration-300"></div>
+
+            <!-- Zoom Controls -->
+            <div class="absolute bottom-4 right-4 flex flex-col gap-1 bg-white rounded-lg shadow-lg border border-gray-200 overflow-hidden z-20">
+                <button id="zoomIn" class="w-10 h-10 flex items-center justify-center text-lg text-gray-600 hover:bg-gray-100 transition-colors">+</button>
+                <div class="h-px bg-gray-200"></div>
+                <button id="zoomOut" class="w-10 h-10 flex items-center justify-center text-lg text-gray-600 hover:bg-gray-100 transition-colors">−</button>
+            </div>
+
+            <!-- LOD Legend -->
+            <div class="absolute bottom-4 left-4 bg-white rounded-lg shadow-lg border border-gray-200 p-3 z-20 text-xs">
+                <div class="font-semibold text-gray-700 mb-2">Zoom Levels (LOD)</div>
+                <div class="flex items-center gap-2 mb-1">
+                    <div class="w-3 h-3 rounded-sm bg-yellow-400"></div>
+                    <span class="text-gray-600">Macro (&lt;0.5x) - Heatmap</span>
+                </div>
+                <div class="flex items-center gap-2 mb-1">
+                    <div class="w-3 h-3 rounded-sm bg-blue-500"></div>
+                    <span class="text-gray-600">Meso (0.5-2x) - DNA Strips</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="w-3 h-3 rounded-sm bg-green-500"></div>
+                    <span class="text-gray-600">Micro (&gt;2x) - Task Cards</span>
+                </div>
+            </div>
+
+            <!-- Instructions -->
+            <div class="absolute top-12 left-1/2 -translate-x-1/2 bg-black/70 text-white text-xs px-4 py-2 rounded-full z-20 pointer-events-none transition-opacity duration-500" id="instructions">
+                Scroll to zoom • Drag to pan • Double-click to zoom in
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ========================================
+        // CONFIGURATION
+        // ========================================
+        const CONFIG = {
+            TRAINS: 50,
+            YEARS: 10,
+            PX_PER_DAY: 10,
+            PX_PER_TRAIN: 24,
+            START_DATE: new Date(2024, 0, 1),
+            MIN_ZOOM: 0.1,
+            MAX_ZOOM: 5,
+            ZOOM_SENSITIVITY: 0.002,
+            LOD_THRESHOLDS: {
+                MACRO: 0.5,    // Below this = Macro
+                MICRO: 2.0    // Above this = Micro
+            }
+        };
+
+        // ========================================
+        // STATE
+        // ========================================
+        const state = {
+            zoom: 1.0,
+            panX: 0,
+            panY: 0,
+            isDragging: false,
+            dragStartX: 0,
+            dragStartY: 0,
+            lastPanX: 0,
+            lastPanY: 0,
+            currentLOD: 'MESO',
+            tasks: [],
+            trains: []
+        };
+
+        // ========================================
+        // DOM ELEMENTS
+        // ========================================
+        const canvas = document.getElementById('mainCanvas');
+        const ctx = canvas.getContext('2d');
+        const sidebar = document.getElementById('trainList');
+        const timelineHeader = document.getElementById('timelineHeader');
+        const microOverlay = document.getElementById('microOverlay');
+        const zoomLevelEl = document.getElementById('zoomLevel');
+        const lodLevelEl = document.getElementById('lodLevel');
+        const instructions = document.getElementById('instructions');
+
+        // ========================================
+        // DATA GENERATION
+        // ========================================
+        function generateData() {
+            // Generate trains
+            state.trains = Array.from({ length: CONFIG.TRAINS }, (_, i) => ({
+                id: `T${String(i + 1).padStart(3, '0')}`,
+                name: `Train ${i + 1}`,
+                type: i < 30 ? 'ALSTOM' : 'KINKI'
+            }));
+
+            // Generate tasks
+            state.tasks = [];
+            const taskTypes = ['maintenance', 'overhaul', 'inspection'];
+            const colors = ['blue', 'orange', 'gray'];
+
+            state.trains.forEach((train, trainIndex) => {
+                // Generate ~10 tasks per year per train
+                for (let year = 0; year < CONFIG.YEARS; year++) {
+                    const tasksPerYear = 8 + Math.floor(Math.random() * 5);
+                    for (let t = 0; t < tasksPerYear; t++) {
+                        const dayOffset = year * 365 + Math.floor(Math.random() * 360);
+                        const duration = 2 + Math.floor(Math.random() * 10);
+                        const typeIndex = Math.floor(Math.random() * taskTypes.length);
+
+                        state.tasks.push({
+                            id: `${train.id}-${year}-${t}`,
+                            trainId: train.id,
+                            trainIndex,
+                            startDay: dayOffset,
+                            duration,
+                            type: taskTypes[typeIndex],
+                            color: colors[typeIndex],
+                            conflict: Math.random() < 0.05 // 5% have conflicts
+                        });
+                    }
+                }
+            });
+        }
+
+        // ========================================
+        // SIDEBAR
+        // ========================================
+        function renderSidebar() {
+            const visibleTrains = getVisibleTrains();
+            sidebar.innerHTML = visibleTrains.map(train => `
+                <div class="px-2 py-1 text-[10px] text-gray-700 border-b border-gray-100 truncate"
+                     style="height: ${CONFIG.PX_PER_TRAIN * state.zoom}px; line-height: ${CONFIG.PX_PER_TRAIN * state.zoom}px;">
+                    ${train.id}
+                </div>
+            `).join('');
+        }
+
+        function getVisibleTrains() {
+            const viewportHeight = canvas.height;
+            const startIndex = Math.max(0, Math.floor(-state.panY / (CONFIG.PX_PER_TRAIN * state.zoom)));
+            const endIndex = Math.min(CONFIG.TRAINS, startIndex + Math.ceil(viewportHeight / (CONFIG.PX_PER_TRAIN * state.zoom)) + 1);
+            return state.trains.slice(startIndex, endIndex);
+        }
+
+        // ========================================
+        // TIMELINE HEADER
+        // ========================================
+        function renderTimelineHeader() {
+            const viewportWidth = canvas.width;
+            const pxPerDay = CONFIG.PX_PER_DAY * state.zoom;
+            const startDay = Math.floor(-state.panX / pxPerDay);
+            const endDay = startDay + Math.ceil(viewportWidth / pxPerDay) + 1;
+
+            let html = '';
+            const date = new Date(CONFIG.START_DATE);
+
+            // Determine granularity based on zoom
+            let step, format;
+            if (state.zoom < 0.3) {
+                step = 365; // Years
+                format = d => d.getFullYear();
+            } else if (state.zoom < 1) {
+                step = 30; // Months
+                format = d => d.toLocaleDateString('en', { month: 'short', year: '2-digit' });
+            } else if (state.zoom < 2) {
+                step = 7; // Weeks
+                format = d => d.toLocaleDateString('en', { month: 'short', day: 'numeric' });
+            } else {
+                step = 1; // Days
+                format = d => d.toLocaleDateString('en', { weekday: 'short', day: 'numeric' });
+            }
+
+            for (let day = Math.max(0, startDay - step); day < endDay; day += step) {
+                date.setTime(CONFIG.START_DATE.getTime() + day * 24 * 60 * 60 * 1000);
+                const x = day * pxPerDay + state.panX;
+                if (x >= -100 && x < viewportWidth + 100) {
+                    html += `<div class="absolute text-[10px] text-gray-500 whitespace-nowrap" style="left: ${x}px;">${format(date)}</div>`;
+                }
+            }
+
+            timelineHeader.innerHTML = html;
+        }
+
+        // ========================================
+        // LOD DETERMINATION
+        // ========================================
+        function getLOD() {
+            if (state.zoom < CONFIG.LOD_THRESHOLDS.MACRO) return 'MACRO';
+            if (state.zoom > CONFIG.LOD_THRESHOLDS.MICRO) return 'MICRO';
+            return 'MESO';
+        }
+
+        function updateLODIndicator() {
+            const lod = getLOD();
+            const colors = {
+                MACRO: 'bg-yellow-100 text-yellow-700',
+                MESO: 'bg-blue-100 text-blue-700',
+                MICRO: 'bg-green-100 text-green-700'
+            };
+            lodLevelEl.textContent = lod;
+            lodLevelEl.className = `font-mono font-semibold px-2 py-0.5 rounded ${colors[lod]}`;
+            state.currentLOD = lod;
+        }
+
+        // ========================================
+        // CANVAS RENDERING
+        // ========================================
+        function resizeCanvas() {
+            const container = canvas.parentElement;
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight - 32; // Account for timeline header
+            render();
+        }
+
+        function render() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const lod = getLOD();
+
+            switch (lod) {
+                case 'MACRO':
+                    renderMacroLayer();
+                    break;
+                case 'MESO':
+                    renderMesoLayer();
+                    break;
+                case 'MICRO':
+                    renderMicroLayer();
+                    break;
+            }
+
+            // Update micro overlay visibility
+            microOverlay.style.opacity = lod === 'MICRO' ? '1' : '0';
+            microOverlay.style.pointerEvents = lod === 'MICRO' ? 'auto' : 'none';
+
+            renderSidebar();
+            renderTimelineHeader();
+            zoomLevelEl.textContent = state.zoom.toFixed(2) + 'x';
+            updateLODIndicator();
+        }
+
+        // ========================================
+        // MACRO LAYER - Heatmap
+        // ========================================
+        function renderMacroLayer() {
+            const pxPerDay = CONFIG.PX_PER_DAY * state.zoom;
+            const pxPerTrain = CONFIG.PX_PER_TRAIN * state.zoom;
+            const cellW = Math.max(4, pxPerDay * 30); // ~1 month per cell
+            const cellH = Math.max(4, pxPerTrain);
+
+            // Create task density map
+            const totalDays = CONFIG.YEARS * 365;
+            const cols = Math.ceil(totalDays / 30);
+            const rows = CONFIG.TRAINS;
+
+            for (let row = 0; row < rows; row++) {
+                for (let col = 0; col < cols; col++) {
+                    const x = col * cellW + state.panX;
+                    const y = row * cellH + state.panY;
+
+                    if (x > canvas.width || y > canvas.height || x + cellW < 0 || y + cellH < 0) continue;
+
+                    // Calculate density based on tasks in this cell
+                    const startDay = col * 30;
+                    const endDay = startDay + 30;
+                    const tasksInCell = state.tasks.filter(t =>
+                        t.trainIndex === row &&
+                        t.startDay < endDay &&
+                        t.startDay + t.duration > startDay
+                    ).length;
+
+                    const density = Math.min(1, tasksInCell / 10);
+                    ctx.fillStyle = getHeatColor(density);
+                    ctx.fillRect(x, y, cellW - 1, cellH - 1);
+                }
+            }
+        }
+
+        function getHeatColor(value) {
+            // Yellow -> Orange -> Red
+            if (value < 0.3) {
+                return `rgb(255, ${Math.floor(243 - value * 100)}, ${Math.floor(196 - value * 300)})`;
+            } else if (value < 0.6) {
+                const t = (value - 0.3) / 0.3;
+                return `rgb(255, ${Math.floor(180 - t * 80)}, ${Math.floor(100 - t * 80)})`;
+            } else {
+                const t = (value - 0.6) / 0.4;
+                return `rgb(${Math.floor(255 - t * 55)}, ${Math.floor(100 - t * 70)}, ${Math.floor(20 + t * 20)})`;
+            }
+        }
+
+        // ========================================
+        // MESO LAYER - DNA Strips
+        // ========================================
+        function renderMesoLayer() {
+            const pxPerDay = CONFIG.PX_PER_DAY * state.zoom;
+            const pxPerTrain = CONFIG.PX_PER_TRAIN * state.zoom;
+
+            // Draw row backgrounds
+            for (let i = 0; i < CONFIG.TRAINS; i++) {
+                const y = i * pxPerTrain + state.panY;
+                if (y > canvas.height || y + pxPerTrain < 0) continue;
+
+                ctx.fillStyle = i % 2 === 0 ? '#fafafa' : '#f5f5f5';
+                ctx.fillRect(0, y, canvas.width, pxPerTrain);
+            }
+
+            // Draw tasks as blocks
+            const visibleTasks = state.tasks.filter(task => {
+                const x = task.startDay * pxPerDay + state.panX;
+                const y = task.trainIndex * pxPerTrain + state.panY;
+                const w = task.duration * pxPerDay;
+                return x + w > 0 && x < canvas.width && y + pxPerTrain > 0 && y < canvas.height;
+            });
+
+            visibleTasks.forEach(task => {
+                const x = task.startDay * pxPerDay + state.panX;
+                const y = task.trainIndex * pxPerTrain + state.panY + 2;
+                const w = Math.max(2, task.duration * pxPerDay - 2);
+                const h = pxPerTrain - 4;
+
+                const colors = {
+                    blue: ['#3b82f6', '#2563eb'],
+                    orange: ['#f59e0b', '#d97706'],
+                    gray: ['#9ca3af', '#6b7280']
+                };
+                const [c1, c2] = colors[task.color] || colors.blue;
+
+                const gradient = ctx.createLinearGradient(x, y, x + w, y + h);
+                gradient.addColorStop(0, c1);
+                gradient.addColorStop(1, c2);
+
+                ctx.fillStyle = gradient;
+                ctx.beginPath();
+                ctx.roundRect(x, y, w, h, 2);
+                ctx.fill();
+
+                // Conflict indicator
+                if (task.conflict) {
+                    ctx.strokeStyle = '#ef4444';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+            });
+        }
+
+        // ========================================
+        // MICRO LAYER - Detailed Cards
+        // ========================================
+        function renderMicroLayer() {
+            const pxPerDay = CONFIG.PX_PER_DAY * state.zoom;
+            const pxPerTrain = CONFIG.PX_PER_TRAIN * state.zoom;
+
+            // Draw grid
+            ctx.strokeStyle = '#e5e7eb';
+            ctx.lineWidth = 1;
+
+            // Vertical lines (days)
+            const startDay = Math.floor(-state.panX / pxPerDay);
+            const endDay = startDay + Math.ceil(canvas.width / pxPerDay) + 1;
+            for (let day = startDay; day < endDay; day++) {
+                const x = day * pxPerDay + state.panX;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, canvas.height);
+                ctx.stroke();
+            }
+
+            // Horizontal lines (trains)
+            for (let i = 0; i <= CONFIG.TRAINS; i++) {
+                const y = i * pxPerTrain + state.panY;
+                if (y < 0 || y > canvas.height) continue;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(canvas.width, y);
+                ctx.stroke();
+            }
+
+            // Draw tasks with labels
+            const visibleTasks = state.tasks.filter(task => {
+                const x = task.startDay * pxPerDay + state.panX;
+                const y = task.trainIndex * pxPerTrain + state.panY;
+                const w = task.duration * pxPerDay;
+                return x + w > 0 && x < canvas.width && y + pxPerTrain > 0 && y < canvas.height;
+            });
+
+            visibleTasks.forEach(task => {
+                const x = task.startDay * pxPerDay + state.panX + 2;
+                const y = task.trainIndex * pxPerTrain + state.panY + 4;
+                const w = Math.max(20, task.duration * pxPerDay - 4);
+                const h = pxPerTrain - 8;
+
+                const colors = {
+                    blue: ['#3b82f6', '#2563eb'],
+                    orange: ['#f59e0b', '#d97706'],
+                    gray: ['#9ca3af', '#6b7280']
+                };
+                const [c1, c2] = colors[task.color] || colors.blue;
+
+                // Draw card shadow
+                ctx.fillStyle = 'rgba(0,0,0,0.1)';
+                ctx.beginPath();
+                ctx.roundRect(x + 2, y + 2, w, h, 4);
+                ctx.fill();
+
+                // Draw card
+                const gradient = ctx.createLinearGradient(x, y, x + w, y + h);
+                gradient.addColorStop(0, c1);
+                gradient.addColorStop(1, c2);
+                ctx.fillStyle = gradient;
+                ctx.beginPath();
+                ctx.roundRect(x, y, w, h, 4);
+                ctx.fill();
+
+                // Conflict border
+                if (task.conflict) {
+                    ctx.strokeStyle = '#ef4444';
+                    ctx.lineWidth = 2;
+                    ctx.shadowColor = '#ef4444';
+                    ctx.shadowBlur = 8;
+                    ctx.stroke();
+                    ctx.shadowBlur = 0;
+                }
+
+                // Draw text if space allows
+                if (w > 50) {
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = `${Math.min(12, h * 0.6)}px system-ui`;
+                    ctx.textBaseline = 'middle';
+                    const label = task.type.charAt(0).toUpperCase() + task.type.slice(1);
+                    const textWidth = ctx.measureText(label).width;
+                    if (textWidth < w - 8) {
+                        ctx.fillText(label, x + 6, y + h / 2);
+                    }
+                }
+            });
+        }
+
+        // ========================================
+        // EVENT HANDLERS
+        // ========================================
+        function handleWheel(e) {
+            e.preventDefault();
+
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            // Calculate zoom factor
+            const delta = -e.deltaY * CONFIG.ZOOM_SENSITIVITY;
+            const newZoom = Math.max(CONFIG.MIN_ZOOM, Math.min(CONFIG.MAX_ZOOM, state.zoom * (1 + delta)));
+
+            // Zoom toward mouse position
+            const zoomRatio = newZoom / state.zoom;
+            state.panX = mouseX - (mouseX - state.panX) * zoomRatio;
+            state.panY = mouseY - (mouseY - state.panY) * zoomRatio;
+            state.zoom = newZoom;
+
+            render();
+        }
+
+        function handleMouseDown(e) {
+            state.isDragging = true;
+            state.dragStartX = e.clientX;
+            state.dragStartY = e.clientY;
+            state.lastPanX = state.panX;
+            state.lastPanY = state.panY;
+            canvas.style.cursor = 'grabbing';
+        }
+
+        function handleMouseMove(e) {
+            if (!state.isDragging) return;
+
+            const dx = e.clientX - state.dragStartX;
+            const dy = e.clientY - state.dragStartY;
+            state.panX = state.lastPanX + dx;
+            state.panY = state.lastPanY + dy;
+
+            render();
+        }
+
+        function handleMouseUp() {
+            state.isDragging = false;
+            canvas.style.cursor = 'grab';
+        }
+
+        function handleDoubleClick(e) {
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            // Zoom in 2x at click location
+            const newZoom = Math.min(CONFIG.MAX_ZOOM, state.zoom * 2);
+            const zoomRatio = newZoom / state.zoom;
+            state.panX = mouseX - (mouseX - state.panX) * zoomRatio;
+            state.panY = mouseY - (mouseY - state.panY) * zoomRatio;
+            state.zoom = newZoom;
+
+            render();
+        }
+
+        // Button handlers
+        document.getElementById('zoomIn').addEventListener('click', () => {
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+            const newZoom = Math.min(CONFIG.MAX_ZOOM, state.zoom * 1.5);
+            const zoomRatio = newZoom / state.zoom;
+            state.panX = centerX - (centerX - state.panX) * zoomRatio;
+            state.panY = centerY - (centerY - state.panY) * zoomRatio;
+            state.zoom = newZoom;
+            render();
+        });
+
+        document.getElementById('zoomOut').addEventListener('click', () => {
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+            const newZoom = Math.max(CONFIG.MIN_ZOOM, state.zoom / 1.5);
+            const zoomRatio = newZoom / state.zoom;
+            state.panX = centerX - (centerX - state.panX) * zoomRatio;
+            state.panY = centerY - (centerY - state.panY) * zoomRatio;
+            state.zoom = newZoom;
+            render();
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            state.zoom = 1.0;
+            state.panX = 0;
+            state.panY = 0;
+            render();
+        });
+
+        // ========================================
+        // INITIALIZATION
+        // ========================================
+        function init() {
+            generateData();
+            resizeCanvas();
+
+            // Attach event listeners
+            canvas.addEventListener('wheel', handleWheel, { passive: false });
+            canvas.addEventListener('mousedown', handleMouseDown);
+            window.addEventListener('mousemove', handleMouseMove);
+            window.addEventListener('mouseup', handleMouseUp);
+            canvas.addEventListener('dblclick', handleDoubleClick);
+            window.addEventListener('resize', resizeCanvas);
+
+            // Hide instructions after 5 seconds
+            setTimeout(() => {
+                instructions.style.opacity = '0';
+            }, 5000);
+
+            render();
+        }
+
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

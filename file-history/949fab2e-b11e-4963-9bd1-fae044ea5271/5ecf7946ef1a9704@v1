@@ -1,0 +1,460 @@
+# MMS Specification Update Plan
+
+> **Based on:** Gemini Review Evaluation (2026-01-05)
+> **Target File:** docs/MMS_COMPLETE_SPECIFICATION.md (8470 lines)
+> **Package:** @belt/tools@0.0.1 (npm public)
+
+---
+
+## Execution Order
+
+Updates are ordered by dependency and risk:
+
+```
+Session 1: Critical API Fixes (Section 17.3)
+     └── Must complete first - foundation for all code examples
+Session 2: Railway Domain Updates (Chapter 2)
+     └── ECM, RAMS, Terminology
+Session 3: Technical Updates (Chapters 19, 20)
+     └── Database, Solver
+Session 4: Demo & Polish (Chapter 25 + misc)
+     └── Fallback strategy, Blueprint.js, design tokens
+```
+
+---
+
+## Session 1: Critical API Fixes
+
+### Task 1.1: Replace @zazcart/toolkit with @belt/tools
+
+**Search Pattern:** `@zazcart/toolkit|@zazcart/tools`
+**Replace With:** `@belt/tools`
+
+```bash
+# Find all occurrences
+grep -n "zazcart" docs/MMS_COMPLETE_SPECIFICATION.md
+```
+
+**Expected Locations:**
+- Package.json examples
+- Import statements
+- Architecture diagrams
+
+---
+
+### Task 1.2: Rewrite Section 17.3 (State Management)
+
+**Current Content (to replace):**
+- FSM-style createMachine examples
+- XState-like states/on/target syntax
+- send() dispatcher pattern
+
+**New Content Structure:**
+
+```markdown
+## 17.3 State Management (@belt/tools)
+
+### Overview
+
+MMS uses `@belt/tools` for state management, providing:
+- **Sync Slices**: UI state with Immer reducers
+- **Async Slices**: Data fetching with built-in loading/error states
+- **Machine**: Combines slices with computed selectors
+
+### Installation
+
+\`\`\`bash
+bun add @belt/tools
+\`\`\`
+
+### Sync Slice Example
+
+\`\`\`typescript
+import { createSlice } from '@belt/tools';
+
+export const viewportSlice = createSlice({
+  id: 'viewport',
+  initial: {
+    camera: { x: 0, y: 0, zoom: 1 },
+    lod: 'MESO' as const,
+    selectedTaskId: null as string | null,
+  },
+  reducers: {
+    setCamera: (state, camera: { x: number; y: number; zoom: number }) => {
+      state.camera = camera;
+      // Compute LOD based on zoom
+      if (camera.zoom < 0.5) state.lod = 'MACRO';
+      else if (camera.zoom > 2.0) state.lod = 'MICRO';
+      else state.lod = 'MESO';
+    },
+    selectTask: (state, taskId: string | null) => {
+      state.selectedTaskId = taskId;
+    },
+  },
+  cache: { policy: 'session' },
+});
+\`\`\`
+
+### Async Slice Example
+
+\`\`\`typescript
+import { createAsyncSlice } from '@belt/tools';
+import type { Train } from '../types';
+
+export const trainsSlice = createAsyncSlice({
+  id: 'trains',
+  load: async (_, context): Promise<Train[]> => {
+    const response = await context.api.get('/api/v1/trains');
+    return response.data;
+  },
+  context: {
+    api: {} as ApiClient,
+  },
+  cache: {
+    policy: 'private',
+    ttl: '5m',
+    swr: true, // Stale-while-revalidate
+  },
+});
+
+// Auto-generated actions:
+// - trainsSlice.actions.load(payload)
+// - trainsSlice.actions.success(data)
+// - trainsSlice.actions.fail(error)
+// - trainsSlice.actions.clear()
+\`\`\`
+
+### Machine Definition
+
+\`\`\`typescript
+import { createMachine } from '@belt/tools';
+import { viewportSlice } from './viewport';
+import { trainsSlice } from './trains';
+import { tasksSlice } from './tasks';
+
+export const canvasMachine = createMachine({
+  id: 'canvas',
+  slices: {
+    viewport: viewportSlice,
+    trains: trainsSlice,
+    tasks: tasksSlice,
+  },
+  selectors: {
+    // Computed values
+    visibleTasks: (state) => {
+      const { trains, tasks, viewport } = state;
+      if (!tasks.value) return [];
+      return filterByViewport(tasks.value, viewport.camera);
+    },
+    hasConflicts: (state) => {
+      return state.tasks.value?.some(t => t.hasConflict) ?? false;
+    },
+  },
+  // CRITICAL for 60fps rendering
+  trackMetadata: false,
+});
+
+// Generated type-safe hook aliases:
+// - canvasMachine.useCanvas('viewport') → { state, actions }
+// - canvasMachine.useCanvasSelector(s => s.visibleTasks)
+\`\`\`
+
+### React Integration
+
+\`\`\`typescript
+import { canvasMachine } from '../state/canvas-machine';
+
+function CanvasControls() {
+  // Access slice state and actions
+  const { state: viewport, actions } = canvasMachine.useCanvas('viewport');
+
+  // Or use selector for computed values
+  const visibleTasks = canvasMachine.useCanvasSelector(s => s.visibleTasks);
+
+  const handleZoom = (delta: number) => {
+    const newZoom = viewport.camera.zoom + delta;
+    actions.setCamera({
+      ...viewport.camera,
+      zoom: Math.max(0.1, Math.min(5, newZoom)),
+    });
+  };
+
+  return (
+    <div>
+      <span>Zoom: {viewport.camera.zoom.toFixed(2)}x</span>
+      <span>LOD: {viewport.lod}</span>
+      <button onClick={() => handleZoom(0.1)}>+</button>
+      <button onClick={() => handleZoom(-0.1)}>-</button>
+    </div>
+  );
+}
+\`\`\`
+
+### Cache Policies
+
+| Policy | Scope | Invalidation | Use Case |
+|--------|-------|--------------|----------|
+| `public` | Global | TTL only | Feature flags, prices |
+| `private` | User | Login/logout or TTL | User preferences, permissions |
+| `session` | App | App close or TTL | Viewport state, UI state |
+
+### Performance: trackMetadata
+
+For 60fps applications (games, WebGL):
+
+\`\`\`typescript
+createMachine({
+  id: 'canvas',
+  slices: { ... },
+  // Disable metadata tracking to prevent GC thrashing
+  trackMetadata: false,
+});
+\`\`\`
+
+With `trackMetadata: false`:
+- No object allocation per dispatch
+- No timestamp tracking
+- Suitable for high-frequency updates (pan, zoom, animation)
+```
+
+---
+
+### Task 1.3: Update Import Statements Throughout
+
+**Pattern to find:**
+```typescript
+// Old patterns
+import { useWorld } from '../state';
+import { worldStore, worldActions } from '../state';
+```
+
+**Replace with:**
+```typescript
+// New pattern
+import { canvasMachine } from '../state/canvas-machine';
+
+// Usage
+const { state, actions } = canvasMachine.useCanvas('viewport');
+```
+
+---
+
+## Session 2: Railway Domain Updates
+
+### Task 2.1: Add ECM Framework Section
+
+**Location:** Chapter 2, after "Fleet Composition"
+
+**Content:**
+```markdown
+## ECM Certification Framework (EU Regulation 2019/779)
+
+MMS aligns with the Entity in Charge of Maintenance (ECM) certification requirements:
+
+| Function | Responsibility | MMS Feature |
+|----------|----------------|-------------|
+| **ECM-F1** | Maintenance Management | Dashboard KPIs, compliance tracking |
+| **ECM-F2** | Maintenance Development | Scheduler optimization, plan generation |
+| **ECM-F3** | Fleet Maintenance Management | Real-time fleet status, conflict detection |
+| **ECM-F4** | Maintenance Delivery | Work order generation, workshop allocation |
+```
+
+---
+
+### Task 2.2: Add RAMS Section
+
+**Location:** Chapter 2, after ECM section
+
+**Content:**
+```markdown
+## RAMS Compliance (EN 50126-1)
+
+| Aspect | Standard | MMS Feature | Target |
+|--------|----------|-------------|--------|
+| **Reliability** | EN 50126-1 §6 | MTBF tracking | TBD |
+| **Availability** | EN 50126-1 §7 | Fleet availability | 95-99% |
+| **Maintainability** | EN 50126-1 §8 | MTTR optimization | <24h |
+| **Safety** | EN 50126-1 §9 | Critical task priority | N/A |
+```
+
+---
+
+### Task 2.3: Add Terminology Mapping
+
+**Location:** Chapter 2, in "Maintenance Types" section
+
+**Content:**
+```markdown
+### Terminology Equivalence
+
+| MMS Term | Railway Standard (EN 15380) | Aviation Origin |
+|----------|----------------------------|-----------------|
+| A-Check | PM1 (Daily/Service) | Line maintenance |
+| B-Check | PM2 (Intermediate) | A-Check |
+| C-Check | PM3 (Scheduled) | C-Check |
+| D-Overhaul | HM (Heavy Maintenance) | D-Check |
+
+> **Note:** MMS uses aviation-derived terminology for client familiarity.
+> EN 15380 equivalents are provided for industry alignment.
+```
+
+---
+
+## Session 3: Technical Updates
+
+### Task 3.1: Add BRIN Index (Section 19)
+
+**Location:** Database schema section
+
+**Content:**
+```sql
+-- BRIN index for time-series mileage data
+-- 128x smaller than B-tree, optimal for append-only tables
+CREATE INDEX idx_mileage_history_brin ON mileage_history
+  USING BRIN (recorded_at) WITH (pages_per_range = 128);
+
+-- Partial index for recent data (last 90 days)
+CREATE INDEX idx_mileage_recent ON mileage_history (train_id, recorded_at DESC)
+  WHERE recorded_at > NOW() - INTERVAL '90 days';
+```
+
+---
+
+### Task 3.2: Update Drizzle Schema (Section 19)
+
+**Pattern to find:**
+```typescript
+id: serial('id').primaryKey()
+```
+
+**Replace with:**
+```typescript
+id: integer('id').primaryKey().generatedAlwaysAsIdentity({
+  startWith: 1000,
+  increment: 1,
+})
+```
+
+---
+
+### Task 3.3: Add OR-Tools Timeout Config (Section 20)
+
+**Content:**
+```python
+class SolverConfig:
+    MAX_SOLVE_TIME_SECONDS = 30
+    FALLBACK_ON_TIMEOUT = True
+    FALLBACK_STRATEGY = 'greedy'
+
+def solve_with_timeout(model, solver):
+    solver.parameters.max_time_in_seconds = SolverConfig.MAX_SOLVE_TIME_SECONDS
+    status = solver.Solve(model)
+
+    if status == cp_model.UNKNOWN:
+        logger.warning("Solver timeout - using fallback")
+        return apply_fallback_strategy()
+
+    return extract_solution(solver)
+```
+
+---
+
+### Task 3.4: Add Weight Normalization (Section 20)
+
+**Content:**
+```python
+def normalize_weights(weights: dict) -> dict:
+    """Normalize weights to [1, 1000] range for numerical stability."""
+    total = sum(weights.values())
+    return {
+        key: max(1, min(1000, int((value / total) * 1000)))
+        for key, value in weights.items()
+    }
+```
+
+---
+
+## Session 4: Demo & Polish
+
+### Task 4.1: Add Demo Fallback Strategy (Chapter 25)
+
+**Content:** See GEMINI_REVIEW_EVALUATION.md Finding #3
+
+---
+
+### Task 4.2: Fix Blueprint.js Class Names
+
+**Pattern to find:** `bp4-` or `bp5-`
+**Replace with:** `bp6-`
+
+```bash
+grep -n "bp[45]-" docs/MMS_COMPLETE_SPECIFICATION.md
+```
+
+---
+
+### Task 4.3: Update Design Tokens Format (Section 8)
+
+**Old format:**
+```json
+{
+  "color-primary": "#1d4ed8"
+}
+```
+
+**New format (W3C 2025.10):**
+```json
+{
+  "color": {
+    "primary": {
+      "$type": "color",
+      "$value": "#1d4ed8",
+      "$description": "Primary brand color"
+    }
+  }
+}
+```
+
+---
+
+## Verification Checklist
+
+After all updates:
+
+- [ ] No `@zazcart/toolkit` references remain
+- [ ] All state examples use @belt/tools API
+- [ ] ECM section exists in Chapter 2
+- [ ] RAMS section exists in Chapter 2
+- [ ] BRIN index documented in Section 19
+- [ ] OR-Tools timeout configured in Section 20
+- [ ] Demo fallback documented in Chapter 25
+- [ ] Blueprint.js uses `bp6-` prefix
+- [ ] Design tokens use W3C 2025.10 format
+- [ ] Document compiles without errors
+
+---
+
+## Commit Strategy
+
+After each session:
+
+```bash
+git add docs/MMS_COMPLETE_SPECIFICATION.md
+git commit -m "$(cat <<'EOF'
+docs(spec): [SESSION_N] update MMS specification
+
+- [List of changes]
+
+Based on Gemini review evaluation (2026-01-05)
+Migrated from @zazcart/toolkit to @belt/tools@0.0.1
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+*Plan created: 2026-01-05*

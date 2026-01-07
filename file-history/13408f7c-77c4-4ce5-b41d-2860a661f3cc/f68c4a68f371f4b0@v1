@@ -1,0 +1,297 @@
+/**
+ * @file Plugin Prettier para padronizar quebras de linha (multi-line)
+ * O objetivo é estabilizar diffs em code reviews e melhorar a legibilidade,
+ * reduzindo inconsistências e rigidez do `printWidth` padrão do Prettier.
+ *
+ * Regras principais:
+ * 1. Garante chaves (`{}`) em `IfStatement` com condições longas.
+ * 2. Aplica multi-line em `ArrayExpression` se `elements.length > arrayWrapThreshold`.
+ * 3. Aplica multi-line em `ObjectExpression` se `properties.length > objectWrapThreshold`.
+ * 4. Aplica multi-line em `TSTypeLiteral` se `members.length > objectWrapThreshold`.
+ * 5. Aplica multi-line em parâmetros de função (vários `FUNCTION_NODE_TYPES`) se
+ * o número de params (> 3) ou o comprimento da string de params (> paramsPrintWidth)
+ * exceder os limites.
+ *
+ * @prettier
+ */
+import { doc } from 'prettier';
+import { printers as estreePrinters } from 'prettier/plugins/estree';
+
+const originalEstreePrinter = estreePrinters.estree;
+const { group, indent, line, softline, join, ifBreak } = doc.builders;
+
+const DEFAULT_THRESHOLD = 1;
+const DEFAULT_CONDITION_PRINT_WIDTH = 50;
+
+// A set of function-like node types that have a `params` property.
+const FUNCTION_NODE_TYPES = new Set([
+  'FunctionDeclaration',
+  'FunctionExpression',
+  'ArrowFunctionExpression',
+  'ObjectMethod',
+  'ClassMethod',
+  'TSDeclareMethod',
+  'TSFunctionType',
+  'TSMethodSignature',
+]);
+
+/**
+ * Creates a wrapped printer that applies custom formatting rules.
+ * @param {object} originalPrinter - The original Prettier printer to wrap.
+ * @returns {object} The new printer with the overridden print function.
+ */
+function createWrappedPrinter(originalPrinter) {
+  return {
+    ...originalPrinter,
+    print(
+      path,
+      options,
+      print
+    ) {
+      const node = path.getValue();
+
+      function getText() {
+        return (getText.cache = getText.cache ?? options.originalText.slice(...node.range));
+      }
+
+      // function getParamWidth() {
+      //   return (getParamWidth.cache =
+      //     getParamWidth.cache ?? getText().match(/^[^)]+\)/)?.[0].length);
+      // }
+
+      // Determine thresholds from options.
+      const multilineWrapThreshold = asInt(options.multilineWrapThreshold, DEFAULT_THRESHOLD);
+      const objectWrapThreshold = asInt(options.objectWrapThreshold, multilineWrapThreshold);
+      const arrayWrapThreshold = asInt(options.arrayWrapThreshold, objectWrapThreshold);
+      // prettier-ignore
+      const paramsPrintWidth = asInt(options.paramsPrintWidth, DEFAULT_CONDITION_PRINT_WIDTH);
+
+      const trailingComma =
+        options.trailingComma === 'all' || options.trailingComma === 'es5' ? ifBreak(',', '') : '';
+
+      // Handle IfStatement to enforce braces
+      if (
+        node?.type === 'IfStatement' &&
+        node.consequent &&
+        node.consequent.type !== 'BlockStatement' &&
+        getText().split(')')[0].length > paramsPrintWidth
+      ) {
+        const parts = [
+          'if (',
+          softline,
+          path.call(print, 'test'),
+          softline,
+          ') ',
+          '{',
+          indent([
+            line,
+            path.call(print, 'consequent'),
+          ]),
+          line,
+          '}',
+        ];
+
+        if (node.alternate) {
+          parts.push(' else ', path.call(print, 'alternate'));
+        }
+
+        return parts;
+      }
+
+      // Handle ArrayExpression nodes.
+      if (node?.type === 'ArrayExpression' && node.elements.length > arrayWrapThreshold) {
+        return group(
+          [
+            '[',
+            indent([
+              line,
+              join(
+                [
+                  ',',
+                  line,
+                ],
+                path.map(print, 'elements'),
+              ),
+              trailingComma,
+            ]),
+            line,
+            ']',
+          ],
+          { shouldBreak: true },
+        );
+      }
+
+      // Handle ObjectExpression nodes.
+      if (node?.type === 'ObjectExpression' && node.properties.length > objectWrapThreshold) {
+        const objectDoc = group(
+          [
+            '{',
+            indent([
+              line,
+              join(
+                [
+                  ',',
+                  line,
+                ],
+                path.map(print, 'properties'),
+              ),
+              trailingComma,
+            ]),
+            line,
+            '}',
+          ],
+          { shouldBreak: true },
+        );
+
+        const parentNode = path.getParentNode();
+        if (parentNode?.type === 'ArrowFunctionExpression' && parentNode.body === node) {
+          return [
+            '(',
+            objectDoc,
+            ')',
+          ];
+        }
+
+        return objectDoc;
+      }
+
+      // Handle TSTypeLiteral nodes.
+      if (node?.type === 'TSTypeLiteral' && node.members.length > objectWrapThreshold) {
+        const trailingSemi = trailingComma ? ifBreak(';', '') : '';
+        return group(
+          [
+            '{',
+            indent([
+              line,
+              join(
+                [
+                  trailingSemi,
+                  line,
+                ],
+                path.map(print, 'members'),
+              ),
+              trailingSemi,
+            ]),
+            line,
+            '}',
+          ],
+          { shouldBreak: true },
+        );
+      }
+
+      const shouldBreakParams = (() => {
+        if (!FUNCTION_NODE_TYPES.has(node?.type)) {
+          return false;
+        }
+        return node.params?.length > 3 //|| getParamWidth() > paramsPrintWidth;
+      })();
+
+      // Handle function parameters.
+      if (shouldBreakParams) {
+        const doc = [];
+
+        // Handle method-specific prefixes.
+        if (
+          node.type === 'ClassMethod' ||
+          node.type === 'ObjectMethod' ||
+          node.type === 'TSDeclareMethod'
+        ) {
+          if (node.static) doc.push('static ');
+          if (node.accessibility) doc.push(node.accessibility, ' ');
+          if (node.abstract) doc.push('abstract ');
+          if (node.kind === 'get' || node.kind === 'set') {
+            doc.push(node.kind, ' ');
+          }
+        }
+
+        if (node.async) {
+          doc.push('async ');
+        }
+
+        if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression') {
+          if (getText().match(/^(async )?function/)) {
+            doc.push('function');
+          }
+
+          if (node.generator) {
+            doc.push('*');
+          }
+          if (node.id) {
+            doc.push(' ', path.call(print, 'id'));
+          }
+        } else if (node.key) {
+          doc.push(path.call(print, 'key'));
+        }
+
+        if (node.typeParameters) {
+          doc.push(path.call(print, 'typeParameters'));
+        }
+
+        // Custom logic to force-break parameters.
+
+        doc.push(
+          group(
+            [
+              '(',
+              shouldBreakParams
+                ? indent([
+                  line,
+                  join(
+                    [
+                      ',',
+                      line,
+                    ],
+                    path.map(print, 'params'),
+                  ),
+                ])
+                : path.map(print, 'params'),
+              line,
+              ')',
+            ],
+            { shouldBreak: true },
+          ),
+        );
+
+        if (node.returnType) {
+          doc.push(path.call(print, 'returnType'));
+        } else if (node.predicate) {
+          doc.push(path.call(print, 'predicate'));
+        }
+
+        if (node.body) {
+          const shouldAddBraces = node.body.type !== 'BlockStatement';
+
+          if (node.type === 'ArrowFunctionExpression') {
+            if (shouldAddBraces) {
+              doc.push('=> {', line, 'return ');
+            } else {
+              doc.push('=>');
+            }
+          }
+
+          doc.push(' ', path.call(print, 'body'));
+          if (shouldAddBraces) {
+            doc.push(line, '}', line);
+          }
+        }
+
+        return doc;
+      }
+
+      // For all other nodes, use the original printer.
+      return originalPrinter.print(path, options, print);
+    },
+  };
+}
+
+function asInt(value, defaultValue) {
+  const num = parseInt(value, 10);
+  if (!Number.isNaN(num) && num >= 0) {
+    return num;
+  }
+  return defaultValue;
+}
+
+export const printers = {
+  estree: createWrappedPrinter(originalEstreePrinter),
+};

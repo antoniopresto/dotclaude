@@ -1,0 +1,709 @@
+     1→/**
+     2→ * MicroLayer - Detailed task card visualization
+     3→ *
+     4→ * Renders detailed task cards with labels at zoom > 2.0x (MICRO LOD level).
+     5→ *
+     6→ * PERFORMANCE OPTIMIZATIONS:
+     7→ * - Frustum culling: Only renders tasks visible in the viewport
+     8→ * - InstancedMesh for grid lines: Single draw call instead of ~251 meshes
+     9→ * - Lazy label rendering: Only labels for visible tasks
+    10→ * - InstancedMesh for row backgrounds: Single draw call instead of 50 meshes
+    11→ */
+    12→
+    13→import { useMemo, useRef, useEffect } from 'react';
+    14→import { InstancedMesh, Object3D, Color, Vector3 } from 'three';
+    15→import { Html, Line } from '@react-three/drei';
+    16→import { useThree } from '@react-three/fiber';
+    17→import type { TaskRender } from '../../data/types';
+    18→import { DEFAULT_VIEW_CONFIG } from '../../data/types';
+    19→import type { ViewportBounds } from '../InfiniteCanvas';
+    20→
+    21→interface MicroLayerProps {
+    22→  tasks: TaskRender[];
+    23→  trainCount: number;
+    24→  /** Opacity for LOD transitions (0-1). Default: 1 */
+    25→  opacity?: number;
+    26→  /** Viewport bounds for frustum culling */
+    27→  viewportBounds?: ViewportBounds;
+    28→  /** Currently hovered task ID for highlight effect */
+    29→  hoveredTaskId?: string | null;
+    30→  /** Currently selected task ID for selection highlight (F019) */
+    31→  selectedTaskId?: string | null;
+    32→  /** Currently keyboard-focused task ID for focus indicator (F021) */
+    33→  focusedTaskId?: string | null;
+    34→}
+    35→
+    36→const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+    37→
+    38→// Task card dimensions
+    39→const CARD_PADDING = 2;
+    40→const CARD_HEIGHT = pxPerTrain - CARD_PADDING * 2 - 2; // Slightly smaller for grid visibility
+    41→
+    42→// Color mappings (matching MesoLayer)
+    43→const COLORS: Record<string, string> = {
+    44→  blue: '#3b82f6',
+    45→  orange: '#f59e0b',
+    46→  gray: '#9ca3af',
+    47→};
+    48→const CONFLICT_COLOR = '#ef4444';
+    49→
+    50→// Grid colors
+    51→const GRID_COLOR_MAJOR = '#d1d5db'; // Gray-300
+    52→const GRID_COLOR_MINOR = '#e5e7eb'; // Gray-200
+    53→
+    54→// Row background colors
+    55→const ROW_BG_EVEN = '#ffffff';
+    56→const ROW_BG_ODD = '#f8fafc';
+    57→
+    58→/**
+    59→ * Filter tasks that are visible within the viewport bounds
+    60→ * This is the core of frustum culling for performance
+    61→ */
+    62→function filterVisibleTasks(tasks: TaskRender[], viewportBounds?: ViewportBounds): TaskRender[] {
+    63→  if (!viewportBounds) return tasks;
+    64→
+    65→  // Add padding to viewport bounds (render slightly outside visible area for smooth panning)
+    66→  const padding = 100; // world units
+    67→  const minX = viewportBounds.minX - padding;
+    68→  const maxX = viewportBounds.maxX + padding;
+    69→  const minY = viewportBounds.minY - padding;
+    70→  const maxY = viewportBounds.maxY + padding;
+    71→
+    72→  return tasks.filter((task) => {
+    73→    const taskStartX = task.startDay * pxPerDay;
+    74→    const taskEndX = taskStartX + task.duration * pxPerDay;
+    75→    const taskY = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+    76→
+    77→    // Check if task overlaps with viewport
+    78→    const xOverlap = taskEndX >= minX && taskStartX <= maxX;
+    79→    const yOverlap = taskY + pxPerTrain / 2 >= minY && taskY - pxPerTrain / 2 <= maxY;
+    80→
+    81→    return xOverlap && yOverlap;
+    82→  });
+    83→}
+    84→
+    85→// Highlight color multiplier for hovered tasks
+    86→const HOVER_BRIGHTNESS = 1.3;
+    87→
+    88→// Selection indicator color (distinct cyan/teal)
+    89→const SELECTION_COLOR = '#06b6d4'; // cyan-500
+    90→
+    91→// Focus indicator color (F021 - keyboard focus)
+    92→const FOCUS_COLOR = '#8b5cf6'; // violet-500
+    93→
+    94→/**
+    95→ * Brighten a color for hover effect
+    96→ */
+    97→function brightenColor(hexColor: string, factor: number): Color {
+    98→  const color = new Color(hexColor);
+    99→  color.r = Math.min(1, color.r * factor);
+   100→  color.g = Math.min(1, color.g * factor);
+   101→  color.b = Math.min(1, color.b * factor);
+   102→  return color;
+   103→}
+   104→
+   105→/**
+   106→ * Task cards using InstancedMesh (same pattern as MesoLayer)
+   107→ */
+   108→function TaskCards({
+   109→  tasks,
+   110→  opacity = 1,
+   111→  hoveredTaskId,
+   112→  selectedTaskId,
+   113→  focusedTaskId,
+   114→}: {
+   115→  tasks: TaskRender[];
+   116→  opacity?: number;
+   117→  hoveredTaskId?: string | null;
+   118→  selectedTaskId?: string | null;
+   119→  focusedTaskId?: string | null;
+   120→}) {
+   121→  const meshRef = useRef<InstancedMesh>(null);
+   122→  const tempObject = useMemo(() => new Object3D(), []);
+   123→  const tempColor = useMemo(() => new Color(), []);
+   124→
+   125→  useEffect(() => {
+   126→    if (!meshRef.current || tasks.length === 0) return;
+   127→
+   128→    const mesh = meshRef.current;
+   129→
+   130→    tasks.forEach((task, i) => {
+   131→      const width = task.duration * pxPerDay - CARD_PADDING * 2;
+   132→      const height = CARD_HEIGHT;
+   133→      const x = task.startDay * pxPerDay + width / 2 + CARD_PADDING;
+   134→      const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+   135→      // Z ordering: selected > focused > conflict > hovered > normal
+   136→      const isSelected = task.id === selectedTaskId;
+   137→      const isFocused = task.id === focusedTaskId;
+   138→      const isHovered = task.id === hoveredTaskId;
+   139→      const z = isSelected ? 0.2 : isFocused ? 0.15 : task.hasConflict ? 0.1 : isHovered ? 0.05 : 0;
+   140→
+   141→      tempObject.position.set(x, y, z);
+   142→      tempObject.scale.set(width, height, 1);
+   143→      tempObject.updateMatrix();
+   144→      mesh.setMatrixAt(i, tempObject.matrix);
+   145→
+   146→      // Set color: selected gets distinct color, focused gets focus color, hovered gets brightened, normal is base
+   147→      if (isSelected) {
+   148→        tempColor.set(SELECTION_COLOR);
+   149→        mesh.setColorAt(i, tempColor);
+   150→      } else if (isFocused) {
+   151→        tempColor.set(FOCUS_COLOR);
+   152→        mesh.setColorAt(i, tempColor);
+   153→      } else if (isHovered) {
+   154→        const baseColor = task.hasConflict ? CONFLICT_COLOR : COLORS[task.color];
+   155→        const brightened = brightenColor(baseColor, HOVER_BRIGHTNESS);
+   156→        mesh.setColorAt(i, brightened);
+   157→      } else {
+   158→        const baseColor = task.hasConflict ? CONFLICT_COLOR : COLORS[task.color];
+   159→        tempColor.set(baseColor);
+   160→        mesh.setColorAt(i, tempColor);
+   161→      }
+   162→    });
+   163→
+   164→    mesh.instanceMatrix.needsUpdate = true;
+   165→    if (mesh.instanceColor) {
+   166→      mesh.instanceColor.needsUpdate = true;
+   167→    }
+   168→  }, [tasks, tempObject, tempColor, hoveredTaskId, selectedTaskId, focusedTaskId]);
+   169→
+   170→  if (tasks.length === 0) return null;
+   171→
+   172→  return (
+   173→    <instancedMesh ref={meshRef} args={[undefined, undefined, tasks.length]}>
+   174→      <planeGeometry args={[1, 1]} />
+   175→      <meshBasicMaterial toneMapped={false} transparent={opacity < 1} opacity={opacity} />
+   176→    </instancedMesh>
+   177→  );
+   178→}
+   179→
+   180→/**
+   181→ * Conflict glow effects (behind task cards)
+   182→ */
+   183→function ConflictGlows({ tasks, opacity = 1 }: { tasks: TaskRender[]; opacity?: number }) {
+   184→  const conflictTasks = useMemo(() => tasks.filter((t) => t.hasConflict), [tasks]);
+   185→  const meshRef = useRef<InstancedMesh>(null);
+   186→  const tempObject = useMemo(() => new Object3D(), []);
+   187→
+   188→  useEffect(() => {
+   189→    if (!meshRef.current || conflictTasks.length === 0) return;
+   190→
+   191→    const mesh = meshRef.current;
+   192→
+   193→    conflictTasks.forEach((task, i) => {
+   194→      const width = task.duration * pxPerDay + 4;
+   195→      const height = CARD_HEIGHT + 4;
+   196→      const x = task.startDay * pxPerDay + (task.duration * pxPerDay) / 2;
+   197→      const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+   198→      const z = -0.05;
+   199→
+   200→      tempObject.position.set(x, y, z);
+   201→      tempObject.scale.set(width, height, 1);
+   202→      tempObject.updateMatrix();
+   203→      mesh.setMatrixAt(i, tempObject.matrix);
+   204→    });
+   205→
+   206→    mesh.instanceMatrix.needsUpdate = true;
+   207→  }, [conflictTasks, tempObject]);
+   208→
+   209→  if (conflictTasks.length === 0) return null;
+   210→
+   211→  return (
+   212→    <instancedMesh ref={meshRef} args={[undefined, undefined, conflictTasks.length]}>
+   213→      <planeGeometry args={[1, 1]} />
+   214→      <meshBasicMaterial color={CONFLICT_COLOR} transparent opacity={0.3 * opacity} />
+   215→    </instancedMesh>
+   216→  );
+   217→}
+   218→
+   219→/**
+   220→ * HTML labels for tasks - ONLY for visible tasks (lazy rendering)
+   221→ * Maximum of 50 labels rendered at once for performance
+   222→ */
+   223→function TaskLabels({ tasks, opacity = 1 }: { tasks: TaskRender[]; opacity?: number }) {
+   224→  const { camera } = useThree();
+   225→  const zoom = (camera as any).zoom || 1;
+   226→
+   227→  // Only show labels on tasks wide enough (> 40 screen pixels)
+   228→  // And limit to max 50 labels for performance
+   229→  const labeledTasks = useMemo(() => {
+   230→    const minWidthForLabel = 40 / zoom; // Convert screen pixels to world pixels
+   231→    const filtered = tasks.filter((t) => t.duration * pxPerDay > minWidthForLabel);
+   232→    // Sort by width (largest first) and take top 50
+   233→    return filtered
+   234→      .sort((a, b) => b.duration - a.duration)
+   235→      .slice(0, 50);
+   236→  }, [tasks, zoom]);
+   237→
+   238→  // Don't render labels during low opacity transitions (performance optimization)
+   239→  if (opacity < 0.3) return null;
+   240→
+   241→  return (
+   242→    <>
+   243→      {labeledTasks.map((task) => {
+   244→        const width = task.duration * pxPerDay;
+   245→        const x = task.startDay * pxPerDay + width / 2;
+   246→        const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+   247→        const label = task.type.charAt(0).toUpperCase() + task.type.slice(1);
+   248→        // F022: Generate descriptive aria-label for screen readers
+   249→        const ariaLabel = `${label} task, Train ${task.trainIndex + 1}, Day ${task.startDay}, Duration ${task.duration} days${task.hasConflict ? ', has conflict' : ''}`;
+   250→
+   251→        return (
+   252→          <Html
+   253→            key={task.id}
+   254→            position={[x, y, 0.2]}
+   255→            center
+   256→            style={{ pointerEvents: 'none', opacity }}
+   257→          >
+   258→            <div
+   259→              role="img"
+   260→              aria-label={ariaLabel}
+   261→              style={{
+   262→                color: 'white',
+   263→                fontSize: '10px',
+   264→                fontFamily: 'system-ui, sans-serif',
+   265→                fontWeight: 600,
+   266→                textShadow: '0 1px 2px rgba(0,0,0,0.3)',
+   267→                whiteSpace: 'nowrap',
+   268→              }}
+   269→            >
+   270→              {label}
+   271→            </div>
+   272→          </Html>
+   273→        );
+   274→      })}
+   275→    </>
+   276→  );
+   277→}
+   278→
+   279→/**
+   280→ * Grid lines using InstancedMesh (OPTIMIZED - single draw call)
+   281→ * Previously: ~251 individual meshes = 251 draw calls
+   282→ * Now: 2 InstancedMesh = 2 draw calls
+   283→ */
+   284→function GridLines({
+   285→  totalDays,
+   286→  trainCount,
+   287→  opacity = 1,
+   288→  viewportBounds,
+   289→}: {
+   290→  totalDays: number;
+   291→  trainCount: number;
+   292→  opacity?: number;
+   293→  viewportBounds?: ViewportBounds;
+   294→}) {
+   295→  const totalWidth = totalDays * pxPerDay;
+   296→  const totalHeight = trainCount * pxPerTrain;
+   297→
+   298→  // Horizontal grid lines (train boundaries) - using InstancedMesh
+   299→  const hMeshRef = useRef<InstancedMesh>(null);
+   300→  const hTempObject = useMemo(() => new Object3D(), []);
+   301→
+   302→  // Vertical grid lines (week boundaries) - using InstancedMesh
+   303→  const vMeshRef = useRef<InstancedMesh>(null);
+   304→  const vTempObject = useMemo(() => new Object3D(), []);
+   305→
+   306→  // Calculate visible horizontal lines based on viewport
+   307→  const visibleHLines = useMemo(() => {
+   308→    if (!viewportBounds) {
+   309→      return Array.from({ length: trainCount + 1 }, (_, i) => i);
+   310→    }
+   311→    const minTrainIndex = Math.max(0, Math.floor(-viewportBounds.maxY / pxPerTrain) - 1);
+   312→    const maxTrainIndex = Math.min(trainCount, Math.ceil(-viewportBounds.minY / pxPerTrain) + 1);
+   313→    return Array.from({ length: maxTrainIndex - minTrainIndex + 1 }, (_, i) => minTrainIndex + i);
+   314→  }, [trainCount, viewportBounds]);
+   315→
+   316→  // Calculate visible vertical lines (weeks) based on viewport
+   317→  const visibleVLines = useMemo(() => {
+   318→    if (!viewportBounds) {
+   319→      const lines = [];
+   320→      for (let day = 0; day <= totalDays; day += 7) {
+   321→        lines.push(day);
+   322→      }
+   323→      return lines.slice(0, 200);
+   324→    }
+   325→    const minDay = Math.max(0, Math.floor(viewportBounds.minX / pxPerDay / 7) * 7 - 7);
+   326→    const maxDay = Math.min(totalDays, Math.ceil(viewportBounds.maxX / pxPerDay / 7) * 7 + 7);
+   327→    const lines = [];
+   328→    for (let day = minDay; day <= maxDay; day += 7) {
+   329→      lines.push(day);
+   330→    }
+   331→    return lines;
+   332→  }, [totalDays, viewportBounds]);
+   333→
+   334→  // Update horizontal lines InstancedMesh
+   335→  useEffect(() => {
+   336→    if (!hMeshRef.current || visibleHLines.length === 0) return;
+   337→
+   338→    const mesh = hMeshRef.current;
+   339→    visibleHLines.forEach((trainIndex, i) => {
+   340→      hTempObject.position.set(totalWidth / 2, -trainIndex * pxPerTrain, -0.05);
+   341→      hTempObject.scale.set(totalWidth, 1, 1);
+   342→      hTempObject.updateMatrix();
+   343→      mesh.setMatrixAt(i, hTempObject.matrix);
+   344→    });
+   345→    mesh.instanceMatrix.needsUpdate = true;
+   346→  }, [visibleHLines, totalWidth, hTempObject]);
+   347→
+   348→  // Update vertical lines InstancedMesh
+   349→  useEffect(() => {
+   350→    if (!vMeshRef.current || visibleVLines.length === 0) return;
+   351→
+   352→    const mesh = vMeshRef.current;
+   353→    visibleVLines.forEach((day, i) => {
+   354→      const isMajor = day % 30 === 0;
+   355→      vTempObject.position.set(day * pxPerDay, -totalHeight / 2, -0.05);
+   356→      vTempObject.scale.set(isMajor ? 1.5 : 1, totalHeight, 1);
+   357→      vTempObject.updateMatrix();
+   358→      mesh.setMatrixAt(i, vTempObject.matrix);
+   359→      mesh.setColorAt(i, new Color(isMajor ? GRID_COLOR_MAJOR : GRID_COLOR_MINOR));
+   360→    });
+   361→    mesh.instanceMatrix.needsUpdate = true;
+   362→    if (mesh.instanceColor) {
+   363→      mesh.instanceColor.needsUpdate = true;
+   364→    }
+   365→  }, [visibleVLines, totalHeight, vTempObject]);
+   366→
+   367→  return (
+   368→    <group>
+   369→      {/* Horizontal lines - InstancedMesh */}
+   370→      {visibleHLines.length > 0 && (
+   371→        <instancedMesh ref={hMeshRef} args={[undefined, undefined, visibleHLines.length]}>
+   372→          <planeGeometry args={[1, 1]} />
+   373→          <meshBasicMaterial color={GRID_COLOR_MAJOR} transparent opacity={0.5 * opacity} />
+   374→        </instancedMesh>
+   375→      )}
+   376→
+   377→      {/* Vertical lines - InstancedMesh */}
+   378→      {visibleVLines.length > 0 && (
+   379→        <instancedMesh ref={vMeshRef} args={[undefined, undefined, visibleVLines.length]}>
+   380→          <planeGeometry args={[1, 1]} />
+   381→          <meshBasicMaterial transparent opacity={0.4 * opacity} />
+   382→        </instancedMesh>
+   383→      )}
+   384→    </group>
+   385→  );
+   386→}
+   387→
+   388→/**
+   389→ * Row backgrounds using InstancedMesh (OPTIMIZED - single draw call)
+   390→ * Previously: 50 individual meshes = 50 draw calls
+   391→ * Now: 1 InstancedMesh = 1 draw call
+   392→ */
+   393→function RowBackgrounds({
+   394→  trainCount,
+   395→  totalDays,
+   396→  opacity = 1,
+   397→  viewportBounds,
+   398→}: {
+   399→  trainCount: number;
+   400→  totalDays: number;
+   401→  opacity?: number;
+   402→  viewportBounds?: ViewportBounds;
+   403→}) {
+   404→  const totalWidth = totalDays * pxPerDay;
+   405→  const meshRef = useRef<InstancedMesh>(null);
+   406→  const tempObject = useMemo(() => new Object3D(), []);
+   407→
+   408→  // Calculate visible rows based on viewport
+   409→  const visibleRows = useMemo(() => {
+   410→    if (!viewportBounds) {
+   411→      return Array.from({ length: trainCount }, (_, i) => i);
+   412→    }
+   413→    const minTrainIndex = Math.max(0, Math.floor(-viewportBounds.maxY / pxPerTrain) - 1);
+   414→    const maxTrainIndex = Math.min(trainCount - 1, Math.ceil(-viewportBounds.minY / pxPerTrain) + 1);
+   415→    return Array.from({ length: maxTrainIndex - minTrainIndex + 1 }, (_, i) => minTrainIndex + i);
+   416→  }, [trainCount, viewportBounds]);
+   417→
+   418→  useEffect(() => {
+   419→    if (!meshRef.current || visibleRows.length === 0) return;
+   420→
+   421→    const mesh = meshRef.current;
+   422→    visibleRows.forEach((trainIndex, i) => {
+   423→      tempObject.position.set(totalWidth / 2, -trainIndex * pxPerTrain - pxPerTrain / 2, -0.1);
+   424→      tempObject.scale.set(totalWidth, pxPerTrain, 1);
+   425→      tempObject.updateMatrix();
+   426→      mesh.setMatrixAt(i, tempObject.matrix);
+   427→      mesh.setColorAt(i, new Color(trainIndex % 2 === 0 ? ROW_BG_EVEN : ROW_BG_ODD));
+   428→    });
+   429→    mesh.instanceMatrix.needsUpdate = true;
+   430→    if (mesh.instanceColor) {
+   431→      mesh.instanceColor.needsUpdate = true;
+   432→    }
+   433→  }, [visibleRows, totalWidth, tempObject]);
+   434→
+   435→  if (visibleRows.length === 0) return null;
+   436→
+   437→  return (
+   438→    <instancedMesh ref={meshRef} args={[undefined, undefined, visibleRows.length]}>
+   439→      <planeGeometry args={[1, 1]} />
+   440→      <meshBasicMaterial transparent opacity={0.5 * opacity} />
+   441→    </instancedMesh>
+   442→  );
+   443→}
+   444→
+   445→// Dependency line color
+   446→const DEPENDENCY_LINE_COLOR = '#8b5cf6'; // Purple-500 for visibility
+   447→const DEPENDENCY_ARROW_COLOR = '#7c3aed'; // Purple-600 for arrow heads
+   448→
+   449→/**
+   450→ * Dependency Lines between tasks (F023)
+   451→ *
+   452→ * Renders curved lines from predecessor task to dependent task with arrow heads.
+   453→ * Only renders dependencies where both tasks are in the visible set.
+   454→ */
+   455→function DependencyLines({
+   456→  tasks,
+   457→  opacity = 1,
+   458→  viewportBounds,
+   459→}: {
+   460→  tasks: TaskRender[];
+   461→  opacity?: number;
+   462→  viewportBounds?: ViewportBounds;
+   463→}) {
+   464→  // Build a map of task ID to task for quick lookup
+   465→  const taskMap = useMemo(() => {
+   466→    return new Map(tasks.map((t) => [t.id, t]));
+   467→  }, [tasks]);
+   468→
+   469→  // Find dependencies where both predecessor and dependent are visible
+   470→  const dependencies = useMemo(() => {
+   471→    const deps: Array<{ from: TaskRender; to: TaskRender }> = [];
+   472→
+   473→    for (const task of tasks) {
+   474→      if (task.predecessorId) {
+   475→        const predecessor = taskMap.get(task.predecessorId);
+   476→        if (predecessor) {
+   477→          deps.push({ from: predecessor, to: task });
+   478→        }
+   479→      }
+   480→    }
+   481→
+   482→    return deps;
+   483→  }, [tasks, taskMap]);
+   484→
+   485→  // Don't render during low opacity transitions (performance)
+   486→  if (opacity < 0.3 || dependencies.length === 0) return null;
+   487→
+   488→  return (
+   489→    <group>
+   490→      {dependencies.map(({ from, to }, index) => {
+   491→        // Calculate connection points
+   492→        // From: right edge of predecessor task (end)
+   493→        const fromX = (from.startDay + from.duration) * pxPerDay;
+   494→        const fromY = -from.trainIndex * pxPerTrain - pxPerTrain / 2;
+   495→
+   496→        // To: left edge of dependent task (start)
+   497→        const toX = to.startDay * pxPerDay;
+   498→        const toY = -to.trainIndex * pxPerTrain - pxPerTrain / 2;
+   499→
+   500→        // Create curved path using bezier-like points
+   501→        const isSameRow = from.trainIndex === to.trainIndex;
+   502→        const midX = (fromX + toX) / 2;
+   503→
+   504→        // Control points for curve
+   505→        let points: Vector3[];
+   506→        if (isSameRow) {
+   507→          // Same row: simple horizontal line with slight vertical offset to avoid overlap
+   508→          const offsetY = 8;
+   509→          points = [
+   510→            new Vector3(fromX, fromY + offsetY, 0.3),
+   511→            new Vector3(midX, fromY + offsetY + 5, 0.3),
+   512→            new Vector3(toX, toY + offsetY, 0.3),
+   513→          ];
+   514→        } else {
+   515→          // Different rows: curved path
+   516→          const controlOffset = Math.abs(toY - fromY) * 0.3;
+   517→          points = [
+   518→            new Vector3(fromX, fromY, 0.3),
+   519→            new Vector3(fromX + controlOffset, fromY, 0.3),
+   520→            new Vector3(midX, (fromY + toY) / 2, 0.3),
+   521→            new Vector3(toX - controlOffset, toY, 0.3),
+   522→            new Vector3(toX, toY, 0.3),
+   523→          ];
+   524→        }
+   525→
+   526→        // Arrow head points (triangle at the destination)
+   527→        const arrowSize = 6;
+   528→        const lastPoint = points[points.length - 1];
+   529→        const secondLastPoint = points[points.length - 2];
+   530→
+   531→        // Direction vector for arrow
+   532→        const direction = new Vector3().subVectors(lastPoint, secondLastPoint).normalize();
+   533→        const perpendicular = new Vector3(-direction.y, direction.x, 0);
+   534→
+   535→        const arrowTip = lastPoint.clone();
+   536→        const arrowBase1 = lastPoint.clone().sub(direction.clone().multiplyScalar(arrowSize)).add(perpendicular.clone().multiplyScalar(arrowSize / 2));
+   537→        const arrowBase2 = lastPoint.clone().sub(direction.clone().multiplyScalar(arrowSize)).sub(perpendicular.clone().multiplyScalar(arrowSize / 2));
+   538→
+   539→        const arrowPoints = [
+   540→          arrowTip,
+   541→          arrowBase1,
+   542→          arrowBase2,
+   543→          arrowTip, // Close the triangle
+   544→        ];
+   545→
+   546→        const key = `dep-${from.id}-${to.id}`;
+   547→
+   548→        return (
+   549→          <group key={key}>
+   550→            {/* Main dependency line */}
+   551→            <Line
+   552→              points={points}
+   553→              color={DEPENDENCY_LINE_COLOR}
+   554→              lineWidth={2}
+   555→              opacity={opacity * 0.8}
+   556→              transparent
+   557→            />
+   558→            {/* Arrow head */}
+   559→            <Line
+   560→              points={arrowPoints}
+   561→              color={DEPENDENCY_ARROW_COLOR}
+   562→              lineWidth={2}
+   563→              opacity={opacity}
+   564→              transparent
+   565→            />
+   566→          </group>
+   567→        );
+   568→      })}
+   569→    </group>
+   570→  );
+   571→}
+   572→
+   573→/**
+   574→ * Focus ring effect layer (F021)
+   575→ * Renders a ring around the focused task for accessibility
+   576→ */
+   577→function FocusRing({
+   578→  tasks,
+   579→  focusedTaskId,
+   580→  opacity = 1,
+   581→}: {
+   582→  tasks: TaskRender[];
+   583→  focusedTaskId: string | null;
+   584→  opacity?: number;
+   585→}) {
+   586→  const focusedTask = useMemo(
+   587→    () => (focusedTaskId ? tasks.find((t) => t.id === focusedTaskId) : null),
+   588→    [tasks, focusedTaskId]
+   589→  );
+   590→
+   591→  const meshRef = useRef<InstancedMesh>(null);
+   592→  const tempObject = useMemo(() => new Object3D(), []);
+   593→
+   594→  useEffect(() => {
+   595→    if (!meshRef.current) return;
+   596→
+   597→    const mesh = meshRef.current;
+   598→
+   599→    if (focusedTask) {
+   600→      const width = focusedTask.duration * pxPerDay + 6;
+   601→      const height = CARD_HEIGHT + 6;
+   602→      const x = focusedTask.startDay * pxPerDay + (focusedTask.duration * pxPerDay) / 2;
+   603→      const y = -focusedTask.trainIndex * pxPerTrain - pxPerTrain / 2;
+   604→      const z = 0.12;
+   605→
+   606→      tempObject.position.set(x, y, z);
+   607→      tempObject.scale.set(width, height, 1);
+   608→      tempObject.updateMatrix();
+   609→      mesh.setMatrixAt(0, tempObject.matrix);
+   610→    } else {
+   611→      // Hide the ring by scaling to zero
+   612→      tempObject.scale.set(0, 0, 1);
+   613→      tempObject.updateMatrix();
+   614→      mesh.setMatrixAt(0, tempObject.matrix);
+   615→    }
+   616→
+   617→    mesh.instanceMatrix.needsUpdate = true;
+   618→  }, [focusedTask, tempObject]);
+   619→
+   620→  return (
+   621→    <instancedMesh ref={meshRef} args={[undefined, undefined, 1]}>
+   622→      <planeGeometry args={[1, 1]} />
+   623→      <meshBasicMaterial
+   624→        color={FOCUS_COLOR}
+   625→        transparent
+   626→        opacity={0.4 * opacity}
+   627→      />
+   628→    </instancedMesh>
+   629→  );
+   630→}
+   631→
+   632→/**
+   633→ * MicroLayer Component
+   634→ *
+   635→ * Optimized for performance with:
+   636→ * - Frustum culling for tasks
+   637→ * - InstancedMesh for grid lines and row backgrounds
+   638→ * - Limited HTML labels (max 50)
+   639→ * - Dependency lines between tasks (F023)
+   640→ * - Keyboard focus indicators (F021)
+   641→ */
+   642→export function MicroLayer({
+   643→  tasks,
+   644→  trainCount,
+   645→  opacity = 1,
+   646→  viewportBounds,
+   647→  hoveredTaskId,
+   648→  selectedTaskId,
+   649→  focusedTaskId,
+   650→}: MicroLayerProps) {
+   651→  // Calculate total days
+   652→  const totalDays = useMemo(() => {
+   653→    if (tasks.length === 0) return 365 * 10;
+   654→    const maxDay = Math.max(...tasks.map((t) => t.startDay + t.duration));
+   655→    return Math.max(maxDay + 30, 365 * 10);
+   656→  }, [tasks]);
+   657→
+   658→  // Filter to visible tasks only (frustum culling)
+   659→  const visibleTasks = useMemo(
+   660→    () => filterVisibleTasks(tasks, viewportBounds),
+   661→    [tasks, viewportBounds]
+   662→  );
+   663→
+   664→  return (
+   665→    <group>
+   666→      {/* Row backgrounds - InstancedMesh */}
+   667→      <RowBackgrounds
+   668→        trainCount={trainCount}
+   669→        totalDays={totalDays}
+   670→        opacity={opacity}
+   671→        viewportBounds={viewportBounds}
+   672→      />
+   673→
+   674→      {/* Grid lines - InstancedMesh */}
+   675→      <GridLines
+   676→        totalDays={totalDays}
+   677→        trainCount={trainCount}
+   678→        opacity={opacity}
+   679→        viewportBounds={viewportBounds}
+   680→      />
+   681→
+   682→      {/* Conflict glow effects - only visible tasks */}
+   683→      <ConflictGlows tasks={visibleTasks} opacity={opacity} />
+   684→
+   685→      {/* Focus ring effect (F021 - behind focused task card) */}
+   686→      <FocusRing tasks={visibleTasks} focusedTaskId={focusedTaskId ?? null} opacity={opacity} />
+   687→
+   688→      {/* Task cards - only visible tasks */}
+   689→      <TaskCards
+   690→        tasks={visibleTasks}
+   691→        opacity={opacity}
+   692→        hoveredTaskId={hoveredTaskId}
+   693→        selectedTaskId={selectedTaskId}
+   694→        focusedTaskId={focusedTaskId}
+   695→      />
+   696→
+   697→      {/* Task labels (HTML overlay) - only visible tasks, max 50 */}
+   698→      <TaskLabels tasks={visibleTasks} opacity={opacity} />
+   699→
+   700→      {/* Dependency lines between tasks (F023) - only visible tasks */}
+   701→      <DependencyLines tasks={visibleTasks} opacity={opacity} viewportBounds={viewportBounds} />
+   702→    </group>
+   703→  );
+   704→}
+   705→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

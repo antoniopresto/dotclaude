@@ -1,0 +1,1452 @@
+#!/usr/bin/env node
+/**
+ * Harness Orchestrator CLI
+ *
+ * Command-line interface for the harness orchestrator.
+ */
+
+import { Command } from 'commander';
+import chalk from 'chalk';
+import ora from 'ora';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import { DependencyGraph } from '../graph/DependencyGraph.js';
+import { CriticalPath } from '../graph/CriticalPath.js';
+import { StateManager } from '../state/StateManager.js';
+import { AIManager } from '../ai/AIManager.js';
+import { Orchestrator } from '../orchestrator/Orchestrator.js';
+import { Dashboard } from '../dashboard/Dashboard.js';
+import { Verifier } from '../verification/Verifier.js';
+import {
+  getAllHookTemplates,
+  getSettingsTemplate,
+} from '../hooks/HookTemplates.js';
+import {
+  generateVisualTestCommands,
+  generateQAChecklist,
+  requiresVisualTesting,
+  getMcpConfig,
+} from '../testing/VisualTesting.js';
+import {
+  checkFeatureReadyForCommit,
+  formatCommitWorkflowCheck,
+  generateGitCommitCommand,
+  getStagedFiles,
+  getUnstagedFiles,
+  getUntrackedFiles,
+} from '../workflow/CommitWorkflow.js';
+import type { HarnessConfig, ModelType } from '../types.js';
+
+const program = new Command();
+
+program
+  .name('harness')
+  .alias('h')
+  .description('AI Project Manager for harness task orchestration')
+  .version('0.1.0');
+
+// Default features path
+const DEFAULT_FEATURES_PATH = 'features.json';
+
+/**
+ * Resolve features path, using default if not provided
+ */
+function resolveFeaturesPath(path?: string): string {
+  return resolve(path || DEFAULT_FEATURES_PATH);
+}
+
+// Analyze command
+program
+  .command('analyze [features-path]')
+  .description('Analyze dependency graph and show execution plan')
+  .action((featuresPath?: string) => {
+    const resolvedPath = resolveFeaturesPath(featuresPath);
+    const content = readFileSync(resolvedPath, 'utf-8');
+    const config: HarnessConfig = JSON.parse(content);
+
+    const graph = new DependencyGraph(config);
+    const criticalPath = new CriticalPath(graph);
+
+    console.log(chalk.bold('\n📊 Dependency Analysis\n'));
+
+    // Check for cycles
+    const cycle = graph.detectCycles();
+    if (cycle) {
+      console.log(chalk.red('❌ Cycle detected:'), cycle.join(' → '));
+      process.exit(1);
+    }
+    console.log(chalk.green('✓ No cycles detected\n'));
+
+    // Show features by status
+    const pending = graph.getPendingFeatures();
+    const completed = graph.getAllFeatures().filter((f) => f.passes);
+
+    console.log(chalk.bold('Status:'));
+    console.log(`  Completed: ${chalk.green(completed.length)}`);
+    console.log(`  Pending: ${chalk.yellow(pending.length)}`);
+    console.log();
+
+    // Show ready tasks
+    const ready = graph.getReadyTasks();
+    console.log(chalk.bold('Ready to run (parallelizable):'));
+    if (ready.length === 0) {
+      console.log(chalk.dim('  None'));
+    } else {
+      for (const f of ready) {
+        const priority = criticalPath.getPriorityScore(f.id);
+        const onCritical = criticalPath.getCriticalPath().includes(f.id);
+        const critical = onCritical ? chalk.red(' [CRITICAL]') : '';
+        console.log(`  ${chalk.cyan(f.id)}: ${f.description}${critical} (priority: ${priority})`);
+      }
+    }
+    console.log();
+
+    // Show critical path
+    const path = criticalPath.getCriticalPath();
+    console.log(chalk.bold('Critical Path:'));
+    console.log(`  ${path.map((id) => chalk.red(id)).join(' → ')}`);
+    console.log();
+
+    // Show execution order
+    const order = graph.topologicalSort();
+    console.log(chalk.bold('Topological Order:'));
+    console.log(`  ${order.map((id) => graph.getFeature(id)?.passes ? chalk.green(id) : chalk.yellow(id)).join(' → ')}`);
+  });
+
+// Status command
+program
+  .command('status [features-path]')
+  .description('Show current progress status')
+  .action((featuresPath?: string) => {
+    const resolvedPath = resolveFeaturesPath(featuresPath);
+    const stateManager = new StateManager(resolvedPath);
+    const aiManager = new AIManager();
+
+    const config = stateManager.load();
+    const progress = stateManager.getProgress();
+
+    console.log(chalk.bold('\n📈 Harness Status\n'));
+    console.log(`Project: ${chalk.cyan(config.project)}`);
+    console.log(`Version: ${config.version}`);
+    console.log(`Last Updated: ${config.lastUpdated}`);
+    console.log();
+
+    // Progress bar
+    const pct = Math.round((progress.completed / progress.total) * 100);
+    const filled = Math.round(pct / 5);
+    const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+    console.log(`Progress: [${bar}] ${pct}%`);
+    console.log(`  ${chalk.green(progress.completed)} completed / ${chalk.yellow(progress.pending)} pending`);
+    console.log();
+
+    // Features list
+    console.log(chalk.bold('Features:'));
+    for (const f of config.features) {
+      const status = f.passes ? chalk.green('✓') : chalk.yellow('○');
+      const blockedBy = f.blockedBy
+        ? chalk.dim(` (blocked by: ${Array.isArray(f.blockedBy) ? f.blockedBy.join(', ') : f.blockedBy})`)
+        : '';
+      console.log(`  ${status} ${f.id}: ${f.description}${blockedBy}`);
+    }
+
+    // AI summary
+    console.log('\n' + aiManager.generateProgressSummary(config.features));
+  });
+
+// Orchestrate command
+program
+  .command('orchestrate [features-path]')
+  .description('Run full orchestration with parallel agents')
+  .option('-n, --max-agents <number>', 'Maximum concurrent agents', '3')
+  .option('-m, --model <model>', 'Default model (haiku, sonnet, opus)', 'sonnet')
+  .option('--dry-run', 'Show plan without executing')
+  .option('--timeout <ms>', 'Timeout per task in milliseconds', '600000')
+  .option('-d, --dashboard', 'Enable real-time dashboard UI')
+  .option('--no-costs', 'Disable cost estimates in dashboard')
+  .action(async (featuresPath: string | undefined, options) => {
+    const spinner = ora('Loading harness configuration...').start();
+
+    try {
+      const resolvedPath = resolveFeaturesPath(featuresPath);
+      const stateManager = new StateManager(resolvedPath);
+      const config = stateManager.load();
+
+      spinner.succeed('Configuration loaded');
+
+      const pending = config.features.filter((f) => !f.passes).length;
+
+      if (options.dryRun) {
+        console.log(chalk.yellow('\n🔍 Dry Run Mode\n'));
+        console.log('Would orchestrate with:');
+        console.log(`  Max agents: ${options.maxAgents}`);
+        console.log(`  Model: ${options.model}`);
+        console.log(`  Features: ${pending} pending`);
+        console.log(`  Dashboard: ${options.dashboard ? 'enabled' : 'disabled'}`);
+        return;
+      }
+
+      if (pending === 0) {
+        console.log(chalk.green('\n✅ All features are already complete!'));
+        return;
+      }
+
+      const orchestrator = new Orchestrator(resolvedPath, {
+        maxAgents: parseInt(options.maxAgents, 10),
+        model: options.model as ModelType,
+        timeout: parseInt(options.timeout, 10),
+      });
+
+      if (options.dashboard) {
+        // Use real-time dashboard
+        const dashboard = new Dashboard(config, {
+          liveRefresh: true,
+          showCosts: options.costs !== false,
+          maxAgents: parseInt(options.maxAgents, 10),
+        });
+        dashboard.setModel(options.model as 'haiku' | 'sonnet' | 'opus');
+        dashboard.attach(orchestrator);
+
+        const result = await orchestrator.run();
+        dashboard.renderFinalSummary();
+
+        if (result.failed > 0) {
+          process.exit(1);
+        }
+      } else {
+        // Classic output mode
+        console.log(chalk.bold('\n🚀 Starting Orchestration\n'));
+        console.log(`  Max agents: ${chalk.cyan(options.maxAgents)}`);
+        console.log(`  Model: ${chalk.cyan(options.model)}`);
+        console.log(`  Pending: ${chalk.yellow(pending)} features`);
+        console.log();
+
+        // Event handlers for progress display
+        orchestrator.on('taskDispatched', ({ taskId, feature }) => {
+          console.log(chalk.blue(`▶ Started ${taskId}: ${feature.description}`));
+        });
+
+        orchestrator.on('taskSucceeded', ({ taskId }) => {
+          console.log(chalk.green(`✓ Completed ${taskId}`));
+        });
+
+        orchestrator.on('taskFailed', ({ taskId, error }) => {
+          console.log(chalk.red(`✗ Failed ${taskId}: ${error}`));
+        });
+
+        orchestrator.on('deadlock', ({ pending }) => {
+          console.log(chalk.red(`\n⚠️  Deadlock detected! ${pending} tasks stuck.`));
+        });
+
+        orchestrator.on('shutdown', ({ signal }) => {
+          console.log(chalk.yellow(`\n⚠️  Received ${signal}, shutting down gracefully...`));
+        });
+
+        const runSpinner = ora('Running orchestration...').start();
+        const result = await orchestrator.run();
+        runSpinner.stop();
+
+        console.log(chalk.bold('\n📊 Results\n'));
+        console.log(`  Completed: ${chalk.green(result.completed)}`);
+        console.log(`  Failed: ${chalk.red(result.failed)}`);
+
+        if (result.failed === 0) {
+          console.log(chalk.green('\n✅ Orchestration completed successfully!'));
+        } else {
+          console.log(chalk.yellow(`\n⚠️  ${result.failed} task(s) failed.`));
+          process.exit(1);
+        }
+      }
+    } catch (error) {
+      spinner.fail('Orchestration failed');
+      console.error(error);
+      process.exit(1);
+    }
+  });
+
+// Dashboard command (standalone)
+program
+  .command('dashboard [features-path]')
+  .description('Show real-time dashboard (attaches to running orchestration)')
+  .option('--no-costs', 'Disable cost estimates')
+  .action((featuresPath: string | undefined, options) => {
+    const resolvedPath = resolveFeaturesPath(featuresPath);
+    const stateManager = new StateManager(resolvedPath);
+    const config = stateManager.load();
+
+    const dashboard = new Dashboard(config, {
+      liveRefresh: false,
+      showCosts: options.costs !== false,
+    });
+
+    dashboard.render();
+  });
+
+// Verify command
+program
+  .command('verify [features-path]')
+  .description('Verify feature completion and show verification status')
+  .option('-f, --feature <id>', 'Verify a specific feature')
+  .option('--all', 'Verify all completed features')
+  .action(async (featuresPath: string | undefined, options) => {
+    const resolvedPath = resolveFeaturesPath(featuresPath);
+    const verifier = new Verifier(resolvedPath);
+    const stateManager = new StateManager(resolvedPath);
+    const config = stateManager.load();
+
+    console.log(chalk.bold('\n🔍 Feature Verification\n'));
+
+    // Get git status
+    const gitStatus = verifier.getGitStatus();
+    if (gitStatus) {
+      console.log(chalk.bold('Git Status:'));
+      console.log(`  Branch: ${chalk.cyan(gitStatus.branch)}`);
+      console.log(`  Clean: ${gitStatus.isClean ? chalk.green('Yes') : chalk.yellow('No')}`);
+      if (gitStatus.ahead > 0 || gitStatus.behind > 0) {
+        console.log(`  Ahead: ${gitStatus.ahead}, Behind: ${gitStatus.behind}`);
+      }
+      console.log();
+    }
+
+    // List feature branches
+    const branches = verifier.listFeatureBranches();
+    if (branches.length > 0) {
+      console.log(chalk.bold('Feature Branches:'));
+      for (const branch of branches) {
+        const status = branch.isMerged ? chalk.green('merged') : chalk.yellow('pending');
+        console.log(`  ${branch.name} (${branch.featureId}) - ${status}`);
+      }
+      console.log();
+    }
+
+    // Verify features
+    const featuresToVerify = options.feature
+      ? config.features.filter(f => f.id === options.feature)
+      : options.all
+        ? config.features.filter(f => f.passes)
+        : config.features.filter(f => f.passes).slice(0, 5);
+
+    if (featuresToVerify.length === 0) {
+      console.log(chalk.dim('No features to verify'));
+      return;
+    }
+
+    console.log(chalk.bold('Verification Results:'));
+    for (const feature of featuresToVerify) {
+      const result = await verifier.verifyFeature(feature);
+      const icon = result.passed ? chalk.green('✓') : chalk.red('✗');
+      console.log(`\n${icon} ${chalk.bold(result.featureId)}: ${feature.description}`);
+      for (const check of result.checks) {
+        const checkIcon = check.passed ? chalk.green('✓') : chalk.red('✗');
+        console.log(`    ${checkIcon} ${check.name}: ${chalk.dim(check.details || '')}`);
+      }
+    }
+  });
+
+// Rollback command
+program
+  .command('rollback [features-path]')
+  .description('Rollback a feature to its previous state')
+  .requiredOption('-f, --feature <id>', 'Feature ID to rollback')
+  .option('--delete-remote', 'Also delete remote branch')
+  .action(async (featuresPath: string | undefined, options) => {
+    const resolvedPath = resolveFeaturesPath(featuresPath);
+    const verifier = new Verifier(resolvedPath);
+    const stateManager = new StateManager(resolvedPath);
+
+    const featureId = options.feature.toUpperCase();
+
+    console.log(chalk.bold(`\n🔄 Rolling back feature ${featureId}\n`));
+
+    const gitStatus = verifier.getGitStatus();
+    if (!gitStatus) {
+      console.log(chalk.red('Not a git repository. Cannot rollback.'));
+      process.exit(1);
+    }
+
+    const branches = verifier.listFeatureBranches();
+    const branch = branches.find(b => b.featureId === featureId);
+
+    if (!branch) {
+      console.log(chalk.yellow(`No branch found for feature ${featureId}`));
+      console.log('Available feature branches:');
+      for (const b of branches) {
+        console.log(`  - ${b.name} (${b.featureId})`);
+      }
+      return;
+    }
+
+    console.log(`Branch: ${chalk.cyan(branch.name)}`);
+    console.log(`Merged: ${branch.isMerged ? chalk.green('Yes') : chalk.yellow('No')}`);
+    console.log();
+
+    // Update state to mark as not complete
+    const config = stateManager.load();
+    const feature = config.features.find(f => f.id === featureId);
+    if (feature) {
+      feature.passes = false;
+      await stateManager.save(config);
+      console.log(chalk.green(`✓ Marked ${featureId} as incomplete in features.json`));
+    }
+
+    // Note: In a real implementation, we'd use the GitManager to delete the branch
+    console.log(chalk.dim(`To delete the branch manually: git branch -D ${branch.name}`));
+
+    console.log(chalk.green('\n✓ Rollback complete'));
+  });
+
+// Branches command
+program
+  .command('branches [features-path]')
+  .description('List and manage feature branches')
+  .option('--cleanup', 'Delete merged feature branches')
+  .action((featuresPath: string | undefined, options) => {
+    const resolvedPath = resolveFeaturesPath(featuresPath);
+    const verifier = new Verifier(resolvedPath);
+
+    const gitStatus = verifier.getGitStatus();
+    if (!gitStatus) {
+      console.log(chalk.red('Not a git repository.'));
+      process.exit(1);
+    }
+
+    console.log(chalk.bold('\n🌿 Feature Branches\n'));
+    console.log(`Current branch: ${chalk.cyan(gitStatus.branch)}`);
+    console.log();
+
+    const branches = verifier.listFeatureBranches();
+
+    if (branches.length === 0) {
+      console.log(chalk.dim('No feature branches found'));
+      return;
+    }
+
+    const merged = branches.filter(b => b.isMerged);
+    const pending = branches.filter(b => !b.isMerged);
+
+    if (pending.length > 0) {
+      console.log(chalk.bold('Pending (not merged):'));
+      for (const branch of pending) {
+        console.log(`  ${chalk.yellow('○')} ${branch.name} (${branch.featureId})`);
+      }
+      console.log();
+    }
+
+    if (merged.length > 0) {
+      console.log(chalk.bold('Merged:'));
+      for (const branch of merged) {
+        console.log(`  ${chalk.green('✓')} ${branch.name} (${branch.featureId})`);
+      }
+      console.log();
+    }
+
+    if (options.cleanup && merged.length > 0) {
+      console.log(chalk.bold('Cleaning up merged branches...'));
+      const deleted = verifier.cleanupMergedBranches();
+      console.log(chalk.green(`✓ Deleted ${deleted.length} branch(es)`));
+    } else if (merged.length > 0) {
+      console.log(chalk.dim(`Run with --cleanup to delete ${merged.length} merged branch(es)`));
+    }
+  });
+
+// Init command - bootstrap a new harness project
+program
+  .command('init [project-path]')
+  .description('Initialize a new harness project with standard structure')
+  .option('-n, --name <name>', 'Project name')
+  .option('--no-hooks', 'Skip generating hooks')
+  .option('--no-git', 'Skip git initialization')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+    const projectName = options.name || targetDir.split('/').pop() || 'my-project';
+
+    console.log(chalk.bold(`\n🚀 Initializing Harness Project: ${projectName}\n`));
+
+    const { existsSync, mkdirSync, writeFileSync } = await import('node:fs');
+
+    // Create directory if needed
+    if (!existsSync(targetDir)) {
+      mkdirSync(targetDir, { recursive: true });
+      console.log(chalk.green(`✓ Created directory: ${targetDir}`));
+    }
+
+    // 1. Generate features.json
+    const featuresPath = resolve(targetDir, 'features.json');
+    if (!existsSync(featuresPath)) {
+      const featuresTemplate = {
+        project: projectName,
+        version: '0.1.0',
+        description: `Harness configuration for ${projectName}`,
+        lastUpdated: new Date().toISOString().split('T')[0],
+        features: [
+          {
+            id: 'F001',
+            category: 'setup',
+            description: 'Project initialization and environment setup',
+            steps: [
+              'Verify development environment',
+              'Install dependencies',
+              'Configure build tools',
+              'Run initial build'
+            ],
+            passes: false,
+            blockedBy: null,
+            notes: 'First feature - no dependencies'
+          }
+        ]
+      };
+      writeFileSync(featuresPath, JSON.stringify(featuresTemplate, null, 2));
+      console.log(chalk.green('✓ Created features.json'));
+    } else {
+      console.log(chalk.yellow('○ features.json already exists, skipping'));
+    }
+
+    // 2. Generate claude-progress.txt
+    const progressPath = resolve(targetDir, 'claude-progress.txt');
+    if (!existsSync(progressPath)) {
+      const today = new Date().toISOString().split('T')[0];
+      const progressTemplate = `# ${projectName} - Progress Log
+
+## Project Goal
+[Describe the main objective of this project]
+
+---
+
+## Session 1 - ${today} - Project Initialization
+
+### Context
+Initial harness setup.
+
+### Completed ✅
+- Created harness structure with \`harness init\`
+- Generated features.json with initial feature
+
+### Current State
+| Feature | Status | Notes |
+|---------|--------|-------|
+| F001 | ○ Pending | Project setup |
+
+### Next Session Priorities
+1. Complete F001: Project initialization
+2. Add more features to features.json
+
+---
+
+## Quick Start for New Session
+
+\`\`\`bash
+# 1. Read current state
+harness status
+
+# 2. Work on next feature
+# ... implement ...
+
+# 3. Mark complete and commit
+# Update features.json: passes: true
+git add . && git commit -m "feat: F001 - description"
+
+# 4. Update this progress file
+\`\`\`
+`;
+      writeFileSync(progressPath, progressTemplate);
+      console.log(chalk.green('✓ Created claude-progress.txt'));
+    } else {
+      console.log(chalk.yellow('○ claude-progress.txt already exists, skipping'));
+    }
+
+    // 3. Generate CLAUDE.md
+    const claudeMdPath = resolve(targetDir, 'CLAUDE.md');
+    if (!existsSync(claudeMdPath)) {
+      const claudeMdTemplate = `# ${projectName} - AI Instructions
+
+## What is This?
+
+This project uses a **Harness** - a framework that enables AI agents to work on long tasks across multiple context windows/sessions.
+
+**Problem:** Each new Claude Code session starts with NO memory of previous sessions.
+**Solution:** State files persist context between sessions.
+
+---
+
+## Harness Protocol
+
+\`\`\`
+1. READ claude-progress.txt → understand current state
+2. READ features.json → find next feature (passes: false)
+3. IMPLEMENT the feature
+4. TEST the implementation
+5. UPDATE features.json → set passes: true
+6. UPDATE claude-progress.txt → add session notes
+7. COMMIT changes
+\`\`\`
+
+---
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| \`features.json\` | Feature definitions and status |
+| \`claude-progress.txt\` | Session history and notes |
+| \`CLAUDE.md\` | This file - AI instructions |
+
+---
+
+## Commands
+
+\`\`\`bash
+# Check status
+harness status
+
+# Analyze dependencies
+harness analyze
+
+# View dashboard
+harness dashboard
+\`\`\`
+
+---
+
+## Rules
+
+1. **One Feature Per Session**: Focus on a single feature to prevent context overflow
+2. **Always Update Progress**: Log what you did before ending session
+3. **Commit After Completion**: Each feature should result in a commit
+4. **Visual Testing**: Use Playwright MCP to verify UI changes
+`;
+      writeFileSync(claudeMdPath, claudeMdTemplate);
+      console.log(chalk.green('✓ Created CLAUDE.md'));
+    } else {
+      console.log(chalk.yellow('○ CLAUDE.md already exists, skipping'));
+    }
+
+    // 4. Generate init.sh
+    const initShPath = resolve(targetDir, 'init.sh');
+    if (!existsSync(initShPath)) {
+      const initShTemplate = `#!/bin/bash
+# ${projectName} - Development Environment Initialization
+# This script is run at the start of each harness session
+
+set -e
+
+echo "🚀 Initializing ${projectName} development environment..."
+
+# Check for required tools
+command -v node >/dev/null 2>&1 || { echo "❌ Node.js is required"; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "❌ Git is required"; exit 1; }
+
+# Install dependencies if needed
+if [ -f "package.json" ] && [ ! -d "node_modules" ]; then
+  echo "📦 Installing dependencies..."
+  npm install || bun install || yarn install
+fi
+
+# Start development server (customize as needed)
+# npm run dev &
+
+echo "✅ Environment ready!"
+`;
+      writeFileSync(initShPath, initShTemplate);
+      // Make executable
+      const { chmodSync } = await import('node:fs');
+      chmodSync(initShPath, '755');
+      console.log(chalk.green('✓ Created init.sh (executable)'));
+    } else {
+      console.log(chalk.yellow('○ init.sh already exists, skipping'));
+    }
+
+    // 5. Generate .claude directory with hooks (if not --no-hooks)
+    if (options.hooks !== false) {
+      const claudeDir = resolve(targetDir, '.claude');
+      const hooksDir = resolve(claudeDir, 'hooks');
+
+      if (!existsSync(claudeDir)) {
+        mkdirSync(claudeDir, { recursive: true });
+      }
+      if (!existsSync(hooksDir)) {
+        mkdirSync(hooksDir, { recursive: true });
+      }
+
+      // Generate settings.json using template
+      const settingsPath = resolve(claudeDir, 'settings.json');
+      if (!existsSync(settingsPath)) {
+        const settingsTemplate = getSettingsTemplate();
+        writeFileSync(settingsPath, JSON.stringify(settingsTemplate, null, 2));
+        console.log(chalk.green('✓ Created .claude/settings.json'));
+      }
+
+      // Generate all hooks using templates
+      const { chmodSync } = await import('node:fs');
+      const hookTemplates = getAllHookTemplates(projectName);
+
+      for (const hook of hookTemplates) {
+        const hookPath = resolve(hooksDir, hook.filename);
+        if (!existsSync(hookPath)) {
+          writeFileSync(hookPath, hook.content);
+          chmodSync(hookPath, '755');
+          console.log(chalk.green(`✓ Created .claude/hooks/${hook.filename}`));
+        } else {
+          console.log(chalk.yellow(`○ .claude/hooks/${hook.filename} already exists, skipping`));
+        }
+      }
+    }
+
+    // 6. Initialize git (if not --no-git)
+    if (options.git !== false) {
+      const gitDir = resolve(targetDir, '.git');
+      if (!existsSync(gitDir)) {
+        const { execSync } = await import('node:child_process');
+        try {
+          execSync('git init', { cwd: targetDir, stdio: 'pipe' });
+          console.log(chalk.green('✓ Initialized git repository'));
+        } catch {
+          console.log(chalk.yellow('○ Could not initialize git'));
+        }
+      } else {
+        console.log(chalk.yellow('○ Git already initialized'));
+      }
+    }
+
+    console.log(chalk.bold.green('\n✅ Harness initialized successfully!\n'));
+    console.log('Next steps:');
+    console.log(`  1. ${chalk.cyan('cd ' + (projectPath || '.'))}`)
+    console.log(`  2. ${chalk.cyan('harness status')} - View current state`);
+    console.log(`  3. Edit ${chalk.cyan('features.json')} to add your features`);
+    console.log(`  4. ${chalk.cyan('harness continue')} - Start working on features`);
+    console.log();
+  });
+
+// Continue command - the CORE harness command per Anthropic protocol
+program
+  .command('continue [project-path]')
+  .description('Continue working on the harness (Two-Agent Architecture per Anthropic)')
+  .option('-m, --model <model>', 'Model to use (haiku, sonnet, opus)', 'sonnet')
+  .option('--timeout <ms>', 'Timeout per feature in milliseconds', '600000')
+  .option('--dry-run', 'Show what would be done without executing')
+  .option('--init-only', 'Only run initializer, do not start coding agent')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+    const progressPath = resolve(targetDir, 'claude-progress.txt');
+    const featuresPath = resolve(targetDir, 'features.json');
+    const initShPath = resolve(targetDir, 'init.sh');
+
+    const { existsSync, readFileSync } = await import('node:fs');
+    const { execSync, spawn } = await import('node:child_process');
+
+    console.log(chalk.bold('\n🚀 Harness Continue\n'));
+    console.log(chalk.dim(`Project: ${targetDir}`));
+    console.log(chalk.dim(`Model: ${options.model}`));
+    console.log();
+
+    // Determine if this is first run (Initializer) or subsequent (Coding Agent)
+    const isFirstRun = !existsSync(progressPath);
+
+    if (isFirstRun) {
+      console.log(chalk.yellow('📋 First run detected - Initializer Agent mode\n'));
+
+      if (options.dryRun) {
+        console.log(chalk.cyan('Dry run: Would spawn Initializer Agent to:'));
+        console.log('  1. Create claude-progress.txt');
+        console.log('  2. Create init.sh if needed');
+        console.log('  3. Set up project structure');
+        return;
+      }
+
+      // Check if harness is already initialized
+      if (!existsSync(featuresPath)) {
+        console.log(chalk.yellow('⚠️  No harness structure found.'));
+        console.log();
+        console.log('Run the following to initialize:');
+        console.log(chalk.cyan(`  harness init ${projectPath || '.'}`));
+        return;
+      }
+
+      // Create initial progress file
+      console.log('Creating initial claude-progress.txt...');
+
+      // Read features to understand the project
+      const featuresData = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+      const projectName = featuresData.project || 'Project';
+
+      const today = new Date().toISOString().split('T')[0];
+      const initialProgress = `# ${projectName} - Progress Log
+
+## Project Goal
+${featuresData.description || '[Describe the main objective of this project]'}
+
+---
+
+## Session 1 - ${today} - Initializer Agent
+
+### Context
+Initial harness setup by Initializer Agent.
+
+### Completed ✅
+- Created claude-progress.txt
+- Verified harness structure exists
+
+### Current State
+| Feature | Status | Notes |
+|---------|--------|-------|
+${featuresData.features.slice(0, 10).map((f: { id: string; passes: boolean; description: string }) =>
+  `| ${f.id} | ${f.passes ? '✅ Complete' : '○ Pending'} | ${f.description.slice(0, 40)}... |`
+).join('\n')}
+
+### Next Session Priorities
+1. Work on first incomplete feature
+2. Run visual tests with Playwright MCP
+3. Commit changes after feature passes
+
+---
+
+## Quick Start for Coding Agent
+
+\`\`\`bash
+# 1. Read current state
+harness status
+
+# 2. Pick first incomplete feature from features.json
+# 3. Implement the feature
+# 4. Test with Playwright MCP
+
+# 5. Update features.json: passes: true
+# 6. Commit changes
+# 7. Run harness continue again
+\`\`\`
+`;
+
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(progressPath, initialProgress);
+      console.log(chalk.green('✓ Created claude-progress.txt'));
+
+      // Run init.sh if it exists
+      if (existsSync(initShPath)) {
+        console.log('Running init.sh...');
+        try {
+          execSync(`bash "${initShPath}"`, { cwd: targetDir, stdio: 'inherit' });
+          console.log(chalk.green('✓ init.sh completed'));
+        } catch (error) {
+          console.log(chalk.yellow('⚠️  init.sh had issues (non-fatal)'));
+        }
+      }
+
+      console.log(chalk.green('\n✅ Initialization complete!\n'));
+
+      if (options.initOnly) {
+        console.log('--init-only specified, stopping here.');
+        return;
+      }
+
+      console.log('Next: Spawning Coding Agent...\n');
+      // Fall through to coding agent
+    } else {
+      console.log(chalk.cyan('📝 Coding Agent mode\n'));
+    }
+
+    // CODING AGENT LOGIC
+
+    // 1. Read progress and features
+    if (!existsSync(featuresPath)) {
+      console.log(chalk.red('❌ features.json not found'));
+      return;
+    }
+
+    const featuresData = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+
+    // 2. Find next incomplete feature (highest priority)
+    const graph = new DependencyGraph(featuresData);
+    const readyTasks = graph.getReadyTasks();
+
+    if (readyTasks.length === 0) {
+      const pending = graph.getPendingFeatures();
+      if (pending.length === 0) {
+        console.log(chalk.green('🎉 All features are complete!'));
+        return;
+      } else {
+        console.log(chalk.yellow('⚠️  No features are ready to work on.'));
+        console.log(chalk.dim('All pending features are blocked by incomplete dependencies.'));
+        console.log();
+        console.log('Blocked features:');
+        for (const f of pending) {
+          const blockedBy = Array.isArray(f.blockedBy) ? f.blockedBy.join(', ') : f.blockedBy;
+          console.log(`  ${chalk.yellow('○')} ${f.id}: ${f.description}`);
+          console.log(chalk.dim(`      Blocked by: ${blockedBy}`));
+        }
+        return;
+      }
+    }
+
+    // Get critical path to prioritize
+    const criticalPath = new CriticalPath(graph);
+    const criticalPathIds = criticalPath.getCriticalPath();
+
+    // Sort ready tasks by priority (critical path first)
+    readyTasks.sort((a, b) => {
+      const aOnCritical = criticalPathIds.includes(a.id);
+      const bOnCritical = criticalPathIds.includes(b.id);
+      if (aOnCritical && !bOnCritical) return -1;
+      if (!aOnCritical && bOnCritical) return 1;
+      return criticalPath.getPriorityScore(b.id) - criticalPath.getPriorityScore(a.id);
+    });
+
+    const nextFeature = readyTasks[0];
+
+    console.log(chalk.bold('Next Feature to Work On:'));
+    console.log(`  ${chalk.cyan(nextFeature.id)}: ${nextFeature.description}`);
+    if (criticalPathIds.includes(nextFeature.id)) {
+      console.log(chalk.red('  [ON CRITICAL PATH]'));
+    }
+    console.log();
+
+    if (nextFeature.steps && nextFeature.steps.length > 0) {
+      console.log(chalk.bold('Steps:'));
+      for (let i = 0; i < nextFeature.steps.length; i++) {
+        console.log(`  ${i + 1}. ${nextFeature.steps[i]}`);
+      }
+      console.log();
+    }
+
+    if (options.dryRun) {
+      console.log(chalk.cyan('Dry run: Would spawn Claude to work on this feature.'));
+      console.log();
+      console.log('To execute, run without --dry-run:');
+      console.log(chalk.cyan(`  harness continue ${projectPath || ''}`));
+      return;
+    }
+
+    // 3. Spawn Claude agent to work on the feature
+    console.log(chalk.bold('Spawning Claude agent...\n'));
+
+    const prompt = `You are working on feature ${nextFeature.id}: "${nextFeature.description}".
+
+Current project: ${featuresData.project}
+Working directory: ${targetDir}
+
+IMPORTANT - Follow the Harness Protocol:
+1. Read claude-progress.txt to understand context
+2. Implement ONLY this ONE feature: ${nextFeature.id}
+3. Test with Playwright MCP (visual verification required!)
+4. Update features.json: set passes: true for ${nextFeature.id}
+5. Update claude-progress.txt with session notes
+6. Commit your changes with descriptive message
+
+Steps for this feature:
+${nextFeature.steps ? nextFeature.steps.map((s: string, i: number) => `${i + 1}. ${s}`).join('\n') : '(No specific steps defined)'}
+
+Notes: ${nextFeature.notes || '(none)'}
+
+Begin implementation now. Work autonomously until this feature is complete.`;
+
+    console.log(chalk.dim('Prompt:'));
+    console.log(chalk.dim('─'.repeat(60)));
+    console.log(chalk.dim(prompt.split('\n').map(l => '  ' + l).join('\n')));
+    console.log(chalk.dim('─'.repeat(60)));
+    console.log();
+
+    // Spawn Claude Code CLI
+    const claudeArgs = [
+      '--print',
+      '--dangerously-skip-permissions',
+      prompt
+    ];
+
+    console.log(chalk.dim(`Running: claude ${claudeArgs.slice(0, 2).join(' ')} "..."`));
+    console.log();
+
+    try {
+      const claudeProcess = spawn('claude', claudeArgs, {
+        cwd: targetDir,
+        stdio: 'inherit',
+        shell: true,
+      });
+
+      claudeProcess.on('error', (error) => {
+        console.log(chalk.red('\n❌ Failed to spawn Claude:'));
+        console.log(chalk.dim(error.message));
+        console.log();
+        console.log('Make sure Claude Code CLI is installed:');
+        console.log(chalk.cyan('  npm install -g @anthropic-ai/claude-code'));
+      });
+
+      claudeProcess.on('close', (code) => {
+        console.log();
+        if (code === 0) {
+          console.log(chalk.green('✅ Claude agent completed successfully'));
+          console.log();
+          console.log('Next steps:');
+          console.log(`  1. Verify ${chalk.cyan('features.json')} has ${nextFeature.id} marked as passes: true`);
+          console.log(`  2. Run ${chalk.cyan('harness continue')} to work on next feature`);
+        } else {
+          console.log(chalk.yellow(`⚠️  Claude agent exited with code ${code}`));
+          console.log();
+          console.log('The agent may have encountered an issue. Check:');
+          console.log(`  1. ${chalk.cyan('claude-progress.txt')} for session notes`);
+          console.log(`  2. Git status for any uncommitted changes`);
+          console.log(`  3. Run ${chalk.cyan('harness continue')} to retry`);
+        }
+      });
+    } catch (error) {
+      console.log(chalk.red('❌ Error spawning Claude:'));
+      console.log(chalk.dim(String(error)));
+    }
+  });
+
+// Session command - create new session entry in progress file
+program
+  .command('session [project-path]')
+  .description('Create a new session entry in claude-progress.txt')
+  .option('-t, --title <title>', 'Session title/description')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+    const progressPath = resolve(targetDir, 'claude-progress.txt');
+    const featuresPath = resolve(targetDir, 'features.json');
+
+    const { existsSync, readFileSync, appendFileSync } = await import('node:fs');
+
+    if (!existsSync(progressPath)) {
+      console.log(chalk.red('❌ claude-progress.txt not found'));
+      console.log(chalk.dim(`Expected at: ${progressPath}`));
+      console.log(chalk.dim('Run "harness init" first to create the harness structure.'));
+      process.exit(1);
+    }
+
+    // Read current progress to determine session number
+    const currentProgress = readFileSync(progressPath, 'utf-8');
+    const sessionMatches = currentProgress.match(/## Session (\d+)/g);
+    const nextSessionNum = sessionMatches ? sessionMatches.length + 1 : 1;
+
+    const today = new Date().toISOString().split('T')[0];
+    const title = options.title || 'New Session';
+
+    // Get feature status if available
+    let featureStatus = '';
+    if (existsSync(featuresPath)) {
+      try {
+        const featuresData = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+        const pending = featuresData.features.filter((f: { passes: boolean }) => !f.passes);
+        const completed = featuresData.features.filter((f: { passes: boolean }) => f.passes);
+
+        featureStatus = `
+### Current State
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+`;
+        for (const f of featuresData.features.slice(0, 10)) {
+          const status = f.passes ? '✅ Complete' : '🔓 Pending';
+          featureStatus += `| ${f.id} | ${status} | ${f.description.slice(0, 40)}... |\n`;
+        }
+        if (featuresData.features.length > 10) {
+          featureStatus += `| ... | ... | ${featuresData.features.length - 10} more features |\n`;
+        }
+
+        featureStatus += `
+### Summary
+- Completed: ${completed.length}
+- Pending: ${pending.length}
+`;
+      } catch {
+        featureStatus = '\n### Features\n(Unable to parse features.json)\n';
+      }
+    }
+
+    const sessionEntry = `
+---
+
+## Session ${nextSessionNum} - ${today} - ${title}
+
+### Context
+[Describe the goal of this session]
+
+### Completed ✅
+- [List completed tasks]
+
+### In Progress 🔄
+- [List tasks in progress]
+
+### Blocked ⚠️
+- [List blocked tasks and why]
+${featureStatus}
+### Next Session Priorities
+1. [Priority 1]
+2. [Priority 2]
+3. [Priority 3]
+
+`;
+
+    appendFileSync(progressPath, sessionEntry);
+
+    console.log(chalk.green(`\n✅ Created Session ${nextSessionNum} in claude-progress.txt\n`));
+    console.log(chalk.dim(`Title: ${title}`));
+    console.log(chalk.dim(`Date: ${today}`));
+    console.log();
+    console.log('Next steps:');
+    console.log(`  1. Edit ${chalk.cyan('claude-progress.txt')} to fill in session details`);
+    console.log(`  2. Work on features from ${chalk.cyan('features.json')}`);
+    console.log(`  3. Run ${chalk.cyan('harness log "message"')} to add quick notes`);
+  });
+
+// Log command - append quick note to progress file
+program
+  .command('log <message>')
+  .description('Append a quick note to claude-progress.txt')
+  .option('-p, --path <path>', 'Path to project directory', '.')
+  .action(async (message: string, options) => {
+    const targetDir = resolve(options.path);
+    const progressPath = resolve(targetDir, 'claude-progress.txt');
+
+    const { existsSync, appendFileSync } = await import('node:fs');
+
+    if (!existsSync(progressPath)) {
+      console.log(chalk.red('❌ claude-progress.txt not found'));
+      console.log(chalk.dim(`Expected at: ${progressPath}`));
+      process.exit(1);
+    }
+
+    const timestamp = new Date().toISOString().replace('T', ' ').split('.')[0];
+    const logEntry = `- [${timestamp}] ${message}\n`;
+
+    appendFileSync(progressPath, logEntry);
+
+    console.log(chalk.green('✓ Added to progress log:'));
+    console.log(chalk.dim(`  ${logEntry.trim()}`));
+  });
+
+// Progress command - show parsed progress file
+program
+  .command('progress [project-path]')
+  .description('Display parsed progress file with statistics')
+  .option('--sessions <n>', 'Show last N sessions', '3')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+    const progressPath = resolve(targetDir, 'claude-progress.txt');
+
+    const { existsSync, readFileSync } = await import('node:fs');
+
+    if (!existsSync(progressPath)) {
+      console.log(chalk.red('❌ claude-progress.txt not found'));
+      console.log(chalk.dim(`Expected at: ${progressPath}`));
+      process.exit(1);
+    }
+
+    const content = readFileSync(progressPath, 'utf-8');
+
+    // Parse sessions
+    const sessionRegex = /## Session (\d+) - (\d{4}-\d{2}-\d{2}) - (.+)/g;
+    const sessions: Array<{ num: number; date: string; title: string }> = [];
+    let match;
+
+    while ((match = sessionRegex.exec(content)) !== null) {
+      sessions.push({
+        num: parseInt(match[1], 10),
+        date: match[2],
+        title: match[3].trim(),
+      });
+    }
+
+    console.log(chalk.bold('\n📜 Progress Log Summary\n'));
+
+    // Show statistics
+    console.log(chalk.bold('Statistics:'));
+    console.log(`  Total sessions: ${chalk.cyan(sessions.length)}`);
+    if (sessions.length > 0) {
+      console.log(`  First session: ${chalk.dim(sessions[0].date)}`);
+      console.log(`  Last session: ${chalk.dim(sessions[sessions.length - 1].date)}`);
+    }
+    console.log();
+
+    // Show recent sessions
+    const numToShow = Math.min(parseInt(options.sessions, 10), sessions.length);
+    const recentSessions = sessions.slice(-numToShow);
+
+    console.log(chalk.bold(`Recent Sessions (last ${numToShow}):`));
+    for (const session of recentSessions) {
+      console.log(`  ${chalk.cyan(`Session ${session.num}`)} - ${session.date}`);
+      console.log(`    ${chalk.dim(session.title)}`);
+    }
+    console.log();
+
+    // Count completed items
+    const completedMatches = content.match(/^- \[?✅?\]?\s*.+$/gm);
+    const inProgressMatches = content.match(/^- \[?🔄?\]?\s*.+$/gm);
+
+    if (completedMatches || inProgressMatches) {
+      console.log(chalk.bold('Task Summary:'));
+      console.log(`  Completed items: ${chalk.green(completedMatches?.length || 0)}`);
+      console.log(`  In progress: ${chalk.yellow(inProgressMatches?.length || 0)}`);
+    }
+  });
+
+// ============================================================================
+// VISUAL TESTING COMMANDS (O018)
+// ============================================================================
+
+// Test command - generate visual testing commands for a feature
+program
+  .command('test [project-path]')
+  .description('Generate visual testing commands for Playwright MCP')
+  .option('-f, --feature <id>', 'Feature ID to test')
+  .option('--url <url>', 'URL to test (default: http://localhost:5173)')
+  .option('--checklist', 'Generate QA checklist instead of commands')
+  .option('--setup', 'Generate .mcp.json configuration')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+    const featuresPath = resolve(targetDir, 'features.json');
+
+    console.log(chalk.bold('\n📸 Visual Testing\n'));
+
+    // Generate .mcp.json setup if requested
+    if (options.setup) {
+      const mcpConfig = getMcpConfig();
+      const mcpPath = resolve(targetDir, '.mcp.json');
+
+      const { existsSync, writeFileSync } = await import('node:fs');
+
+      if (existsSync(mcpPath)) {
+        console.log(chalk.yellow('○ .mcp.json already exists'));
+      } else {
+        writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2));
+        console.log(chalk.green('✓ Created .mcp.json with Playwright MCP configuration'));
+      }
+      console.log();
+      console.log('Configuration:');
+      console.log(chalk.dim(JSON.stringify(mcpConfig, null, 2)));
+      return;
+    }
+
+    const { existsSync, readFileSync } = await import('node:fs');
+
+    // Load features to find the one to test
+    let featureId = options.feature;
+    let featureDescription = 'Feature';
+
+    if (existsSync(featuresPath)) {
+      const featuresData = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+
+      if (!featureId) {
+        // Find first incomplete feature
+        const graph = new DependencyGraph(featuresData);
+        const readyTasks = graph.getReadyTasks();
+        if (readyTasks.length > 0) {
+          featureId = readyTasks[0].id;
+          featureDescription = readyTasks[0].description;
+          console.log(chalk.dim(`Auto-selected feature: ${featureId}`));
+        }
+      } else {
+        const feature = featuresData.features?.find((f: { id: string }) => f.id === featureId);
+        if (feature) {
+          featureDescription = feature.description;
+
+          // Check if this feature requires visual testing
+          const needsVisual = requiresVisualTesting(feature.category || '', feature.steps);
+          if (!needsVisual) {
+            console.log(chalk.dim(`Note: Feature ${featureId} may not require visual testing`));
+            console.log(chalk.dim(`Category: ${feature.category || 'unknown'}`));
+          }
+        }
+      }
+    }
+
+    if (!featureId) {
+      featureId = 'FEATURE';
+      console.log(chalk.yellow('No feature specified, using generic template'));
+    }
+
+    console.log(`Feature: ${chalk.cyan(featureId)} - ${featureDescription}`);
+    console.log();
+
+    if (options.checklist) {
+      // Generate QA checklist
+      console.log(chalk.bold('QA Checklist:'));
+      console.log(chalk.dim('─'.repeat(60)));
+      console.log(generateQAChecklist(featureId, featureDescription));
+    } else {
+      // Generate Playwright MCP commands
+      console.log(chalk.bold('Playwright MCP Commands:'));
+      console.log(chalk.dim('─'.repeat(60)));
+      console.log(generateVisualTestCommands(featureId, {
+        url: options.url || 'http://localhost:5173',
+        screenshotDir: 'screenshots',
+        devServerCommand: 'bun run dev',
+        devServerTimeout: 10000,
+        pageTimeout: 30000,
+      }));
+    }
+
+    console.log();
+    console.log(chalk.bold('Quick Reference:'));
+    console.log(`  ${chalk.cyan('harness test --checklist')} - Full QA checklist`);
+    console.log(`  ${chalk.cyan('harness test --setup')} - Generate .mcp.json`);
+    console.log(`  ${chalk.cyan('harness test -f F001')} - Commands for specific feature`);
+  });
+
+// ============================================================================
+// COMMIT WORKFLOW COMMANDS (O019)
+// ============================================================================
+
+// Commit command - validate and prepare commit following harness protocol
+program
+  .command('commit [project-path]')
+  .description('Validate and prepare commit following harness protocol')
+  .requiredOption('-f, --feature <id>', 'Feature ID being committed')
+  .option('-m, --message <msg>', 'Custom commit message')
+  .option('--type <type>', 'Commit type (feat, fix, docs, refactor, test, chore)', 'feat')
+  .option('--dry-run', 'Show what would be committed without executing')
+  .option('--force', 'Skip validation checks (not recommended)')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+    const featuresPath = resolve(targetDir, 'features.json');
+    const featureId = options.feature.toUpperCase();
+
+    console.log(chalk.bold('\n🔐 Commit Workflow\n'));
+    console.log(`Feature: ${chalk.cyan(featureId)}`);
+    console.log(`Directory: ${chalk.dim(targetDir)}`);
+    console.log();
+
+    // 1. Check if feature is ready for commit
+    const readyCheck = checkFeatureReadyForCommit(featureId, targetDir);
+
+    console.log(chalk.bold('Pre-Commit Checks:'));
+    for (const check of readyCheck.checks) {
+      const icon = check.passed ? chalk.green('✓') : chalk.red('✗');
+      console.log(`  ${icon} ${check.name}`);
+      console.log(chalk.dim(`      ${check.message}`));
+    }
+    console.log();
+
+    if (!readyCheck.ready && !options.force) {
+      console.log(chalk.red('❌ Feature is not ready for commit\n'));
+      console.log('Fix the issues above, or use --force to skip checks (not recommended).');
+      console.log();
+      console.log('Common fixes:');
+      console.log(`  1. Update ${chalk.cyan('features.json')}: set passes: true for ${featureId}`);
+      console.log(`  2. Update ${chalk.cyan('claude-progress.txt')}: add session notes`);
+      console.log(`  3. Stage files: ${chalk.cyan('git add .')}`);
+      process.exit(1);
+    }
+
+    if (!readyCheck.ready && options.force) {
+      console.log(chalk.yellow('⚠️  Forcing commit despite failed checks\n'));
+    }
+
+    // 2. Get feature description for commit message
+    const { existsSync, readFileSync } = await import('node:fs');
+    let description = 'implementation';
+
+    if (existsSync(featuresPath)) {
+      const featuresData = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+      const feature = featuresData.features?.find((f: { id: string }) => f.id === featureId);
+      if (feature) {
+        description = feature.description;
+      }
+    }
+
+    // 3. Generate commit command
+    const commitType = options.type as 'feat' | 'fix' | 'docs' | 'refactor' | 'test' | 'chore';
+    const commitCommand = generateGitCommitCommand(featureId, options.message || description, commitType);
+
+    // 4. Show git status
+    const staged = getStagedFiles(targetDir);
+    const unstaged = getUnstagedFiles(targetDir);
+    const untracked = getUntrackedFiles(targetDir);
+
+    console.log(chalk.bold('Git Status:'));
+    if (staged.length > 0) {
+      console.log(chalk.green('  Staged:'));
+      for (const file of staged.slice(0, 10)) {
+        console.log(chalk.green(`    + ${file}`));
+      }
+      if (staged.length > 10) {
+        console.log(chalk.dim(`    ... and ${staged.length - 10} more`));
+      }
+    }
+    if (unstaged.length > 0) {
+      console.log(chalk.yellow('  Modified (not staged):'));
+      for (const file of unstaged.slice(0, 5)) {
+        console.log(chalk.yellow(`    M ${file}`));
+      }
+      if (unstaged.length > 5) {
+        console.log(chalk.dim(`    ... and ${unstaged.length - 5} more`));
+      }
+    }
+    if (untracked.length > 0) {
+      console.log(chalk.dim('  Untracked:'));
+      for (const file of untracked.slice(0, 5)) {
+        console.log(chalk.dim(`    ? ${file}`));
+      }
+      if (untracked.length > 5) {
+        console.log(chalk.dim(`    ... and ${untracked.length - 5} more`));
+      }
+    }
+    console.log();
+
+    if (options.dryRun) {
+      console.log(chalk.cyan('Dry run - would execute:\n'));
+      console.log(chalk.dim('─'.repeat(60)));
+      console.log(commitCommand);
+      console.log(chalk.dim('─'.repeat(60)));
+      return;
+    }
+
+    // 5. Execute commit
+    console.log(chalk.bold('Commit Command:'));
+    console.log(chalk.dim('─'.repeat(60)));
+    console.log(commitCommand);
+    console.log(chalk.dim('─'.repeat(60)));
+    console.log();
+
+    console.log(chalk.yellow('To execute this commit, run the command above.'));
+    console.log(chalk.dim('(Auto-commit disabled for safety - review the command first)'));
+  });
+
+// Pre-commit check command (can be used as git hook)
+program
+  .command('pre-commit [project-path]')
+  .description('Run pre-commit validation (for git hooks)')
+  .option('-f, --feature <id>', 'Feature ID to validate')
+  .action(async (projectPath: string | undefined, options) => {
+    const targetDir = resolve(projectPath || '.');
+
+    // Try to detect feature from recent changes or branch name
+    let featureId = options.feature;
+
+    if (!featureId) {
+      // Try to get from git branch name
+      const { execSync } = await import('node:child_process');
+      try {
+        const branch = execSync('git branch --show-current', {
+          cwd: targetDir,
+          encoding: 'utf-8',
+        }).trim();
+
+        // Extract feature ID from branch name (e.g., "feature/F001-description" → "F001")
+        const match = branch.match(/([A-Z]\d{3})/);
+        if (match) {
+          featureId = match[1];
+        }
+      } catch {
+        // Ignore git errors
+      }
+    }
+
+    if (!featureId) {
+      console.log(chalk.yellow('⚠️  Could not determine feature ID'));
+      console.log(chalk.dim('Use --feature <id> to specify, or name your branch with feature ID'));
+      process.exit(0); // Don't block commit
+    }
+
+    const readyCheck = checkFeatureReadyForCommit(featureId, targetDir);
+
+    if (!readyCheck.ready) {
+      console.log(chalk.red(`\n❌ Pre-commit check failed for ${featureId}\n`));
+      for (const check of readyCheck.checks.filter(c => !c.passed)) {
+        console.log(chalk.red(`  ✗ ${check.name}: ${check.message}`));
+      }
+      process.exit(1);
+    }
+
+    console.log(chalk.green(`✓ Pre-commit check passed for ${featureId}`));
+    process.exit(0);
+  });
+
+program.parse();

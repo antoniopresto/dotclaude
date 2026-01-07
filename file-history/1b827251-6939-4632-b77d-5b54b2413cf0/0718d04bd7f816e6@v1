@@ -1,0 +1,1495 @@
+# MMS DEMO PLAYBOOK
+
+> Documento único de referência para criação da demo de sistema de gestão de frota ferroviária (MMS).
+> 
+> **Objetivo:** Ganhar licitação impressionando cliente em 3 meses de desenvolvimento.
+
+---
+
+## Índice
+
+1. [Contexto e Objetivo](#1-contexto-e-objetivo)
+2. [Domínio Ferroviário (Discovery)](#2-domínio-ferroviário-discovery)
+3. [Análise de Mercado](#3-análise-de-mercado)
+4. [Estratégia da Demo](#4-estratégia-da-demo)
+5. [Requisitos Funcionais](#5-requisitos-funcionais)
+6. [Requisitos Não-Funcionais](#6-requisitos-não-funcionais)
+7. [UX/UI Specification](#7-uxui-specification)
+8. [Arquitetura Técnica](#8-arquitetura-técnica)
+9. [Dados e Seed](#9-dados-e-seed)
+10. [Cronograma](#10-cronograma)
+11. [Riscos e Mitigações](#11-riscos-e-mitigações)
+12. [Roteiro de Apresentação](#12-roteiro-de-apresentação)
+13. [Apêndices](#13-apêndices)
+
+---
+
+## 1. Contexto e Objetivo
+
+### 1.1 Situação
+
+Empresa de desenvolvimento de software, referência de mercado mas **não especialista em sistemas ferroviários**, participa de licitação para construir sistema de gestão de frota (MMS - Maintenance Management System).
+
+### 1.2 Objetivo
+
+Criar demo funcional em **3 meses** que:
+- Demonstre competência técnica
+- Prove entendimento do domínio ferroviário
+- Impressione decisores (Diretor de Operações, CTO do cliente)
+
+### 1.3 Métrica de Sucesso
+
+> Após 15 minutos de demo, o cliente pensa: **"Eles entendem nosso problema melhor que os outros."**
+
+### 1.4 O Que Este Projeto NÃO É
+
+| Não É | Justificativa |
+|-------|---------------|
+| Sistema de produção | Demo para licitação, não operação real |
+| MVP completo | Foco em impressionar, não em feature completeness |
+| Integração real com EAM | Dados mockados são suficientes |
+| Solução de todos os problemas | Resolver 1 dor bem > 10 dores mal |
+
+---
+
+## 2. Domínio Ferroviário (Discovery)
+
+> **LEITURA OBRIGATÓRIA** para todos os membros da equipe antes de iniciar qualquer trabalho.
+
+### 2.1 Glossário Essencial
+
+| Termo | Definição | Uso no Sistema |
+|-------|-----------|----------------|
+| **Rolling Stock** | Material rodante (trens, locomotivas, vagões) | Entidade principal gerenciada |
+| **Consist** | Composição de unidades formando um trem | Um "trem" pode ter múltiplas unidades |
+| **Married Pair** | Unidades mecanicamente inseparáveis | Não podem ser alocadas separadamente |
+| **Dead Running** | Deslocamento sem passageiros/carga | Custo a minimizar |
+| **Shunting** | Manobra de trens no pátio/depot | Consome 15-30 min + custo |
+| **LMD** | Light Maintenance Depot | Manutenção leve (PM1, PM2) |
+| **HMD** | Heavy Maintenance Depot | Manutenção pesada (overhaul) |
+| **PM** | Preventive Maintenance | Manutenção preventiva programada |
+| **HM** | Heavy Maintenance | Manutenção pesada |
+| **Wheelset** | Conjunto roda + eixo | Componente mais crítico para balanceamento |
+| **Bogie** | Truque (estrutura com rodas) | Maior MTTR, ponto de falha |
+| **Timetable** | Grade horária fixa de serviços | Já existe, MMS não cria |
+| **Service/Run** | Um trajeto específico no timetable | MMS aloca trem a serviço |
+| **Aptitude/Homologation** | Certificação de trem para rota/país | Restrição hard de alocação |
+
+### 2.2 Entidades do Negócio
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        MODELO CONCEITUAL                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────┐ pertence a  ┌─────────┐  possui   ┌────────────┐  │
+│  │  TRAIN  │────────────▶│  DEPOT  │◀──────────│  CAPACITY  │  │
+│  └────┬────┘             └─────────┘           └────────────┘  │
+│       │                                                         │
+│       │ executa                                                 │
+│       ▼                                                         │
+│  ┌─────────┐  parte de   ┌───────────┐                         │
+│  │ SERVICE │────────────▶│ TIMETABLE │                         │
+│  └────┬────┘             └───────────┘                         │
+│       │                                                         │
+│       │ acumula                                                 │
+│       ▼                                                         │
+│  ┌─────────┐  dispara    ┌─────────────┐  ocorre em            │
+│  │MILEAGE  │────────────▶│ MAINTENANCE │───────────▶ DEPOT     │
+│  └─────────┘             └─────────────┘                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Relacionamentos Críticos
+
+| Relação | Cardinalidade | Regra de Negócio |
+|---------|---------------|------------------|
+| Train → Depot | N:1 | Trem tem depot "casa" |
+| Train → Service | N:M | Um trem executa vários serviços; serviço pode ter trens diferentes em dias diferentes |
+| Train → Maintenance | 1:N | Trem tem histórico de manutenções |
+| Depot → Capacity | 1:1 | Cada depot tem capacidade limitada |
+| Service → Timetable | N:1 | Serviços pertencem a um timetable |
+
+### 2.3 Ciclo de Vida do Trem
+
+```
+    ┌──────────────────────────────────────────────────────────┐
+    │                    CICLO OPERACIONAL                     │
+    │                                                          │
+    │   ┌─────────┐    ┌─────────┐    ┌─────────┐             │
+    │   │  DEPOT  │───▶│ SERVICE │───▶│  DEPOT  │             │
+    │   │ (start) │    │  (run)  │    │  (end)  │             │
+    │   └─────────┘    └─────────┘    └────┬────┘             │
+    │                                      │                   │
+    │        ┌─────────────────────────────┘                   │
+    │        │                                                 │
+    │        ▼                                                 │
+    │   ┌─────────┐    ┌─────────┐    ┌─────────┐             │
+    │   │  CHECK  │───▶│  MAINT  │───▶│ RETURN  │             │
+    │   │ (need?) │    │  (fix)  │    │ (ready) │             │
+    │   └─────────┘    └─────────┘    └─────────┘             │
+    │                                                          │
+    └──────────────────────────────────────────────────────────┘
+```
+
+#### Intervalos Típicos de Manutenção
+
+| Nível | Intervalo | Duração | Lead Time | Local |
+|-------|-----------|---------|-----------|-------|
+| PM1 | 10.000-30.000 km | 4-8 horas | 1-2 semanas | LMD |
+| PM2 | 60.000-120.000 km | 1-3 dias | 2-4 semanas | LMD |
+| HM | 6-12 anos | 2-6 semanas | 6-12 meses | HMD |
+| Overhaul | 12-20 anos | 2-6 meses | 12-24 meses | HMD |
+
+### 2.4 Unknown Unknowns (Descobertas Críticas)
+
+> Itens que não são óbvios mas que, se ignorados, podem invalidar o sistema.
+
+#### 2.4.1 Wheelset (Rodeiro)
+
+| Fato | Implicação |
+|------|------------|
+| Flange < 28.5mm = reprofiling obrigatório | Constraint hard |
+| Desgaste é **não-linear** | Balancear só km total é insuficiente |
+| Curvas e clima aceleram degradação | Deve ponderar por perfil de rota |
+| Intervalo típico: ~60.000 km | Mais frequente que PM2 |
+
+#### 2.4.2 Bogie (Truque)
+
+| Fato | Implicação |
+|------|------------|
+| Componentes em série | Single point of failure |
+| MTTR: 4-72 horas | Maior impacto em disponibilidade |
+| Sistemas wayside (TBOGI) detectam degradação | Se cliente tem, integrar para predição |
+
+#### 2.4.3 Consist (Composição)
+
+| Fato | Implicação |
+|------|------------|
+| Trens são composições (A+B) | Não tratar "trem" como átomo |
+| Married pairs são inseparáveis | Modelo deve rastrear integridade |
+| Acoplamento/desacoplamento tem custo | Considerar em otimização |
+
+#### 2.4.4 Identificação de Trens
+
+| Fato | Implicação |
+|------|------------|
+| ID operacional muda em fronteiras | Separar `physical_asset_id` de `operational_number` |
+| Número UIC é padrão europeu | Usar como ID canônico se aplicável |
+
+#### 2.4.5 Crew (Tripulação)
+
+| Fato | Implicação |
+|------|------------|
+| Alocação de trem é interdependente com crew | Plano "perfeito" falha sem motorista |
+| Route knowledge: motorista só opera rotas conhecidas | Constraint de habilitação |
+| Traction knowledge: certificação por tipo de trem | Outra constraint |
+| Hours of Service: limites legais | Constraint temporal |
+| Operational times ignorados: sign-on (15-30min), walk (5-15min), preparation (10-20min), securing (5-15min) | Adiciona 30-60 min/serviço |
+
+**Para Demo:** Modelar crew como constraint simplificada (disponibilidade por depot/turno). Integração completa em fase futura.
+
+#### 2.4.6 Shunting (Manobra)
+
+| Fato | Implicação |
+|------|------------|
+| Mover trem dentro de depot: 15-30 min | Planos que ignoram ficam inexequíveis |
+| Custo: ~€350/manobra | Deve minimizar |
+
+#### 2.4.7 Homologações
+
+| Fato | Implicação |
+|------|------------|
+| Trem certificado por país/rede | Aptidão é matriz (trem × rede × tipo serviço) |
+| Não é boolean simples | Modelo de dados deve suportar |
+
+#### 2.4.8 Infrastructure Windows
+
+| Fato | Implicação |
+|------|------------|
+| Trilhos têm manutenção própria | Rota pode estar bloqueada mesmo com trem disponível |
+| Geralmente informado com antecedência | Integrar como constraint de rota |
+
+### 2.5 O Que o Sistema NÃO Faz
+
+| Responsabilidade | Quem Define | MMS Apenas... |
+|------------------|-------------|---------------|
+| Intervalos de manutenção | Fabricante / Regulador | Otimiza DENTRO da janela |
+| Timetable (grade horária) | Planejamento de Transporte | Aloca trem a serviço existente |
+| Rotas | Infraestrutura | Usa rotas como input |
+| Capacidade de depot | Engenharia | Respeita como constraint |
+
+### 2.6 Modelo Mental Correto
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     HIERARQUIA DE DECISÃO                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ESTRATÉGICO (meses-anos)          OPERACIONAL (dias-semanas)  │
+│  ┌─────────────────────┐           ┌─────────────────────┐     │
+│  │ Quando cada trem    │           │ Qual trem executa   │     │
+│  │ entra em manutenção │──────────▶│ qual serviço hoje   │     │
+│  │ (macro schedule)    │ restringe │ (alocação diária)   │     │
+│  └─────────────────────┘           └─────────────────────┘     │
+│           │                                   │                 │
+│           │ feedback se                       │                 │
+│           │ inviável                          │                 │
+│           └───────────────────────────────────┘                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Análise de Mercado
+
+### 3.1 Concorrentes Principais
+
+#### Tier 1 — Enterprise Rail
+
+| Sistema | Empresa | Forças | Fraquezas |
+|---------|---------|--------|-----------|
+| **DELMIA Quintiq** | Dassault | Líder de mercado, solução end-to-end, otimização avançada | Custo muito alto, implementação 12-24 meses, lock-in |
+| **zedas®asset** | ZEDAS | Especialista em ECM compliance, forte na Alemanha | Menos flexível, foco em compliance mais que otimização |
+| **Railfleet** | Railnova | UX moderna, foco em telemetria e IoT | Não foca em otimização de alocação |
+| **TRACS-RS** | Tracsis | Rolling stock diagrams, forte no UK | Regional, menos internacional |
+
+#### Tier 2 — EAM Genérico
+
+| Sistema | Empresa | Forças | Fraquezas |
+|---------|---------|--------|-----------|
+| **Maximo for Transportation** | IBM | Maduro, enterprise-grade | Genérico, requer heavy customization |
+| **SAP PM / S/4HANA** | SAP | Integração com ecossistema SAP | Não é rail-specific |
+
+### 3.2 Gap de Mercado
+
+| Observação | Oportunidade |
+|------------|--------------|
+| Nenhuma solução open-source para rail | Diferenciação se considerar modelo aberto |
+| Balanceamento de km não é feature primária | Pode ser diferencial |
+| UX geralmente datada | Interface moderna impressiona |
+| Integração Manutenção ↔ Operações fraca | Interface unificada é diferencial |
+
+### 3.3 Padrões Visuais do Mercado
+
+Elementos comuns em sistemas de referência:
+
+| Elemento | Uso | Exemplo |
+|----------|-----|---------|
+| Traffic-light status | Estado rápido (verde/amarelo/vermelho) | Saúde do trem, ocupação depot |
+| Depot cards | Cartões com gauge de ocupação | Dashboard principal |
+| Gantt interativo | Timeline de manutenção com drag-drop | Planejamento |
+| Mapa com clustering | Posição de trens, zoom agrupa | Visão operacional |
+| Feed de alertas | Lista em tempo real | Sidebar ou modal |
+| Drill-down | Frota → Trem → Componente → Histórico | Navegação padrão |
+
+### 3.4 Diferencial Proposto para MMS
+
+| Diferencial | Por Que Importa |
+|-------------|-----------------|
+| Balanceamento de km como objetivo primário | Concorrentes tratam como secundário |
+| Interface unificada Manutenção ↔ Operações | Elimina silos, reduz retrabalho |
+| Dead running cost visível | Custo oculto tornado explícito |
+| What-if simulation acessível | Decisores podem "brincar" |
+| Justificativa visível das decisões | Confiança, não caixa-preta |
+
+---
+
+## 4. Estratégia da Demo
+
+### 4.1 Princípio Fundamental
+
+> **Profundidade > Amplitude**
+>
+> Resolver UMA dor muito bem impressiona mais que 20 features superficiais.
+
+**Dor escolhida:** Balanceamento de quilometragem da frota.
+
+- Visualmente claro (gráficos comparativos)
+- Impacto financeiro óbvio (vida útil, TCO)
+- Diferencial competitivo (concorrentes não focam)
+
+### 4.2 Wow Moments (O Que Fica na Memória)
+
+| Momento | Quando | Efeito no Cliente |
+|---------|--------|-------------------|
+| Mapa com trens "vivos" | Início da demo | "Eles entendem nossa operação" |
+| Simulação interativa | Meio da demo | Cliente se sente dono, interage |
+| Justificativa de decisão | Fim da demo | "Não é caixa-preta, posso confiar" |
+| Terminologia correta | Durante toda demo | "Eles conhecem nosso negócio" |
+
+### 4.3 Checklist de Credibilidade
+
+| Item | Status | Responsável |
+|------|--------|-------------|
+| Glossário dominado pela equipe | ☐ | Todos |
+| Seed data com nomes plausíveis | ☐ | Dev dados |
+| Km e intervalos realistas | ☐ | Dev dados |
+| Terminologia correta na UI | ☐ | Designer |
+| FAQ de domínio preparado | ☐ | PO |
+| Consultor de domínio consultado | ☐ | PO |
+
+### 4.4 O Que Evitar (Anti-patterns)
+
+| Anti-pattern | Por Que É Fatal | Mitigação |
+|--------------|-----------------|-----------|
+| UI genérica | "Parece qualquer sistema" | Elementos específicos de rail |
+| Dados fake óbvios | "Train 1, Train 2, Depot A" | Nomes e números realistas |
+| Caixa-preta | "Por que recomendou isso?" | Justificativa sempre visível |
+| Features demais, rasas | "Não funciona de verdade" | Foco em 1 fluxo completo |
+| Loading lento | "Sistema não escala" | Otimizar para demo |
+| Bug durante apresentação | "Não estão prontos" | Ensaio exaustivo |
+
+### 4.5 Escopo IN (Fazer)
+
+| Feature | Prioridade | Justificativa |
+|---------|------------|---------------|
+| Dashboard com KPIs | Must | Primeira impressão |
+| Mapa com posição de trens | Must | Wow visual |
+| Visualização de balanceamento km | Must | Dor principal |
+| Motor de alocação funcionando | Must | Prova de capacidade técnica |
+| Simulação de cenários | Must | Interação com cliente |
+| Justificativa de recomendações | Must | Confiança |
+| Gantt de manutenção | Should | Expectativa do mercado |
+| Alertas visuais | Should | Demonstra proatividade |
+| Export PDF/Excel | Could | Nice-to-have |
+
+### 4.6 Escopo OUT (Não Fazer)
+
+| Feature | Por Que Fora | Quando Incluir |
+|---------|--------------|----------------|
+| Otimização MILP (longo prazo) | Complexidade, 3 meses insuficientes | Fase 2 |
+| Integração real com EAM | Depende de ambiente cliente | Fase 2 |
+| Disruption management | Arquitetura diferente, escopo enorme | Fase 3 |
+| Crew scheduling integrado | Dobra complexidade | Fase 3 |
+| Mobile nativo | Web responsivo suficiente | Se cliente exigir |
+| Multi-idioma | Inglês suficiente para demo | Produção |
+
+---
+
+## 5. Requisitos Funcionais
+
+### 5.1 Módulos e Features
+
+#### 5.1.1 Dashboard (Must Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| KPIs de frota | Total de trens, disponíveis, em manutenção, % utilização | Números atualizados em < 5s |
+| Ocupação de depots | Gauge por depot mostrando ocupação atual vs capacidade | Visual tipo velocímetro |
+| Alertas ativos | Lista dos alertas críticos (sobre/sub-rodagem, manutenção próxima) | Ordenado por criticidade |
+| Variância de km | Indicador de distribuição de km na frota | Verde (< 10%), amarelo (10-20%), vermelho (> 20%) |
+
+#### 5.1.2 Mapa (Must Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| Posição de trens | Ícones no mapa mostrando localização | Pode ser última posição conhecida |
+| Depots | Marcadores de depots com ocupação | Click abre detalhes |
+| Rotas | Linhas conectando pontos | Simplificado para demo |
+| Clustering | Agrupamento em zoom out | Número indica quantidade |
+
+**Nota:** Para demo, posições podem ser simuladas/mockadas. Não requer integração GPS real.
+
+#### 5.1.3 Balanceamento de Km (Must Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| Gráfico de distribuição | Histogram ou box plot da frota | Mostra média, outliers |
+| Ranking de trens | Lista ordenada por km (sobre/sub-rodados) | Top 10 cada extremo |
+| Tendência | Gráfico temporal mostrando evolução | Últimos 6 meses |
+| Drill-down | Click em trem abre detalhes | Histórico de km e serviços |
+
+#### 5.1.4 Alocação (Must Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| Input de requisitos | Selecionar serviço e data | Form simples |
+| Recomendação rankeada | Lista de trens ordenada por adequação | Top 5 com scores |
+| Justificativa | Por que cada trem foi rankeado assim | Texto legível |
+| Aplicar alocação | Confirmar escolha | Atualiza estado |
+
+**Exemplo de Justificativa:**
+```
+Recomendação: Trem T-1234 para Serviço S-789
+
+Razões:
+• Km 12% abaixo da média da frota (prioridade para balanceamento)
+• Serviço termina a 5km do depot de manutenção
+• PM prevista em 3 dias, depot destino tem slot disponível
+• Aptidão confirmada para rota Lisboa-Porto
+
+Score: 94/100
+```
+
+#### 5.1.5 Simulação / What-If (Must Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| Criar cenário | Duplicar estado atual para sandbox | Cenário isolado |
+| Modificar parâmetros | Alterar alocações, datas de manutenção | Interface drag-drop ou form |
+| Comparar resultados | Side-by-side de KPIs | Tabela comparativa |
+| Projeção | Mostrar impacto em 30/60/90 dias | Gráficos de tendência |
+
+#### 5.1.6 Gantt de Manutenção (Should Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| Timeline visual | Barras por trem mostrando manutenções | Scroll horizontal |
+| Drag-drop | Mover manutenção para outra data | Atualiza e valida conflitos |
+| Cores por tipo | PM1, PM2, HM diferenciados | Legenda visível |
+| Conflitos | Destaque visual se depot cheio | Borda vermelha |
+
+#### 5.1.7 Alertas (Should Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| Feed em tempo real | Lista de alertas atualizando | WebSocket ou polling 30s |
+| Categorias | Sobre-rodagem, sub-rodagem, manutenção, capacidade | Filtro por tipo |
+| Ação rápida | Link para resolver (ir para trem, alocação) | 1 click |
+
+#### 5.1.8 Export (Could Have)
+
+| Feature | Descrição | Critério de Aceite |
+|---------|-----------|-------------------|
+| PDF | Relatório de estado da frota | Layout profissional |
+| Excel | Dados de km e manutenções | Colunas organizadas |
+
+### 5.2 User Stories Principais
+
+```
+US-01: Como Planejador, quero visualizar a distribuição de km da frota 
+       para identificar trens sobre/sub-rodados.
+
+US-02: Como Planejador, quero receber recomendação de qual trem alocar 
+       a um serviço, com justificativa visível.
+
+US-03: Como Planejador, quero simular cenários de alocação para comparar 
+       impacto antes de decidir.
+
+US-04: Como Dispatcher, quero ver posição atual dos trens no mapa 
+       para decisões rápidas.
+
+US-05: Como Gestor, quero dashboard com KPIs para visão executiva 
+       sem precisar navegar em múltiplas telas.
+
+US-06: Como Planejador, quero ver timeline de manutenção em Gantt 
+       para identificar conflitos de capacidade.
+```
+
+---
+
+## 6. Requisitos Não-Funcionais
+
+### 6.1 Performance
+
+| Requisito | Target | Justificativa |
+|-----------|--------|---------------|
+| Tempo de alocação | < 30 segundos para 100 trens | Dispatcher não espera |
+| Carregamento de tela | < 3 segundos | Credibilidade |
+| Atualização de mapa | < 5 segundos | Sensação de "tempo real" |
+| Simulação de cenário | < 10 segundos | Interatividade |
+
+### 6.2 Escalabilidade (para Demo)
+
+| Dimensão | Target Demo | Produção (futuro) |
+|----------|-------------|-------------------|
+| Trens | 80-120 | 500+ |
+| Depots | 12-15 | 50+ |
+| Serviços/dia | 200-300 | 2000+ |
+| Usuários simultâneos | 5-10 | 100+ |
+
+### 6.3 Disponibilidade
+
+Para demo: **N/A** — não é sistema de produção.
+
+Requisito real: **Funcionar 15 minutos sem crash durante apresentação.**
+
+### 6.4 Segurança
+
+Para demo: **Mínima** — autenticação básica suficiente.
+
+### 6.5 Dados
+
+| Requisito | Especificação |
+|-----------|---------------|
+| Seed data | 80-120 trens, 12-15 depots, 6 meses de histórico |
+| Realismo | Nomes plausíveis, km coerentes, intervalos corretos |
+| Reset | Capacidade de resetar para estado inicial da demo |
+
+---
+
+## 7. UX/UI Specification
+
+### 7.1 Personas
+
+#### Persona 1: Planejador de Manutenção
+
+| Atributo | Valor |
+|----------|-------|
+| Nome | Paulo, 45 anos |
+| Objetivo | Agendar manutenções minimizando impacto operacional |
+| Frequência | Diário, 4-8 horas no sistema |
+| Dispositivo | Desktop, monitor grande |
+| Frustrações | Excel, falta de visibilidade, retrabalho |
+| Requisito crítico | Gantt com drag-drop |
+
+#### Persona 2: Dispatcher (Controlador de Operações)
+
+| Atributo | Valor |
+|----------|-------|
+| Nome | Diana, 38 anos |
+| Objetivo | Alocar trens a serviços em tempo real |
+| Frequência | Contínuo durante turno |
+| Dispositivo | Desktop, múltiplos monitores |
+| Frustrações | Sistema lento, falta de informação |
+| Requisito crítico | Response < 3 segundos |
+
+#### Persona 3: Gestor de Frota
+
+| Atributo | Valor |
+|----------|-------|
+| Nome | Gabriel, 52 anos |
+| Objetivo | Monitorar KPIs, tomar decisões estratégicas |
+| Frequência | Semanal, 30-60 minutos |
+| Dispositivo | Desktop ou tablet |
+| Frustrações | Dados dispersos, falta de drill-down |
+| Requisito crítico | Dashboard com visão executiva |
+
+### 7.2 Jornadas Críticas
+
+#### Jornada 1: Alocar Trem a Serviço
+
+```
+1. Dispatcher recebe demanda (serviço X precisa de trem)
+2. Abre tela de Alocação
+3. Seleciona serviço e data
+4. Sistema mostra recomendações rankeadas com justificativa
+5. Dispatcher revisa top 3 opções
+6. Seleciona trem preferido
+7. Confirma alocação
+8. Sistema atualiza estado e notifica
+
+Tempo esperado: < 2 minutos
+Clicks: < 5
+```
+
+#### Jornada 2: Identificar e Resolver Desbalanceamento
+
+```
+1. Planejador abre Dashboard
+2. Vê indicador de variância de km em amarelo/vermelho
+3. Clica para ver detalhes de balanceamento
+4. Identifica trens mais sub-rodados
+5. Abre simulação de cenário
+6. Ajusta alocações futuras para priorizar sub-rodados
+7. Compara impacto projetado
+8. Aplica mudanças
+
+Tempo esperado: < 10 minutos
+```
+
+#### Jornada 3: Planejar Manutenção
+
+```
+1. Planejador abre Gantt de manutenção
+2. Vê próximas 4 semanas
+3. Identifica conflito (depot cheio em semana 2)
+4. Drag-drop de uma manutenção para semana 3
+5. Sistema valida (sem conflito)
+6. Salva alteração
+
+Tempo esperado: < 5 minutos
+```
+
+### 7.3 Padrões de UI
+
+#### 7.3.1 Layout Geral
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  HEADER: Logo | Navegação | Alertas (badge) | User         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────┐  ┌───────────────────────────────────────┐│
+│  │             │  │                                       ││
+│  │  SIDEBAR    │  │           MAIN CONTENT                ││
+│  │             │  │                                       ││
+│  │  - Dashboard│  │                                       ││
+│  │  - Frota    │  │                                       ││
+│  │  - Alocação │  │                                       ││
+│  │  - Manutenç.│  │                                       ││
+│  │  - Simulação│  │                                       ││
+│  │  - Relatóri.│  │                                       ││
+│  │             │  │                                       ││
+│  └─────────────┘  └───────────────────────────────────────┘│
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.2 Componentes Reutilizáveis
+
+| Componente | Uso | Props Principais |
+|------------|-----|------------------|
+| `<StatusBadge>` | Indicador verde/amarelo/vermelho | status, label |
+| `<DepotCard>` | Card de depot com gauge | name, capacity, current |
+| `<TrainRow>` | Linha de trem em lista | train, km, status, actions |
+| `<KPICard>` | Card de métrica | title, value, trend, icon |
+| `<GanttBar>` | Barra no timeline | start, end, type, draggable |
+| `<MapMarker>` | Marcador no mapa | position, type, tooltip |
+| `<JustificationCard>` | Explicação de recomendação | reasons[], score |
+
+#### 7.3.3 Cores e Semântica
+
+| Cor | Uso | Hex |
+|-----|-----|-----|
+| Verde | OK, dentro do esperado | #22C55E |
+| Amarelo | Atenção, próximo do limite | #EAB308 |
+| Vermelho | Crítico, ação necessária | #EF4444 |
+| Azul | Informação, links | #3B82F6 |
+| Cinza | Neutro, desabilitado | #6B7280 |
+
+### 7.4 Anti-patterns a Evitar
+
+| Anti-pattern | Problema | Solução |
+|--------------|----------|---------|
+| Dashboard read-only | Planejador não pode agir | Ações inline |
+| Loading spinner > 3s | Parece lento | Skeleton + progressive loading |
+| Dados sem contexto | "150.000 km" — é bom ou ruim? | Comparar com média, mostrar status |
+| Modal sobre modal | UX confusa | Máximo 1 nível de modal |
+| Tabelas gigantes | Scroll infinito | Paginação + filtros + busca |
+| Gráficos decorativos | Não informam | Todo gráfico deve ter ação associada |
+
+### 7.5 Wireframes de Referência
+
+> **Nota:** Criar wireframes em Figma baseados nas seguintes referências de mercado:
+> - Railnova Railfleet (dashboard moderno)
+> - DELMIA Quintiq (Gantt avançado)
+> - Google Maps (clustering de marcadores)
+
+#### Dashboard — Estrutura
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  KPI Cards (4 colunas)                                      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐       │
+│  │ Total    │ │ Dispon.  │ │ Em Manut.│ │ Variância│       │
+│  │ 112      │ │ 98 (87%) │ │ 14       │ │ 18% ⚠️   │       │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘       │
+├─────────────────────────────────────────────────────────────┤
+│  ┌────────────────────────┐  ┌────────────────────────────┐│
+│  │                        │  │                            ││
+│  │       MAPA             │  │     ALERTAS                ││
+│  │    (posição trens)     │  │   (feed em tempo real)     ││
+│  │                        │  │                            ││
+│  └────────────────────────┘  └────────────────────────────┘│
+├─────────────────────────────────────────────────────────────┤
+│  Depot Cards (scroll horizontal)                            │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐           │
+│  │ Depot A │ │ Depot B │ │ Depot C │ │ Depot D │ ...       │
+│  │ 12/15   │ │ 8/10    │ │ 20/20 🔴│ │ 5/12    │           │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 8. Arquitetura Técnica
+
+### 8.1 Visão Geral
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        ARQUITETURA MMS DEMO                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────┐                                               │
+│   │   BROWSER   │                                               │
+│   │  (Next.js)  │                                               │
+│   └──────┬──────┘                                               │
+│          │ HTTP/WS                                              │
+│          ▼                                                      │
+│   ┌─────────────┐         ┌─────────────┐                      │
+│   │   API       │         │   SOLVER    │                      │
+│   │  (Fastify)  │◄───────▶│  (Python)   │                      │
+│   └──────┬──────┘  gRPC   └─────────────┘                      │
+│          │                       │                              │
+│          ▼                       │                              │
+│   ┌─────────────┐               │                              │
+│   │    CACHE    │               │                              │
+│   │   (Redis)   │               │                              │
+│   └──────┬──────┘               │                              │
+│          │                       │                              │
+│          ▼                       ▼                              │
+│   ┌─────────────────────────────────────┐                      │
+│   │            DATABASE                  │                      │
+│   │    (PostgreSQL + TimescaleDB)        │                      │
+│   └─────────────────────────────────────┘                      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 Stack Tecnológico
+
+| Camada | Tecnologia | Justificativa |
+|--------|------------|---------------|
+| Frontend | Next.js 14 + React 18 + TypeScript | SSR, produtividade, tipagem |
+| Styling | Tailwind CSS + shadcn/ui | Componentes prontos, consistência |
+| State | Zustand ou React Query | Simplicidade |
+| API | Node.js + Fastify + TypeScript | Performance, tipagem nativa |
+| Solver | Python 3.11 + OR-Tools | Biblioteca de otimização madura |
+| Database | PostgreSQL 16 | Confiável, JSONB para flexibilidade |
+| Time-series | TimescaleDB | Se precisar de histórico de telemetria |
+| Cache | Redis | Session state, filas, pub/sub para alertas |
+| Monorepo | Turborepo | Builds incrementais |
+| Maps | Mapbox ou Leaflet | Mapbox mais bonito, Leaflet gratuito |
+| Charts | Recharts ou Chart.js | Integração React |
+| Gantt | react-gantt-timeline ou custom | Avaliar libs existentes |
+
+### 8.3 Modelo de Dados
+
+#### 8.3.1 Entidades Principais
+
+```sql
+-- Trem (ativo físico)
+CREATE TABLE trains (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    physical_asset_id VARCHAR(50) UNIQUE NOT NULL,  -- ID permanente
+    operational_number VARCHAR(50),                  -- Pode mudar
+    train_type VARCHAR(50) NOT NULL,
+    home_depot_id UUID REFERENCES depots(id),
+    current_depot_id UUID REFERENCES depots(id),
+    total_km DECIMAL(12,2) DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'available',          -- available, in_service, maintenance, out_of_service
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Depot
+CREATE TABLE depots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(20) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    type VARCHAR(20) NOT NULL,                       -- LMD, HMD
+    capacity INTEGER NOT NULL,
+    latitude DECIMAL(10,7),
+    longitude DECIMAL(10,7),
+    valid_from DATE DEFAULT CURRENT_DATE,
+    valid_to DATE DEFAULT '9999-12-31',              -- Temporal versioning
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Serviço (do timetable)
+CREATE TABLE services (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    service_number VARCHAR(50) NOT NULL,
+    origin_depot_id UUID REFERENCES depots(id),
+    destination_depot_id UUID REFERENCES depots(id),
+    distance_km DECIMAL(10,2) NOT NULL,
+    departure_time TIME NOT NULL,
+    arrival_time TIME NOT NULL,
+    days_of_week INTEGER[] DEFAULT '{1,2,3,4,5,6,7}',
+    train_type_required VARCHAR(50),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Alocação (trem → serviço)
+CREATE TABLE allocations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id UUID REFERENCES trains(id) NOT NULL,
+    service_id UUID REFERENCES services(id) NOT NULL,
+    date DATE NOT NULL,
+    status VARCHAR(20) DEFAULT 'planned',            -- planned, confirmed, completed, cancelled
+    allocated_by VARCHAR(50),                        -- user or 'system'
+    allocation_reason JSONB,                         -- Justificativa
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(service_id, date)
+);
+
+-- Manutenção
+CREATE TABLE maintenances (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id UUID REFERENCES trains(id) NOT NULL,
+    depot_id UUID REFERENCES depots(id) NOT NULL,
+    type VARCHAR(20) NOT NULL,                       -- PM1, PM2, HM, OVERHAUL
+    scheduled_date DATE NOT NULL,
+    scheduled_duration_hours INTEGER NOT NULL,
+    actual_start TIMESTAMPTZ,
+    actual_end TIMESTAMPTZ,
+    status VARCHAR(20) DEFAULT 'scheduled',          -- scheduled, in_progress, completed, cancelled
+    km_at_maintenance DECIMAL(12,2),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Histórico de km (para análise temporal)
+CREATE TABLE mileage_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id UUID REFERENCES trains(id) NOT NULL,
+    date DATE NOT NULL,
+    km_accumulated DECIMAL(12,2) NOT NULL,
+    km_delta DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(train_id, date)
+);
+
+-- Aptidões (homologações)
+CREATE TABLE train_aptitudes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id UUID REFERENCES trains(id) NOT NULL,
+    network VARCHAR(50) NOT NULL,                    -- 'Portugal', 'Spain', etc.
+    service_type VARCHAR(50) NOT NULL,               -- 'passenger', 'freight', 'high_speed'
+    valid_from DATE NOT NULL,
+    valid_to DATE DEFAULT '9999-12-31',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Planos de manutenção (versionados)
+CREATE TABLE maintenance_plans (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_type VARCHAR(50) NOT NULL,
+    maintenance_type VARCHAR(20) NOT NULL,
+    interval_km DECIMAL(10,2),
+    interval_days INTEGER,
+    tolerance_percent DECIMAL(5,2) DEFAULT 10,
+    duration_hours INTEGER NOT NULL,
+    version INTEGER DEFAULT 1,
+    valid_from DATE DEFAULT CURRENT_DATE,
+    valid_to DATE DEFAULT '9999-12-31',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+#### 8.3.2 Decisões Críticas de Modelagem
+
+| Decisão | Escolha | Justificativa |
+|---------|---------|---------------|
+| ID de trem | UUID + physical_asset_id separado | Operational number muda |
+| Km | DECIMAL(12,2) | Evita erro de arredondamento |
+| Timestamps | TIMESTAMPTZ (sempre UTC) | Operações cross-timezone |
+| Depot | Temporal versioning | Depots mudam ao longo do tempo |
+| Aptidão | Tabela separada (matriz) | Não é boolean simples |
+| Justificativa de alocação | JSONB | Estrutura flexível |
+
+### 8.4 Solver (Motor de Otimização)
+
+#### 8.4.1 Tecnologia
+
+- **Biblioteca:** Google OR-Tools (CP-SAT solver)
+- **Linguagem:** Python
+- **Comunicação:** gRPC com API Node.js
+
+#### 8.4.2 Modelo de Otimização (Simplificado para Demo)
+
+**Variáveis de decisão:**
+- `x[t,s]` ∈ {0,1}: trem `t` é alocado ao serviço `s`
+
+**Função objetivo (minimizar):**
+```
+minimize:
+    α * variância_km                    -- Balanceamento
+  + β * Σ dead_running_km              -- Deslocamentos vazios
+  + γ * Σ (km_acima_media)²            -- Penaliza sobre-rodagem
+```
+
+**Constraints (restrições):**
+```
+1. Cada serviço tem exatamente 1 trem
+   Σ_t x[t,s] = 1  ∀s
+
+2. Trem só pode fazer 1 serviço por vez (sem overlap temporal)
+   
+3. Trem deve estar disponível (não em manutenção)
+   
+4. Trem deve ter aptidão para a rota
+   
+5. Depot de destino do serviço anterior = depot de origem do próximo
+   (ou contabilizar dead running)
+
+6. Capacidade de depot respeitada
+```
+
+#### 8.4.3 API do Solver
+
+```python
+# solver/service.py
+
+from ortools.sat.python import cp_model
+from dataclasses import dataclass
+
+@dataclass
+class AllocationRequest:
+    services: list[Service]
+    trains: list[Train]
+    date: str
+    constraints: dict
+
+@dataclass
+class AllocationResult:
+    allocations: list[Allocation]
+    score: float
+    solve_time_ms: int
+    justifications: dict[str, list[str]]
+
+def solve_allocation(request: AllocationRequest) -> AllocationResult:
+    model = cp_model.CpModel()
+    
+    # Criar variáveis
+    x = {}
+    for t in request.trains:
+        for s in request.services:
+            x[t.id, s.id] = model.NewBoolVar(f'x_{t.id}_{s.id}')
+    
+    # Adicionar constraints
+    # ... (implementação detalhada)
+    
+    # Resolver
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30
+    status = solver.Solve(model)
+    
+    # Extrair resultados e justificativas
+    # ...
+    
+    return AllocationResult(...)
+```
+
+#### 8.4.4 Geração de Justificativas
+
+```python
+def generate_justification(train: Train, service: Service, context: dict) -> list[str]:
+    reasons = []
+    
+    fleet_avg_km = context['fleet_avg_km']
+    km_diff_pct = (train.total_km - fleet_avg_km) / fleet_avg_km * 100
+    
+    if km_diff_pct < -10:
+        reasons.append(f"Km {abs(km_diff_pct):.0f}% abaixo da média (prioridade para balanceamento)")
+    elif km_diff_pct > 10:
+        reasons.append(f"⚠️ Km {km_diff_pct:.0f}% acima da média")
+    
+    if service.destination_depot_id == train.next_maintenance_depot_id:
+        reasons.append("Serviço termina próximo ao depot de manutenção")
+    
+    if train.days_to_maintenance <= 7:
+        reasons.append(f"Manutenção prevista em {train.days_to_maintenance} dias")
+    
+    return reasons
+```
+
+### 8.5 API Backend
+
+#### 8.5.1 Endpoints Principais
+
+| Método | Endpoint | Descrição |
+|--------|----------|-----------|
+| GET | `/api/dashboard` | KPIs agregados |
+| GET | `/api/trains` | Lista de trens com filtros |
+| GET | `/api/trains/:id` | Detalhes de um trem |
+| GET | `/api/depots` | Lista de depots |
+| GET | `/api/services` | Lista de serviços |
+| POST | `/api/allocations/recommend` | Solicita recomendação do solver |
+| POST | `/api/allocations` | Confirma alocação |
+| GET | `/api/maintenances` | Lista de manutenções |
+| PATCH | `/api/maintenances/:id` | Atualiza manutenção (reagendar) |
+| POST | `/api/simulations` | Cria cenário de simulação |
+| GET | `/api/simulations/:id/compare` | Compara com baseline |
+
+#### 8.5.2 Exemplo de Response (Recomendação)
+
+```json
+{
+  "service": {
+    "id": "srv-789",
+    "number": "IC 501",
+    "origin": "Lisboa Santa Apolónia",
+    "destination": "Porto Campanhã",
+    "distance_km": 336
+  },
+  "recommendations": [
+    {
+      "rank": 1,
+      "train": {
+        "id": "trn-1234",
+        "number": "UTE 3400-012",
+        "type": "Intercidades",
+        "current_km": 142350.5,
+        "fleet_avg_km": 161200.0
+      },
+      "score": 94,
+      "justifications": [
+        "Km 12% abaixo da média da frota (prioridade para balanceamento)",
+        "Serviço termina a 5km do depot de manutenção",
+        "PM1 prevista em 3 dias, depot Porto tem slot disponível",
+        "Aptidão confirmada para linha do Norte"
+      ]
+    },
+    {
+      "rank": 2,
+      "train": { "..." },
+      "score": 87,
+      "justifications": ["..."]
+    }
+  ],
+  "solve_time_ms": 2340
+}
+```
+
+### 8.6 Cache Strategy
+
+| Dado | TTL | Invalidação |
+|------|-----|-------------|
+| Lista de trens | 5 min | On update |
+| KPIs dashboard | 1 min | On allocation |
+| Posição de trens | 30 seg | Polling |
+| Resultado de solver | 10 min | Por request hash |
+
+### 8.7 Comunicação API ↔ Solver
+
+**Opção escolhida:** gRPC
+
+**Justificativa:**
+- Tipagem forte (protobuf)
+- Performance superior a REST para dados complexos
+- Suporte a streaming (útil para progresso de solver)
+
+**Fallback:** REST com timeout de 45 segundos.
+
+```protobuf
+// solver.proto
+service AllocationSolver {
+    rpc Recommend(AllocationRequest) returns (AllocationResponse);
+    rpc Simulate(SimulationRequest) returns (SimulationResponse);
+}
+
+message AllocationRequest {
+    repeated Service services = 1;
+    repeated Train trains = 2;
+    string date = 3;
+    Constraints constraints = 4;
+}
+```
+
+---
+
+## 9. Dados e Seed
+
+### 9.1 Visão Geral
+
+| Entidade | Quantidade | Notas |
+|----------|------------|-------|
+| Trens | 100 | Mix de tipos |
+| Depots | 14 | 10 LMD + 4 HMD |
+| Serviços | 250/dia | Timetable fictício realista |
+| Histórico de km | 6 meses | Para gráficos de tendência |
+| Manutenções | 200 | Históricas + futuras |
+
+### 9.2 Dados de Trens
+
+#### 9.2.1 Tipos de Trem
+
+| Tipo | Quantidade | Intervalo PM1 | Intervalo PM2 |
+|------|------------|---------------|---------------|
+| Intercidades | 35 | 15.000 km | 90.000 km |
+| Regional | 40 | 12.000 km | 75.000 km |
+| Suburbano | 25 | 10.000 km | 60.000 km |
+
+#### 9.2.2 Exemplo de Seed (Trens)
+
+```json
+[
+  {
+    "physical_asset_id": "UTE-3400-001",
+    "operational_number": "IC-3401",
+    "train_type": "Intercidades",
+    "home_depot_id": "depot-lisboa-sta-apolonia",
+    "total_km": 187420.50,
+    "status": "available"
+  },
+  {
+    "physical_asset_id": "UTE-2200-015",
+    "operational_number": "R-2215",
+    "train_type": "Regional",
+    "home_depot_id": "depot-porto-campanha",
+    "total_km": 98320.75,
+    "status": "available"
+  }
+]
+```
+
+### 9.3 Dados de Depots
+
+| Código | Nome | Tipo | Capacidade | Lat/Long |
+|--------|------|------|------------|----------|
+| LSA | Lisboa Santa Apolónia | LMD | 15 | 38.7139, -9.1225 |
+| PCA | Porto Campanhã | LMD | 12 | 41.1496, -8.5856 |
+| ENT | Entroncamento | HMD | 25 | 39.4653, -8.4683 |
+| CBR | Coimbra-B | LMD | 8 | 40.2262, -8.4390 |
+| FAR | Faro | LMD | 6 | 37.0194, -7.9322 |
+| ... | ... | ... | ... | ... |
+
+### 9.4 Cenário Inicial para Demo
+
+Para que a demo seja impactante, o seed deve criar um estado "problemático" que o sistema resolve:
+
+| Condição | Valor | Por Que |
+|----------|-------|---------|
+| Variância de km | 22% | Acima do ideal (< 10%), mostra problema |
+| Trens sobre-rodados | 15 | Top 15% da frota |
+| Trens sub-rodados | 12 | Bottom 12% da frota |
+| Depot quase cheio | 2 | LSA e PCA em 90%+ |
+| Manutenções próximas | 8 | Nos próximos 7 dias |
+
+### 9.5 Script de Seed
+
+```bash
+# Localização: scripts/seed.ts
+
+# Executar seed
+pnpm seed
+
+# Reset para estado inicial
+pnpm seed:reset
+
+# Seed parcial (apenas trens)
+pnpm seed:trains
+```
+
+---
+
+## 10. Cronograma
+
+### 10.1 Visão Geral (12 Semanas)
+
+```
+Semana  1  2  3  4  5  6  7  8  9  10 11 12
+        ├──┴──┼──┴──┼──┴──┼──┴──┼──┴──┼──┴──┤
+        │SETUP│CORE │FRONT│INTEG│VALID│DEMO │
+        │     │     │     │     │     │     │
+```
+
+### 10.2 Detalhamento por Sprint
+
+#### Sprint 1 (Semanas 1-2): Setup + Imersão
+
+| Entregável | Responsável | Definition of Done |
+|------------|-------------|-------------------|
+| Monorepo configurado | Tech Lead | Turborepo + packages + CI |
+| Modelo de dados | Backend | Migrations PostgreSQL |
+| Seed básico | Backend | 50 trens, 10 depots |
+| Design system | Designer | Cores, tipografia, componentes base |
+| Imersão de domínio | Todos | Glossário dominado |
+
+**Milestone:** Ambiente de desenvolvimento funcional.
+
+#### Sprint 2 (Semanas 3-4): Core Solver
+
+| Entregável | Responsável | Definition of Done |
+|------------|-------------|-------------------|
+| Solver básico | Backend/Python | Alocação para 100 trens < 30s |
+| API de alocação | Backend | Endpoint funcionando |
+| Justificativas | Backend | 3+ razões por recomendação |
+| Testes do solver | Backend | Cobertura 80% |
+
+**Milestone:** Motor de alocação funcionando via API.
+
+#### Sprint 3 (Semanas 5-6): Frontend Base
+
+| Entregável | Responsável | Definition of Done |
+|------------|-------------|-------------------|
+| Dashboard | Frontend | KPIs + alertas + depot cards |
+| Mapa | Frontend | Trens + depots + clustering |
+| Tela de balanceamento | Frontend | Gráfico + ranking |
+| Navegação | Frontend | Sidebar + routing |
+
+**Milestone:** UI navegável com dados mockados.
+
+#### Sprint 4 (Semanas 7-8): Integração
+
+| Entregável | Responsável | Definition of Done |
+|------------|-------------|-------------------|
+| Dashboard ↔ API | Frontend | Dados reais |
+| Alocação ↔ Solver | Full stack | Fluxo completo |
+| Justificativas na UI | Frontend | Card de justificativa |
+| Simulação básica | Full stack | Criar cenário + comparar |
+
+**Milestone:** Fluxo principal end-to-end.
+
+#### Sprint 5 (Semanas 9-10): Validação + Polish
+
+| Entregável | Responsável | Definition of Done |
+|------------|-------------|-------------------|
+| Seed realista | Backend | 100 trens, dados plausíveis |
+| Revisão de terminologia | Designer | UI com termos corretos |
+| Performance | Full stack | Todas telas < 3s |
+| Teste com usuário de domínio | PO | Feedback incorporado |
+| Gantt (se tempo) | Frontend | Visualização básica |
+
+**Milestone:** Sistema validado por especialista.
+
+#### Sprint 6 (Semanas 11-12): Demo
+
+| Entregável | Responsável | Definition of Done |
+|------------|-------------|-------------------|
+| Roteiro finalizado | PO | 15 min cronometrados |
+| Ensaio geral | Todos | 3 runs sem bugs |
+| FAQ preparado | PO | 20 perguntas + respostas |
+| Fallback screens | Frontend | Telas estáticas para emergência |
+| Ambiente de demo | DevOps | URL estável, dados resetáveis |
+
+**Milestone:** Pronto para apresentação.
+
+### 10.3 Marcos de Decisão (Go/No-Go)
+
+| Semana | Checkpoint | Critério Go |
+|--------|------------|-------------|
+| 2 | Setup completo? | Ambiente funcional, equipe alinhada |
+| 4 | Solver funciona? | Alocação em < 30s |
+| 6 | UI apresentável? | Dashboard + mapa navegáveis |
+| 8 | Integração OK? | Fluxo end-to-end |
+| 10 | Validação OK? | Feedback positivo de especialista |
+| 12 | Demo pronta? | 3 ensaios sem falhas |
+
+---
+
+## 11. Riscos e Mitigações
+
+### 11.1 Matriz de Riscos
+
+| ID | Risco | Prob. | Impacto | Exposição | Mitigação |
+|----|-------|-------|---------|-----------|-----------|
+| R1 | Parecer genérico | Alta | Fatal | **Crítico** | Terminologia + seed realista + consultor |
+| R2 | Solver lento | Média | Alto | **Alto** | Timeout + cache + limitar dados |
+| R3 | Perguntas sem resposta | Média | Alto | **Alto** | FAQ + consultor 2h |
+| R4 | Bug durante demo | Média | Alto | **Alto** | Fallback + ensaio exaustivo |
+| R5 | Escopo creep | Alta | Médio | **Alto** | PO como guardião, escopo fechado |
+| R6 | Equipe sem conhecimento de domínio | Alta | Médio | **Alto** | Imersão obrigatória semana 1 |
+| R7 | Integração API/Solver falha | Baixa | Alto | **Médio** | Mock do solver como fallback |
+| R8 | Designer não entende domínio | Média | Médio | **Médio** | Designer participa de imersão |
+
+### 11.2 Planos de Contingência
+
+#### R1: Parecer Genérico
+
+**Triggers:** Feedback negativo em validação, termos incorretos na UI.
+
+**Ações:**
+1. Pausar desenvolvimento
+2. Contratar consultor ferroviário (4h)
+3. Revisar toda terminologia
+4. Refazer seed com dados do consultor
+
+#### R4: Bug Durante Demo
+
+**Triggers:** Crash em ensaio.
+
+**Ações:**
+1. Identificar cenários de falha
+2. Criar fallback screens (PNG/PDF)
+3. Roteiro alternativo que evita áreas instáveis
+4. Apresentador treinado para contornar
+
+#### R5: Escopo Creep
+
+**Triggers:** Stakeholder pede "só mais uma feature".
+
+**Ações:**
+1. PO documenta request
+2. Avalia impacto no cronograma
+3. Trade-off: "Para incluir X, removemos Y"
+4. Decisão formal documentada
+
+---
+
+## 12. Roteiro de Apresentação
+
+### 12.1 Estrutura (15 minutos)
+
+| Min | Seção | Ação | Objetivo |
+|-----|-------|------|----------|
+| 0-1 | Abertura | Slide de título | Profissionalismo |
+| 1-3 | Contexto | "Entendemos seu problema" | Credibilidade |
+| 3-5 | Dashboard | KPIs, alertas, visão geral | Primeira impressão |
+| 5-7 | Mapa | Trens, depots, clustering | Wow visual |
+| 7-9 | Balanceamento | Gráfico, outliers | Resolver dor principal |
+| 9-11 | Alocação | Recomendação + justificativa | Motor funcionando |
+| 11-13 | Simulação | What-if interativo | Cliente interage |
+| 13-14 | Transparência | "Não é caixa-preta" | Confiança |
+| 14-15 | Fechamento | Próximos passos | Call to action |
+
+### 12.2 Script por Seção
+
+#### Abertura (0-1 min)
+
+> "Bom dia. Hoje vamos mostrar como o MMS resolve o desafio de equilibrar a utilização da sua frota enquanto mantém a disponibilidade operacional."
+
+#### Contexto (1-3 min)
+
+> "Conversamos com operadores do setor e identificamos três dores principais:
+> 1. Trens sobre-rodados degradam mais rápido, aumentando custo de manutenção
+> 2. Trens sub-rodados representam capital parado
+> 3. Planejamento manual em Excel não escala
+>
+> O MMS ataca esses três pontos."
+
+#### Dashboard (3-5 min)
+
+**Ação:** Mostrar tela de dashboard.
+
+> "Esta é a visão executiva. Em segundos vocês veem:
+> - 98 de 112 trens disponíveis
+> - Variância de km em 18% — acima do ideal de 10%
+> - 2 depots próximos da capacidade
+>
+> O vermelho aqui indica ação necessária."
+
+#### Mapa (5-7 min)
+
+**Ação:** Navegar para mapa, zoom in/out.
+
+> "Aqui vemos a posição atual de cada trem. Zoom out agrupa automaticamente. Clicando em um depot, vemos os trens estacionados e a ocupação."
+
+#### Balanceamento (7-9 min)
+
+**Ação:** Mostrar gráfico de distribuição.
+
+> "Este gráfico mostra a distribuição de km. Vejam estes 5 trens bem acima da média — são candidatos prioritários para parada. E estes 4 abaixo — devemos alocar mais."
+
+#### Alocação (9-11 min)
+
+**Ação:** Executar alocação ao vivo.
+
+> "Vamos alocar um trem para o serviço IC 501 de amanhã."
+> [Seleciona serviço, clica em Recomendar]
+> "O sistema sugere o trem UTE-3400-012. Por quê? Vejam a justificativa:
+> - 12% abaixo da média — precisa rodar mais
+> - Termina em Porto, que tem slot de manutenção em 3 dias
+> - Aptidão confirmada para a linha"
+
+#### Simulação (11-13 min)
+
+**Ação:** Criar cenário, ajustar, comparar.
+
+> "E se quisermos testar outra estratégia? Criamos um cenário paralelo..."
+> [Mostra side-by-side]
+> "Vemos que a alternativa reduz variância em 3% mas aumenta dead running em 8%. A decisão é de vocês, com dados."
+
+#### Transparência (13-14 min)
+
+> "Importante: o MMS não é caixa-preta. Toda recomendação mostra o porquê. Vocês mantêm o controle, o sistema ajuda a decidir."
+
+#### Fechamento (14-15 min)
+
+> "Em resumo: balanceamento visível, alocação inteligente com justificativa, simulação para decisão informada. Perguntas?"
+
+### 12.3 FAQ Preparado
+
+| Pergunta | Resposta |
+|----------|----------|
+| "Integra com SAP?" | "A arquitetura suporta. Para produção, conectamos via API padrão." |
+| "E se o solver demorar?" | "Timeout de 30s, fallback para última solução válida." |
+| "Funciona offline?" | "Web-based, precisa de conexão. Modo offline em roadmap." |
+| "Considera tripulação?" | "Modelo atual trata como constraint simplificada. Integração completa em fase 2." |
+| "Quantos trens suporta?" | "Demo validada para 100. Arquitetura escala para 500+." |
+| "Como atualiza km?" | "Integração com telemetria ou import de EAM em batch." |
+
+### 12.4 Plano B (Se Algo Falhar)
+
+| Falha | Ação |
+|-------|------|
+| Tela não carrega | "Enquanto carrega, deixem-me explicar..." (fallback slide) |
+| Solver timeout | "O sistema está calculando cenários complexos. Aqui está um resultado pré-computado." |
+| Crash total | Slides PDF com screenshots de cada tela |
+
+---
+
+## 13. Apêndices
+
+### Apêndice A: Glossário Completo
+
+| Termo | Definição |
+|-------|-----------|
+| Allocation | Atribuição de trem a serviço |
+| Aptitude | Habilitação de trem para rota/tipo de serviço |
+| Bogie | Truque — estrutura com rodas sob o vagão |
+| Consist | Composição de unidades formando trem |
+| Dead running | Deslocamento de trem vazio (sem passageiros/carga) |
+| Depot | Local de estacionamento e/ou manutenção |
+| ECM | Entity in Charge of Maintenance — responsável pela manutenção |
+| EAM | Enterprise Asset Management — sistema de gestão de ativos |
+| HM | Heavy Maintenance — manutenção pesada |
+| HMD | Heavy Maintenance Depot — depot de manutenção pesada |
+| LMD | Light Maintenance Depot — depot de manutenção leve |
+| Married pair | Unidades de trem mecanicamente inseparáveis |
+| MTTR | Mean Time To Repair — tempo médio de reparo |
+| Overhaul | Revisão geral (a mais completa) |
+| PM | Preventive Maintenance — manutenção preventiva |
+| Rolling stock | Material rodante (trens, locomotivas, vagões) |
+| Service | Um trajeto específico no timetable |
+| Shunting | Manobra de trens no pátio |
+| Timetable | Grade horária de serviços |
+| Wheelset | Conjunto roda + eixo |
+
+### Apêndice B: FAQ de Domínio (Para Equipe)
+
+| Pergunta | Resposta |
+|----------|----------|
+| Por que não chamar de "carro" ou "veículo"? | Termo técnico é "rolling stock" ou "material rodante". |
+| Qual a diferença entre LMD e HMD? | LMD faz manutenção leve (PM1, PM2). HMD faz pesada (overhaul). |
+| O que é "dead running"? | Trem andando vazio. Tem custo de combustível/energia e desgaste sem receita. |
+| Por que balancear km é importante? | Desgaste uniforme = vida útil igual = compra de frota nova sincronizada = economia. |
+| O que é "consist"? | A composição de unidades que forma um trem. Pode mudar. |
+| O que são "married pairs"? | Unidades que não podem ser separadas (conexão mecânica permanente). |
+
+### Apêndice C: Referências Visuais
+
+**Sistemas a estudar:**
+1. Railnova Railfleet — https://www.railnova.eu/
+2. DELMIA Quintiq — https://www.3ds.com/products-services/delmia/products/quintiq/
+3. Tracsis TRACS — https://www.tracsis.com/
+4. Google Maps (clustering) — padrão de UX
+
+**Padrões de UI:**
+- Material Design 3 (Google)
+- Tailwind UI components
+- shadcn/ui
+
+### Apêndice D: Fontes de Pesquisa
+
+**Papers:**
+- "Rolling Stock Scheduling" — literatura acadêmica de operational research
+- "Vehicle and Crew Scheduling" — integração de problemas
+
+**Casos:**
+- Netherlands Railways (NS) — referência em otimização
+- Deutsche Bahn — escala e complexidade
+- Trenitalia — balanceamento de frota
+
+**Normas:**
+- EN 15380 — classificação de sistemas ferroviários
+- ECM Regulation — entidade responsável por manutenção
+
+---
+
+## Controle de Versão
+
+| Versão | Data | Autor | Alterações |
+|--------|------|-------|------------|
+| 1.0 | 2025-12-28 | [Equipe] | Versão inicial |
+
+---
+
+## Aprovações
+
+| Papel | Nome | Data | Assinatura |
+|-------|------|------|------------|
+| Product Owner | | | |
+| Tech Lead | | | |
+| Designer Lead | | | |
+| Sponsor | | | |
+
+---
+
+*Documento gerado para suportar o desenvolvimento da demo MMS.*
+*Qualquer dúvida não coberta aqui deve ser escalada ao PO.*

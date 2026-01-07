@@ -1,0 +1,653 @@
+/**
+ * POC: Semantic Zoom with Crossfade Transitions
+ *
+ * Demonstrates smooth LOD transitions using opacity crossfade:
+ * - Strategic (zoom < 0.3): Heatmap overview
+ * - Tactical (0.3 <= zoom < 1.0): Stacked bars
+ * - Operational (1.0 <= zoom < 3.0): DNA Gantt pattern
+ * - Execution (zoom >= 3.0): Detailed task cards
+ *
+ * Key concepts:
+ * 1. Each LOD layer renders independently
+ * 2. Crossfade opacity based on zoom proximity to threshold
+ * 3. Smooth 60fps transitions without jarring changes
+ */
+
+import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import type { Meta, StoryObj } from '@storybook/react';
+import { useGesture } from '@use-gesture/react';
+import { Card, Tag, Intent, Divider, ProgressBar, Slider } from '@blueprintjs/core';
+
+import { COLORS, LOD_THRESHOLDS, ANIMATION, getLODLevel } from '../../data/mock-config';
+import type { LODLevel } from '../../data/mock-config';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+interface ViewportState {
+  zoom: number;
+  x: number;
+  y: number;
+}
+
+interface LayerOpacities {
+  strategic: number;
+  tactical: number;
+  operational: number;
+  execution: number;
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const CROSSFADE_RANGE = 0.15; // Opacity transition range around threshold
+
+const LOD_COLORS: Record<LODLevel, string> = {
+  strategic: '#3b82f6',    // blue-500
+  tactical: '#8b5cf6',     // violet-500
+  operational: '#f59e0b',  // amber-500
+  execution: '#10b981',    // emerald-500
+};
+
+const LOD_DESCRIPTIONS: Record<LODLevel, string> = {
+  strategic: '12-Year Heatmap Overview',
+  tactical: 'Quarterly Stacked Bars',
+  operational: 'Monthly DNA Gantt',
+  execution: 'Weekly Task Details',
+};
+
+// =============================================================================
+// OPACITY CALCULATION
+// =============================================================================
+
+/**
+ * Calculate layer opacities based on current zoom level.
+ * Uses smooth crossfade transitions near thresholds.
+ */
+function calculateLayerOpacities(zoom: number): LayerOpacities {
+  const { strategic, tactical, operational } = LOD_THRESHOLDS;
+
+  // Helper: smooth step function for crossfade
+  const smoothStep = (value: number, edge0: number, edge1: number): number => {
+    const t = Math.max(0, Math.min(1, (value - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t); // Smooth Hermite interpolation
+  };
+
+  // Calculate fade factors for each threshold
+  const fadeStrategicToTactical = smoothStep(
+    zoom,
+    strategic - CROSSFADE_RANGE,
+    strategic + CROSSFADE_RANGE
+  );
+
+  const fadeTacticalToOperational = smoothStep(
+    zoom,
+    tactical - CROSSFADE_RANGE,
+    tactical + CROSSFADE_RANGE
+  );
+
+  const fadeOperationalToExecution = smoothStep(
+    zoom,
+    operational - CROSSFADE_RANGE,
+    operational + CROSSFADE_RANGE
+  );
+
+  // Calculate final opacities
+  return {
+    strategic: 1 - fadeStrategicToTactical,
+    tactical: fadeStrategicToTactical * (1 - fadeTacticalToOperational),
+    operational: fadeTacticalToOperational * (1 - fadeOperationalToExecution),
+    execution: fadeOperationalToExecution,
+  };
+}
+
+// =============================================================================
+// MOCK LOD LAYER COMPONENTS
+// =============================================================================
+
+interface LayerProps {
+  opacity: number;
+  zoom: number;
+}
+
+function StrategicLayer({ opacity, zoom }: LayerProps) {
+  if (opacity < 0.01) return null;
+
+  // Generate heatmap cells
+  const cells = useMemo(() => {
+    const items = [];
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 12; col++) {
+        const intensity = Math.sin(row * 0.5 + col * 0.3) * 0.5 + 0.5;
+        items.push({ row, col, intensity });
+      }
+    }
+    return items;
+  }, []);
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        opacity,
+        transition: 'opacity 50ms ease-out',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(12, 1fr)',
+        gridTemplateRows: 'repeat(8, 1fr)',
+        gap: 2,
+        padding: 40,
+      }}
+    >
+      {cells.map(({ row, col, intensity }) => (
+        <div
+          key={`${row}-${col}`}
+          style={{
+            background: `rgba(59, 130, 246, ${0.2 + intensity * 0.6})`,
+            borderRadius: 4,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 10,
+            color: intensity > 0.5 ? 'white' : COLORS.text.secondary,
+            fontWeight: 500,
+          }}
+        >
+          {Math.round(intensity * 100)}%
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TacticalLayer({ opacity, zoom }: LayerProps) {
+  if (opacity < 0.01) return null;
+
+  const bars = useMemo(() => {
+    const items = [];
+    for (let row = 0; row < 16; row++) {
+      const widths = [
+        20 + Math.random() * 30,
+        20 + Math.random() * 30,
+        20 + Math.random() * 30,
+      ];
+      items.push({ row, widths });
+    }
+    return items;
+  }, []);
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        opacity,
+        transition: 'opacity 50ms ease-out',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        padding: 40,
+        overflow: 'hidden',
+      }}
+    >
+      {bars.map(({ row, widths }) => (
+        <div
+          key={row}
+          style={{
+            flex: 1,
+            display: 'flex',
+            gap: 2,
+            alignItems: 'center',
+          }}
+        >
+          <div style={{ width: 40, fontSize: 10, color: COLORS.text.secondary }}>
+            T-{String(row + 1).padStart(3, '0')}
+          </div>
+          <div style={{ flex: 1, display: 'flex', gap: 2 }}>
+            <div
+              style={{
+                width: `${widths[0]}%`,
+                height: '100%',
+                background: '#8b5cf6',
+                borderRadius: 2,
+              }}
+            />
+            <div
+              style={{
+                width: `${widths[1]}%`,
+                height: '100%',
+                background: '#a78bfa',
+                borderRadius: 2,
+              }}
+            />
+            <div
+              style={{
+                width: `${widths[2]}%`,
+                height: '100%',
+                background: '#c4b5fd',
+                borderRadius: 2,
+              }}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OperationalLayer({ opacity, zoom }: LayerProps) {
+  if (opacity < 0.01) return null;
+
+  const tasks = useMemo(() => {
+    const items = [];
+    for (let row = 0; row < 20; row++) {
+      const taskCount = 3 + Math.floor(Math.random() * 5);
+      const rowTasks = [];
+      let x = 40;
+      for (let t = 0; t < taskCount; t++) {
+        const width = 30 + Math.random() * 80;
+        const gap = 5 + Math.random() * 20;
+        rowTasks.push({ x, width, type: t % 3 });
+        x += width + gap;
+      }
+      items.push({ row, tasks: rowTasks });
+    }
+    return items;
+  }, []);
+
+  const typeColors = ['#f59e0b', '#fb923c', '#fbbf24'];
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        opacity,
+        transition: 'opacity 50ms ease-out',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+        padding: '40px 10px',
+        overflow: 'hidden',
+      }}
+    >
+      {tasks.map(({ row, tasks: rowTasks }) => (
+        <div
+          key={row}
+          style={{
+            flex: 1,
+            position: 'relative',
+            background: COLORS.bg.tertiary,
+            borderRadius: 2,
+          }}
+        >
+          {rowTasks.map((task, i) => (
+            <div
+              key={i}
+              style={{
+                position: 'absolute',
+                left: task.x,
+                top: 2,
+                bottom: 2,
+                width: task.width,
+                background: typeColors[task.type],
+                borderRadius: 3,
+              }}
+            />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExecutionLayer({ opacity, zoom }: LayerProps) {
+  if (opacity < 0.01) return null;
+
+  const cards = useMemo(() => {
+    const items = [];
+    for (let row = 0; row < 6; row++) {
+      for (let col = 0; col < 3; col++) {
+        items.push({
+          row,
+          col,
+          train: `K-${String(row * 3 + col + 1).padStart(3, '0')}`,
+          task: ['PM1', 'PM2', 'PM3', 'Overhaul'][Math.floor(Math.random() * 4)],
+          status: ['scheduled', 'in-progress', 'completed'][Math.floor(Math.random() * 3)],
+        });
+      }
+    }
+    return items;
+  }, []);
+
+  const statusColors = {
+    scheduled: COLORS.status.neutral,
+    'in-progress': COLORS.status.info,
+    completed: COLORS.status.healthy,
+  };
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        opacity,
+        transition: 'opacity 50ms ease-out',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(3, 1fr)',
+        gridTemplateRows: 'repeat(6, 1fr)',
+        gap: 8,
+        padding: 40,
+      }}
+    >
+      {cards.map(({ row, col, train, task, status }) => (
+        <Card
+          key={`${row}-${col}`}
+          elevation={1}
+          style={{
+            padding: 8,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+          }}
+        >
+          <div style={{ fontSize: 12, fontWeight: 600 }}>{train}</div>
+          <div style={{ fontSize: 11, color: COLORS.text.secondary }}>{task}</div>
+          <Tag
+            minimal
+            style={{
+              background: statusColors[status as keyof typeof statusColors],
+              color: 'white',
+              fontSize: 9,
+            }}
+          >
+            {status}
+          </Tag>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+// =============================================================================
+// INFO PANEL
+// =============================================================================
+
+interface InfoPanelProps {
+  viewport: ViewportState;
+  opacities: LayerOpacities;
+  currentLOD: LODLevel;
+}
+
+function InfoPanel({ viewport, opacities, currentLOD }: InfoPanelProps) {
+  return (
+    <Card style={{ position: 'absolute', top: 10, left: 10, padding: '8px 12px', zIndex: 100, width: 220 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Semantic Zoom State</div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <Tag
+          large
+          intent={Intent.PRIMARY}
+          style={{ background: LOD_COLORS[currentLOD] }}
+        >
+          {currentLOD.toUpperCase()}
+        </Tag>
+        <span style={{ fontSize: 12, fontWeight: 500 }}>{viewport.zoom.toFixed(2)}x</span>
+      </div>
+
+      <div style={{ fontSize: 10, color: COLORS.text.secondary, marginBottom: 8 }}>
+        {LOD_DESCRIPTIONS[currentLOD]}
+      </div>
+
+      <Divider style={{ margin: '8px 0' }} />
+
+      <div style={{ fontSize: 10, fontWeight: 600, marginBottom: 4 }}>Layer Opacities</div>
+
+      {(Object.keys(opacities) as LODLevel[]).map((layer) => (
+        <div key={layer} style={{ marginBottom: 4 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 2 }}>
+            <span style={{ color: LOD_COLORS[layer] }}>{layer}</span>
+            <span>{(opacities[layer] * 100).toFixed(0)}%</span>
+          </div>
+          <ProgressBar
+            value={opacities[layer]}
+            intent={opacities[layer] > 0.5 ? Intent.SUCCESS : Intent.NONE}
+            stripes={false}
+            animate={false}
+          />
+        </div>
+      ))}
+
+      <Divider style={{ margin: '8px 0' }} />
+
+      <div style={{ fontSize: 10, color: COLORS.text.muted }}>
+        Thresholds: {LOD_THRESHOLDS.strategic} / {LOD_THRESHOLDS.tactical} / {LOD_THRESHOLDS.operational}
+      </div>
+    </Card>
+  );
+}
+
+// =============================================================================
+// ZOOM CONTROL
+// =============================================================================
+
+interface ZoomControlProps {
+  zoom: number;
+  onZoomChange: (zoom: number) => void;
+}
+
+function ZoomControl({ zoom, onZoomChange }: ZoomControlProps) {
+  return (
+    <Card style={{ position: 'absolute', bottom: 10, left: 10, right: 10, padding: '8px 16px', zIndex: 100 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <span style={{ fontSize: 11, fontWeight: 600, minWidth: 80 }}>Zoom: {zoom.toFixed(2)}x</span>
+        <Slider
+          min={0.1}
+          max={5}
+          stepSize={0.01}
+          value={zoom}
+          onChange={onZoomChange}
+          labelRenderer={false}
+          showTrackFill={false}
+        />
+        <div style={{ display: 'flex', gap: 4, fontSize: 9, color: COLORS.text.muted }}>
+          {Object.entries(LOD_THRESHOLDS).map(([name, threshold]) => (
+            <Tag key={name} minimal style={{ fontSize: 9 }}>
+              {name}: {threshold === Infinity ? '∞' : threshold}
+            </Tag>
+          ))}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// =============================================================================
+// MAIN COMPONENT
+// =============================================================================
+
+function SemanticZoomDemo() {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Viewport state
+  const [viewport, setViewport] = useState<ViewportState>({
+    zoom: 0.15,
+    x: 0,
+    y: 0,
+  });
+
+  // Calculate current LOD and layer opacities
+  const currentLOD = useMemo(() => getLODLevel(viewport.zoom), [viewport.zoom]);
+  const opacities = useMemo(() => calculateLayerOpacities(viewport.zoom), [viewport.zoom]);
+
+  // Zoom change handler
+  const handleZoomChange = useCallback((newZoom: number) => {
+    setViewport((prev) => ({ ...prev, zoom: newZoom }));
+  }, []);
+
+  // Gesture bindings for wheel zoom
+  const bind = useGesture({
+    onWheel: ({ delta: [, dy], event }) => {
+      event.preventDefault();
+      setViewport((prev) => ({
+        ...prev,
+        zoom: Math.max(0.1, Math.min(5, prev.zoom * (1 - dy * 0.002))),
+      }));
+    },
+  }, {
+    wheel: { preventDefault: true },
+  });
+
+  return (
+    <div
+      ref={containerRef}
+      {...bind()}
+      style={{
+        width: '100%',
+        height: '100vh',
+        position: 'relative',
+        background: COLORS.bg.primary,
+        overflow: 'hidden',
+        touchAction: 'none',
+      }}
+    >
+      {/* LOD Layers with crossfade */}
+      <StrategicLayer opacity={opacities.strategic} zoom={viewport.zoom} />
+      <TacticalLayer opacity={opacities.tactical} zoom={viewport.zoom} />
+      <OperationalLayer opacity={opacities.operational} zoom={viewport.zoom} />
+      <ExecutionLayer opacity={opacities.execution} zoom={viewport.zoom} />
+
+      {/* UI Overlays */}
+      <InfoPanel viewport={viewport} opacities={opacities} currentLOD={currentLOD} />
+      <ZoomControl zoom={viewport.zoom} onZoomChange={handleZoomChange} />
+    </div>
+  );
+}
+
+// =============================================================================
+// STORYBOOK CONFIG
+// =============================================================================
+
+const meta: Meta<typeof SemanticZoomDemo> = {
+  title: '01-POCs/Rendering/Semantic Zoom',
+  component: SemanticZoomDemo,
+  parameters: {
+    layout: 'fullscreen',
+    docs: {
+      description: {
+        component: `
+## Semantic Zoom POC
+
+Demonstrates smooth crossfade transitions between LOD levels.
+
+### LOD Levels:
+- **Strategic** (zoom < 0.3): 12-year heatmap overview
+- **Tactical** (0.3 - 1.0): Quarterly stacked bars
+- **Operational** (1.0 - 3.0): Monthly DNA Gantt pattern
+- **Execution** (> 3.0): Detailed task cards
+
+### Crossfade Algorithm:
+- Uses smooth Hermite interpolation (smoothstep)
+- Transition range: ±0.15 around each threshold
+- Multiple layers can be partially visible during transitions
+
+### Usage:
+- Use the **slider** to change zoom level
+- Use **mouse wheel** to zoom
+- Watch layer opacities change in the info panel
+        `,
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof SemanticZoomDemo>;
+
+export const Default: Story = {};
+
+export const AtStrategicLevel: Story = {
+  render: () => {
+    const [viewport, setViewport] = useState<ViewportState>({ zoom: 0.15, x: 0, y: 0 });
+    const opacities = calculateLayerOpacities(viewport.zoom);
+
+    return (
+      <div style={{ width: '100%', height: '100vh', position: 'relative', background: COLORS.bg.primary }}>
+        <StrategicLayer opacity={opacities.strategic} zoom={viewport.zoom} />
+        <Card style={{ position: 'absolute', top: 10, left: 10, padding: 8 }}>
+          <Tag intent={Intent.PRIMARY} large style={{ background: LOD_COLORS.strategic }}>
+            STRATEGIC VIEW
+          </Tag>
+          <div style={{ fontSize: 10, marginTop: 4, color: COLORS.text.secondary }}>
+            12-year heatmap at {viewport.zoom.toFixed(2)}x zoom
+          </div>
+        </Card>
+      </div>
+    );
+  },
+};
+
+export const AtTacticalLevel: Story = {
+  render: () => {
+    const [viewport, setViewport] = useState<ViewportState>({ zoom: 0.6, x: 0, y: 0 });
+    const opacities = calculateLayerOpacities(viewport.zoom);
+
+    return (
+      <div style={{ width: '100%', height: '100vh', position: 'relative', background: COLORS.bg.primary }}>
+        <TacticalLayer opacity={opacities.tactical} zoom={viewport.zoom} />
+        <Card style={{ position: 'absolute', top: 10, left: 10, padding: 8 }}>
+          <Tag intent={Intent.PRIMARY} large style={{ background: LOD_COLORS.tactical }}>
+            TACTICAL VIEW
+          </Tag>
+          <div style={{ fontSize: 10, marginTop: 4, color: COLORS.text.secondary }}>
+            Quarterly bars at {viewport.zoom.toFixed(2)}x zoom
+          </div>
+        </Card>
+      </div>
+    );
+  },
+};
+
+export const AtOperationalLevel: Story = {
+  render: () => {
+    const [viewport, setViewport] = useState<ViewportState>({ zoom: 2.0, x: 0, y: 0 });
+    const opacities = calculateLayerOpacities(viewport.zoom);
+
+    return (
+      <div style={{ width: '100%', height: '100vh', position: 'relative', background: COLORS.bg.primary }}>
+        <OperationalLayer opacity={opacities.operational} zoom={viewport.zoom} />
+        <Card style={{ position: 'absolute', top: 10, left: 10, padding: 8 }}>
+          <Tag intent={Intent.PRIMARY} large style={{ background: LOD_COLORS.operational }}>
+            OPERATIONAL VIEW
+          </Tag>
+          <div style={{ fontSize: 10, marginTop: 4, color: COLORS.text.secondary }}>
+            DNA Gantt at {viewport.zoom.toFixed(2)}x zoom
+          </div>
+        </Card>
+      </div>
+    );
+  },
+};
+
+export const AtExecutionLevel: Story = {
+  render: () => {
+    const [viewport, setViewport] = useState<ViewportState>({ zoom: 4.0, x: 0, y: 0 });
+    const opacities = calculateLayerOpacities(viewport.zoom);
+
+    return (
+      <div style={{ width: '100%', height: '100vh', position: 'relative', background: COLORS.bg.primary }}>
+        <ExecutionLayer opacity={opacities.execution} zoom={viewport.zoom} />
+        <Card style={{ position: 'absolute', top: 10, left: 10, padding: 8 }}>
+          <Tag intent={Intent.PRIMARY} large style={{ background: LOD_COLORS.execution }}>
+            EXECUTION VIEW
+          </Tag>
+          <div style={{ fontSize: 10, marginTop: 4, color: COLORS.text.secondary }}>
+            Task cards at {viewport.zoom.toFixed(2)}x zoom
+          </div>
+        </Card>
+      </div>
+    );
+  },
+};

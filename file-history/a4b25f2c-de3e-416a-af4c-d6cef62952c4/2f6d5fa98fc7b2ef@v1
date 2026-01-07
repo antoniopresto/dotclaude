@@ -1,0 +1,248 @@
+import { useCallback, useEffect, useRef } from 'react';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export interface Keybinding {
+  key: string;
+  command: string;
+  args?: Record<string, unknown>;
+  when?: string;
+  description?: string;
+}
+
+export interface KeybindingsConfig {
+  keybindings: Keybinding[];
+}
+
+type CommandHandler = (args?: Record<string, unknown>) => void;
+
+interface CommandRegistry {
+  [command: string]: CommandHandler;
+}
+
+interface ContextState {
+  [key: string]: boolean;
+}
+
+// =============================================================================
+// Key Parsing
+// =============================================================================
+
+interface ParsedKey {
+  key: string;
+  cmd: boolean;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+}
+
+function parseKeyString(keyString: string): ParsedKey {
+  const parts = keyString.toLowerCase().split('+');
+  const result: ParsedKey = {
+    key: '',
+    cmd: false,
+    ctrl: false,
+    alt: false,
+    shift: false,
+  };
+
+  for (const part of parts) {
+    switch (part) {
+      case 'cmd':
+      case 'meta':
+        result.cmd = true;
+        break;
+      case 'ctrl':
+      case 'control':
+        result.ctrl = true;
+        break;
+      case 'alt':
+      case 'option':
+        result.alt = true;
+        break;
+      case 'shift':
+        result.shift = true;
+        break;
+      default:
+        result.key = part;
+    }
+  }
+
+  return result;
+}
+
+function eventMatchesKeybinding(event: KeyboardEvent, parsed: ParsedKey): boolean {
+  // Normalize the key
+  let eventKey = event.key.toLowerCase();
+
+  // Handle special keys
+  if (eventKey === 'escape') eventKey = 'escape';
+  if (eventKey === 'enter') eventKey = 'enter';
+  if (eventKey === 'backspace') eventKey = 'backspace';
+  if (eventKey === 'delete') eventKey = 'delete';
+  if (eventKey === 'tab') eventKey = 'tab';
+  if (eventKey === ' ') eventKey = 'space';
+  if (eventKey === '[') eventKey = '[';
+  if (eventKey === ']') eventKey = ']';
+  if (eventKey === '\\') eventKey = '\\';
+
+  // Check modifiers
+  const cmdMatch = parsed.cmd === (event.metaKey || false);
+  const ctrlMatch = parsed.ctrl === (event.ctrlKey || false);
+  const altMatch = parsed.alt === (event.altKey || false);
+  const shiftMatch = parsed.shift === (event.shiftKey || false);
+  const keyMatch = parsed.key === eventKey;
+
+  return cmdMatch && ctrlMatch && altMatch && shiftMatch && keyMatch;
+}
+
+// =============================================================================
+// When Clause Evaluation
+// =============================================================================
+
+function evaluateWhenClause(when: string | undefined, context: ContextState): boolean {
+  if (!when) return true;
+
+  // Simple evaluation - supports "key" and "!key"
+  const trimmed = when.trim();
+
+  if (trimmed.startsWith('!')) {
+    const key = trimmed.slice(1);
+    return !context[key];
+  }
+
+  return !!context[trimmed];
+}
+
+// =============================================================================
+// Hook: useKeybindings
+// =============================================================================
+
+export interface UseKeybindingsOptions {
+  keybindings: Keybinding[];
+  commands: CommandRegistry;
+  context?: ContextState;
+  enabled?: boolean;
+}
+
+export function useKeybindings({
+  keybindings,
+  commands,
+  context = {},
+  enabled = true,
+}: UseKeybindingsOptions): void {
+  const commandsRef = useRef(commands);
+  const contextRef = useRef(context);
+
+  // Update refs when values change
+  useEffect(() => {
+    commandsRef.current = commands;
+  }, [commands]);
+
+  useEffect(() => {
+    contextRef.current = context;
+  }, [context]);
+
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent) => {
+      if (!enabled) return;
+
+      // Don't capture shortcuts when typing in inputs
+      const target = event.target as HTMLElement;
+      if (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable
+      ) {
+        // Still allow Escape to work in inputs
+        if (event.key !== 'Escape') {
+          return;
+        }
+      }
+
+      // Find matching keybinding
+      for (const binding of keybindings) {
+        const parsed = parseKeyString(binding.key);
+
+        if (eventMatchesKeybinding(event, parsed)) {
+          // Check when clause
+          if (!evaluateWhenClause(binding.when, contextRef.current)) {
+            continue;
+          }
+
+          // Find and execute command
+          const handler = commandsRef.current[binding.command];
+          if (handler) {
+            event.preventDefault();
+            event.stopPropagation();
+            handler(binding.args);
+            return;
+          }
+        }
+      }
+    },
+    [keybindings, enabled]
+  );
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [handleKeyDown, enabled]);
+}
+
+// =============================================================================
+// Hook: useGlobalKeybindings
+// =============================================================================
+
+import defaultKeybindingsJson from '../config/defaultKeybindings.json';
+
+const defaultKeybindings = defaultKeybindingsJson.keybindings as Keybinding[];
+
+export interface UseGlobalKeybindingsOptions {
+  commands: CommandRegistry;
+  context?: ContextState;
+  enabled?: boolean;
+  additionalKeybindings?: Keybinding[];
+}
+
+export function useGlobalKeybindings({
+  commands,
+  context = {},
+  enabled = true,
+  additionalKeybindings = [],
+}: UseGlobalKeybindingsOptions): void {
+  const allKeybindings = [...defaultKeybindings, ...additionalKeybindings];
+
+  useKeybindings({
+    keybindings: allKeybindings,
+    commands,
+    context,
+    enabled,
+  });
+}
+
+// =============================================================================
+// Utility: Format Shortcut for Display
+// =============================================================================
+
+export function formatShortcut(key: string): string {
+  return key
+    .replace(/cmd\+/gi, '⌘')
+    .replace(/ctrl\+/gi, '⌃')
+    .replace(/alt\+/gi, '⌥')
+    .replace(/shift\+/gi, '⇧')
+    .replace(/enter/gi, '↵')
+    .replace(/backspace/gi, '⌫')
+    .replace(/delete/gi, '⌦')
+    .replace(/escape/gi, '⎋')
+    .replace(/tab/gi, '⇥')
+    .replace(/space/gi, '␣');
+}
+
+export default useKeybindings;

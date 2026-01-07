@@ -1,0 +1,175 @@
+/**
+ * Seed Script - Populate database with Dubai Metro fleet
+ *
+ * Run with: bun run src/scripts/seed-fleet.ts
+ */
+
+import { MongoClient } from "mongodb";
+import type { Asset, MaintenanceType } from "@uptime/types";
+
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017";
+const DB_NAME = process.env.DB_NAME || "mms";
+
+// Fleet constants
+const ALSTOM_COUNT = 79;
+const KINKI_COUNT = 49;
+
+// Maintenance types
+const maintenanceTypes: MaintenanceType[] = [
+  {
+    id: "mt-a",
+    level: "A",
+    name: "A-Check",
+    intervalKm: 10000,
+    toleranceKm: 2000,
+    durationHours: 4,
+    manHours: 8,
+    requiredTracks: 1,
+    estimatedCost: 2500,
+  },
+  {
+    id: "mt-b",
+    level: "B",
+    name: "B-Check",
+    intervalKm: 50000,
+    toleranceKm: 5000,
+    durationHours: 16,
+    manHours: 32,
+    requiredTracks: 1,
+    estimatedCost: 8500,
+  },
+  {
+    id: "mt-c",
+    level: "C",
+    name: "C-Check",
+    intervalKm: 200000,
+    toleranceKm: 20000,
+    durationHours: 72,
+    manHours: 160,
+    requiredTracks: 1,
+    estimatedCost: 45000,
+  },
+  {
+    id: "mt-d",
+    level: "D",
+    name: "D-Overhaul",
+    intervalKm: 800000,
+    toleranceKm: 50000,
+    durationHours: 480,
+    manHours: 1200,
+    requiredTracks: 2,
+    estimatedCost: 180000,
+  },
+];
+
+/**
+ * Generate staggered mileage to avoid maintenance clustering
+ */
+function staggerMileage(
+  index: number,
+  fleetSize: number,
+  baseKm: number,
+  rangeKm: number
+): number {
+  const phase = (index / fleetSize) * rangeKm;
+  const noise = ((index * 7) % 13) * 1000;
+  return Math.round(baseKm + phase + noise);
+}
+
+/**
+ * Generate fleet assets
+ */
+function generateFleet(): Asset[] {
+  const assets: Asset[] = [];
+
+  // Generate Alstom trains (ALT-001 to ALT-079)
+  for (let i = 0; i < ALSTOM_COUNT; i++) {
+    const trainNumber = String(i + 1).padStart(3, "0");
+    const currentKm = staggerMileage(i, ALSTOM_COUNT, 450000, 350000);
+
+    assets.push({
+      id: `ALT-${trainNumber}`,
+      assetNumber: `ALT-${trainNumber}`,
+      assetType: "ALSTOM",
+      carsCount: 5,
+      currentMileageKm: currentKm,
+      avgDailyMileageKm: 420 + (i % 12) * 5,
+      lastMaintenanceDate: "2025-01-01",
+      status: "operational",
+      lastMaintenanceKm: {
+        "mt-a": currentKm - staggerMileage(i, ALSTOM_COUNT, 0, 10000),
+        "mt-b": currentKm - staggerMileage(i, ALSTOM_COUNT, 0, 50000),
+        "mt-c": currentKm - staggerMileage(i, ALSTOM_COUNT, 0, 200000),
+        "mt-d": currentKm - staggerMileage(i, ALSTOM_COUNT, 0, 800000),
+      },
+    });
+  }
+
+  // Generate Kinki Sharyo trains (KNK-001 to KNK-049)
+  for (let i = 0; i < KINKI_COUNT; i++) {
+    const trainNumber = String(i + 1).padStart(3, "0");
+    const currentKm = staggerMileage(i, KINKI_COUNT, 320000, 280000);
+
+    assets.push({
+      id: `KNK-${trainNumber}`,
+      assetNumber: `KNK-${trainNumber}`,
+      assetType: "KINKI",
+      carsCount: 5,
+      currentMileageKm: currentKm,
+      avgDailyMileageKm: 400 + (i % 10) * 6,
+      lastMaintenanceDate: "2025-01-01",
+      status: "operational",
+      lastMaintenanceKm: {
+        "mt-a": currentKm - staggerMileage(i, KINKI_COUNT, 0, 10000),
+        "mt-b": currentKm - staggerMileage(i, KINKI_COUNT, 0, 50000),
+        "mt-c": currentKm - staggerMileage(i, KINKI_COUNT, 0, 200000),
+        "mt-d": currentKm - staggerMileage(i, KINKI_COUNT, 0, 800000),
+      },
+    });
+  }
+
+  return assets;
+}
+
+async function seed() {
+  console.log("Connecting to MongoDB...");
+  const client = new MongoClient(MONGO_URI);
+  await client.connect();
+  const db = client.db(DB_NAME);
+
+  console.log("Generating fleet data...");
+  const assets = generateFleet();
+
+  console.log(`Seeding ${assets.length} assets...`);
+  const assetsCollection = db.collection("assets");
+  await assetsCollection.deleteMany({});
+  await assetsCollection.insertMany(assets);
+
+  console.log(`Seeding ${maintenanceTypes.length} maintenance types...`);
+  const mtCollection = db.collection("maintenance_types");
+  await mtCollection.deleteMany({});
+  await mtCollection.insertMany(maintenanceTypes);
+
+  // Create indexes
+  console.log("Creating indexes...");
+  await assetsCollection.createIndex({ id: 1 }, { unique: true });
+  await assetsCollection.createIndex({ assetType: 1 });
+  await assetsCollection.createIndex({ status: 1 });
+  await mtCollection.createIndex({ id: 1 }, { unique: true });
+  await mtCollection.createIndex({ level: 1 });
+
+  // Create scenarios collection index
+  const scenariosCollection = db.collection("scenarios");
+  await scenariosCollection.createIndex({ id: 1 }, { unique: true });
+  await scenariosCollection.createIndex({ status: 1 });
+  await scenariosCollection.createIndex({ createdAt: -1 });
+
+  console.log("\nSeed completed!");
+  console.log(`  - ${assets.filter((a) => a.assetType === "ALSTOM").length} Alstom trains`);
+  console.log(`  - ${assets.filter((a) => a.assetType === "KINKI").length} Kinki Sharyo trains`);
+  console.log(`  - ${maintenanceTypes.length} maintenance types`);
+
+  await client.close();
+}
+
+seed().catch(console.error);

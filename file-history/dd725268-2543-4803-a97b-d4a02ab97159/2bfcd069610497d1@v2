@@ -1,0 +1,454 @@
+/**
+ * Real-time Progress Dashboard
+ *
+ * Terminal UI that displays:
+ * - Agent status (busy/idle)
+ * - Progress bars per feature
+ * - Cost tracking (estimated API usage)
+ * - Time estimates
+ * - Log streaming from agents
+ */
+
+import chalk from 'chalk';
+import type { Feature, HarnessConfig } from '../types.js';
+import type { Orchestrator } from '../orchestrator/Orchestrator.js';
+
+export interface DashboardOptions {
+  /** Enable live refresh (clears terminal) */
+  liveRefresh: boolean;
+  /** Refresh interval in ms */
+  refreshInterval: number;
+  /** Maximum log lines to keep */
+  maxLogLines: number;
+  /** Show cost estimates */
+  showCosts: boolean;
+  /** Maximum concurrent agents */
+  maxAgents: number;
+}
+
+interface AgentState {
+  id: string;
+  taskId: string;
+  startedAt: Date;
+  status: 'running' | 'completed' | 'failed';
+  lastOutput?: string;
+}
+
+interface TaskState {
+  id: string;
+  description: string;
+  status: 'pending' | 'ready' | 'running' | 'completed' | 'failed';
+  startedAt?: Date;
+  completedAt?: Date;
+  error?: string;
+  agentId?: string;
+}
+
+interface CostEstimate {
+  inputTokens: number;
+  outputTokens: number;
+  totalCost: number;
+}
+
+const DEFAULT_OPTIONS: DashboardOptions = {
+  liveRefresh: true,
+  refreshInterval: 500,
+  maxLogLines: 10,
+  showCosts: true,
+  maxAgents: 3,
+};
+
+// Estimated costs per model per 1M tokens (Dec 2024 pricing)
+const MODEL_COSTS = {
+  haiku: { input: 0.25, output: 1.25 },
+  sonnet: { input: 3.0, output: 15.0 },
+  opus: { input: 15.0, output: 75.0 },
+} as const;
+
+export class Dashboard {
+  private options: DashboardOptions;
+  private agents: Map<string, AgentState> = new Map();
+  private tasks: Map<string, TaskState> = new Map();
+  private logs: string[] = [];
+  private startTime?: Date;
+  private endTime?: Date;
+  private refreshTimer?: ReturnType<typeof setInterval>;
+  private costs: CostEstimate = { inputTokens: 0, outputTokens: 0, totalCost: 0 };
+  private model: 'haiku' | 'sonnet' | 'opus' = 'sonnet';
+  private isRunning = false;
+
+  constructor(
+    private config: HarnessConfig,
+    options: Partial<DashboardOptions> = {}
+  ) {
+    this.options = { ...DEFAULT_OPTIONS, ...options };
+
+    // Initialize task states from config
+    for (const feature of config.features) {
+      this.tasks.set(feature.id, {
+        id: feature.id,
+        description: feature.description,
+        status: feature.passes ? 'completed' : 'pending',
+      });
+    }
+  }
+
+  /**
+   * Attach to an orchestrator and listen for events
+   */
+  attach(orchestrator: Orchestrator): void {
+    orchestrator.on('started', () => {
+      this.startTime = new Date();
+      this.isRunning = true;
+      this.addLog('🚀 Orchestration started');
+      if (this.options.liveRefresh) {
+        this.startRefresh();
+      }
+    });
+
+    orchestrator.on('taskDispatched', ({ taskId, feature }) => {
+      this.updateTask(taskId, { status: 'running', startedAt: new Date() });
+      this.addLog(`▶ ${chalk.blue(taskId)}: ${feature.description}`);
+    });
+
+    orchestrator.on('taskStarted', ({ agentId, taskId }) => {
+      this.agents.set(agentId, {
+        id: agentId,
+        taskId,
+        startedAt: new Date(),
+        status: 'running',
+      });
+      this.updateTask(taskId, { agentId });
+    });
+
+    orchestrator.on('taskOutput', ({ agentId, taskId, text }) => {
+      const agent = this.agents.get(agentId);
+      if (agent) {
+        agent.lastOutput = text.slice(0, 100);
+      }
+      // Estimate tokens from output (rough: 1 token ~ 4 chars)
+      this.addOutputTokens(Math.ceil(text.length / 4));
+    });
+
+    orchestrator.on('taskSucceeded', ({ taskId }) => {
+      this.updateTask(taskId, { status: 'completed', completedAt: new Date() });
+      this.addLog(`${chalk.green('✓')} ${chalk.green(taskId)} completed`);
+    });
+
+    orchestrator.on('taskFailed', ({ taskId, error }) => {
+      this.updateTask(taskId, { status: 'failed', error, completedAt: new Date() });
+      this.addLog(`${chalk.red('✗')} ${chalk.red(taskId)}: ${error}`);
+    });
+
+    orchestrator.on('taskKilled', ({ agentId, taskId, reason }) => {
+      const agent = this.agents.get(agentId);
+      if (agent) {
+        agent.status = 'failed';
+      }
+      this.addLog(`${chalk.yellow('⚠')} ${taskId} killed: ${reason}`);
+    });
+
+    orchestrator.on('deadlock', ({ pending }) => {
+      this.addLog(`${chalk.red('⚠️')} Deadlock detected! ${pending} tasks stuck.`);
+    });
+
+    orchestrator.on('shutdown', ({ signal }) => {
+      this.addLog(`${chalk.yellow('⚠️')} Received ${signal}, shutting down...`);
+    });
+
+    orchestrator.on('finished', ({ completed, failed }) => {
+      this.endTime = new Date();
+      this.isRunning = false;
+      this.stopRefresh();
+      this.addLog(`🏁 Finished: ${completed} completed, ${failed} failed`);
+      this.render();
+    });
+  }
+
+  /**
+   * Set the model for cost estimation
+   */
+  setModel(model: 'haiku' | 'sonnet' | 'opus'): void {
+    this.model = model;
+  }
+
+  /**
+   * Add output tokens to cost estimate
+   */
+  private addOutputTokens(tokens: number): void {
+    this.costs.outputTokens += tokens;
+    // Assume input is roughly 2x output for prompts
+    this.costs.inputTokens += tokens * 2;
+    this.updateCost();
+  }
+
+  /**
+   * Update cost calculation
+   */
+  private updateCost(): void {
+    const rates = MODEL_COSTS[this.model];
+    this.costs.totalCost =
+      (this.costs.inputTokens / 1_000_000) * rates.input +
+      (this.costs.outputTokens / 1_000_000) * rates.output;
+  }
+
+  /**
+   * Update a task's state
+   */
+  private updateTask(taskId: string, update: Partial<TaskState>): void {
+    const task = this.tasks.get(taskId);
+    if (task) {
+      Object.assign(task, update);
+    }
+  }
+
+  /**
+   * Add a log line
+   */
+  private addLog(message: string): void {
+    const timestamp = new Date().toLocaleTimeString();
+    this.logs.push(`${chalk.dim(timestamp)} ${message}`);
+    if (this.logs.length > this.options.maxLogLines) {
+      this.logs.shift();
+    }
+  }
+
+  /**
+   * Start periodic refresh
+   */
+  private startRefresh(): void {
+    if (this.refreshTimer) return;
+    this.refreshTimer = setInterval(() => {
+      this.render();
+    }, this.options.refreshInterval);
+    this.render();
+  }
+
+  /**
+   * Stop periodic refresh
+   */
+  private stopRefresh(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
+  }
+
+  /**
+   * Render the dashboard
+   */
+  render(): void {
+    if (this.options.liveRefresh) {
+      // Clear screen and move cursor to top
+      process.stdout.write('\x1B[2J\x1B[0f');
+    }
+
+    const lines: string[] = [];
+
+    // Header
+    lines.push(chalk.bold.cyan('┌─────────────────────────────────────────────────────────┐'));
+    lines.push(chalk.bold.cyan('│') + chalk.bold('  🤖 Harness Orchestrator Dashboard                       ') + chalk.bold.cyan('│'));
+    lines.push(chalk.bold.cyan('└─────────────────────────────────────────────────────────┘'));
+    lines.push('');
+
+    // Summary bar
+    const summary = this.getSummary();
+    lines.push(
+      `${chalk.bold('Status:')} ${this.isRunning ? chalk.green('● Running') : chalk.dim('○ Stopped')}  ` +
+      `${chalk.bold('Agents:')} ${chalk.cyan(summary.activeAgents)}/${summary.maxAgents}  ` +
+      `${chalk.bold('Elapsed:')} ${this.formatDuration(this.getElapsedTime())}`
+    );
+    lines.push('');
+
+    // Overall progress
+    lines.push(chalk.bold('Progress:'));
+    lines.push(this.renderProgressBar(summary.completed, summary.total, 50));
+    lines.push(
+      `  ${chalk.green('✓')} ${summary.completed} completed  ` +
+      `${chalk.blue('▶')} ${summary.running} running  ` +
+      `${chalk.yellow('○')} ${summary.pending} pending  ` +
+      `${chalk.red('✗')} ${summary.failed} failed`
+    );
+    lines.push('');
+
+    // Feature status
+    lines.push(chalk.bold('Features:'));
+    for (const [id, task] of this.tasks) {
+      lines.push(this.renderFeatureRow(task));
+    }
+    lines.push('');
+
+    // Active agents
+    if (summary.activeAgents > 0) {
+      lines.push(chalk.bold('Active Agents:'));
+      for (const agent of this.agents.values()) {
+        if (agent.status === 'running') {
+          const duration = this.formatDuration(Date.now() - agent.startedAt.getTime());
+          const output = agent.lastOutput ? chalk.dim(` "${agent.lastOutput.slice(0, 40)}..."`) : '';
+          lines.push(`  ${chalk.cyan(agent.id)} → ${agent.taskId} (${duration})${output}`);
+        }
+      }
+      lines.push('');
+    }
+
+    // Cost estimates
+    if (this.options.showCosts) {
+      lines.push(chalk.bold('Cost Estimate:'));
+      lines.push(
+        `  Model: ${chalk.cyan(this.model)}  ` +
+        `Input: ~${this.formatNumber(this.costs.inputTokens)} tokens  ` +
+        `Output: ~${this.formatNumber(this.costs.outputTokens)} tokens  ` +
+        `Est. Cost: ${chalk.yellow('$' + this.costs.totalCost.toFixed(4))}`
+      );
+      lines.push('');
+    }
+
+    // Time estimate
+    if (this.isRunning && summary.completed > 0) {
+      const avgTimePerTask = this.getElapsedTime() / summary.completed;
+      const remaining = (summary.pending + summary.running) * avgTimePerTask;
+      lines.push(chalk.bold('Time Estimate:'));
+      lines.push(`  Remaining: ~${this.formatDuration(remaining)} (based on avg ${this.formatDuration(avgTimePerTask)}/task)`);
+      lines.push('');
+    }
+
+    // Recent logs
+    lines.push(chalk.bold('Recent Activity:'));
+    if (this.logs.length === 0) {
+      lines.push(chalk.dim('  No activity yet'));
+    } else {
+      for (const log of this.logs) {
+        lines.push(`  ${log}`);
+      }
+    }
+
+    // Footer
+    lines.push('');
+    lines.push(chalk.dim('Press Ctrl+C to stop gracefully'));
+
+    console.log(lines.join('\n'));
+  }
+
+  /**
+   * Render a progress bar
+   */
+  private renderProgressBar(current: number, total: number, width: number): string {
+    const pct = total > 0 ? current / total : 0;
+    const filled = Math.round(pct * width);
+    const empty = width - filled;
+    const bar = chalk.green('█'.repeat(filled)) + chalk.dim('░'.repeat(empty));
+    const pctStr = `${Math.round(pct * 100)}%`.padStart(4);
+    return `  [${bar}] ${pctStr} (${current}/${total})`;
+  }
+
+  /**
+   * Render a feature row
+   */
+  private renderFeatureRow(task: TaskState): string {
+    const icon = {
+      pending: chalk.dim('○'),
+      ready: chalk.yellow('◐'),
+      running: chalk.blue('●'),
+      completed: chalk.green('✓'),
+      failed: chalk.red('✗'),
+    }[task.status];
+
+    const id = task.status === 'running' ? chalk.blue(task.id) :
+               task.status === 'completed' ? chalk.green(task.id) :
+               task.status === 'failed' ? chalk.red(task.id) : task.id;
+
+    let extra = '';
+    if (task.status === 'running' && task.startedAt) {
+      const duration = this.formatDuration(Date.now() - task.startedAt.getTime());
+      extra = chalk.dim(` (${duration})`);
+    } else if (task.status === 'completed' && task.startedAt && task.completedAt) {
+      const duration = this.formatDuration(task.completedAt.getTime() - task.startedAt.getTime());
+      extra = chalk.dim(` (${duration})`);
+    } else if (task.status === 'failed' && task.error) {
+      extra = chalk.red(` - ${task.error.slice(0, 40)}`);
+    }
+
+    const desc = task.description.slice(0, 40);
+    return `  ${icon} ${id.padEnd(6)} ${desc}${extra}`;
+  }
+
+  /**
+   * Get summary statistics
+   */
+  private getSummary() {
+    let completed = 0;
+    let running = 0;
+    let pending = 0;
+    let failed = 0;
+
+    for (const task of this.tasks.values()) {
+      switch (task.status) {
+        case 'completed':
+          completed++;
+          break;
+        case 'running':
+          running++;
+          break;
+        case 'pending':
+        case 'ready':
+          pending++;
+          break;
+        case 'failed':
+          failed++;
+          break;
+      }
+    }
+
+    return {
+      completed,
+      running,
+      pending,
+      failed,
+      total: this.tasks.size,
+      activeAgents: [...this.agents.values()].filter(a => a.status === 'running').length,
+      maxAgents: this.options.maxAgents
+    };
+  }
+
+  /**
+   * Get elapsed time in ms
+   */
+  private getElapsedTime(): number {
+    if (!this.startTime) return 0;
+    const end = this.endTime || new Date();
+    return end.getTime() - this.startTime.getTime();
+  }
+
+  /**
+   * Format duration in human readable form
+   */
+  private formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${Math.round(ms / 1000)}s`;
+    if (ms < 3600000) {
+      const mins = Math.floor(ms / 60000);
+      const secs = Math.round((ms % 60000) / 1000);
+      return `${mins}m ${secs}s`;
+    }
+    const hours = Math.floor(ms / 3600000);
+    const mins = Math.round((ms % 3600000) / 60000);
+    return `${hours}h ${mins}m`;
+  }
+
+  /**
+   * Format number with K/M suffix
+   */
+  private formatNumber(n: number): string {
+    if (n < 1000) return String(n);
+    if (n < 1000000) return `${(n / 1000).toFixed(1)}K`;
+    return `${(n / 1000000).toFixed(2)}M`;
+  }
+
+  /**
+   * Render a final summary (for non-live mode)
+   */
+  renderFinalSummary(): void {
+    this.options.liveRefresh = false;
+    this.render();
+  }
+}

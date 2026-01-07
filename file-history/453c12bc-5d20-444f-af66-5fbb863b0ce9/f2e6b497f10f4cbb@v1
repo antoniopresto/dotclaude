@@ -1,0 +1,397 @@
+# System-Level Test Design - MMS Metro Mileage Management System
+
+**Date:** 2025-12-28
+**Author:** MMS_PROGRAMMER (TEA Agent)
+**Status:** Draft
+**Mode:** System-Level (Phase 3 - Testability Review)
+
+---
+
+## Executive Summary
+
+**Scope:** System-level testability assessment for MMS railway fleet management demo.
+
+**Project Context:**
+- Demo-focused system (15-minute presentation to win competitive bid)
+- 12-week development timeline
+- 33 user stories across 6 epics implemented
+- Tech stack: Next.js 14 + Fastify + Python OR-Tools + PostgreSQL
+
+**Testability Assessment Result:** PASS with CONCERNS
+
+---
+
+## Testability Assessment
+
+### Controllability: PASS
+
+**Can we control system state for testing?**
+
+| Capability | Status | Evidence |
+|------------|--------|----------|
+| API seeding | ✅ YES | Fastify routes accept POST for creating trains, depots, services, allocations |
+| Database reset | ✅ YES | `docker-compose down -v && docker-compose up` resets to clean state |
+| Seed data script | ✅ YES | `bun run db:seed` populates demo data (architecture.md Section 10.2) |
+| External dependencies mockable | ✅ YES | Solver is HTTP-based, can be mocked via network interception |
+| Error injection | ⚠️ PARTIAL | No explicit chaos engineering, but API can return error responses |
+
+**Controllability Summary:**
+- REST API design allows full control of system state via HTTP calls
+- Docker Compose provides clean state reset between test runs
+- Solver service is loosely coupled (HTTP integration) - easily mockable
+- Database seeding scripts exist for realistic test data
+
+### Observability: PASS
+
+**Can we inspect system state?**
+
+| Capability | Status | Evidence |
+|------------|--------|----------|
+| Health checks | ✅ YES | `GET /health` returns `{ status: 'ok', timestamp: ISO }` (Story 1.4) |
+| API responses | ✅ YES | All endpoints return JSON with predictable structure |
+| Error responses | ✅ YES | Standardized format: `{ error: string, code: string, details?: object }` |
+| Solver metrics | ✅ YES | `solver_time_ms` field in recommendation responses |
+| Frontend state | ✅ YES | @zazcart/toolkit provides observable state via devtools |
+
+**Observability Summary:**
+- Health endpoints available for service monitoring
+- Solver returns execution time metrics for performance validation
+- Standardized error format enables reliable error testing
+- Frontend state management (toolkit) is inspectable
+
+### Reliability: PASS with CONCERNS
+
+**Are tests isolated and reproducible?**
+
+| Capability | Status | Evidence |
+|------------|--------|----------|
+| Parallel-safe | ⚠️ CONCERNS | No explicit test isolation documented |
+| Stateless tests | ⚠️ CONCERNS | Seed data is global, not per-test |
+| Cleanup discipline | ⚠️ CONCERNS | No auto-cleanup fixtures documented |
+| Deterministic waits | ⚠️ CONCERNS | Map refresh every 30s could cause flaky tests |
+| Mockable components | ✅ YES | Solver, Redis cache - all HTTP/network based |
+
+**Reliability Concerns:**
+1. **Seed data is global** - Tests may conflict if run in parallel on shared database
+2. **30-second map refresh** - Auto-refresh could introduce timing flakiness
+3. **No test isolation pattern** - Need fixture-based cleanup for parallel runs
+
+**Recommendations for Sprint 0:**
+- Implement per-test database transactions with rollback
+- Create fixture factory for unique test data (avoid hardcoded IDs)
+- Disable auto-refresh during E2E tests or use network mocking
+
+---
+
+## Architecturally Significant Requirements (ASRs)
+
+### From PRD NFRs
+
+| ASR ID | Requirement | Impact | Probability | Score | Test Approach |
+|--------|-------------|--------|-------------|-------|---------------|
+| ASR-1 | Allocation recommendation < 30s | 3 (PERF) | 2 | 6 | k6 load test with 100 trains |
+| ASR-2 | Screen loading < 3s | 2 (PERF) | 2 | 4 | Playwright performance assertions |
+| ASR-3 | Map refresh < 5s | 2 (PERF) | 2 | 4 | Network timing validation |
+| ASR-4 | Simulation response < 10s | 2 (PERF) | 2 | 4 | API performance test |
+| ASR-5 | Database queries < 500ms | 2 (PERF) | 2 | 4 | Server-timing headers validation |
+| ASR-6 | Demo stability (15 min no crash) | 3 (REL) | 2 | 6 | End-to-end journey test with retries |
+| ASR-7 | Support 80-120 trains | 2 (SCALE) | 1 | 2 | Load test with seeded data |
+| ASR-8 | Domain terminology (EN 15380) | 2 (BUS) | 1 | 2 | UI text validation via snapshots |
+
+### High-Priority ASRs (Score >= 6)
+
+**ASR-1: Solver Performance (Score: 6)**
+- Probability: 2 (Possible) - Solver optimization complexity
+- Impact: 3 (Critical) - Dispatcher won't wait > 30s
+- Mitigation: CP-SAT timeout enforcement, fallback to simple ranking
+- Test: k6 performance test with realistic train count
+
+**ASR-6: Demo Stability (Score: 6)**
+- Probability: 2 (Possible) - 15-minute continuous operation
+- Impact: 3 (Critical) - Demo failure = lost bid
+- Mitigation: Error boundaries, fallback screens, pre-demo rehearsals
+- Test: Full E2E journey with error scenario recovery
+
+---
+
+## Test Levels Strategy
+
+Based on architecture (web app + API + Python solver):
+
+### Recommended Split
+
+| Level | Percentage | Rationale |
+|-------|------------|-----------|
+| Unit | 30% | Solver logic, price calculations, data transformations |
+| Integration/API | 40% | Service layer, database operations, Fastify routes |
+| E2E | 30% | Critical user journeys (demo flows) |
+
+### Test Level Allocation by Module
+
+| Module | Unit | Integration | E2E |
+|--------|------|-------------|-----|
+| Dashboard | 10% | 30% | 60% |
+| Map | 5% | 25% | 70% |
+| Allocation | 20% | 40% | 40% |
+| Balancing | 25% | 45% | 30% |
+| Simulation | 30% | 50% | 20% |
+| Gantt | 15% | 35% | 50% |
+| Solver (Python) | 60% | 30% | 10% |
+
+### Justification
+
+1. **Dashboard/Map heavy on E2E**: User-facing, visual validation critical
+2. **Solver heavy on Unit**: Complex algorithm, edge cases, fast feedback
+3. **Simulation heavy on Integration**: Business logic in service layer
+4. **Gantt heavy on E2E**: Drag-drop, visual interaction validation
+
+---
+
+## NFR Testing Approach
+
+### Security (Demo Scope - Simplified)
+
+| Test | Approach | Tool | Priority |
+|------|----------|------|----------|
+| No auth required | Verify no auth gates | Playwright | P2 |
+| SQL injection blocked | API input validation | Playwright API | P1 |
+| XSS sanitization | Content rendering | Playwright | P1 |
+| No PII in seed data | Data audit | Manual + script | P0 |
+
+**Note:** Demo scope explicitly excludes authentication (architecture.md Section 9).
+
+### Performance
+
+| Test | Approach | Tool | Priority |
+|------|----------|------|----------|
+| Solver < 30s | k6 load test, 100 trains | k6 | P0 |
+| Screen load < 3s | Lighthouse, page timing | Playwright + Lighthouse | P0 |
+| API response < 500ms | Server-Timing headers | Playwright API | P1 |
+| Concurrent users (10-20) | k6 staged load | k6 | P1 |
+
+**k6 Test Configuration:**
+```yaml
+stages:
+  - duration: 1m, target: 10   # Ramp to 10 users
+  - duration: 3m, target: 10   # Sustain
+  - duration: 1m, target: 20   # Spike to 20
+  - duration: 2m, target: 20   # Sustain
+  - duration: 1m, target: 0    # Ramp down
+thresholds:
+  http_req_duration: ['p(95)<500']
+  http_req_failed: ['rate<0.01']
+```
+
+### Reliability
+
+| Test | Approach | Tool | Priority |
+|------|----------|------|----------|
+| API 500 error handling | Mock API failures | Playwright route mocking | P0 |
+| Solver timeout fallback | Mock 30s delay | Playwright + API mock | P0 |
+| Network disconnection | Offline mode test | Playwright context.setOffline | P1 |
+| Error boundaries | Trigger React errors | Playwright | P1 |
+
+**Circuit Breaker Pattern:**
+- Solver fallback: If OR-Tools times out, return simple ranking (top trains by km delta)
+- Frontend: Error boundaries show retry option, not blank page
+
+### Maintainability
+
+| Metric | Target | Validation | Tool |
+|--------|--------|------------|------|
+| Code coverage | >= 60% | CI pipeline | Vitest coverage |
+| TypeScript strict | 100% | Build check | tsc --noEmit |
+| Duplication | < 10% | CI pipeline | jscpd |
+| Documentation | Key functions | Manual review | JSDoc |
+
+---
+
+## Test Environment Requirements
+
+### Local Development
+
+```yaml
+Services:
+  - PostgreSQL 16: localhost:5432
+  - Redis 7: localhost:6379
+  - Fastify API: localhost:4000
+  - Python Solver: localhost:8000
+  - Next.js Frontend: localhost:3000
+
+Setup:
+  1. docker-compose up -d postgres redis
+  2. cd apps/api && bun run db:migrate && bun run db:seed
+  3. cd apps/api && bun run dev
+  4. cd solver && uvicorn src.main:app --reload
+  5. cd apps/web && bun run dev
+```
+
+### CI Environment (GitHub Actions)
+
+```yaml
+Services:
+  postgres:
+    image: postgres:16
+    env:
+      POSTGRES_USER: mms
+      POSTGRES_PASSWORD: mms
+      POSTGRES_DB: mms
+    ports: ['5432:5432']
+
+  redis:
+    image: redis:7
+    ports: ['6379:6379']
+
+Test Matrix:
+  - Unit tests: Node 20, isolated
+  - Integration tests: Full services
+  - E2E tests: Playwright with browser
+```
+
+---
+
+## Testability Concerns
+
+### CONCERN-1: Seed Data Conflicts (MEDIUM)
+
+**Issue:** Global seed data may cause parallel test collisions
+**Impact:** Flaky tests when running with multiple workers
+**Recommendation:** Implement per-test data factories with unique identifiers
+```typescript
+// Use faker for unique data
+const train = createTrain({
+  trainId: `UTE-TEST-${faker.string.nanoid(6)}`,
+  currentKm: faker.number.int({ min: 50000, max: 150000 })
+});
+```
+
+### CONCERN-2: Auto-Refresh Timing (MEDIUM)
+
+**Issue:** Map auto-refreshes every 30 seconds (Story 3.5)
+**Impact:** E2E tests may have non-deterministic timing
+**Recommendation:** Mock timer or disable auto-refresh in test environment
+```typescript
+// Playwright: Freeze time
+await page.clock.install({ time: new Date('2025-01-01') });
+```
+
+### CONCERN-3: Solver Performance Variability (LOW)
+
+**Issue:** OR-Tools solver time varies with train count
+**Impact:** Performance tests may have variance
+**Recommendation:** Use consistent seed data with exact train count for perf tests
+
+### CONCERN-4: No Circuit Breaker Telemetry (LOW)
+
+**Issue:** Fallback mechanism not instrumented
+**Impact:** Hard to validate fallback triggered correctly
+**Recommendation:** Add log/metric when solver fallback activates
+
+---
+
+## Recommendations for Sprint 0
+
+### Test Framework Setup (Priority: P0)
+
+1. **Install Playwright** for E2E tests
+   - Configure for Chromium headless
+   - Setup base fixtures for API requests
+   - Create auth bypass fixture (demo has no auth)
+
+2. **Install Vitest** for unit/integration tests
+   - Configure coverage reporting (target: 60%)
+   - Setup mocking for external services
+
+3. **Install k6** for performance tests
+   - Create baseline performance scripts
+   - Define SLO thresholds
+
+### Fixture Architecture (Priority: P0)
+
+1. **Database fixture** with per-test cleanup
+   ```typescript
+   export const test = base.extend({
+     db: async ({}, use) => {
+       const records: { table: string; id: string }[] = [];
+       await use({
+         seed: async (table, data) => {
+           const result = await apiRequest.post(`/api/${table}`, data);
+           records.push({ table, id: result.id });
+           return result;
+         }
+       });
+       // Cleanup
+       for (const { table, id } of records.reverse()) {
+         await apiRequest.delete(`/api/${table}/${id}`);
+       }
+     }
+   });
+   ```
+
+2. **Factory functions** for all entities
+   - `createTrain()`, `createDepot()`, `createService()`, etc.
+   - Use faker for unique data
+
+### CI Pipeline (Priority: P1)
+
+1. **GitHub Actions workflow** with stages:
+   - Lint + TypeScript check
+   - Unit tests (Vitest)
+   - Integration tests (Vitest + test DB)
+   - E2E tests (Playwright)
+   - Performance tests (k6, optional)
+
+2. **Coverage gates**:
+   - Fail if coverage < 60%
+   - Fail if TypeScript errors
+
+---
+
+## Quality Gate Criteria (Pre-Release)
+
+### P0 Tests (Must Pass)
+- [ ] Solver returns recommendations within 30s (100 trains)
+- [ ] Dashboard loads in < 3s
+- [ ] Full demo journey completes without crash (15 min)
+- [ ] No SQL injection vulnerabilities
+- [ ] Error boundaries catch React failures
+
+### P1 Tests (Should Pass)
+- [ ] API responses < 500ms (p95)
+- [ ] 10 concurrent users supported
+- [ ] Solver fallback works when timeout
+- [ ] All 33 story acceptance criteria covered
+
+### Coverage Targets
+- [ ] Unit: 60% minimum
+- [ ] Integration: 50% minimum
+- [ ] E2E: Critical paths (5-7 journeys)
+
+---
+
+## Test Design Summary
+
+| Category | Status | Notes |
+|----------|--------|-------|
+| Controllability | ✅ PASS | API-first design, mockable dependencies |
+| Observability | ✅ PASS | Health checks, metrics, structured errors |
+| Reliability | ⚠️ CONCERNS | Need test isolation patterns |
+| ASR Coverage | ✅ PASS | 8 ASRs identified, 2 high-priority |
+| NFR Approach | ✅ PASS | Tool selection defined per category |
+| Environment | ✅ PASS | Docker Compose + GitHub Actions |
+
+**Overall Assessment:** Architecture is testable. Proceed with implementation after addressing test isolation concerns in Sprint 0.
+
+---
+
+## Follow-on Workflows
+
+- Run `*testarch-framework` to scaffold Playwright + Vitest + k6
+- Run `*testarch-ci` to create GitHub Actions pipeline
+- Run `*testarch-atdd` per epic to generate failing P0 tests
+
+---
+
+**Generated by**: BMad TEA Agent - Test Architect Module
+**Workflow**: `_bmad/bmm/testarch/test-design` (System-Level Mode)
+**Version**: 4.0 (BMad v6)

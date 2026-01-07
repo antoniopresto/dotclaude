@@ -1,0 +1,225 @@
+     1→# Harness Orchestrator - AI Instructions
+     2→
+     3→## What is This?
+     4→
+     5→This is a **sub-project** within the MMS monorepo. It's an AI orchestration system that manages multiple Claude agents to complete harness tasks in parallel.
+     6→
+     7→**IMPORTANT**: This is isolated from the main MMS canvas project. Do NOT modify files in `apps/canvas/` when working on this package.
+     8→
+     9→---
+    10→
+    11→## Harness Protocol
+    12→
+    13→```
+    14→1. READ progress.txt → understand current state
+    15→2. READ features.json → find next feature (passes: false)
+    16→3. IMPLEMENT the feature
+    17→4. TEST the implementation
+    18→5. UPDATE features.json → set passes: true
+    19→6. UPDATE progress.txt → add session notes
+    20→7. COMMIT changes to this package only
+    21→```
+    22→
+    23→---
+    24→
+    25→## Project Goal
+    26→
+    27→Create an AI Project Manager that:
+    28→- Analyzes task dependencies from any harness features.json
+    29→- Identifies tasks that can run in parallel
+    30→- Dispatches multiple Claude agents simultaneously
+    31→- Tracks progress and handles failures
+    32→- Optimizes for quality, speed, and cost
+    33→
+    34→---
+    35→
+    36→## Architecture Overview
+    37→
+    38→```
+    39→┌─────────────────────────────────────────────────────────────┐
+    40→│                    ORCHESTRATOR                              │
+    41→├─────────────────────────────────────────────────────────────┤
+    42→│                                                              │
+    43→│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+    44→│  │  Dependency  │───▶│    Task      │───▶│    Agent     │  │
+    45→│  │    Graph     │    │  Scheduler   │    │    Pool      │  │
+    46→│  └──────────────┘    └──────────────┘    └──────────────┘  │
+    47→│                                                              │
+    48→│  ┌──────────────┐    ┌──────────────┐                       │
+    49→│  │    State     │    │     AI       │                       │
+    50→│  │   Manager    │    │   Manager    │                       │
+    51→│  └──────────────┘    └──────────────┘                       │
+    52→│                                                              │
+    53→└─────────────────────────────────────────────────────────────┘
+    54→```
+    55→
+    56→### Components
+    57→
+    58→| Component | Responsibility |
+    59→|-----------|----------------|
+    60→| **DependencyGraph** | Parse blockedBy, build DAG, topological sort |
+    61→| **TaskScheduler** | Ready queue, priority scoring, critical path |
+    62→| **AgentPool** | Spawn Claude processes, manage lifecycle |
+    63→| **StateManager** | Atomic updates, file locking, recovery |
+    64→| **AIManager** | Smart decisions, model selection, quality review |
+    65→
+    66→---
+    67→
+    68→## Key Algorithms
+    69→
+    70→### 1. Dependency Graph (DAG)
+    71→
+    72→```typescript
+    73→// Build graph from features
+    74→features.forEach(f => {
+    75→  graph.addNode(f.id);
+    76→  if (f.blockedBy) {
+    77→    const blockers = Array.isArray(f.blockedBy) ? f.blockedBy : [f.blockedBy];
+    78→    blockers.forEach(b => graph.addEdge(b, f.id));
+    79→  }
+    80→});
+    81→
+    82→// Find ready tasks (no pending deps)
+    83→function getReadyTasks() {
+    84→  return features.filter(f =>
+    85→    !f.passes &&
+    86→    getDependencies(f).every(dep => dep.passes)
+    87→  );
+    88→}
+    89→```
+    90→
+    91→### 2. Critical Path
+    92→
+    93→```typescript
+    94→// Longest path determines minimum completion time
+    95→function criticalPath(graph) {
+    96→  const distances = topologicalSort(graph).reduce((acc, node) => {
+    97→    const maxPredecessor = Math.max(
+    98→      0,
+    99→      ...getPredecessors(node).map(p => acc[p] + 1)
+   100→    );
+   101→    acc[node] = maxPredecessor;
+   102→    return acc;
+   103→  }, {});
+   104→
+   105→  return Object.entries(distances)
+   106→    .sort((a, b) => b[1] - a[1]);
+   107→}
+   108→```
+   109→
+   110→### 3. File Locking
+   111→
+   112→```typescript
+   113→// Prevent race conditions on features.json
+   114→import { lockfile } from 'proper-lockfile';
+   115→
+   116→async function atomicUpdate(path, updater) {
+   117→  const release = await lockfile.lock(path);
+   118→  try {
+   119→    const data = JSON.parse(readFileSync(path));
+   120→    const updated = updater(data);
+   121→    writeFileSync(path, JSON.stringify(updated, null, 2));
+   122→  } finally {
+   123→    release();
+   124→  }
+   125→}
+   126→```
+   127→
+   128→---
+   129→
+   130→## Directory Structure (Target)
+   131→
+   132→```
+   133→packages/harness-orchestrator/
+   134→├── CLAUDE.md           # This file
+   135→├── features.json       # Feature definitions for this project
+   136→├── progress.txt        # Session progress log
+   137→├── package.json        # Dependencies
+   138→├── tsconfig.json       # TypeScript config
+   139→└── src/
+   140→    ├── index.ts        # CLI entry point
+   141→    ├── graph/
+   142→    │   ├── DependencyGraph.ts
+   143→    │   └── CriticalPath.ts
+   144→    ├── scheduler/
+   145→    │   ├── TaskScheduler.ts
+   146→    │   └── PriorityQueue.ts
+   147→    ├── agents/
+   148→    │   ├── AgentPool.ts
+   149→    │   └── ClaudeAgent.ts
+   150→    ├── state/
+   151→    │   ├── StateManager.ts
+   152→    │   └── FileLock.ts
+   153→    ├── ai/
+   154→    │   └── AIManager.ts
+   155→    └── cli/
+   156→        └── commands.ts
+   157→```
+   158→
+   159→---
+   160→
+   161→## Commands (Target)
+   162→
+   163→```bash
+   164→# Run orchestration on main project
+   165→npx harness-orchestrator orchestrate ../../../features.json
+   166→
+   167→# Analyze dependencies
+   168→npx harness-orchestrator analyze ../../../features.json
+   169→
+   170→# Show status
+   171→npx harness-orchestrator status ../../../features.json
+   172→
+   173→# Options
+   174→--max-agents 3      # Limit concurrent agents
+   175→--model sonnet      # Default model
+   176→--dry-run           # Show plan without executing
+   177→```
+   178→
+   179→---
+   180→
+   181→## Development Rules
+   182→
+   183→1. **Isolation**: Only modify files in `packages/harness-orchestrator/`
+   184→2. **Testing**: Test with this package's own features.json first
+   185→3. **Commits**: Commit only this package's changes
+   186→4. **Dependencies**: Install deps here, not in root
+   187→5. **No Conflicts**: Don't touch apps/canvas or root features.json
+   188→
+   189→---
+   190→
+   191→## Quick Start for New Session
+   192→
+   193→```bash
+   194→# 1. Navigate to package
+   195→cd packages/harness-orchestrator
+   196→
+   197→# 2. Read current state
+   198→cat progress.txt
+   199→cat features.json | jq '.features[] | select(.passes == false) | .id'
+   200→
+   201→# 3. Work on next feature
+   202→# ... implement ...
+   203→
+   204→# 4. Update progress
+   205→# ... update progress.txt ...
+   206→
+   207→# 5. Commit
+   208→git add packages/harness-orchestrator/
+   209→git commit -m "feat(orchestrator): description"
+   210→```
+   211→
+   212→---
+   213→
+   214→## Reference Implementation
+   215→
+   216→See `scripts/harness-runner.js` for a simple sequential implementation. This orchestrator extends that concept with:
+   217→- Parallel execution
+   218→- Dependency analysis
+   219→- Intelligent scheduling
+   220→- State management
+   221→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,109 @@
+import { NavigationProp, useNavigation } from '@react-navigation/native';
+import { useCallback, useEffect, useMemo } from 'react';
+import { PointsProduct } from '../../../redux/ducks/points';
+import { PropsRootStack } from '../../../routes/Models';
+import { KEY_NAME_TO_ICON, NAME_TO_ICON } from '../../../screens/Points/data';
+import { PointsCardItem } from '../../../screens/Points/Models';
+import { useInvoiceCashbackPermission } from '../../../services/invoiceCashbackPermission';
+import { extractRawProducts, isValidProduct, normalizeName } from './data';
+import { PointsCardItemBuilder } from './data/pointsCardItemBuilder';
+
+export const useCardBuilderWhereUseMyPoints = () => {
+  const navigation = useNavigation<NavigationProp<PropsRootStack>>();
+  const { checkHasRedeemed } = useInvoiceCashbackPermission();
+
+  useEffect(() => {
+    // preloading cashback permission
+    checkHasRedeemed({ showLoading: false }).catch(() => {});
+  }, [checkHasRedeemed]);
+
+  const onPressKeyName = useMemo(
+    () => ({
+      [normalizeName(KEY_NAME_TO_ICON.MARKETPLACE)]: () => {
+        navigation.navigate('RewardProgramMarketplace');
+      },
+      [normalizeName(KEY_NAME_TO_ICON.FUEL_VOUCHER)]: () => {},
+      [normalizeName(KEY_NAME_TO_ICON.MONTHLY_DISCOUNT)]: () => {},
+      [normalizeName(KEY_NAME_TO_ICON.CAR_INSURANCE_DISCOUNT)]: () => {},
+      [normalizeName(KEY_NAME_TO_ICON.PARKING_DISCOUNT)]: () => {},
+      [normalizeName(KEY_NAME_TO_ICON.FINES_DISCOUNT)]: () => {},
+      [normalizeName(KEY_NAME_TO_ICON.IPVA_DISCOUNT)]: () => {},
+      [normalizeName(KEY_NAME_TO_ICON.AIRLINE_MILES)]: () => {},
+    }),
+    [navigation]
+  );
+
+  const handleOnPress = useCallback(
+    (keyName: string) => {
+      return () => {
+        if (keyName in onPressKeyName) {
+          onPressKeyName[keyName]();
+        }
+      };
+    },
+    [onPressKeyName]
+  );
+
+  const buildPointsCardItems = useCallback(
+    (pointsOptions: PointsProduct[] | undefined): PointsCardItem[] => {
+      const rawProducts = extractRawProducts(pointsOptions);
+      const builder = PointsCardItemBuilder.getInstance();
+
+      return rawProducts.filter(isValidProduct).map((product, index) => {
+        const normalizedName = normalizeName(product.name);
+        const icon = NAME_TO_ICON[normalizedName] || 'icon-default';
+
+        const isCashbackInInvoice =
+          normalizedName === normalizeName(KEY_NAME_TO_ICON.RESCUE_IN_INVOICE);
+
+        const onPress = isCashbackInInvoice
+          ? async () => {
+              const rawCF =
+                (product as any).conversionFactor ?? (product as any).convertionFactor ?? 0;
+              const conversionFactor = (() => {
+                if (typeof rawCF === 'number') return rawCF;
+                if (typeof rawCF === 'string') {
+                  const n = Number(
+                    String(rawCF)
+                      .replace(',', '.')
+                      .replace(/[^0-9.-]/g, '')
+                  );
+                  return Number.isFinite(n) ? n : 0;
+                }
+                return 0;
+              })();
+              const productCode = (product as any).productCode ?? (product as any).code;
+              const campaingId =
+                (product as any).campaingId ?? (product as any).campaignId ?? undefined;
+
+              const hasRedeemed = await checkHasRedeemed();
+              if (hasRedeemed) {
+                navigation.navigate('InvoiceCashbackPoints', {
+                  conversionFactor,
+                  productCode,
+                  campaingId,
+                });
+              } else {
+                navigation.navigate('InvoiceCashbackOnboarding', {
+                  conversionFactor,
+                  productCode,
+                  campaingId,
+                });
+              }
+            }
+          : handleOnPress(normalizedName);
+
+        return builder
+          .reset()
+          .setId(index + 1)
+          .setText(product.name)
+          .setIcon(icon)
+          .setOnPress(onPress)
+          .build();
+      });
+    },
+    [handleOnPress, checkHasRedeemed, navigation]
+  );
+
+  return buildPointsCardItems;
+};

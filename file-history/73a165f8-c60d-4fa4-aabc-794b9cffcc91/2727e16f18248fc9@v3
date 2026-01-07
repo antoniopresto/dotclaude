@@ -1,0 +1,153 @@
+/**
+ * Content script for video detection on web pages
+ * Runs in the context of web pages to find and extract video information
+ */
+
+import { detectVideos, type DetectedVideo } from '../utils/video-detector';
+
+/**
+ * Get a clean page title based on the current site
+ */
+function getPageTitle(): string {
+  const hostname = window.location.hostname;
+
+  // YouTube
+  if (hostname.includes('youtube.com') || hostname.includes('youtu.be')) {
+    // Try YouTube-specific selectors
+    const ytTitle = document.querySelector('yt-formatted-string.ytd-watch-metadata, h1.ytd-watch-metadata yt-formatted-string, #title h1 yt-formatted-string');
+    if (ytTitle?.textContent?.trim()) {
+      return ytTitle.textContent.trim().slice(0, 80);
+    }
+
+    // Shorts-specific
+    const shortsTitle = document.querySelector('[class*="shorts"] h2, ytd-reel-video-renderer h2, .reel-player-header-renderer h2');
+    if (shortsTitle?.textContent?.trim()) {
+      return shortsTitle.textContent.trim().slice(0, 80);
+    }
+  }
+
+  // Instagram
+  if (hostname.includes('instagram.com')) {
+    const userLink = document.querySelector('header a[href*="/"]');
+    let title = '';
+    if (userLink) {
+      const href = userLink.getAttribute('href');
+      if (href) {
+        const username = href.replace(/\//g, '');
+        if (username && username.length > 0 && username.length < 50) {
+          title = `@${username}`;
+        }
+      }
+    }
+    const metaDesc = document.querySelector('meta[property="og:description"]');
+    if (metaDesc?.getAttribute('content')) {
+      const caption = metaDesc.getAttribute('content')!.split(/[#@]/)[0].trim().slice(0, 60);
+      if (caption) {
+        title = title ? `${title} - ${caption}` : caption;
+      }
+    }
+    if (title) return title;
+  }
+
+  // Twitter/X
+  if (hostname.includes('twitter.com') || hostname.includes('x.com')) {
+    const tweetText = document.querySelector('[data-testid="tweetText"]');
+    if (tweetText?.textContent) {
+      return tweetText.textContent.slice(0, 60).trim();
+    }
+  }
+
+  // TikTok
+  if (hostname.includes('tiktok.com')) {
+    const descEl = document.querySelector('[data-e2e="browse-video-desc"], [data-e2e="video-desc"]');
+    if (descEl?.textContent) {
+      return descEl.textContent.slice(0, 60).trim();
+    }
+  }
+
+  // Generic fallback
+  const pageTitle = document.title || 'Video';
+  return pageTitle
+    .replace(/\s*[-|•·]\s*(YouTube|Instagram|Twitter|Facebook|TikTok|X).*$/i, '')
+    .replace(/\s*on\s*(YouTube|Instagram|Twitter|Facebook|TikTok|X)$/i, '')
+    .trim()
+    .slice(0, 80) || 'Video';
+}
+
+export default defineContentScript({
+  matches: ['<all_urls>'],
+  runAt: 'document_idle',
+
+  main() {
+    console.log('[Video Downloader] Content script loaded');
+
+    // Listen for messages from popup or background
+    browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message.action === 'detectVideos') {
+        const videos = detectVideos();
+        const pageTitle = getPageTitle();
+        console.log('[Video Downloader] Detected videos:', videos);
+        sendResponse({ videos, pageTitle });
+        return true;
+      }
+
+      if (message.action === 'ping') {
+        sendResponse({ status: 'ready' });
+        return true;
+      }
+
+      return false;
+    });
+
+    // Observe for dynamically loaded videos
+    const observer = new MutationObserver((mutations) => {
+      let hasNewVideos = false;
+
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof HTMLElement) {
+            if (node.tagName === 'VIDEO' || node.querySelector('video')) {
+              hasNewVideos = true;
+            }
+          }
+        });
+      });
+
+      if (hasNewVideos) {
+        // Notify background about potential new videos
+        browser.runtime.sendMessage({ action: 'videosUpdated' }).catch(() => {
+          // Background might not be ready
+        });
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+
+    // Initial detection and notification
+    setTimeout(() => {
+      const videos = detectVideos();
+      if (videos.length > 0) {
+        browser.runtime.sendMessage({
+          action: 'videosDetected',
+          count: videos.length,
+        }).catch(() => {
+          // Background might not be ready
+        });
+      }
+    }, 1000);
+  },
+});
+
+// Type declaration for WXT's defineContentScript
+declare function defineContentScript(options: {
+  matches: string[];
+  runAt?: 'document_start' | 'document_end' | 'document_idle';
+  main: () => void;
+}): {
+  matches: string[];
+  runAt?: 'document_start' | 'document_end' | 'document_idle';
+  main: () => void;
+};

@@ -1,0 +1,248 @@
+     1→/**
+     2→ * Spatial Indexing Types for PERF-002
+     3→ *
+     4→ * This module defines interfaces for spatial queries on the canvas.
+     5→ * The goal is to efficiently find entities within a viewport region
+     6→ * without iterating through all 60k+ tasks.
+     7→ *
+     8→ * Architecture:
+     9→ * - ISpatialIndex: Abstract interface for any spatial index implementation
+    10→ * - SimpleSpatialIndex: O(n) placeholder (this PR)
+    11→ * - RBushSpatialIndex: Full R-tree implementation (STATE-ARCH-001.Phase2)
+    12→ *
+    13→ * Coordinate system matches canvas:
+    14→ * - X: days from start (positive = future)
+    15→ * - Y: train rows (0 = top, negative = down)
+    16→ */
+    17→
+    18→import type { TaskRender } from '../data/types';
+    19→
+    20→// ─────────────────────────────────────────────────────────────
+    21→// VIEWPORT BOUNDS
+    22→// ─────────────────────────────────────────────────────────────
+    23→
+    24→/**
+    25→ * Rectangle defining the visible viewport in world coordinates.
+    26→ * Used for culling queries - only render entities within these bounds.
+    27→ */
+    28→export interface ViewportBounds {
+    29→  /** Left edge in world X (days * pxPerDay) */
+    30→  minX: number;
+    31→  /** Right edge in world X */
+    32→  maxX: number;
+    33→  /** Bottom edge in world Y (negative, more trains) */
+    34→  minY: number;
+    35→  /** Top edge in world Y (closer to 0) */
+    36→  maxY: number;
+    37→}
+    38→
+    39→/**
+    40→ * Entity bounding box for spatial indexing.
+    41→ * Compatible with RBush item format.
+    42→ */
+    43→export interface SpatialItem {
+    44→  /** Left edge */
+    45→  minX: number;
+    46→  /** Right edge */
+    47→  maxX: number;
+    48→  /** Bottom edge (lower Y value, more negative) */
+    49→  minY: number;
+    50→  /** Top edge (higher Y value, closer to 0) */
+    51→  maxY: number;
+    52→  /** Reference to the entity ID */
+    53→  id: string;
+    54→}
+    55→
+    56→// ─────────────────────────────────────────────────────────────
+    57→// SPATIAL INDEX INTERFACE
+    58→// ─────────────────────────────────────────────────────────────
+    59→
+    60→/**
+    61→ * Query result with optional distance for nearest-neighbor queries.
+    62→ */
+    63→export interface SpatialQueryResult {
+    64→  /** Entity ID */
+    65→  id: string;
+    66→  /** Distance from query point (for nearest queries) */
+    67→  distance?: number;
+    68→}
+    69→
+    70→/**
+    71→ * Statistics for monitoring index performance.
+    72→ */
+    73→export interface SpatialIndexStats {
+    74→  /** Total number of indexed items */
+    75→  itemCount: number;
+    76→  /** Time taken for last bulk load (ms) */
+    77→  lastBuildTimeMs?: number;
+    78→  /** Time taken for last query (ms) */
+    79→  lastQueryTimeMs?: number;
+    80→  /** Number of items returned in last query */
+    81→  lastQueryResultCount?: number;
+    82→}
+    83→
+    84→/**
+    85→ * Abstract interface for spatial indexing.
+    86→ *
+    87→ * This interface is implementation-agnostic - it can be backed by:
+    88→ * - SimpleSpatialIndex: O(n) linear scan (placeholder)
+    89→ * - RBushSpatialIndex: R-tree for O(log n) queries
+    90→ * - FlatbushSpatialIndex: Static R-tree for read-heavy workloads
+    91→ * - Custom TypedArray-based index for maximum performance
+    92→ *
+    93→ * Usage pattern:
+    94→ * 1. Create index and load data once (or on data change)
+    95→ * 2. Query frequently during pan/zoom
+    96→ * 3. Clear and rebuild only when data changes
+    97→ */
+    98→export interface ISpatialIndex {
+    99→  /**
+   100→   * Bulk load items into the index.
+   101→   * More efficient than inserting one by one.
+   102→   *
+   103→   * @param items - Array of items to index
+   104→   */
+   105→  load(items: SpatialItem[]): void;
+   106→
+   107→  /**
+   108→   * Insert a single item into the index.
+   109→   * Use sparingly - bulk load is more efficient.
+   110→   *
+   111→   * @param item - Item to insert
+   112→   */
+   113→  insert(item: SpatialItem): void;
+   114→
+   115→  /**
+   116→   * Remove an item from the index by ID.
+   117→   *
+   118→   * @param id - ID of item to remove
+   119→   * @returns true if item was found and removed
+   120→   */
+   121→  remove(id: string): boolean;
+   122→
+   123→  /**
+   124→   * Clear all items from the index.
+   125→   */
+   126→  clear(): void;
+   127→
+   128→  /**
+   129→   * Query items within viewport bounds.
+   130→   * This is the main query used for viewport culling.
+   131→   *
+   132→   * @param bounds - Viewport rectangle in world coordinates
+   133→   * @returns Array of item IDs within bounds
+   134→   */
+   135→  queryViewport(bounds: ViewportBounds): string[];
+   136→
+   137→  /**
+   138→   * Query items within a circular region.
+   139→   * Useful for mouse hover detection.
+   140→   *
+   141→   * @param x - Center X in world coordinates
+   142→   * @param y - Center Y in world coordinates
+   143→   * @param radius - Search radius in world units
+   144→   * @returns Array of item IDs within radius
+   145→   */
+   146→  queryRadius(x: number, y: number, radius: number): string[];
+   147→
+   148→  /**
+   149→   * Find the nearest item to a point.
+   150→   * Useful for snapping and selection.
+   151→   *
+   152→   * @param x - Query X in world coordinates
+   153→   * @param y - Query Y in world coordinates
+   154→   * @param maxDistance - Maximum search distance (optional)
+   155→   * @returns Nearest item ID and distance, or null if none found
+   156→   */
+   157→  queryNearest(x: number, y: number, maxDistance?: number): SpatialQueryResult | null;
+   158→
+   159→  /**
+   160→   * Get performance statistics.
+   161→   */
+   162→  getStats(): SpatialIndexStats;
+   163→}
+   164→
+   165→// ─────────────────────────────────────────────────────────────
+   166→// HELPER FUNCTIONS
+   167→// ─────────────────────────────────────────────────────────────
+   168→
+   169→/**
+   170→ * Convert a TaskRender to a SpatialItem for indexing.
+   171→ *
+   172→ * @param task - Task with render coordinates
+   173→ * @param pxPerDay - Pixels per day (default: 10)
+   174→ * @param pxPerTrain - Pixels per train row (default: 24)
+   175→ * @returns SpatialItem for indexing
+   176→ */
+   177→export function taskToSpatialItem(
+   178→  task: TaskRender,
+   179→  pxPerDay: number = 10,
+   180→  pxPerTrain: number = 24
+   181→): SpatialItem {
+   182→  const minX = task.startDay * pxPerDay;
+   183→  const maxX = (task.startDay + task.duration) * pxPerDay;
+   184→  // Y is negative (trains go downward from 0)
+   185→  const maxY = -task.trainIndex * pxPerTrain;
+   186→  const minY = maxY - pxPerTrain;
+   187→
+   188→  return {
+   189→    minX,
+   190→    maxX,
+   191→    minY,
+   192→    maxY,
+   193→    id: task.id,
+   194→  };
+   195→}
+   196→
+   197→/**
+   198→ * Convert an array of TaskRender to SpatialItems.
+   199→ *
+   200→ * @param tasks - Array of tasks
+   201→ * @param pxPerDay - Pixels per day
+   202→ * @param pxPerTrain - Pixels per train row
+   203→ * @returns Array of SpatialItems
+   204→ */
+   205→export function tasksToSpatialItems(
+   206→  tasks: TaskRender[],
+   207→  pxPerDay: number = 10,
+   208→  pxPerTrain: number = 24
+   209→): SpatialItem[] {
+   210→  return tasks.map(task => taskToSpatialItem(task, pxPerDay, pxPerTrain));
+   211→}
+   212→
+   213→/**
+   214→ * Check if two rectangles intersect.
+   215→ *
+   216→ * @param a - First rectangle
+   217→ * @param b - Second rectangle
+   218→ * @returns true if rectangles overlap
+   219→ */
+   220→export function rectanglesIntersect(
+   221→  a: { minX: number; maxX: number; minY: number; maxY: number },
+   222→  b: { minX: number; maxX: number; minY: number; maxY: number }
+   223→): boolean {
+   224→  return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
+   225→}
+   226→
+   227→/**
+   228→ * Calculate distance from a point to the center of a rectangle.
+   229→ *
+   230→ * @param px - Point X
+   231→ * @param py - Point Y
+   232→ * @param rect - Rectangle
+   233→ * @returns Distance to center
+   234→ */
+   235→export function distanceToCenter(
+   236→  px: number,
+   237→  py: number,
+   238→  rect: { minX: number; maxX: number; minY: number; maxY: number }
+   239→): number {
+   240→  const cx = (rect.minX + rect.maxX) / 2;
+   241→  const cy = (rect.minY + rect.maxY) / 2;
+   242→  return Math.sqrt((px - cx) ** 2 + (py - cy) ** 2);
+   243→}
+   244→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

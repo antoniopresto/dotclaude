@@ -1,0 +1,201 @@
+/**
+ * Claude Code Integration Tests
+ *
+ * These tests call the REAL Claude Code CLI against mock projects
+ * to verify the agentrc hooks work end-to-end.
+ *
+ * IMPORTANT: These tests require:
+ * - Claude Code CLI installed (`claude` command)
+ * - bun installed
+ * - Network access (Claude API)
+ *
+ * These tests are SLOW (each Claude call takes 5-30 seconds)
+ * Run with: pnpm test:e2e
+ */
+
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import {
+  createConfiguredTestProject,
+  isClaudeCodeAvailable,
+  isBunAvailable,
+  type TestProject,
+} from './test-utils';
+
+// Skip all tests if Claude Code is not available
+const runTests = isClaudeCodeAvailable() && isBunAvailable();
+
+describe.skipIf(!runTests)('Claude Code E2E Integration', () => {
+  beforeAll(() => {
+    if (!runTests) {
+      console.warn('⚠️ Claude Code or bun not available, E2E tests will be skipped');
+    }
+  });
+
+  describe('blocking rules via Claude Code', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createConfiguredTestProject('claude-e2e-block');
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should block Claude from creating .forbidden files', async () => {
+      // Ask Claude to create a .forbidden file
+      const result = await project.runClaudeCode(
+        'Create a file called test.forbidden with the content "hello"',
+        { timeout: 60000 }
+      );
+
+      // The hook should have blocked it
+      // Check stderr for block message OR check that file wasn't created
+      const fileExists = project.fileExists('test.forbidden');
+
+      // Either Claude was blocked (file doesn't exist) or we see the block message
+      expect(
+        !fileExists || result.stderr.includes('RULE VIOLATION') || result.stderr.includes('NO-FORBIDDEN-FILES')
+      ).toBe(true);
+    }, 90000);
+
+    it('should allow Claude to create normal .ts files', async () => {
+      const result = await project.runClaudeCode(
+        'Create a file called src/hello.ts with content: export const hello = "world";',
+        { timeout: 60000 }
+      );
+
+      // Should succeed - no blocking
+      expect(result.stderr).not.toContain('RULE VIOLATION');
+
+      // File should be created (or Claude acknowledged the request)
+      // Note: Claude might not actually create the file in --print mode
+    }, 90000);
+  });
+
+  describe('warning rules via Claude Code', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createConfiguredTestProject('claude-e2e-warn');
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should warn Claude when touching sensitive paths', async () => {
+      const result = await project.runClaudeCode(
+        'Create a file called config/secrets.json with content: {"key": "value"}',
+        { timeout: 60000 }
+      );
+
+      // Should see warning in stderr (but action allowed)
+      // The DEFAULT_AGENTRC has WARN-SENSITIVE rule for /secret|password|credential/i
+      expect(
+        result.stderr.includes('WARNING') ||
+        result.stderr.includes('WARN-SENSITIVE') ||
+        result.stderr.includes('Sensitive')
+      ).toBe(true);
+    }, 90000);
+  });
+
+  describe('hook injection via Claude Code', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createConfiguredTestProject('claude-e2e-inject');
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should inject context from PreToolUse hook', async () => {
+      const result = await project.runClaudeCode(
+        'Create a file called src/component.ts with a simple React component',
+        { timeout: 60000 }
+      );
+
+      // The DEFAULT_AGENTRC injects "[TEST] Tool: Write, Path: ..."
+      // This should appear in Claude's context/output
+      expect(
+        result.stdout.includes('[TEST]') ||
+        result.stderr.includes('[TEST]')
+      ).toBe(true);
+    }, 90000);
+  });
+
+  describe('cascade hierarchy via Claude Code', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createConfiguredTestProject('claude-e2e-cascade');
+
+      // Add a child .agentrc.ts that blocks .local files
+      project.createDir('src');
+      project.writeFile(
+        'src/.agentrc.ts',
+        `
+export default {
+  rules: [
+    {
+      id: 'SRC-NO-LOCAL',
+      match: (path) => path.endsWith('.local'),
+      action: 'block',
+      message: 'No .local files in src directory',
+    },
+  ],
+};
+`
+      );
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should apply child agentrc rules', async () => {
+      // Try to create .local file in src/ (should be blocked by child rule)
+      const result = await project.runClaudeCode(
+        'Create a file called src/config.local with content: local=true',
+        { timeout: 60000 }
+      );
+
+      // Should be blocked by child rule
+      const fileExists = project.fileExists('src/config.local');
+      expect(
+        !fileExists ||
+        result.stderr.includes('SRC-NO-LOCAL') ||
+        result.stderr.includes('RULE VIOLATION')
+      ).toBe(true);
+    }, 90000);
+
+    it('should still apply parent rules in child directories', async () => {
+      // Try to create .forbidden file in src/ (should be blocked by parent rule)
+      const result = await project.runClaudeCode(
+        'Create a file called src/test.forbidden with content: test',
+        { timeout: 60000 }
+      );
+
+      // Should be blocked by parent rule
+      const fileExists = project.fileExists('src/test.forbidden');
+      expect(
+        !fileExists ||
+        result.stderr.includes('NO-FORBIDDEN-FILES') ||
+        result.stderr.includes('RULE VIOLATION')
+      ).toBe(true);
+    }, 90000);
+  });
+});
+
+/**
+ * Smoke test - quick sanity check that Claude Code works at all
+ */
+describe.skipIf(!runTests)('Claude Code Smoke Test', () => {
+  it('should be able to run claude --help', async () => {
+    const { execSync } = await import('child_process');
+    const result = execSync('claude --help', { encoding: 'utf-8' });
+    expect(result).toContain('Claude Code');
+  });
+});

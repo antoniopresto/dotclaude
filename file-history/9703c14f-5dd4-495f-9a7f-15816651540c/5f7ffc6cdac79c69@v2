@@ -1,0 +1,163 @@
+/**
+ * MMS - Dashboard Routes
+ *
+ * Endpoints for dashboard KPIs and overview data
+ */
+
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { db, schema } from '../db/client';
+import { sql, count, avg, and, eq, gte, lte } from 'drizzle-orm';
+
+export async function dashboardRoutes(fastify: FastifyInstance) {
+  // GET /api/dashboard/summary
+  fastify.get('/summary', async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      // Count total trains
+      const totalResult = await db.select({ value: count() }).from(schema.trains);
+      const totalTrains = Number(totalResult[0].value);
+
+      // Count available (fit) trains
+      const availableResult = await db
+        .select({ value: count() })
+        .from(schema.trains)
+        .where(eq(schema.trains.fitnessStatus, 'fit'));
+      const availableTrains = Number(availableResult[0].value);
+
+      // Count in-maintenance
+      const inMaintenanceCount = totalTrains - availableTrains;
+
+      // Calculate km variance
+      const kmStats = await db
+        .select({
+          avgKm: avg(schema.trains.currentKm),
+          targetKm: avg(schema.trains.targetKm),
+        })
+        .from(schema.trains);
+
+      const avgKm = Number(kmStats[0].avgKm) || 0;
+      const targetKm = Number(kmStats[0].targetKm) || avgKm;
+
+      // Calculate variance percentage based on standard deviation
+      const varianceQuery = await db.execute(sql`
+        SELECT
+          ROUND(STDDEV(current_km) / NULLIF(AVG(current_km), 0) * 100, 1) as variance_percent
+        FROM trains
+      `);
+      const kmVariance = Number((varianceQuery as any)[0]?.variance_percent) || 0;
+
+      // Determine variance status
+      let varianceStatus: 'green' | 'yellow' | 'red';
+      if (kmVariance <= 10) varianceStatus = 'green';
+      else if (kmVariance <= 20) varianceStatus = 'yellow';
+      else varianceStatus = 'red';
+
+      return {
+        totalTrains,
+        availableTrains,
+        inMaintenanceCount,
+        kmVariance,
+        varianceStatus,
+      };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to fetch dashboard summary' });
+    }
+  });
+
+  // GET /api/dashboard/depot-capacity
+  fastify.get('/depot-capacity', async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const depots = await db.select().from(schema.depots);
+
+      // For each depot, count trains currently stationed there
+      const result = await Promise.all(
+        depots.map(async (depot) => {
+          const trainCount = await db
+            .select({ value: count() })
+            .from(schema.trains)
+            .where(eq(schema.trains.baseDepotId, depot.id));
+
+          const currentOccupancy = Number(trainCount[0].value);
+          const maxCapacity = depot.capacityTracks || 5;
+          const percentUsed = Math.round((currentOccupancy / maxCapacity) * 100);
+
+          return {
+            id: depot.id,
+            name: depot.name,
+            code: depot.code,
+            currentOccupancy,
+            maxCapacity,
+            percentUsed,
+          };
+        })
+      );
+
+      return { depots: result };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to fetch depot capacity' });
+    }
+  });
+
+  // GET /api/dashboard/maintenance-alerts
+  fastify.get('/maintenance-alerts', async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const today = new Date();
+      const sevenDaysFromNow = new Date(today);
+      sevenDaysFromNow.setDate(sevenDaysFromNow.getDate() + 7);
+
+      const todayStr = today.toISOString().split('T')[0];
+      const futureStr = sevenDaysFromNow.toISOString().split('T')[0];
+
+      // Get upcoming maintenance in next 7 days
+      const upcomingMaintenance = await db.query.maintenanceSchedules.findMany({
+        where: and(
+          gte(schema.maintenanceSchedules.scheduledDate, todayStr),
+          lte(schema.maintenanceSchedules.scheduledDate, futureStr),
+          eq(schema.maintenanceSchedules.status, 'scheduled')
+        ),
+        with: {
+          train: true,
+          depot: true,
+        },
+        orderBy: (ms, { asc }) => [asc(ms.scheduledDate)],
+        limit: 10,
+      });
+
+      // Count by type
+      const countByType = {
+        PM1: 0,
+        PM2: 0,
+        HM: 0,
+        OVH: 0,
+      };
+
+      upcomingMaintenance.forEach((m) => {
+        const type = m.maintenanceType as keyof typeof countByType;
+        if (type in countByType) {
+          countByType[type]++;
+        }
+      });
+
+      // Format alerts list (top 5)
+      const alerts = upcomingMaintenance.slice(0, 5).map((m) => ({
+        id: m.id,
+        trainId: m.train?.trainId || 'Unknown',
+        type: m.maintenanceType,
+        date: m.scheduledDate,
+        depot: m.depot?.name || 'Unknown',
+        depotCode: m.depot?.code || '--',
+        durationDays: m.durationDays || 1,
+      }));
+
+      return {
+        totalUpcoming: upcomingMaintenance.length,
+        countByType,
+        alerts,
+      };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to fetch maintenance alerts' });
+    }
+  });
+}

@@ -1,0 +1,575 @@
+//! Semantic search using vector embeddings.
+//!
+//! This module provides embedding generation and vector search using:
+//! - **fastembed**: Local ONNX model for text embeddings (AllMiniLML6V2, 384 dims)
+//! - **sqlite-vec**: SQLite extension for vector similarity search (KNN)
+//!
+//! Key features:
+//! - Singleton EmbeddingService with lazy initialization
+//! - Auto-sync with CRUD operations (create → embed, update → re-embed, delete → remove)
+//! - Semantic search that finds conceptually similar content
+
+use std::sync::OnceLock;
+
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use parking_lot::Mutex;
+use rusqlite::{params, Connection};
+
+use chrono::Utc;
+
+use super::{DbError, DbResult, ProjectProgress, ProjectTask, TaskStatus};
+
+// =============================================================================
+// EMBEDDING SERVICE (Singleton)
+// =============================================================================
+
+/// Global embedding service instance (lazy initialized).
+static EMBEDDING_SERVICE: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
+
+/// Get the global embedding service.
+///
+/// First call initializes the model (~3s on first load, downloads if needed).
+/// Subsequent calls return the cached instance.
+pub fn get_embedding_service() -> &'static Mutex<TextEmbedding> {
+    EMBEDDING_SERVICE.get_or_init(|| {
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+        )
+        .expect("Failed to load embedding model");
+        Mutex::new(model)
+    })
+}
+
+/// Check if the embedding service is initialized.
+pub fn is_initialized() -> bool {
+    EMBEDDING_SERVICE.get().is_some()
+}
+
+// =============================================================================
+// EMBEDDING GENERATION
+// =============================================================================
+
+/// Generate embedding vector for text.
+///
+/// Returns a 384-dimensional vector (AllMiniLML6V2 model).
+pub fn generate_embedding(text: &str) -> DbResult<Vec<f32>> {
+    let model = get_embedding_service().lock();
+    let embeddings = model
+        .embed(vec![text], None)
+        .map_err(|e| DbError::Embedding(e.to_string()))?;
+    Ok(embeddings.into_iter().next().unwrap_or_default())
+}
+
+/// Convert embedding vector to bytes for sqlite-vec storage.
+fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
+    embedding
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect()
+}
+
+/// Convert bytes from sqlite-vec back to embedding vector.
+#[allow(dead_code)]
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+// =============================================================================
+// TASK EMBEDDINGS
+// =============================================================================
+
+/// Store embedding for a task (by rowid).
+pub fn store_task_embedding(conn: &Connection, task_rowid: i64, embedding: &[f32]) -> DbResult<()> {
+    let bytes = embedding_to_bytes(embedding);
+    conn.execute(
+        "INSERT INTO task_embeddings(rowid, embedding) VALUES (?1, ?2)",
+        params![task_rowid, bytes],
+    )?;
+    Ok(())
+}
+
+/// Update embedding for a task (delete + insert).
+pub fn update_task_embedding(
+    conn: &Connection,
+    task_rowid: i64,
+    embedding: &[f32],
+) -> DbResult<()> {
+    delete_task_embedding(conn, task_rowid)?;
+    store_task_embedding(conn, task_rowid, embedding)
+}
+
+/// Delete embedding for a task.
+pub fn delete_task_embedding(conn: &Connection, task_rowid: i64) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM task_embeddings WHERE rowid = ?1",
+        params![task_rowid],
+    )?;
+    Ok(())
+}
+
+/// Get rowid for a task by ID.
+pub fn get_task_rowid(conn: &Connection, task_id: &str) -> DbResult<Option<i64>> {
+    let result = conn.query_row(
+        "SELECT rowid FROM project_tasks WHERE id = ?1",
+        [task_id],
+        |row| row.get::<_, i64>(0),
+    );
+
+    match result {
+        Ok(rowid) => Ok(Some(rowid)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Semantic search for tasks using vector similarity (KNN).
+///
+/// Returns tasks ordered by semantic similarity to the query.
+pub fn search_tasks_semantic(
+    conn: &Connection,
+    query: &str,
+    limit: Option<usize>,
+) -> DbResult<Vec<(ProjectTask, f32)>> {
+    let query_embedding = generate_embedding(query)?;
+    let query_bytes = embedding_to_bytes(&query_embedding);
+    let limit = limit.unwrap_or(20);
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            p.id, p.title, p.description, p.status, p.category,
+            p.sort_order, p.is_passed, p.created_at, p.updated_at,
+            e.distance
+        FROM project_tasks p
+        JOIN task_embeddings e ON p.rowid = e.rowid
+        WHERE e.embedding MATCH ?1 AND k = ?2
+        ORDER BY e.distance
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![query_bytes, limit as i64], |row| {
+        let status_str: String = row.get(3)?;
+        let is_passed_str: String = row.get(6)?;
+        let created_at_str: String = row.get(7)?;
+        let updated_at_str: String = row.get(8)?;
+
+        let task = ProjectTask {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            status: TaskStatus::from_str(&status_str).unwrap_or_default(),
+            category: row.get(4)?,
+            sort_order: row.get(5)?,
+            is_passed: is_passed_str == "true",
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        };
+        let distance: f32 = row.get(9)?;
+        Ok((task, distance))
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+// =============================================================================
+// PROGRESS EMBEDDINGS
+// =============================================================================
+
+/// Store embedding for a progress entry (by rowid).
+pub fn store_progress_embedding(
+    conn: &Connection,
+    progress_rowid: i64,
+    embedding: &[f32],
+) -> DbResult<()> {
+    let bytes = embedding_to_bytes(embedding);
+    conn.execute(
+        "INSERT INTO progress_embeddings(rowid, embedding) VALUES (?1, ?2)",
+        params![progress_rowid, bytes],
+    )?;
+    Ok(())
+}
+
+/// Update embedding for a progress entry (delete + insert).
+pub fn update_progress_embedding(
+    conn: &Connection,
+    progress_rowid: i64,
+    embedding: &[f32],
+) -> DbResult<()> {
+    delete_progress_embedding(conn, progress_rowid)?;
+    store_progress_embedding(conn, progress_rowid, embedding)
+}
+
+/// Delete embedding for a progress entry.
+pub fn delete_progress_embedding(conn: &Connection, progress_rowid: i64) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM progress_embeddings WHERE rowid = ?1",
+        params![progress_rowid],
+    )?;
+    Ok(())
+}
+
+/// Get rowid for a progress entry by ID.
+pub fn get_progress_rowid(conn: &Connection, progress_id: &str) -> DbResult<Option<i64>> {
+    let result = conn.query_row(
+        "SELECT rowid FROM project_progress WHERE id = ?1",
+        [progress_id],
+        |row| row.get::<_, i64>(0),
+    );
+
+    match result {
+        Ok(rowid) => Ok(Some(rowid)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Semantic search for progress entries using vector similarity (KNN).
+///
+/// Returns progress entries ordered by semantic similarity to the query.
+pub fn search_progress_semantic(
+    conn: &Connection,
+    query: &str,
+    limit: Option<usize>,
+) -> DbResult<Vec<(ProjectProgress, f32)>> {
+    let query_embedding = generate_embedding(query)?;
+    let query_bytes = embedding_to_bytes(&query_embedding);
+    let limit = limit.unwrap_or(20);
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            p.id, p.content, p.created_at,
+            e.distance
+        FROM project_progress p
+        JOIN progress_embeddings e ON p.rowid = e.rowid
+        WHERE e.embedding MATCH ?1 AND k = ?2
+        ORDER BY e.distance
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![query_bytes, limit as i64], |row| {
+        let created_at_str: String = row.get(2)?;
+
+        let entry = ProjectProgress {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        };
+        let distance: f32 = row.get(3)?;
+        Ok((entry, distance))
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+// =============================================================================
+// EMBEDDING STATISTICS
+// =============================================================================
+
+/// Statistics about embeddings in the database.
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingStats {
+    /// Number of task embeddings.
+    pub task_embeddings: i64,
+    /// Number of progress embeddings.
+    pub progress_embeddings: i64,
+    /// Whether the embedding service is loaded.
+    pub service_loaded: bool,
+}
+
+impl EmbeddingStats {
+    /// Collect embedding statistics.
+    pub fn collect(conn: &Connection) -> DbResult<Self> {
+        let task_embeddings: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_embeddings",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let progress_embeddings: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM progress_embeddings",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(EmbeddingStats {
+            task_embeddings,
+            progress_embeddings,
+            service_loaded: is_initialized(),
+        })
+    }
+}
+
+// =============================================================================
+// REBUILD EMBEDDINGS
+// =============================================================================
+
+/// Rebuild all task embeddings from scratch.
+///
+/// Useful after model changes or to fix corrupted embeddings.
+pub fn rebuild_task_embeddings(conn: &Connection) -> DbResult<usize> {
+    // Clear existing embeddings
+    conn.execute("DELETE FROM task_embeddings", [])?;
+
+    // Get all tasks
+    let mut stmt = conn.prepare(
+        "SELECT rowid, title, description FROM project_tasks",
+    )?;
+
+    let tasks: Vec<(i64, String, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let count = tasks.len();
+
+    // Generate and store embeddings
+    for (rowid, title, description) in tasks {
+        let text = format!("{} {}", title, description.as_deref().unwrap_or(""));
+        let embedding = generate_embedding(&text)?;
+        store_task_embedding(conn, rowid, &embedding)?;
+    }
+
+    Ok(count)
+}
+
+/// Rebuild all progress embeddings from scratch.
+pub fn rebuild_progress_embeddings(conn: &Connection) -> DbResult<usize> {
+    // Clear existing embeddings
+    conn.execute("DELETE FROM progress_embeddings", [])?;
+
+    // Get all progress entries
+    let mut stmt = conn.prepare(
+        "SELECT rowid, content FROM project_progress",
+    )?;
+
+    let entries: Vec<(i64, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let count = entries.len();
+
+    // Generate and store embeddings
+    for (rowid, content) in entries {
+        let embedding = generate_embedding(&content)?;
+        store_progress_embedding(conn, rowid, &embedding)?;
+    }
+
+    Ok(count)
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::connection::open_in_memory;
+
+    // -------------------------------------------------------------------------
+    // Embedding generation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_embedding_returns_384_dims() {
+        let embedding = generate_embedding("Hello world").unwrap();
+        assert_eq!(embedding.len(), 384);
+    }
+
+    #[test]
+    fn test_generate_embedding_normalized() {
+        let embedding = generate_embedding("Test text").unwrap();
+        // Check it's normalized (length ~= 1.0)
+        let length: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((length - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_embedding_bytes_roundtrip() {
+        let original = vec![1.0f32, 2.0, 3.0, 4.0];
+        let bytes = embedding_to_bytes(&original);
+        let recovered = bytes_to_embedding(&bytes);
+        assert_eq!(original, recovered);
+    }
+
+    // -------------------------------------------------------------------------
+    // Task embedding tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_store_task_embedding() {
+        let conn = open_in_memory().unwrap();
+
+        // Insert a task first
+        conn.execute(
+            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Test task', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Get rowid and store embedding
+        let rowid = get_task_rowid(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap().unwrap();
+        let embedding = generate_embedding("Test task").unwrap();
+        store_task_embedding(&conn, rowid, &embedding).unwrap();
+
+        // Verify stored
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_embeddings",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_delete_task_embedding() {
+        let conn = open_in_memory().unwrap();
+
+        // Insert task and embedding
+        conn.execute(
+            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Test', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+            [],
+        ).unwrap();
+
+        let rowid = get_task_rowid(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap().unwrap();
+        let embedding = generate_embedding("Test").unwrap();
+        store_task_embedding(&conn, rowid, &embedding).unwrap();
+
+        // Delete embedding
+        delete_task_embedding(&conn, rowid).unwrap();
+
+        // Verify deleted
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_embeddings",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Semantic search tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_semantic_search_finds_similar() {
+        let conn = open_in_memory().unwrap();
+
+        // Insert tasks
+        let tasks = [
+            ("01ARZ3NDEKTSV4RRFFQ69G5FAV", "Implement OAuth2 authentication"),
+            ("01BSZ3NDEKTSV4RRFFQ69G5FBV", "Fix database connection pool"),
+            ("01CSZ3NDEKTSV4RRFFQ69G5FCV", "Add user login functionality"),
+        ];
+
+        for (id, title) in &tasks {
+            conn.execute(
+                "INSERT INTO project_tasks (id, title, created_at, updated_at)
+                 VALUES (?1, ?2, '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+                params![id, title],
+            ).unwrap();
+
+            let rowid = get_task_rowid(&conn, id).unwrap().unwrap();
+            let embedding = generate_embedding(title).unwrap();
+            store_task_embedding(&conn, rowid, &embedding).unwrap();
+        }
+
+        // Search for "OAuth" - should find OAuth2 task first
+        let results = search_tasks_semantic(&conn, "OAuth", Some(3)).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].0.title.contains("OAuth"));
+
+        // Search for "login" - should find login task
+        let results = search_tasks_semantic(&conn, "login", Some(3)).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].0.title.contains("login") || results[0].0.title.contains("OAuth"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Statistics tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_embedding_stats_empty() {
+        let conn = open_in_memory().unwrap();
+        let stats = EmbeddingStats::collect(&conn).unwrap();
+
+        assert_eq!(stats.task_embeddings, 0);
+        assert_eq!(stats.progress_embeddings, 0);
+    }
+
+    #[test]
+    fn test_embedding_stats_with_data() {
+        let conn = open_in_memory().unwrap();
+
+        // Insert task with embedding
+        conn.execute(
+            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Test', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+            [],
+        ).unwrap();
+
+        let rowid = get_task_rowid(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap().unwrap();
+        let embedding = generate_embedding("Test").unwrap();
+        store_task_embedding(&conn, rowid, &embedding).unwrap();
+
+        let stats = EmbeddingStats::collect(&conn).unwrap();
+        assert_eq!(stats.task_embeddings, 1);
+        assert_eq!(stats.progress_embeddings, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rebuild tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_rebuild_task_embeddings() {
+        let conn = open_in_memory().unwrap();
+
+        // Insert tasks without embeddings
+        for i in 1..=3 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO project_tasks (id, title, created_at, updated_at)
+                     VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FA{}', 'Task {}', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+                    i, i
+                ),
+                [],
+            ).unwrap();
+        }
+
+        // Verify no embeddings
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_embeddings",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+
+        // Rebuild
+        let rebuilt = rebuild_task_embeddings(&conn).unwrap();
+        assert_eq!(rebuilt, 3);
+
+        // Verify embeddings exist
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_embeddings",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 3);
+    }
+}

@@ -1,0 +1,94 @@
+import { api } from '@semparar/mf-app-user';
+import type { PermissionDocument } from '../models';
+import { invoiceCashbackPermissionRepository } from '../repository';
+
+// Teste de variações da API - remover após debug
+export async function testPermissionApi(accountId: string) {
+  const BASE_URL = 'https://homolog.apisemparar.com.br';
+  const delays = [0, 500, 1000, 2000];
+  const allResults: { delay: number; results: { input: any; output: any }[] }[] = [];
+
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  for (const delay of delays) {
+    const results: { input: any; output: any }[] = [];
+
+    const run = async (method: 'GET' | 'POST', path: string, body?: any, extraHeaders?: any) => {
+      if (delay > 0) await sleep(delay);
+      const url = `${BASE_URL}/${path}`;
+      const headers = {
+        codigoCliente: accountId,
+        codigocanal: '11',
+        empresa: 'CGMP',
+        ...extraHeaders,
+      };
+      const input = { method, url, headers, ...(body && { body }) };
+      try {
+        const res = method === 'GET'
+          ? await api.get(path, { headers })
+          : await api.post(path, body, { headers });
+        results.push({ input, output: res.data });
+      } catch (e: any) {
+        results.push({ input, output: e?.data || { error: e?.message } });
+      }
+    };
+
+    // Testes
+    await run('GET', 'fintech/v1/rewardProgram/consult-permission');
+
+    await run('POST', 'fintech/v1/rewardProgram/insert-permission', {
+      codigoCliente: accountId,
+      value: "{\"nrc\":\"465681\"}",
+      status: 0,
+    });
+
+    await run('POST', 'fintech/v1/rewardProgram/insert-permission', {
+      codigoCliente: accountId,
+      status: 1,
+      value: JSON.stringify({ invoiceCashbackRedemption: { redeemedAtDate: new Date().toISOString() } }),
+    });
+
+    await run('POST', 'fintech/v1/rewardProgram/update-permission', {
+      codigoCliente: accountId,
+      status: 1,
+      value: JSON.stringify({ invoiceCashbackRedemption: { redeemedAtDate: new Date().toISOString() } }),
+    });
+
+    await run('GET', 'fintech/v1/rewardProgram/consult-permission');
+
+    allResults.push({ delay, results });
+  }
+
+  console.log(JSON.stringify(allResults, null, 2));
+}
+
+class InvoiceCashbackPermissionService {
+  private readonly repository = invoiceCashbackPermissionRepository;
+
+  async hasRedeemed(accountId: string): Promise<boolean> {
+    console.log('[DEBUG:Service] hasRedeemed called with accountId:', accountId);
+    const result = await this.repository.getPermission({ accountNumber: accountId });
+    console.log('[DEBUG:Service] Repository result:', result);
+    const redeemedAt = result?.invoiceCashbackRedemption?.redeemedAtDate;
+    console.log('[DEBUG:Service] redeemedAt:', redeemedAt, '-> returning:', Boolean(redeemedAt));
+    return Boolean(redeemedAt);
+  }
+
+  async markAsRedeemed(accountId: string): Promise<void> {
+    console.log('[DEBUG:Service] markAsRedeemed called with accountId:', accountId);
+    const document = {
+      codigoCliente: accountId,
+      status: 1,
+      value: JSON.stringify({
+        invoiceCashbackRedemption: {
+          redeemedAtDate: new Date().toISOString(),
+        },
+      }),
+    };
+    console.log('[DEBUG:Service] markAsRedeemed document:', document);
+    await this.repository.savePermission(document as any);
+    console.log('[DEBUG:Service] markAsRedeemed completed');
+  }
+}
+
+export const invoiceCashbackPermissionService = new InvoiceCashbackPermissionService();

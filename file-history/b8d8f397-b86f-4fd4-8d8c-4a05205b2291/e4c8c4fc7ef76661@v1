@@ -1,0 +1,364 @@
+/**
+ * Integration Tests - Setup CLI
+ *
+ * Tests the belt-ai setup command by creating real temporary directories
+ * and verifying files are created correctly.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execSync } from 'child_process';
+import { join, resolve } from 'path';
+import { existsSync, readFileSync, statSync } from 'fs';
+import { createTestProject, type TestProject } from './test-utils';
+
+// Path to the built setup CLI
+const SETUP_CLI = resolve(__dirname, '../../../dist/setup.mjs');
+
+describe('Setup CLI Integration', () => {
+  describe('empty project setup', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createTestProject('setup-empty', {
+        // Empty project, just a placeholder file
+        '.gitkeep': '',
+      });
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should create .claude directory', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.claude')).toBe(true);
+      expect(statSync(join(project.root, '.claude')).isDirectory()).toBe(true);
+    });
+
+    it('should create .claude/hooks directory', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.claude/hooks')).toBe(true);
+      expect(statSync(join(project.root, '.claude/hooks')).isDirectory()).toBe(true);
+    });
+
+    it('should create .claude/settings.json', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.claude/settings.json')).toBe(true);
+
+      const settings = JSON.parse(project.readFile('.claude/settings.json'));
+      expect(settings.$schema).toBe('https://json.schemastore.org/claude-code-settings.json');
+      expect(settings.hooks).toBeDefined();
+    });
+
+    it('should create settings with PreToolUse hooks', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const settings = JSON.parse(project.readFile('.claude/settings.json'));
+
+      expect(settings.hooks.PreToolUse).toBeDefined();
+      expect(settings.hooks.PreToolUse.length).toBeGreaterThanOrEqual(2);
+
+      const writeHook = settings.hooks.PreToolUse.find((h: any) => h.matcher === 'Write');
+      const editHook = settings.hooks.PreToolUse.find((h: any) => h.matcher === 'Edit');
+
+      expect(writeHook).toBeDefined();
+      expect(editHook).toBeDefined();
+      expect(writeHook.hooks[0].command).toContain('agentrc-wrapper.sh');
+    });
+
+    it('should create .claude/hooks/agentrc-runner.ts', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.claude/hooks/agentrc-runner.ts')).toBe(true);
+
+      const content = project.readFile('.claude/hooks/agentrc-runner.ts');
+      expect(content).toContain('#!/usr/bin/env bun');
+      expect(content).toContain('AGENTRC_FILES');
+      expect(content).toContain('evaluateRuleMatch');
+    });
+
+    it('should create .claude/hooks/agentrc-wrapper.sh', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.claude/hooks/agentrc-wrapper.sh')).toBe(true);
+
+      const content = project.readFile('.claude/hooks/agentrc-wrapper.sh');
+      expect(content).toContain('#!/bin/bash');
+      expect(content).toContain('agentrc-runner.ts');
+    });
+
+    it('should make wrapper executable', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const wrapperPath = join(project.root, '.claude/hooks/agentrc-wrapper.sh');
+      const stats = statSync(wrapperPath);
+
+      // Check if executable bit is set (mode & 0o111)
+      expect(stats.mode & 0o111).toBeGreaterThan(0);
+    });
+
+    it('should create .agentrc.ts', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.agentrc.ts')).toBe(true);
+
+      const content = project.readFile('.agentrc.ts');
+      expect(content).toContain('defineAgent');
+      expect(content).toContain('rules');
+      expect(content).toContain('hooks');
+    });
+
+    it('should output success messages', () => {
+      const result = execSync(`node "${SETUP_CLI}" setup "${project.root}"`, {
+        encoding: 'utf-8',
+      });
+
+      expect(result).toContain('belt-ai setup');
+      expect(result).toContain('Created .claude/');
+      expect(result).toContain('AgentRC setup complete');
+    });
+  });
+
+  describe('existing project merge', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      // Create project with existing .claude config
+      project = createTestProject('setup-existing', {
+        '.claude': {
+          'settings.json': JSON.stringify(
+            {
+              $schema: 'https://json.schemastore.org/claude-code-settings.json',
+              hooks: {
+                SessionStart: [
+                  {
+                    matcher: '*',
+                    hooks: [{ type: 'command', command: 'echo "existing hook"' }],
+                  },
+                ],
+                PreToolUse: [
+                  {
+                    matcher: 'Bash',
+                    hooks: [{ type: 'command', command: 'echo "existing bash hook"' }],
+                  },
+                ],
+              },
+            },
+            null,
+            2
+          ),
+        },
+      });
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should preserve existing hooks', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const settings = JSON.parse(project.readFile('.claude/settings.json'));
+
+      // Should have SessionStart from existing
+      expect(settings.hooks.SessionStart).toBeDefined();
+      expect(settings.hooks.SessionStart[0].hooks[0].command).toContain('existing hook');
+
+      // Should have Bash from existing
+      const bashHook = settings.hooks.PreToolUse.find((h: any) => h.matcher === 'Bash');
+      expect(bashHook).toBeDefined();
+    });
+
+    it('should add new Write/Edit hooks', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const settings = JSON.parse(project.readFile('.claude/settings.json'));
+
+      const writeHook = settings.hooks.PreToolUse.find((h: any) => h.matcher === 'Write');
+      const editHook = settings.hooks.PreToolUse.find((h: any) => h.matcher === 'Edit');
+
+      expect(writeHook).toBeDefined();
+      expect(editHook).toBeDefined();
+    });
+
+    it('should not duplicate existing hooks', () => {
+      // Run setup twice
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const settings = JSON.parse(project.readFile('.claude/settings.json'));
+
+      // Should only have one Write matcher
+      const writeMatchers = settings.hooks.PreToolUse.filter((h: any) => h.matcher === 'Write');
+      expect(writeMatchers.length).toBe(1);
+
+      // Write matcher should only have one agentrc hook
+      const agentrcHooks = writeMatchers[0].hooks.filter((h: any) =>
+        h.command.includes('agentrc-wrapper.sh')
+      );
+      expect(agentrcHooks.length).toBe(1);
+    });
+
+    it('should output merge message', () => {
+      const result = execSync(`node "${SETUP_CLI}" setup "${project.root}"`, {
+        encoding: 'utf-8',
+      });
+
+      expect(result).toContain('Merging existing');
+    });
+  });
+
+  describe('existing .agentrc.ts', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createTestProject('setup-agentrc-exists', {
+        '.agentrc.ts': `
+import { defineAgent } from '@belt/ai';
+
+export default defineAgent({
+  rules: [
+    { id: 'CUSTOM-RULE', match: '.custom', action: 'block' },
+  ],
+});
+`,
+      });
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should not overwrite existing .agentrc.ts', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const content = project.readFile('.agentrc.ts');
+
+      // Should still have custom rule
+      expect(content).toContain('CUSTOM-RULE');
+      expect(content).toContain('.custom');
+    });
+
+    it('should output skip message', () => {
+      const result = execSync(`node "${SETUP_CLI}" setup "${project.root}"`, {
+        encoding: 'utf-8',
+      });
+
+      expect(result).toContain('.agentrc.ts already exists');
+    });
+  });
+
+  describe('default directory (cwd)', () => {
+    let project: TestProject;
+    let originalCwd: string;
+
+    beforeEach(() => {
+      project = createTestProject('setup-cwd', {});
+      originalCwd = process.cwd();
+    });
+
+    afterEach(() => {
+      process.chdir(originalCwd);
+      project.cleanup();
+    });
+
+    it('should setup in current directory when no path provided', () => {
+      // Change to project directory
+      process.chdir(project.root);
+
+      execSync(`node "${SETUP_CLI}" setup`, { stdio: 'pipe' });
+
+      expect(project.fileExists('.claude/settings.json')).toBe(true);
+      expect(project.fileExists('.agentrc.ts')).toBe(true);
+    });
+  });
+
+  describe('error handling', () => {
+    it('should handle invalid directory', () => {
+      expect(() => {
+        execSync(`node "${SETUP_CLI}" setup "/nonexistent/path/12345"`, { stdio: 'pipe' });
+      }).toThrow();
+    });
+  });
+
+  describe('file permissions', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createTestProject('setup-perms', {});
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should create readable settings.json', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      // Should be able to read and parse
+      const content = project.readFile('.claude/settings.json');
+      expect(() => JSON.parse(content)).not.toThrow();
+    });
+
+    it('should create readable runner.ts', () => {
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+
+      const content = project.readFile('.claude/hooks/agentrc-runner.ts');
+      expect(content.length).toBeGreaterThan(100);
+    });
+  });
+
+  describe('content validation', () => {
+    let project: TestProject;
+
+    beforeEach(() => {
+      project = createTestProject('setup-content', {});
+      execSync(`node "${SETUP_CLI}" setup "${project.root}"`, { stdio: 'pipe' });
+    });
+
+    afterEach(() => {
+      project.cleanup();
+    });
+
+    it('should create valid JSON in settings.json', () => {
+      const content = project.readFile('.claude/settings.json');
+
+      expect(() => JSON.parse(content)).not.toThrow();
+    });
+
+    it('should create settings with correct schema', () => {
+      const settings = JSON.parse(project.readFile('.claude/settings.json'));
+
+      expect(settings.$schema).toBe('https://json.schemastore.org/claude-code-settings.json');
+    });
+
+    it('should create runner with proper shebang', () => {
+      const content = project.readFile('.claude/hooks/agentrc-runner.ts');
+
+      expect(content.startsWith('#!/usr/bin/env bun')).toBe(true);
+    });
+
+    it('should create wrapper with proper shebang', () => {
+      const content = project.readFile('.claude/hooks/agentrc-wrapper.sh');
+
+      expect(content.startsWith('#!/bin/bash')).toBe(true);
+    });
+
+    it('should create .agentrc.ts with defineAgent import', () => {
+      const content = project.readFile('.agentrc.ts');
+
+      expect(content).toContain("import { defineAgent } from '@belt/ai'");
+    });
+
+    it('should create .agentrc.ts with example structure', () => {
+      const content = project.readFile('.agentrc.ts');
+
+      expect(content).toContain('rules:');
+      expect(content).toContain('hooks:');
+      expect(content).toContain('PreToolUse');
+    });
+  });
+});

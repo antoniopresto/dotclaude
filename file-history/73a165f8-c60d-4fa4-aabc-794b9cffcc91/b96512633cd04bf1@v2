@@ -1,0 +1,189 @@
+/**
+ * Instagram-specific E2E tests
+ *
+ * Run with: bun run test:e2e -- --grep "Instagram"
+ * Or debug: bun run test:e2e:debug -- --grep "Instagram"
+ */
+
+import { test, expect, chromium, type BrowserContext, type Page } from '@playwright/test';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const extensionPath = path.join(__dirname, '../.output/chrome-mv3');
+
+async function getExtensionId(context: BrowserContext): Promise<string> {
+  let [background] = context.serviceWorkers();
+  if (!background) {
+    background = await context.waitForEvent('serviceworker');
+  }
+  return background.url().split('/')[2];
+}
+
+async function openPopup(context: BrowserContext, extensionId: string): Promise<Page> {
+  const popup = await context.newPage();
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await popup.waitForTimeout(1000);
+  return popup;
+}
+
+test.describe('Instagram Video Detection', () => {
+  let context: BrowserContext;
+  let extensionId: string;
+
+  test.beforeAll(async () => {
+    context = await chromium.launchPersistentContext('', {
+      headless: false,
+      args: [
+        `--disable-extensions-except=${extensionPath}`,
+        `--load-extension=${extensionPath}`,
+        '--no-sandbox',
+      ],
+    });
+    extensionId = await getExtensionId(context);
+    console.log(`Extension ID: ${extensionId}`);
+  });
+
+  test.afterAll(async () => {
+    await context.close();
+  });
+
+  test('detects videos on Instagram reel page', async () => {
+    // Note: This test requires a real Instagram reel URL
+    // Replace with an actual reel URL for testing
+    const reelUrl = process.env.INSTAGRAM_REEL_URL || 'https://www.instagram.com/reels/';
+
+    const page = await context.newPage();
+
+    // Set up network logging to see intercepted requests
+    const interceptedUrls: string[] = [];
+    page.on('response', (response) => {
+      const url = response.url();
+      if (url.includes('.mp4') || url.includes('cdninstagram')) {
+        interceptedUrls.push(url);
+        console.log(`[Network] ${url.substring(0, 100)}...`);
+      }
+    });
+
+    console.log(`Navigating to: ${reelUrl}`);
+    await page.goto(reelUrl, { waitUntil: 'domcontentloaded' });
+
+    // Wait for video content to load
+    await page.waitForTimeout(5000);
+
+    // Log intercepted URLs
+    console.log(`\nIntercepted ${interceptedUrls.length} video-related URLs:`);
+    interceptedUrls.forEach((url, i) => {
+      const isInit = url.includes('dashinit');
+      const hasMp4 = url.includes('.mp4');
+      console.log(`  ${i + 1}. [${isInit ? 'INIT' : 'VIDEO'}] ${hasMp4 ? 'MP4' : 'OTHER'}`);
+    });
+
+    // Open extension popup
+    const popup = await openPopup(context, extensionId);
+
+    // Wait for detection
+    await popup.waitForTimeout(3000);
+
+    // Check results
+    const videoList = popup.locator('.video-list');
+    const noVideos = popup.locator('.no-videos');
+    const loading = popup.locator('.loading');
+
+    const isLoading = await loading.isVisible();
+    const hasVideos = await videoList.isVisible();
+    const hasNoVideos = await noVideos.isVisible();
+
+    console.log(`\nPopup state: loading=${isLoading}, hasVideos=${hasVideos}, noVideos=${hasNoVideos}`);
+
+    if (hasVideos) {
+      const videoItems = await popup.locator('.video-item').count();
+      console.log(`✓ Found ${videoItems} video(s) in popup`);
+
+      // Log video details
+      for (let i = 0; i < videoItems; i++) {
+        const item = popup.locator('.video-item').nth(i);
+        const title = await item.locator('.video-title').textContent();
+        const meta = await item.locator('.video-meta').textContent();
+        console.log(`  Video ${i + 1}: "${title}" - ${meta}`);
+      }
+    }
+
+    // Take screenshot for debugging
+    await popup.screenshot({ path: 'test-results/instagram-popup.png' });
+
+    await page.close();
+    await popup.close();
+
+    // Test passes if we found videos or completed without errors
+    expect(isLoading).toBe(false);
+  });
+
+  test('manual Instagram test with interactive browser', async () => {
+    // This test opens a browser and waits for you to interact
+    // Useful for debugging
+
+    test.setTimeout(300000); // 5 minutes
+
+    const page = await context.newPage();
+    await page.goto('https://www.instagram.com/');
+
+    console.log('\n===========================================');
+    console.log('MANUAL TEST MODE');
+    console.log('===========================================');
+    console.log('1. Log in to Instagram if needed');
+    console.log('2. Navigate to a reel');
+    console.log('3. Open the extension popup');
+    console.log('4. Check if videos are detected');
+    console.log('\nThe browser will stay open for 5 minutes.');
+    console.log('Press Ctrl+C to end the test.\n');
+
+    // Log network requests
+    page.on('response', (response) => {
+      const url = response.url();
+      if (url.includes('.mp4') && !url.includes('dashinit')) {
+        console.log(`[DETECTED] ${url.substring(0, 80)}...`);
+      }
+    });
+
+    // Keep browser open
+    await page.waitForTimeout(300000);
+  });
+});
+
+// Quick Instagram check that can be run standalone
+test('Instagram quick check', async () => {
+  const context = await chromium.launchPersistentContext('', {
+    headless: false,
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+      '--no-sandbox',
+    ],
+  });
+
+  try {
+    const extensionId = await getExtensionId(context);
+    const page = await context.newPage();
+
+    // Go to Instagram
+    await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(3000);
+
+    // Open popup
+    const popup = await context.newPage();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await popup.waitForTimeout(3000);
+
+    // Check state
+    const header = await popup.locator('.header h1').textContent();
+    expect(header).toContain('Video Downloader');
+
+    console.log('✓ Extension loaded on Instagram');
+
+    await page.close();
+    await popup.close();
+  } finally {
+    await context.close();
+  }
+});

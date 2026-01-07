@@ -1,0 +1,420 @@
+     1→'use client';
+     2→
+     3→import React, { useState, useCallback, useEffect, useRef } from 'react';
+     4→import { apiFetch } from '@/lib/api';
+     5→
+     6→interface MaintenanceEvent {
+     7→  id: string;
+     8→  trainId: string;
+     9→  trainCode: string;
+    10→  type: 'PM1' | 'PM2' | 'HM' | 'OVH';
+    11→  startDate: string;
+    12→  endDate: string;
+    13→  depotId: string;
+    14→  depotName: string;
+    15→  kmAtMaintenance: number;
+    16→}
+    17→
+    18→interface TrainRow {
+    19→  id: string;
+    20→  trainId: string;
+    21→  fleetName: string;
+    22→  depotCode: string;
+    23→  events: MaintenanceEvent[];
+    24→}
+    25→
+    26→interface GanttData {
+    27→  trains: TrainRow[];
+    28→  startDate: string;
+    29→  endDate: string;
+    30→}
+    31→
+    32→type ViewMode = 'week' | '2-week' | '4-week';
+    33→
+    34→const MAINTENANCE_COLORS: Record<string, { bg: string; border: string; text: string }> = {
+    35→  PM1: { bg: 'bg-blue-200', border: 'border-blue-400', text: 'text-blue-800' },
+    36→  PM2: { bg: 'bg-blue-500', border: 'border-blue-700', text: 'text-white' },
+    37→  HM: { bg: 'bg-red-400', border: 'border-red-600', text: 'text-white' },
+    38→  OVH: { bg: 'bg-purple-400', border: 'border-purple-600', text: 'text-white' },
+    39→};
+    40→
+    41→/**
+    42→ * Maintenance Gantt Component
+    43→ *
+    44→ * Interactive Gantt chart for maintenance scheduling.
+    45→ * Features:
+    46→ * - Timeline view with trains as rows
+    47→ * - Color-coded maintenance blocks
+    48→ * - Drag-drop scheduling (with constraints)
+    49→ * - Real-time validation
+    50→ */
+    51→export function MaintenanceGantt() {
+    52→  const [ganttData, setGanttData] = useState<GanttData | null>(null);
+    53→  const [loading, setLoading] = useState(true);
+    54→  const [error, setError] = useState<string | null>(null);
+    55→  const [viewMode, setViewMode] = useState<ViewMode>('4-week');
+    56→  const [selectedFleet, setSelectedFleet] = useState<string>('all');
+    57→  const [draggingEvent, setDraggingEvent] = useState<MaintenanceEvent | null>(null);
+    58→  const [dragOffset, setDragOffset] = useState(0);
+    59→  const [validDropZones, setValidDropZones] = useState<Set<string>>(new Set());
+    60→  const [undoAction, setUndoAction] = useState<{ event: MaintenanceEvent; originalDate: string } | null>(null);
+    61→  const containerRef = useRef<HTMLDivElement>(null);
+    62→
+    63→  // Generate dates array based on view mode
+    64→  const generateDates = useCallback(() => {
+    65→    const today = new Date();
+    66→    today.setHours(0, 0, 0, 0);
+    67→    const dates: Date[] = [];
+    68→    const days = viewMode === 'week' ? 7 : viewMode === '2-week' ? 14 : 28;
+    69→
+    70→    for (let i = 0; i < days; i++) {
+    71→      const date = new Date(today);
+    72→      date.setDate(today.getDate() + i);
+    73→      dates.push(date);
+    74→    }
+    75→    return dates;
+    76→  }, [viewMode]);
+    77→
+    78→  const dates = generateDates();
+    79→
+    80→  const fetchGanttData = useCallback(async () => {
+    81→    setLoading(true);
+    82→    setError(null);
+    83→
+    84→    const { data, error } = await apiFetch<GanttData>('/api/maintenance/gantt');
+    85→
+    86→    if (error) {
+    87→      setError(error);
+    88→    } else if (data) {
+    89→      setGanttData(data);
+    90→    }
+    91→
+    92→    setLoading(false);
+    93→  }, []);
+    94→
+    95→  useEffect(() => {
+    96→    fetchGanttData();
+    97→  }, [fetchGanttData]);
+    98→
+    99→  // Clear undo after 10 seconds
+   100→  useEffect(() => {
+   101→    if (undoAction) {
+   102→      const timer = setTimeout(() => setUndoAction(null), 10000);
+   103→      return () => clearTimeout(timer);
+   104→    }
+   105→  }, [undoAction]);
+   106→
+   107→  const handleDragStart = (event: MaintenanceEvent, e: React.DragEvent) => {
+   108→    setDraggingEvent(event);
+   109→    e.dataTransfer.effectAllowed = 'move';
+   110→    // Calculate which zones are valid
+   111→    const validZones = new Set<string>();
+   112→    dates.forEach((date) => {
+   113→      const dateStr = date.toISOString().split('T')[0];
+   114→      // Simple validation: not in past, not overlapping
+   115→      if (date >= new Date()) {
+   116→        validZones.add(`${event.trainId}-${dateStr}`);
+   117→      }
+   118→    });
+   119→    setValidDropZones(validZones);
+   120→  };
+   121→
+   122→  const handleDragEnd = () => {
+   123→    setDraggingEvent(null);
+   124→    setValidDropZones(new Set());
+   125→  };
+   126→
+   127→  const handleDragOver = (trainId: string, dateStr: string, e: React.DragEvent) => {
+   128→    e.preventDefault();
+   129→    const zoneKey = `${trainId}-${dateStr}`;
+   130→    if (validDropZones.has(zoneKey)) {
+   131→      e.dataTransfer.dropEffect = 'move';
+   132→    } else {
+   133→      e.dataTransfer.dropEffect = 'none';
+   134→    }
+   135→  };
+   136→
+   137→  const handleDrop = async (trainId: string, newDateStr: string, e: React.DragEvent) => {
+   138→    e.preventDefault();
+   139→    if (!draggingEvent) return;
+   140→
+   141→    const zoneKey = `${trainId}-${newDateStr}`;
+   142→    if (!validDropZones.has(zoneKey)) {
+   143→      return; // Invalid drop zone
+   144→    }
+   145→
+   146→    const originalDate = draggingEvent.startDate;
+   147→
+   148→    // Optimistic update
+   149→    setGanttData((prev) => {
+   150→      if (!prev) return prev;
+   151→      return {
+   152→        ...prev,
+   153→        trains: prev.trains.map((train) => ({
+   154→          ...train,
+   155→          events: train.events.map((evt) =>
+   156→            evt.id === draggingEvent.id
+   157→              ? { ...evt, startDate: newDateStr, endDate: newDateStr }
+   158→              : evt
+   159→          ),
+   160→        })),
+   161→      };
+   162→    });
+   163→
+   164→    // Save undo action
+   165→    setUndoAction({ event: draggingEvent, originalDate });
+   166→
+   167→    // API call to persist
+   168→    await apiFetch(`/api/maintenance/schedule/${draggingEvent.id}`, {
+   169→      method: 'PUT',
+   170→      body: JSON.stringify({ startDate: newDateStr }),
+   171→    });
+   172→
+   173→    setDraggingEvent(null);
+   174→    setValidDropZones(new Set());
+   175→  };
+   176→
+   177→  const handleUndo = async () => {
+   178→    if (!undoAction) return;
+   179→
+   180→    // Revert to original date
+   181→    setGanttData((prev) => {
+   182→      if (!prev) return prev;
+   183→      return {
+   184→        ...prev,
+   185→        trains: prev.trains.map((train) => ({
+   186→          ...train,
+   187→          events: train.events.map((evt) =>
+   188→            evt.id === undoAction.event.id
+   189→              ? { ...evt, startDate: undoAction.originalDate, endDate: undoAction.originalDate }
+   190→              : evt
+   191→          ),
+   192→        })),
+   193→      };
+   194→    });
+   195→
+   196→    await apiFetch(`/api/maintenance/schedule/${undoAction.event.id}`, {
+   197→      method: 'PUT',
+   198→      body: JSON.stringify({ startDate: undoAction.originalDate }),
+   199→    });
+   200→
+   201→    setUndoAction(null);
+   202→  };
+   203→
+   204→  // Filter trains by fleet
+   205→  const filteredTrains = ganttData?.trains.filter((train) =>
+   206→    selectedFleet === 'all' || train.fleetName === selectedFleet
+   207→  ) || [];
+   208→
+   209→  // Get unique fleets for filter
+   210→  const fleets = Array.from(new Set(ganttData?.trains.map((t) => t.fleetName) || []));
+   211→
+   212→  // Check if a date is today
+   213→  const isToday = (date: Date) => {
+   214→    const today = new Date();
+   215→    return date.toDateString() === today.toDateString();
+   216→  };
+   217→
+   218→  if (loading) {
+   219→    return (
+   220→      <div className="bg-white shadow rounded-lg p-6 animate-pulse">
+   221→        <div className="h-6 bg-gray-200 rounded w-1/4 mb-4"></div>
+   222→        <div className="h-96 bg-gray-200 rounded"></div>
+   223→      </div>
+   224→    );
+   225→  }
+   226→
+   227→  if (error) {
+   228→    return (
+   229→      <div className="bg-red-50 border border-red-200 rounded-lg p-6">
+   230→        <p className="text-red-800">
+   231→          <strong>Error:</strong> {error}
+   232→        </p>
+   233→      </div>
+   234→    );
+   235→  }
+   236→
+   237→  return (
+   238→    <div className="bg-white shadow rounded-lg overflow-hidden">
+   239→      {/* Header with Controls */}
+   240→      <div className="p-4 border-b border-gray-200 flex items-center justify-between flex-wrap gap-4">
+   241→        <h2 className="text-lg font-semibold text-gray-900">Maintenance Timeline</h2>
+   242→
+   243→        <div className="flex items-center gap-4 flex-wrap">
+   244→          {/* View Mode Toggle */}
+   245→          <div className="flex rounded-lg border border-gray-300 overflow-hidden">
+   246→            {(['week', '2-week', '4-week'] as ViewMode[]).map((mode) => (
+   247→              <button
+   248→                key={mode}
+   249→                onClick={() => setViewMode(mode)}
+   250→                className={`px-3 py-1 text-sm transition-colors ${
+   251→                  viewMode === mode
+   252→                    ? 'bg-primary-600 text-white'
+   253→                    : 'bg-white text-gray-600 hover:bg-gray-50'
+   254→                }`}
+   255→              >
+   256→                {mode === 'week' ? '1 Week' : mode === '2-week' ? '2 Weeks' : '4 Weeks'}
+   257→              </button>
+   258→            ))}
+   259→          </div>
+   260→
+   261→          {/* Fleet Filter */}
+   262→          <select
+   263→            value={selectedFleet}
+   264→            onChange={(e) => setSelectedFleet(e.target.value)}
+   265→            className="px-3 py-1 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
+   266→          >
+   267→            <option value="all">All Fleets</option>
+   268→            {fleets.map((fleet) => (
+   269→              <option key={fleet} value={fleet}>
+   270→                {fleet}
+   271→              </option>
+   272→            ))}
+   273→          </select>
+   274→        </div>
+   275→      </div>
+   276→
+   277→      {/* Undo Toast */}
+   278→      {undoAction && (
+   279→        <div className="fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-4 z-50">
+   280→          <span>Moved {undoAction.event.type} for {undoAction.event.trainCode}</span>
+   281→          <button
+   282→            onClick={handleUndo}
+   283→            className="px-3 py-1 bg-white text-gray-800 rounded hover:bg-gray-100 text-sm font-medium"
+   284→          >
+   285→            Undo
+   286→          </button>
+   287→        </div>
+   288→      )}
+   289→
+   290→      {/* Legend */}
+   291→      <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 flex items-center gap-4 flex-wrap">
+   292→        <span className="text-sm text-gray-600 font-medium">Legend:</span>
+   293→        {Object.entries(MAINTENANCE_COLORS).map(([type, colors]) => (
+   294→          <span
+   295→            key={type}
+   296→            className={`px-2 py-1 text-xs font-medium rounded ${colors.bg} ${colors.text}`}
+   297→          >
+   298→            {type}
+   299→          </span>
+   300→        ))}
+   301→      </div>
+   302→
+   303→      {/* Gantt Chart */}
+   304→      <div ref={containerRef} className="overflow-x-auto">
+   305→        <div style={{ minWidth: `${dates.length * 60 + 200}px` }}>
+   306→          {/* Header Row - Dates */}
+   307→          <div className="flex border-b border-gray-200 bg-gray-50 sticky top-0 z-10">
+   308→            <div className="w-48 flex-shrink-0 px-4 py-2 font-medium text-gray-700 border-r border-gray-200">
+   309→              Train
+   310→            </div>
+   311→            {dates.map((date) => {
+   312→              const dateStr = date.toISOString().split('T')[0];
+   313→              const dayName = date.toLocaleDateString('en-US', { weekday: 'short' });
+   314→              const dayNum = date.getDate();
+   315→              const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+   316→
+   317→              return (
+   318→                <div
+   319→                  key={dateStr}
+   320→                  className={`w-14 flex-shrink-0 text-center py-2 text-xs border-r border-gray-100 ${
+   321→                    isToday(date)
+   322→                      ? 'bg-primary-100 font-bold text-primary-800'
+   323→                      : isWeekend
+   324→                      ? 'bg-gray-100'
+   325→                      : ''
+   326→                  }`}
+   327→                >
+   328→                  <div className="font-medium">{dayName}</div>
+   329→                  <div>{dayNum}</div>
+   330→                </div>
+   331→              );
+   332→            })}
+   333→          </div>
+   334→
+   335→          {/* Train Rows */}
+   336→          {filteredTrains.length === 0 ? (
+   337→            <div className="p-8 text-center text-gray-500">
+   338→              No trains match the selected filter
+   339→            </div>
+   340→          ) : (
+   341→            filteredTrains.map((train) => (
+   342→              <div key={train.id} className="flex border-b border-gray-100 hover:bg-gray-50">
+   343→                {/* Train Info */}
+   344→                <div className="w-48 flex-shrink-0 px-4 py-3 border-r border-gray-200">
+   345→                  <div className="font-mono font-semibold text-gray-900">{train.trainId}</div>
+   346→                  <div className="text-xs text-gray-500">
+   347→                    {train.fleetName} • {train.depotCode}
+   348→                  </div>
+   349→                </div>
+   350→
+   351→                {/* Date Cells */}
+   352→                {dates.map((date) => {
+   353→                  const dateStr = date.toISOString().split('T')[0];
+   354→                  const event = train.events.find((e) => e.startDate === dateStr);
+   355→                  const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+   356→                  const zoneKey = `${train.trainId}-${dateStr}`;
+   357→                  const isValidDrop = validDropZones.has(zoneKey);
+   358→                  const isInvalidDrop = draggingEvent && !isValidDrop && draggingEvent.trainId === train.trainId;
+   359→
+   360→                  return (
+   361→                    <div
+   362→                      key={`${train.id}-${dateStr}`}
+   363→                      className={`w-14 h-12 flex-shrink-0 border-r border-gray-100 relative ${
+   364→                        isToday(date)
+   365→                          ? 'bg-primary-50'
+   366→                          : isWeekend
+   367→                          ? 'bg-gray-50'
+   368→                          : ''
+   369→                      } ${
+   370→                        draggingEvent && isValidDrop
+   371→                          ? 'bg-green-100 ring-2 ring-green-400 ring-inset'
+   372→                          : ''
+   373→                      } ${isInvalidDrop ? 'bg-red-50' : ''}`}
+   374→                      onDragOver={(e) => handleDragOver(train.trainId, dateStr, e)}
+   375→                      onDrop={(e) => handleDrop(train.trainId, dateStr, e)}
+   376→                    >
+   377→                      {/* Today Line */}
+   378→                      {isToday(date) && (
+   379→                        <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-primary-500 z-10"></div>
+   380→                      )}
+   381→
+   382→                      {/* Maintenance Block */}
+   383→                      {event && (
+   384→                        <div
+   385→                          draggable
+   386→                          onDragStart={(e) => handleDragStart(event, e)}
+   387→                          onDragEnd={handleDragEnd}
+   388→                          className={`absolute inset-1 rounded cursor-move flex items-center justify-center text-xs font-medium ${
+   389→                            MAINTENANCE_COLORS[event.type]?.bg || 'bg-gray-300'
+   390→                          } ${MAINTENANCE_COLORS[event.type]?.text || 'text-gray-800'} ${
+   391→                            MAINTENANCE_COLORS[event.type]?.border || 'border-gray-400'
+   392→                          } border shadow-sm hover:shadow-md transition-shadow`}
+   393→                          title={`${event.type}\nDepot: ${event.depotName}\nKm: ${event.kmAtMaintenance.toLocaleString()}`}
+   394→                        >
+   395→                          {event.type}
+   396→                        </div>
+   397→                      )}
+   398→                    </div>
+   399→                  );
+   400→                })}
+   401→              </div>
+   402→            ))
+   403→          )}
+   404→        </div>
+   405→      </div>
+   406→
+   407→      {/* Empty State */}
+   408→      {!ganttData?.trains.length && (
+   409→        <div className="p-8 text-center text-gray-500">
+   410→          No maintenance schedules to display
+   411→        </div>
+   412→      )}
+   413→    </div>
+   414→  );
+   415→}
+   416→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,265 @@
+import { Container, Graphics } from 'pixi.js';
+import { getSimulationState, BlockType, type BlockTypeValue } from '../../engine/store/simulationStore';
+import { getViewportState } from '../../engine/store/viewportStore';
+import { batchTimeToPixel } from '../../engine/physics/coordinateTransformer';
+
+/**
+ * BarsLayer - LOD 1 renderer for medium zoom levels.
+ *
+ * Renders schedule blocks as colored bars with type-based stacking.
+ * Uses Graphics pooling for efficient batch rendering.
+ *
+ * Performance: Pre-allocates Graphics objects and reuses them,
+ * only drawing visible blocks (view frustum culling).
+ */
+
+export interface BarsConfig {
+  /** Row height in pixels */
+  rowHeight: number;
+  /** Number of train rows */
+  numRows: number;
+  /** Minimum bar width to render */
+  minBarWidth: number;
+  /** Bar height as fraction of row height */
+  barHeightRatio: number;
+}
+
+const DEFAULT_CONFIG: BarsConfig = {
+  rowHeight: 40,
+  numRows: 128,
+  minBarWidth: 2,
+  barHeightRatio: 0.8,
+};
+
+/** Colors for each maintenance type */
+const TYPE_COLORS: Record<BlockTypeValue, number> = {
+  [BlockType.PM]: 0x3ddc84,         // Green - Preventive
+  [BlockType.OVERHAUL]: 0xff6b35,   // Orange - Major
+  [BlockType.INSPECTION]: 0x4ecdc4, // Cyan - Inspection
+  [BlockType.REPAIR]: 0xd62828,     // Red - Repair
+  [BlockType.CLEANING]: 0x9b59b6,   // Purple - Cleaning
+};
+
+/** Pre-allocated arrays for batch transform */
+const MAX_VISIBLE_BLOCKS = 5000;
+const tempX = new Float32Array(MAX_VISIBLE_BLOCKS);
+const tempWidth = new Float32Array(MAX_VISIBLE_BLOCKS);
+
+export class BarsLayer {
+  private container: Container;
+  private barsGraphics: Graphics;
+  private config: BarsConfig;
+  private isDirty = true;
+
+  /** Visible block indices for current frame */
+  private visibleIndices: number[] = [];
+
+  constructor(config: Partial<BarsConfig> = {}) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.container = new Container();
+    this.container.label = 'bars-layer';
+
+    // Single Graphics object for all bars (batched rendering)
+    this.barsGraphics = new Graphics();
+    this.barsGraphics.label = 'bars-graphics';
+    this.container.addChild(this.barsGraphics);
+  }
+
+  /**
+   * Get the container for adding to stage.
+   */
+  getContainer(): Container {
+    return this.container;
+  }
+
+  /**
+   * Mark layer as needing recalculation.
+   */
+  markDirty(): void {
+    this.isDirty = true;
+  }
+
+  /**
+   * Update and render the bars.
+   */
+  update(): void {
+    if (!this.isDirty) return;
+
+    this.cullVisibleBlocks();
+    this.renderBars();
+    this.isDirty = false;
+  }
+
+  /**
+   * Determine which blocks are visible in the current viewport.
+   * Uses view frustum culling for performance.
+   */
+  private cullVisibleBlocks(): void {
+    const { schedule } = getSimulationState();
+    const viewport = getViewportState();
+    const { numRows } = this.config;
+
+    this.visibleIndices = [];
+
+    if (schedule.count === 0) return;
+
+    // Calculate visible time range
+    const { originTime, scale, offsetX, width, height, offsetY } = viewport;
+    const viewStartTime = (0 - offsetX) / scale + originTime;
+    const viewEndTime = (width - offsetX) / scale + originTime;
+
+    // Calculate visible row range
+    const viewStartRow = Math.max(0, Math.floor(-offsetY / this.config.rowHeight));
+    const viewEndRow = Math.min(numRows, Math.ceil((height - offsetY) / this.config.rowHeight));
+
+    // Cull blocks
+    for (let i = 0; i < schedule.count && this.visibleIndices.length < MAX_VISIBLE_BLOCKS; i++) {
+      const blockStart = schedule.startTimes[i];
+      const blockEnd = schedule.endTimes[i];
+      const trainId = schedule.trainIds[i];
+
+      // Skip if outside visible time range
+      if (blockEnd < viewStartTime || blockStart > viewEndTime) continue;
+
+      // Skip if outside visible row range
+      if (trainId < viewStartRow || trainId > viewEndRow) continue;
+
+      this.visibleIndices.push(i);
+    }
+  }
+
+  /**
+   * Render visible bars using batched Graphics.
+   */
+  private renderBars(): void {
+    const { schedule } = getSimulationState();
+    const viewport = getViewportState();
+    const { rowHeight, minBarWidth, barHeightRatio } = this.config;
+
+    this.barsGraphics.clear();
+
+    if (this.visibleIndices.length === 0) return;
+
+    // Batch transform time to pixels
+    const count = this.visibleIndices.length;
+
+    // Create temporary arrays for visible blocks
+    const visibleStartTimes = new Float64Array(count);
+    const visibleEndTimes = new Float64Array(count);
+
+    for (let i = 0; i < count; i++) {
+      const idx = this.visibleIndices[i];
+      visibleStartTimes[i] = schedule.startTimes[idx];
+      visibleEndTimes[i] = schedule.endTimes[idx];
+    }
+
+    batchTimeToPixel(visibleStartTimes, visibleEndTimes, count, tempX, tempWidth);
+
+    // Calculate bar geometry
+    const barHeight = rowHeight * barHeightRatio;
+    const barYOffset = (rowHeight - barHeight) / 2;
+
+    // Draw bars by type for better batching
+    for (const typeValue of Object.values(BlockType)) {
+      if (typeof typeValue !== 'number') continue;
+
+      const color = TYPE_COLORS[typeValue as BlockTypeValue];
+
+      for (let i = 0; i < count; i++) {
+        const idx = this.visibleIndices[i];
+        const blockType = schedule.types[idx];
+
+        if (blockType !== typeValue) continue;
+
+        const x = tempX[i];
+        const width = Math.max(minBarWidth, tempWidth[i]);
+        const trainId = schedule.trainIds[idx];
+        const y = trainId * rowHeight + barYOffset + viewport.offsetY;
+
+        // Skip if completely outside viewport
+        if (x + width < 0 || x > viewport.width) continue;
+
+        // Get flags for visual state
+        const flags = schedule.flags[idx];
+        const isSelected = (flags & 1) !== 0;
+        const isDragging = (flags & 2) !== 0;
+        const hasConflict = (flags & 4) !== 0;
+
+        // Determine bar color based on state
+        let barColor = color;
+        let alpha = 0.9;
+
+        if (hasConflict) {
+          barColor = 0xff0000;
+          alpha = 0.8;
+        } else if (isDragging) {
+          alpha = 0.5;
+        }
+
+        // Draw rounded rectangle
+        this.barsGraphics.roundRect(x, y, width, barHeight, 3);
+        this.barsGraphics.fill({ color: barColor, alpha });
+
+        // Draw selection border
+        if (isSelected) {
+          this.barsGraphics.roundRect(x, y, width, barHeight, 3);
+          this.barsGraphics.stroke({ width: 2, color: 0xffffff });
+        }
+      }
+    }
+  }
+
+  /**
+   * Get block index at screen position, or -1 if none.
+   */
+  hitTest(screenX: number, screenY: number): number {
+    const { schedule } = getSimulationState();
+    const viewport = getViewportState();
+    const { rowHeight, barHeightRatio } = this.config;
+
+    const barHeight = rowHeight * barHeightRatio;
+    const barYOffset = (rowHeight - barHeight) / 2;
+
+    // Calculate which row was clicked
+    const row = Math.floor((screenY - viewport.offsetY) / rowHeight);
+
+    // Check visible blocks in that row
+    for (let i = 0; i < this.visibleIndices.length; i++) {
+      const idx = this.visibleIndices[i];
+
+      if (schedule.trainIds[idx] !== row) continue;
+
+      const x = tempX[i];
+      const width = tempWidth[i];
+      const y = row * rowHeight + barYOffset + viewport.offsetY;
+
+      // Check if click is within bar bounds
+      if (
+        screenX >= x &&
+        screenX <= x + width &&
+        screenY >= y &&
+        screenY <= y + barHeight
+      ) {
+        return idx;
+      }
+    }
+
+    return -1;
+  }
+
+  /**
+   * Resize the layer.
+   */
+  resize(_width: number, _height: number): void {
+    this.markDirty();
+  }
+
+  /**
+   * Destroy the layer and release resources.
+   */
+  destroy(): void {
+    this.barsGraphics.destroy();
+    this.container.destroy({ children: true });
+    this.visibleIndices = [];
+  }
+}

@@ -1,0 +1,590 @@
+'use client';
+
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { Application, Container, Graphics, Text, TextStyle } from 'pixi.js';
+import { Viewport } from 'pixi-viewport';
+import {
+  LODLevel,
+  getLODFromScale,
+  LOD_THRESHOLDS,
+  viewportActions,
+} from '@/stores/viewportStore';
+
+interface MaintenanceEvent {
+  id: string;
+  trainId: string;
+  trainName: string;
+  type: 'PM1' | 'PM2' | 'HM' | 'OVH';
+  startDate: Date;
+  endDate: Date;
+  depot: string;
+}
+
+interface ScheduleCanvasProps {
+  events: MaintenanceEvent[];
+  onEventSelect?: (event: MaintenanceEvent) => void;
+  onEventHover?: (event: MaintenanceEvent | null) => void;
+  startDate?: Date;
+  endDate?: Date;
+  width?: number;
+  height?: number;
+}
+
+// Color palette for maintenance types
+const MAINTENANCE_COLORS = {
+  PM1: 0x10B981, // Green
+  PM2: 0x3B82F6, // Blue
+  HM: 0xF59E0B,  // Amber
+  OVH: 0xEF4444, // Red
+};
+
+// LOD level descriptions
+const LOD_LABELS = {
+  0: 'Strategic (10-12 years)',
+  1: 'Tactical (1-3 years)',
+  2: 'Operational (1-6 months)',
+  3: 'Execution (1-4 weeks)',
+};
+
+// Day width in pixels at scale 1.0
+const DAY_WIDTH = 20;
+const ROW_HEIGHT = 40;
+const HEADER_HEIGHT = 60;
+
+export function ScheduleCanvas({
+  events,
+  onEventSelect,
+  onEventHover,
+  startDate = new Date(),
+  endDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+  width = 1200,
+  height = 600,
+}: ScheduleCanvasProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const appRef = useRef<Application | null>(null);
+  const viewportRef = useRef<Viewport | null>(null);
+  const [currentLOD, setCurrentLOD] = useState<LODLevel>(2);
+  const [scale, setScale] = useState(0.5);
+
+  // Initialize Pixi application
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const app = new Application();
+
+    const initApp = async () => {
+      await app.init({
+        width,
+        height,
+        backgroundColor: 0x0A0A0A, // Dark canvas background
+        resolution: window.devicePixelRatio || 1,
+        autoDensity: true,
+        antialias: true,
+      });
+
+      containerRef.current?.appendChild(app.canvas);
+      appRef.current = app;
+
+      // Create viewport
+      const viewport = new Viewport({
+        screenWidth: width,
+        screenHeight: height,
+        worldWidth: width * 10,
+        worldHeight: height * 5,
+        events: app.renderer.events,
+      });
+
+      app.stage.addChild(viewport);
+      viewportRef.current = viewport;
+
+      // Enable viewport interactions
+      viewport
+        .drag()
+        .pinch()
+        .wheel()
+        .decelerate()
+        .clampZoom({
+          minScale: 0.05,
+          maxScale: 4.0,
+        });
+
+      // Listen to zoom/scale changes
+      viewport.on('zoomed', () => {
+        const newScale = viewport.scale.x;
+        setScale(newScale);
+        setCurrentLOD(getLODFromScale(newScale));
+        viewportActions.zoom(newScale);
+      });
+
+      viewport.on('moved', () => {
+        viewportActions.pan(viewport.x, viewport.y);
+      });
+
+      // Initial render
+      renderContent(viewport, events, startDate, endDate, getLODFromScale(0.5));
+    };
+
+    initApp();
+
+    return () => {
+      if (appRef.current) {
+        appRef.current.destroy(true);
+        appRef.current = null;
+      }
+    };
+  }, [width, height]);
+
+  // Re-render when events or LOD changes
+  useEffect(() => {
+    if (viewportRef.current) {
+      renderContent(viewportRef.current, events, startDate, endDate, currentLOD);
+    }
+  }, [events, currentLOD, startDate, endDate]);
+
+  // Handle window resize
+  useEffect(() => {
+    const handleResize = () => {
+      if (appRef.current && viewportRef.current) {
+        appRef.current.renderer.resize(width, height);
+        viewportRef.current.resize(width, height);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [width, height]);
+
+  const renderContent = useCallback(
+    (
+      viewport: Viewport,
+      events: MaintenanceEvent[],
+      startDate: Date,
+      endDate: Date,
+      lod: LODLevel
+    ) => {
+      // Clear existing children except the viewport container
+      viewport.removeChildren();
+
+      // Create container for all content
+      const contentContainer = new Container();
+      viewport.addChild(contentContainer);
+
+      // Render based on LOD level
+      switch (lod) {
+        case 0:
+          renderStrategicView(contentContainer, events, startDate, endDate);
+          break;
+        case 1:
+          renderTacticalView(contentContainer, events, startDate, endDate);
+          break;
+        case 2:
+          renderOperationalView(contentContainer, events, startDate, endDate);
+          break;
+        case 3:
+          renderExecutionView(contentContainer, events, startDate, endDate, onEventSelect, onEventHover);
+          break;
+      }
+
+      // Add timeline ruler
+      renderTimelineRuler(contentContainer, startDate, endDate, lod);
+    },
+    [onEventSelect, onEventHover]
+  );
+
+  return (
+    <div className="relative">
+      {/* Canvas container */}
+      <div ref={containerRef} className="rounded-lg overflow-hidden" />
+
+      {/* Overlay controls */}
+      <div className="absolute top-4 left-4 bg-panel/90 backdrop-blur-sm rounded-lg p-3 space-y-2">
+        <div className="text-xs text-text-secondary">LOD Level</div>
+        <div className="text-sm font-medium text-text-primary">
+          {LOD_LABELS[currentLOD]}
+        </div>
+        <div className="text-xs text-text-muted">
+          Scale: {(scale * 100).toFixed(0)}%
+        </div>
+      </div>
+
+      {/* Zoom controls */}
+      <div className="absolute bottom-4 right-4 flex gap-2">
+        <button
+          onClick={() => viewportRef.current?.zoomPercent(0.2, true)}
+          className="p-2 bg-panel hover:bg-elevated rounded text-text-primary"
+        >
+          +
+        </button>
+        <button
+          onClick={() => viewportRef.current?.zoomPercent(-0.2, true)}
+          className="p-2 bg-panel hover:bg-elevated rounded text-text-primary"
+        >
+          -
+        </button>
+        <button
+          onClick={() => {
+            viewportRef.current?.fit();
+            viewportRef.current?.moveCenter(width / 2, height / 2);
+          }}
+          className="p-2 bg-panel hover:bg-elevated rounded text-text-primary text-xs"
+        >
+          Fit
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// LOD 0: Strategic View (10-12 years) - Heatmap aggregation
+function renderStrategicView(
+  container: Container,
+  events: MaintenanceEvent[],
+  startDate: Date,
+  endDate: Date
+) {
+  const graphics = new Graphics();
+  container.addChild(graphics);
+
+  // Calculate yearly aggregations
+  const yearlyData = new Map<number, { PM1: number; PM2: number; HM: number; OVH: number }>();
+
+  events.forEach((event) => {
+    const year = event.startDate.getFullYear();
+    if (!yearlyData.has(year)) {
+      yearlyData.set(year, { PM1: 0, PM2: 0, HM: 0, OVH: 0 });
+    }
+    const data = yearlyData.get(year)!;
+    data[event.type]++;
+  });
+
+  // Render yearly blocks
+  const years = Array.from(yearlyData.keys()).sort();
+  const blockWidth = 100;
+  const blockHeight = 80;
+
+  years.forEach((year, index) => {
+    const data = yearlyData.get(year)!;
+    const total = data.PM1 + data.PM2 + data.HM + data.OVH;
+    const intensity = Math.min(1, total / 50); // Normalize
+
+    graphics.rect(
+      index * (blockWidth + 10) + 20,
+      HEADER_HEIGHT,
+      blockWidth,
+      blockHeight
+    );
+    graphics.fill({ color: 0x3B82F6, alpha: 0.3 + intensity * 0.7 });
+
+    // Year label
+    const style = new TextStyle({
+      fontSize: 14,
+      fill: 0xFAFAFA,
+      fontFamily: 'Inter',
+    });
+    const yearText = new Text({ text: year.toString(), style });
+    yearText.x = index * (blockWidth + 10) + 20 + blockWidth / 2 - yearText.width / 2;
+    yearText.y = HEADER_HEIGHT + blockHeight + 5;
+    container.addChild(yearText);
+
+    // Count label
+    const countStyle = new TextStyle({
+      fontSize: 20,
+      fill: 0xFAFAFA,
+      fontWeight: 'bold',
+      fontFamily: 'Inter',
+    });
+    const countText = new Text({ text: total.toString(), style: countStyle });
+    countText.x = index * (blockWidth + 10) + 20 + blockWidth / 2 - countText.width / 2;
+    countText.y = HEADER_HEIGHT + blockHeight / 2 - countText.height / 2;
+    container.addChild(countText);
+  });
+}
+
+// LOD 1: Tactical View (1-3 years) - Campaign bars
+function renderTacticalView(
+  container: Container,
+  events: MaintenanceEvent[],
+  startDate: Date,
+  endDate: Date
+) {
+  const graphics = new Graphics();
+  container.addChild(graphics);
+
+  // Calculate quarterly aggregations
+  const quarterlyData = new Map<string, { PM1: number; PM2: number; HM: number; OVH: number }>();
+
+  events.forEach((event) => {
+    const year = event.startDate.getFullYear();
+    const quarter = Math.floor(event.startDate.getMonth() / 3) + 1;
+    const key = `${year}-Q${quarter}`;
+
+    if (!quarterlyData.has(key)) {
+      quarterlyData.set(key, { PM1: 0, PM2: 0, HM: 0, OVH: 0 });
+    }
+    const data = quarterlyData.get(key)!;
+    data[event.type]++;
+  });
+
+  // Render quarterly bars
+  const quarters = Array.from(quarterlyData.keys()).sort();
+  const barWidth = 60;
+  const maxHeight = 150;
+
+  quarters.forEach((quarter, index) => {
+    const data = quarterlyData.get(quarter)!;
+    let yOffset = HEADER_HEIGHT;
+
+    // Stack by type
+    (['PM1', 'PM2', 'HM', 'OVH'] as const).forEach((type) => {
+      const count = data[type];
+      if (count > 0) {
+        const height = (count / 20) * maxHeight;
+        graphics.rect(
+          index * (barWidth + 5) + 20,
+          yOffset,
+          barWidth,
+          height
+        );
+        graphics.fill({ color: MAINTENANCE_COLORS[type] });
+        yOffset += height;
+      }
+    });
+
+    // Quarter label
+    const style = new TextStyle({
+      fontSize: 10,
+      fill: 0xA1A1A1,
+      fontFamily: 'Inter',
+    });
+    const text = new Text({ text: quarter, style });
+    text.x = index * (barWidth + 5) + 20 + barWidth / 2 - text.width / 2;
+    text.y = HEADER_HEIGHT + maxHeight + 5;
+    container.addChild(text);
+  });
+}
+
+// LOD 2: Operational View (1-6 months) - Work orders as blocks
+function renderOperationalView(
+  container: Container,
+  events: MaintenanceEvent[],
+  startDate: Date,
+  endDate: Date
+) {
+  const graphics = new Graphics();
+  container.addChild(graphics);
+
+  // Group by train
+  const trainGroups = new Map<string, MaintenanceEvent[]>();
+  events.forEach((event) => {
+    if (!trainGroups.has(event.trainId)) {
+      trainGroups.set(event.trainId, []);
+    }
+    trainGroups.get(event.trainId)!.push(event);
+  });
+
+  const trains = Array.from(trainGroups.keys()).slice(0, 15); // Limit visible trains
+  const startTime = startDate.getTime();
+  const msPerDay = 24 * 60 * 60 * 1000;
+
+  trains.forEach((trainId, rowIndex) => {
+    const trainEvents = trainGroups.get(trainId)!;
+    const y = HEADER_HEIGHT + rowIndex * ROW_HEIGHT;
+
+    // Row background
+    graphics.rect(0, y, 2000, ROW_HEIGHT - 2);
+    graphics.fill({ color: rowIndex % 2 === 0 ? 0x141414 : 0x1C1C1C });
+
+    // Train label
+    const style = new TextStyle({
+      fontSize: 11,
+      fill: 0xA1A1A1,
+      fontFamily: 'JetBrains Mono',
+    });
+    const label = new Text({ text: trainEvents[0]?.trainName || trainId, style });
+    label.x = 10;
+    label.y = y + ROW_HEIGHT / 2 - label.height / 2;
+    container.addChild(label);
+
+    // Events
+    trainEvents.forEach((event) => {
+      const startOffset = (event.startDate.getTime() - startTime) / msPerDay;
+      const duration = (event.endDate.getTime() - event.startDate.getTime()) / msPerDay;
+
+      const x = 120 + startOffset * DAY_WIDTH;
+      const width = Math.max(duration * DAY_WIDTH, 8);
+
+      graphics.rect(x, y + 4, width, ROW_HEIGHT - 8);
+      graphics.fill({ color: MAINTENANCE_COLORS[event.type] });
+    });
+  });
+}
+
+// LOD 3: Execution View (1-4 weeks) - Full task details
+function renderExecutionView(
+  container: Container,
+  events: MaintenanceEvent[],
+  startDate: Date,
+  endDate: Date,
+  onEventSelect?: (event: MaintenanceEvent) => void,
+  onEventHover?: (event: MaintenanceEvent | null) => void
+) {
+  const graphics = new Graphics();
+  container.addChild(graphics);
+
+  // Group by train
+  const trainGroups = new Map<string, MaintenanceEvent[]>();
+  events.forEach((event) => {
+    if (!trainGroups.has(event.trainId)) {
+      trainGroups.set(event.trainId, []);
+    }
+    trainGroups.get(event.trainId)!.push(event);
+  });
+
+  const trains = Array.from(trainGroups.keys()).slice(0, 20);
+  const startTime = startDate.getTime();
+  const msPerDay = 24 * 60 * 60 * 1000;
+
+  trains.forEach((trainId, rowIndex) => {
+    const trainEvents = trainGroups.get(trainId)!;
+    const y = HEADER_HEIGHT + rowIndex * ROW_HEIGHT;
+
+    // Row background
+    graphics.rect(0, y, 3000, ROW_HEIGHT - 2);
+    graphics.fill({ color: rowIndex % 2 === 0 ? 0x141414 : 0x1C1C1C });
+
+    // Train label
+    const style = new TextStyle({
+      fontSize: 12,
+      fill: 0xFAFAFA,
+      fontFamily: 'JetBrains Mono',
+    });
+    const label = new Text({ text: trainEvents[0]?.trainName || trainId, style });
+    label.x = 10;
+    label.y = y + ROW_HEIGHT / 2 - label.height / 2;
+    container.addChild(label);
+
+    // Events with full details
+    trainEvents.forEach((event) => {
+      const startOffset = (event.startDate.getTime() - startTime) / msPerDay;
+      const duration = (event.endDate.getTime() - event.startDate.getTime()) / msPerDay;
+
+      const x = 150 + startOffset * DAY_WIDTH * 2; // Larger scale at execution level
+      const width = Math.max(duration * DAY_WIDTH * 2, 30);
+
+      // Event block
+      const eventGraphics = new Graphics();
+      eventGraphics.rect(0, 0, width, ROW_HEIGHT - 10);
+      eventGraphics.fill({ color: MAINTENANCE_COLORS[event.type] });
+
+      // Rounded corners simulation
+      eventGraphics.rect(0, 0, width, ROW_HEIGHT - 10);
+      eventGraphics.fill({ color: MAINTENANCE_COLORS[event.type] });
+
+      eventGraphics.x = x;
+      eventGraphics.y = y + 5;
+      eventGraphics.eventMode = 'static';
+      eventGraphics.cursor = 'pointer';
+
+      eventGraphics.on('pointerover', () => {
+        eventGraphics.alpha = 0.8;
+        onEventHover?.(event);
+      });
+
+      eventGraphics.on('pointerout', () => {
+        eventGraphics.alpha = 1;
+        onEventHover?.(null);
+      });
+
+      eventGraphics.on('pointertap', () => {
+        onEventSelect?.(event);
+      });
+
+      container.addChild(eventGraphics);
+
+      // Event type label
+      if (width > 40) {
+        const typeStyle = new TextStyle({
+          fontSize: 10,
+          fill: 0xFFFFFF,
+          fontWeight: 'bold',
+          fontFamily: 'Inter',
+        });
+        const typeText = new Text({ text: event.type, style: typeStyle });
+        typeText.x = x + 5;
+        typeText.y = y + 8;
+        container.addChild(typeText);
+
+        // Depot label
+        if (width > 80) {
+          const depotStyle = new TextStyle({
+            fontSize: 9,
+            fill: 0xFFFFFF,
+            alpha: 0.8,
+            fontFamily: 'Inter',
+          });
+          const depotText = new Text({ text: event.depot, style: depotStyle });
+          depotText.x = x + 5;
+          depotText.y = y + 22;
+          container.addChild(depotText);
+        }
+      }
+    });
+  });
+}
+
+// Timeline ruler
+function renderTimelineRuler(
+  container: Container,
+  startDate: Date,
+  endDate: Date,
+  lod: LODLevel
+) {
+  const graphics = new Graphics();
+  container.addChild(graphics);
+
+  // Header background
+  graphics.rect(0, 0, 3000, HEADER_HEIGHT);
+  graphics.fill({ color: 0x1C1C1C });
+
+  const style = new TextStyle({
+    fontSize: 11,
+    fill: 0xA1A1A1,
+    fontFamily: 'Inter',
+  });
+
+  // Different granularity based on LOD
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const startTime = startDate.getTime();
+
+  if (lod >= 2) {
+    // Show months
+    const months = [];
+    let current = new Date(startDate);
+    while (current < endDate) {
+      months.push(new Date(current));
+      current.setMonth(current.getMonth() + 1);
+    }
+
+    months.forEach((month, index) => {
+      const offset = (month.getTime() - startTime) / msPerDay;
+      const x = 150 + offset * DAY_WIDTH * (lod === 3 ? 2 : 1);
+
+      // Month line
+      graphics.moveTo(x, HEADER_HEIGHT - 20);
+      graphics.lineTo(x, HEADER_HEIGHT);
+      graphics.stroke({ color: 0x2A2A2A, width: 1 });
+
+      // Month label
+      const monthLabel = month.toLocaleDateString('en-US', {
+        month: 'short',
+        year: '2-digit',
+      });
+      const text = new Text({ text: monthLabel, style });
+      text.x = x + 5;
+      text.y = HEADER_HEIGHT - 18;
+      container.addChild(text);
+    });
+  }
+}
+
+export default ScheduleCanvas;

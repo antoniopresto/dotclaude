@@ -1,0 +1,149 @@
+/**
+ * MMS - Database Migration Script
+ *
+ * Run with: bun run db:migrate
+ */
+
+import postgres from 'postgres';
+
+const connectionString = process.env.DATABASE_URL || 'postgresql://mms:mms@localhost:5432/mms';
+
+const sql = postgres(connectionString);
+
+async function migrate() {
+  console.log('Running MMS database migrations...');
+
+  try {
+    // Create extension for UUID generation
+    await sql`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`;
+
+    // Create fleets table
+    await sql`
+      CREATE TABLE IF NOT EXISTS fleets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(100) NOT NULL,
+        manufacturer VARCHAR(50),
+        pm1_interval_km INTEGER NOT NULL,
+        pm2_interval_km INTEGER NOT NULL,
+        hm_interval_km INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('  ✓ fleets table');
+
+    // Create depots table
+    await sql`
+      CREATE TABLE IF NOT EXISTS depots (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(100) NOT NULL,
+        code VARCHAR(10) UNIQUE NOT NULL,
+        latitude DECIMAL(10, 6),
+        longitude DECIMAL(10, 6),
+        capacity_tracks INTEGER DEFAULT 5,
+        capacity_manhours INTEGER DEFAULT 80,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('  ✓ depots table');
+
+    // Create trains table
+    await sql`
+      CREATE TABLE IF NOT EXISTS trains (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        train_id VARCHAR(20) UNIQUE NOT NULL,
+        fleet_id UUID REFERENCES fleets(id),
+        base_depot_id UUID REFERENCES depots(id),
+        current_km INTEGER DEFAULT 0,
+        target_km INTEGER DEFAULT 0,
+        fitness_status VARCHAR(10) DEFAULT 'fit' CHECK (fitness_status IN ('fit', 'unfit')),
+        last_maintenance_date DATE,
+        next_maintenance_km INTEGER,
+        latitude DECIMAL(10, 6),
+        longitude DECIMAL(10, 6),
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('  ✓ trains table');
+
+    // Create services table
+    await sql`
+      CREATE TABLE IF NOT EXISTS services (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        service_code VARCHAR(20) UNIQUE NOT NULL,
+        origin VARCHAR(100) NOT NULL,
+        destination VARCHAR(100) NOT NULL,
+        distance_km INTEGER NOT NULL,
+        departure_time TIME NOT NULL,
+        arrival_time TIME NOT NULL,
+        service_type VARCHAR(20) DEFAULT 'regional',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('  ✓ services table');
+
+    // Create allocations table
+    await sql`
+      CREATE TABLE IF NOT EXISTS allocations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        service_id UUID REFERENCES services(id),
+        train_id UUID REFERENCES trains(id),
+        allocation_date DATE NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'completed', 'cancelled')),
+        score INTEGER,
+        justifications JSONB,
+        created_by VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(service_id, allocation_date)
+      )
+    `;
+    console.log('  ✓ allocations table');
+
+    // Create mileage_history table
+    await sql`
+      CREATE TABLE IF NOT EXISTS mileage_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        train_id UUID REFERENCES trains(id),
+        recorded_date DATE NOT NULL,
+        km_value INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('  ✓ mileage_history table');
+
+    // Create maintenance_schedules table
+    await sql`
+      CREATE TABLE IF NOT EXISTS maintenance_schedules (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        train_id UUID REFERENCES trains(id),
+        depot_id UUID REFERENCES depots(id),
+        maintenance_type VARCHAR(10) CHECK (maintenance_type IN ('PM1', 'PM2', 'HM', 'OVH')),
+        scheduled_date DATE NOT NULL,
+        duration_days INTEGER DEFAULT 1,
+        status VARCHAR(20) DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'in_progress', 'completed', 'cancelled')),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('  ✓ maintenance_schedules table');
+
+    // Create indexes
+    await sql`CREATE INDEX IF NOT EXISTS idx_trains_fleet ON trains(fleet_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_trains_depot ON trains(base_depot_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_allocations_date ON allocations(allocation_date)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_allocations_status ON allocations(status)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_mileage_train_date ON mileage_history(train_id, recorded_date)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_maintenance_train ON maintenance_schedules(train_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_maintenance_depot ON maintenance_schedules(depot_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_maintenance_date ON maintenance_schedules(scheduled_date)`;
+    console.log('  ✓ indexes created');
+
+    console.log('\n✅ All migrations completed successfully!');
+  } catch (error) {
+    console.error('Migration failed:', error);
+    process.exit(1);
+  } finally {
+    await sql.end();
+  }
+}
+
+migrate();

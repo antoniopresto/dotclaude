@@ -1,0 +1,481 @@
+     1→# Domain Model Reference
+     2→
+     3→This document defines the domain entities, data structures, and business rules for the MMS System.
+     4→
+     5→---
+     6→
+     7→## Fleet Composition
+     8→
+     9→### Demo Implementation (Current)
+    10→
+    11→| Property | Value | Notes |
+    12→|----------|-------|-------|
+    13→| Total Trains | 50 | Simplified for demo |
+    14→| Time Range | 10 years | Mock data generator |
+    15→| Tasks per Train | ~120/year | Varies by maintenance type |
+    16→| Total Tasks | ~60,000 | Across all trains/years |
+    17→
+    18→### Full System (From RFQ)
+    19→
+    20→| Type | Prefix | Count | Line | Depot |
+    21→|------|--------|-------|------|-------|
+    22→| Alstom | ALT-001 to ALT-079 | 79 | Red Line | Al Rashidiya |
+    23→| Kinki Sharyo | KNK-001 to KNK-049 | 49 | Green Line | Jebel Ali |
+    24→| **Total** | | **128** | | |
+    25→
+    26→---
+    27→
+    28→## Maintenance Types
+    29→
+    30→| Level | Name | Interval (km) | Tolerance | Duration | Man-Hours | Tracks | Est. Cost |
+    31→|-------|------|---------------|-----------|----------|-----------|--------|-----------|
+    32→| A | A-Check | 10,000 | ±2,000 | 4h | 8 | 1 | $2,500 |
+    33→| B | B-Check | 50,000 | ±5,000 | 16h | 32 | 1 | $8,500 |
+    34→| C | C-Check | 200,000 | ±20,000 | 72h | 160 | 1 | $45,000 |
+    35→| D | D-Overhaul | 800,000 | ±50,000 | 480h | 1,200 | 2 | $180,000 |
+    36→
+    37→### Maintenance Triggers
+    38→
+    39→1. **Mileage-based** (primary): Triggered when train reaches interval threshold
+    40→2. **Time-based** (secondary): Calendar-based inspections
+    41→3. **Condition-based** (future): Based on sensor data and predictive analytics
+    42→
+    43→---
+    44→
+    45→## Depot Configuration
+    46→
+    47→| Depot ID | Name | Tracks | Weekly Man-Hours | Serves |
+    48→|----------|------|--------|------------------|--------|
+    49→| depot-red | Al Rashidiya | 5 | 2,800 | Alstom (Red Line) |
+    50→| depot-green | Jebel Ali | 4 | 2,400 | Kinki Sharyo (Green Line) |
+    51→
+    52→### Resource Constraints
+    53→
+    54→```
+    55→Weekly Man-Hours: 5,200 (combined)
+    56→Monthly Man-Hours: 20,800
+    57→Total Maintenance Tracks: 9
+    58→Track Capacity/Day: 2 trains per track
+    59→```
+    60→
+    61→---
+    62→
+    63→## Fleet Characteristics
+    64→
+    65→### Alstom (ALT) Fleet
+    66→- **Count**: 79 trains
+    67→- **Cars per train**: 5
+    68→- **Base mileage**: ~450,000 - 800,000 km
+    69→- **Daily average**: 420-475 km/day
+    70→- **Assigned depot**: Al Rashidiya
+    71→
+    72→### Kinki Sharyo (KNK) Fleet
+    73→- **Count**: 49 trains (newer fleet)
+    74→- **Cars per train**: 5
+    75→- **Base mileage**: ~320,000 - 600,000 km
+    76→- **Daily average**: 400-454 km/day
+    77→- **Assigned depot**: Jebel Ali
+    78→
+    79→---
+    80→
+    81→## TypeScript Interfaces
+    82→
+    83→Implementation location: `apps/canvas/src/data/`
+    84→
+    85→### Architecture: Persistence vs Rendering
+    86→
+    87→Data flows through two distinct layers:
+    88→
+    89→```
+    90→┌─────────────────┐    parse/     ┌─────────────────┐    compute    ┌─────────────────┐
+    91→│   Persistent    │  ──────────>  │     Runtime     │  ──────────>  │    Rendering    │
+    92→│   (JSON/API)    │               │   (in memory)   │               │    (canvas)     │
+    93→│                 │               │                 │               │                 │
+    94→│ startDate:      │               │ (Date objects   │               │ startDay: 74    │
+    95→│ "2024-03-15"    │               │  for logic)     │               │ trainIndex: 5   │
+    96→└─────────────────┘               └─────────────────┘               └─────────────────┘
+    97→```
+    98→
+    99→**Why this separation?**
+   100→- `Date` objects cannot be serialized to JSON (become `{}`)
+   101→- Canvas needs numeric offsets for position calculations
+   102→- Domain logic needs semantic dates for business rules
+   103→
+   104→---
+   105→
+   106→### Domain Types (Persistent/Serializable)
+   107→
+   108→These types can be saved to JSON, sent via API, or stored in localStorage.
+   109→
+   110→```typescript
+   111→// ─────────────────────────────────────────────────────────────
+   112→// ENUMS & CONSTANTS
+   113→// ─────────────────────────────────────────────────────────────
+   114→
+   115→type AssetType = 'ALSTOM' | 'KINKI';
+   116→type TaskType = 'maintenance' | 'overhaul' | 'inspection';
+   117→type MaintenanceLevel = 'A' | 'B' | 'C' | 'D';
+   118→
+   119→// ─────────────────────────────────────────────────────────────
+   120→// TRAIN (Persistent)
+   121→// ─────────────────────────────────────────────────────────────
+   122→
+   123→interface Train {
+   124→  id: string;              // "TRAIN-001" or "ALT-001"
+   125→  name: string;            // Display name
+   126→  assetType: AssetType;    // Fleet type
+   127→}
+   128→
+   129→// ─────────────────────────────────────────────────────────────
+   130→// TASK (Persistent)
+   131→// ─────────────────────────────────────────────────────────────
+   132→
+   133→interface Task {
+   134→  id: string;              // Unique identifier
+   135→  trainId: string;         // Reference to Train.id
+   136→  startDate: string;       // ISO 8601 date: "2024-03-15"
+   137→  endDate: string;         // ISO 8601 date: "2024-03-20"
+   138→  type: TaskType;          // Visual category
+   139→  hasConflict: boolean;    // Conflict indicator
+   140→}
+   141→
+   142→// ─────────────────────────────────────────────────────────────
+   143→// DATASET METADATA (Persistent)
+   144→// ─────────────────────────────────────────────────────────────
+   145→
+   146→interface DatasetMeta {
+   147→  startDate: string;       // ISO 8601: "2024-01-01"
+   148→  trainCount: number;      // Number of trains
+   149→  years: number;           // Time range in years
+   150→}
+   151→
+   152→// ─────────────────────────────────────────────────────────────
+   153→// GENERATED DATA (Complete dataset)
+   154→// ─────────────────────────────────────────────────────────────
+   155→
+   156→interface GeneratedData {
+   157→  trains: Train[];
+   158→  tasks: Task[];
+   159→  meta: DatasetMeta;
+   160→}
+   161→```
+   162→
+   163→---
+   164→
+   165→### Rendering Types (Runtime/Calculated)
+   166→
+   167→These types are computed when data loads and used by the canvas. Never persisted.
+   168→
+   169→```typescript
+   170→// ─────────────────────────────────────────────────────────────
+   171→// TASK RENDER (Calculated for canvas)
+   172→// ─────────────────────────────────────────────────────────────
+   173→
+   174→type TaskColor = 'blue' | 'orange' | 'gray';
+   175→
+   176→interface TaskRender {
+   177→  id: string;              // Same as Task.id
+   178→  trainIndex: number;      // Y position (0-based index in trains array)
+   179→  startDay: number;        // X position (days since meta.startDate)
+   180→  duration: number;        // Width (days)
+   181→  color: TaskColor;        // Derived from Task.type
+   182→  hasConflict: boolean;    // Passthrough from Task
+   183→  type: TaskType;          // For label display in MicroLayer
+   184→}
+   185→
+   186→// ─────────────────────────────────────────────────────────────
+   187→// MAPPINGS
+   188→// ─────────────────────────────────────────────────────────────
+   189→
+   190→const TYPE_TO_COLOR: Record<TaskType, TaskColor> = {
+   191→  maintenance: 'blue',
+   192→  overhaul: 'orange',
+   193→  inspection: 'gray',
+   194→};
+   195→```
+   196→
+   197→---
+   198→
+   199→### Canvas Configuration
+   200→
+   201→```typescript
+   202→// ─────────────────────────────────────────────────────────────
+   203→// VIEW CONFIG (Visual settings)
+   204→// ─────────────────────────────────────────────────────────────
+   205→
+   206→interface ViewConfig {
+   207→  pxPerDay: number;        // Pixels per day (X scale)
+   208→  pxPerTrain: number;      // Pixels per train row (Y scale)
+   209→  minZoom: number;         // Minimum zoom level
+   210→  maxZoom: number;         // Maximum zoom level
+   211→  zoomSensitivity: number; // Scroll sensitivity
+   212→  lodThresholds: {
+   213→    macro: number;         // Below this → MACRO view
+   214→    micro: number;         // Above this → MICRO view
+   215→  };
+   216→}
+   217→
+   218→// ─────────────────────────────────────────────────────────────
+   219→// VIEWPORT STATE (Runtime)
+   220→// ─────────────────────────────────────────────────────────────
+   221→
+   222→type LODLevel = 'MACRO' | 'MESO' | 'MICRO';
+   223→
+   224→interface ViewportState {
+   225→  zoom: number;
+   226→  panX: number;
+   227→  panY: number;
+   228→  lod: LODLevel;
+   229→}
+   230→
+   231→// ─────────────────────────────────────────────────────────────
+   232→// DEFAULT VALUES
+   233→// ─────────────────────────────────────────────────────────────
+   234→
+   235→const DEFAULT_VIEW_CONFIG: ViewConfig = {
+   236→  pxPerDay: 10,
+   237→  pxPerTrain: 24,
+   238→  minZoom: 0.1,
+   239→  maxZoom: 5,
+   240→  zoomSensitivity: 0.002,
+   241→  lodThresholds: {
+   242→    macro: 0.5,
+   243→    micro: 2.0,
+   244→  },
+   245→};
+   246→
+   247→const DEFAULT_DATASET_META: DatasetMeta = {
+   248→  startDate: '2024-01-01',
+   249→  trainCount: 50,
+   250→  years: 10,
+   251→};
+   252→```
+   253→
+   254→---
+   255→
+   256→### Future Extensions (Optional Fields)
+   257→
+   258→These fields can be added without breaking existing code:
+   259→
+   260→```typescript
+   261→// Extended Train (future)
+   262→interface TrainExtended extends Train {
+   263→  carsCount?: number;
+   264→  currentMileageKm?: number;
+   265→  avgDailyMileageKm?: number;
+   266→  status?: 'operational' | 'maintenance' | 'out-of-service';
+   267→}
+   268→
+   269→// Extended Task (future)
+   270→interface TaskExtended extends Task {
+   271→  maintenanceLevel?: MaintenanceLevel;  // A/B/C/D
+   272→  manHours?: number;
+   273→  estimatedCost?: number;
+   274→  dependencies?: string[];              // Predecessor task IDs
+   275→  status?: 'scheduled' | 'in-progress' | 'completed';
+   276→}
+   277→
+   278→// Conflict as separate entity (future)
+   279→interface Conflict {
+   280→  id: string;
+   281→  taskIds: [string, string];
+   282→  type: 'overlap' | 'resource' | 'dependency';
+   283→  severity: 'low' | 'medium' | 'high';
+   284→  description?: string;
+   285→}
+   286→
+   287→// Depot (future)
+   288→interface Depot {
+   289→  id: string;
+   290→  name: string;
+   291→  assetTypes: AssetType[];
+   292→  trackCount: number;
+   293→  weeklyManHours: number;
+   294→}
+   295→```
+   296→
+   297→---
+   298→
+   299→## Data Generation
+   300→
+   301→### Mock Data Generator
+   302→
+   303→Implementation: `apps/canvas/src/data/generator.ts`
+   304→
+   305→The generator creates:
+   306→
+   307→1. **50 Trains** with unique IDs (TRAIN-001 to TRAIN-050)
+   308→2. **10 Years of Tasks** (~10-12 tasks per train per year)
+   309→3. **~5% Conflict Rate** (hasConflict flag for testing)
+   310→
+   311→### Generation Algorithm
+   312→
+   313→```typescript
+   314→function generateData(meta: DatasetMeta): GeneratedData {
+   315→  const trains = generateTrains(meta.trainCount);
+   316→  const tasks = generateTasks(trains, meta);
+   317→
+   318→  return { trains, tasks, meta };
+   319→}
+   320→
+   321→function generateTrains(count: number): Train[] {
+   322→  return Array.from({ length: count }, (_, i) => ({
+   323→    id: `TRAIN-${String(i + 1).padStart(3, '0')}`,
+   324→    name: `Train ${i + 1}`,
+   325→    assetType: i < 30 ? 'ALSTOM' : 'KINKI',
+   326→  }));
+   327→}
+   328→
+   329→function generateTasks(trains: Train[], meta: DatasetMeta): Task[] {
+   330→  const tasks: Task[] = [];
+   331→  const types: TaskType[] = ['maintenance', 'overhaul', 'inspection'];
+   332→
+   333→  trains.forEach((train) => {
+   334→    for (let year = 0; year < meta.years; year++) {
+   335→      const tasksPerYear = 8 + Math.floor(Math.random() * 5);
+   336→      for (let t = 0; t < tasksPerYear; t++) {
+   337→        const dayOffset = year * 365 + Math.floor(Math.random() * 360);
+   338→        const duration = 2 + Math.floor(Math.random() * 10);
+   339→        const startDate = addDays(meta.startDate, dayOffset);
+   340→        const endDate = addDays(startDate, duration);
+   341→
+   342→        tasks.push({
+   343→          id: `${train.id}-${year}-${t}`,
+   344→          trainId: train.id,
+   345→          startDate: formatISO(startDate),
+   346→          endDate: formatISO(endDate),
+   347→          type: types[Math.floor(Math.random() * types.length)],
+   348→          hasConflict: Math.random() < 0.05,  // 5% conflict rate
+   349→        });
+   350→      }
+   351→    }
+   352→  });
+   353→
+   354→  return tasks;
+   355→}
+   356→```
+   357→
+   358→### Transform to Render Data
+   359→
+   360→```typescript
+   361→function prepareRenderData(
+   362→  data: GeneratedData
+   363→): { trains: Train[]; tasks: TaskRender[] } {
+   364→  const trainIndexMap = new Map(
+   365→    data.trains.map((t, i) => [t.id, i])
+   366→  );
+   367→  const startDate = new Date(data.meta.startDate);
+   368→
+   369→  const tasks = data.tasks.map(task => ({
+   370→    id: task.id,
+   371→    trainIndex: trainIndexMap.get(task.trainId)!,
+   372→    startDay: daysBetween(startDate, new Date(task.startDate)),
+   373→    duration: daysBetween(new Date(task.startDate), new Date(task.endDate)),
+   374→    color: TYPE_TO_COLOR[task.type],
+   375→    hasConflict: task.hasConflict,
+   376→    type: task.type,
+   377→  }));
+   378→
+   379→  return { trains: data.trains, tasks };
+   380→}
+   381→```
+   382→
+   383→---
+   384→
+   385→## Coordinate System
+   386→
+   387→### Canvas Coordinates
+   388→
+   389→The visualization uses a world-space coordinate system:
+   390→
+   391→| Axis | Represents | Scale |
+   392→|------|-----------|-------|
+   393→| X | Time | PX_PER_DAY = 10 pixels |
+   394→| Y | Train Index | PX_PER_TRAIN = 24 pixels |
+   395→| Z | Layer depth | 0 = front, -1 = back |
+   396→
+   397→### Conversion Functions
+   398→
+   399→```typescript
+   400→// Time to X position
+   401→function dateToX(date: Date, startDate: Date): number {
+   402→  const days = differenceInDays(date, startDate);
+   403→  return days * PX_PER_DAY;
+   404→}
+   405→
+   406→// Train index to Y position
+   407→function trainIndexToY(index: number): number {
+   408→  return index * PX_PER_TRAIN;
+   409→}
+   410→
+   411→// Screen to world coordinates
+   412→function screenToWorld(screenX: number, screenY: number, camera: Camera): Vector3 {
+   413→  // ... projection math
+   414→}
+   415→```
+   416→
+   417→---
+   418→
+   419→## Heatmap Data Encoding
+   420→
+   421→For the MacroLayer (shader), train occupancy is encoded into a DataTexture:
+   422→
+   423→```typescript
+   424→// Texture dimensions
+   425→const TEXTURE_WIDTH = 4096;  // Days (≈11 years at 1px/day)
+   426→const TEXTURE_HEIGHT = 50;   // Trains
+   427→
+   428→// Pixel encoding
+   429→// R channel: Occupancy level (0.0 - 1.0)
+   430→// G channel: Conflict flag (0.0 or 1.0)
+   431→// B channel: Reserved
+   432→// A channel: Always 1.0
+   433→```
+   434→
+   435→---
+   436→
+   437→## Business Rules
+   438→
+   439→### Mileage Management
+   440→
+   441→1. **Overrun Risk**: Train within 5% of maintenance interval → Yellow warning
+   442→2. **Overrun**: Train exceeds interval → Red alert, must schedule immediately
+   443→3. **Underrun**: Train significantly below target mileage → Efficiency warning
+   444→
+   445→### Scheduling Constraints
+   446→
+   447→1. **Track Availability**: Max 2 trains per track per day
+   448→2. **Man-Hours**: Cannot exceed weekly depot capacity
+   449→3. **Dependencies**: Child tasks cannot start before parent completes
+   450→4. **Tolerance Window**: Tasks must be scheduled within ±tolerance of ideal date
+   451→
+   452→### Conflict Resolution Priority
+   453→
+   454→1. Safety-critical (D-Overhaul) → Highest priority
+   455→2. Regulatory compliance (C-Check) → High priority
+   456→3. Preventive maintenance (A/B-Check) → Normal priority
+   457→4. Optimization (equalizing) → Low priority
+   458→
+   459→---
+   460→
+   461→## Future Enhancements
+   462→
+   463→### Phase 1 (Current Demo)
+   464→- ✅ Basic entities (Train, Task, Conflict)
+   465→- ✅ Mock data generation
+   466→- ✅ Visualization layers
+   467→
+   468→### Phase 2 (Next)
+   469→- [ ] Real mileage integration
+   470→- [ ] Depot and resource modeling
+   471→- [ ] Cost calculations
+   472→
+   473→### Phase 3 (Future)
+   474→- [ ] IBM Maximo integration
+   475→- [ ] Predictive maintenance
+   476→- [ ] What-If simulation engine
+   477→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

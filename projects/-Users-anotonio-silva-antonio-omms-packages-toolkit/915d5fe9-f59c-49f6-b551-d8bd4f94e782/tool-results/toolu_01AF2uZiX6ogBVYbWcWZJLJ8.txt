@@ -1,0 +1,394 @@
+     1→import _getProperty from 'lodash/get';
+     2→import _isPlainObject from 'lodash/isPlainObject';
+     3→import _setProperty from 'lodash/set';
+     4→
+     5→import {
+     6→  assertErrorLike,
+     7→  invariant,
+     8→  InvariantError,
+     9→  moveStackTrace,
+    10→  tryCatch,
+    11→} from './error-utils';
+    12→
+    13→import { capitalize } from './string-utils';
+    14→import {
+    15→  AsString,
+    16→  BuiltIn,
+    17→  CastUnknown,
+    18→  Compute,
+    19→  Falsy,
+    20→  isFalsy,
+    21→  ObjectEntries,
+    22→  Paths,
+    23→  PathType,
+    24→  UnionToIntersection,
+    25→  UnknownRecord,
+    26→  Writable,
+    27→} from './type-utils';
+    28→import { getTypeOf } from './typeof';
+    29→
+    30→/**
+    31→ * Utils to handle object and object paths
+    32→ * Some example of object paths:
+    33→ * - considering a User object:
+    34→ *  - 'user.id';
+    35→ *  - 'user.address.street';
+    36→ *  - 'user.address';
+    37→ */
+    38→
+    39→/**
+    40→ * extract object keys with type inference
+    41→ */
+    42→export function objectKeys<Obj extends object>(
+    43→  value: Obj,
+    44→): Extract<keyof Obj, string>[] {
+    45→  try {
+    46→    return Object.keys(value) as never;
+    47→  } catch (e) {
+    48→    assertErrorLike(e);
+    49→    throw moveStackTrace(e, objectKeys);
+    50→  }
+    51→}
+    52→
+    53→export function objectMap<const O extends {}>(
+    54→  object: O,
+    55→): ObjectEntries<Writable<O>> & Writable<O> {
+    56→  const list = objectEntries(object);
+    57→  const proxyTarget = { ...object };
+    58→  Object.setPrototypeOf(proxyTarget, Object.getPrototypeOf(list));
+    59→
+    60→  list.forEach((value, idx) => {
+    61→    Object.defineProperty(proxyTarget, idx, {
+    62→      value,
+    63→      enumerable: false,
+    64→      configurable: false,
+    65→    });
+    66→  });
+    67→
+    68→  return new Proxy(proxyTarget, {
+    69→    get(target, prop, receiver) {
+    70→      const value = Reflect.get(target, prop, receiver);
+    71→
+    72→      if (typeof value === 'function') {
+    73→        function fn(...args: any[]) {
+    74→          const value = Reflect.get(target, prop, receiver) as never;
+    75→          return Reflect.apply(value, list, args);
+    76→        }
+    77→        const name = Object.getOwnPropertyDescriptor(list, prop);
+    78→        if (name) Object.defineProperties(fn, { name });
+    79→        return fn;
+    80→      }
+    81→
+    82→      return value;
+    83→    },
+    84→  }) as never;
+    85→}
+    86→
+    87→export function objectEntries<O extends object>(init: O): ObjectEntries<O> {
+    88→  return Object.entries(init) as never;
+    89→}
+    90→
+    91→export function objectValues<O extends object>(init: O): O[keyof O][] {
+    92→  return Object.values(init) as any;
+    93→}
+    94→
+    95→/**
+    96→ * Checks if value is a plain object, that is, an object created by the
+    97→ * Object constructor or one with a [[Prototype]] of null.
+    98→ */
+    99→export function isObject(value: unknown): value is UnknownRecord {
+   100→  return _isPlainObject(value);
+   101→}
+   102→
+   103→export function assertObject(
+   104→  value: unknown,
+   105→  message?: string,
+   106→  parent?: Function,
+   107→): asserts value is UnknownRecord {
+   108→  if (isObject(value)) return;
+   109→
+   110→  message =
+   111→    message ??
+   112→    `Expected value to be an object; found ${getTypeOf(value)} instead.`;
+   113→  throw new InvariantError(message, parent ?? assertObject, { value });
+   114→}
+   115→
+   116→/**
+   117→ * Get value from an object path.
+   118→ * It will assert against 'falsy' values unless configured to accept.
+   119→ * Any value that matches `Boolean(value) === false` is falsy.
+   120→ *
+   121→ * @example:
+   122→ * - getValue(value, 'user.id'); // => string;
+   123→ * - getValue(value, 'user.id', true); // => string|null|undefined;
+   124→ * @param object
+   125→ * @param path
+   126→ * @param allowFalsyValues
+   127→ */
+   128→
+   129→export function getProperty<Obj, OPath extends Paths<Obj>>(
+   130→  object: Obj,
+   131→  path: CastUnknown<OPath, string>,
+   132→  allowFalsyValues: false, // default mode
+   133→): Exclude<PathType<Obj, OPath>, Falsy>;
+   134→
+   135→export function getProperty<Obj, OPath extends Paths<Obj>>(
+   136→  object: Obj,
+   137→  path: CastUnknown<OPath, string>,
+   138→): Exclude<PathType<Obj, OPath>, Falsy>;
+   139→
+   140→export function getProperty<Obj, OPath extends Paths<Obj>>(
+   141→  object: Obj,
+   142→  path: CastUnknown<OPath, string>,
+   143→  allowFalsyValues: true,
+   144→): PathType<Obj, OPath> | null | undefined;
+   145→
+   146→export function getProperty<Obj, OPath extends Paths<Obj>>(
+   147→  object: Obj,
+   148→  path: CastUnknown<OPath, string>,
+   149→  allowFalsyValues: boolean = false,
+   150→): PathType<Obj, OPath> | null | undefined {
+   151→  const [error, value] = tryCatch(() => _getProperty(object, path));
+   152→
+   153→  if (error) {
+   154→    throw new InvariantError(error, getProperty);
+   155→  }
+   156→
+   157→  const normalizedValue = typeof value === 'string' ? value.trim() : value;
+   158→
+   159→  if (!allowFalsyValues && isFalsy(normalizedValue)) {
+   160→    throw new InvariantError(
+   161→      `Expected property \`${path}\` to not be falsy; found ${JSON.stringify(value)} instead.`,
+   162→      getProperty,
+   163→    );
+   164→  }
+   165→
+   166→  return value as never;
+   167→}
+   168→
+   169→export function objectHasOwnProperty<Obj>(
+   170→  object: Obj,
+   171→  key: any,
+   172→): key is keyof Obj {
+   173→  return Object.prototype.hasOwnProperty.call(object, key as never);
+   174→}
+   175→
+   176→export function setProperty<Obj extends object, TPath extends Paths<Obj>>(
+   177→  object: Obj,
+   178→  property: CastUnknown<TPath, string>,
+   179→  value: PathType<Obj, TPath>,
+   180→): Obj {
+   181→  return _setProperty(object, property, value);
+   182→}
+   183→
+   184→/**
+   185→ * @internal
+   186→ * @param object
+   187→ * @param setters
+   188→ */
+   189→export function setProperties<Obj extends object>(
+   190→  object: Obj,
+   191→  setters: { [K in Paths<Obj>]?: PathType<Obj, K> },
+   192→): Obj {
+   193→  const sortedSetters = Object.entries(setters).sort(([a], [b]) => {
+   194→    return a.split('.').length > b.split('.').length ? 1 : -1;
+   195→  });
+   196→
+   197→  sortedSetters.forEach(([k, v]) => {
+   198→    // @ts-ignore
+   199→    setProperty(object, k, v);
+   200→  });
+   201→
+   202→  return object as never;
+   203→}
+   204→
+   205→export type WithFalsyValues<Obj> = { [K in keyof Obj]?: Obj[K] | Falsy };
+   206→
+   207→/**
+   208→ * @internal
+   209→ * @param record
+   210→ */
+   211→export function assertValues<Obj>(
+   212→  record: WithFalsyValues<Obj>,
+   213→): asserts record is Obj {
+   214→  let errMessage = '';
+   215→
+   216→  if (!isObject(record)) {
+   217→    throw new InvariantError('Expected plain object', assertValues);
+   218→  }
+   219→
+   220→  Object.keys(record).forEach(key => {
+   221→    try {
+   222→      getProperty(record, key as never);
+   223→    } catch (e: any) {
+   224→      const prefix = errMessage ? ' ' : '';
+   225→      errMessage += prefix + e.message;
+   226→    }
+   227→  });
+   228→
+   229→  if (errMessage) {
+   230→    throw new InvariantError(errMessage, assertValues);
+   231→  }
+   232→}
+   233→
+   234→/**
+   235→ * Asserts object against 'Falsy' property values
+   236→ * @param record
+   237→ */
+   238→export function requireAll<Obj>(record: WithFalsyValues<Obj>): Obj {
+   239→  return moveStackTrace(() => {
+   240→    assertValues(record);
+   241→    return record;
+   242→  }, requireAll);
+   243→}
+   244→
+   245→/**
+   246→ * Creates an object composed of keys generated from the results of running
+   247→ * each element of collection through getKey
+   248→ * @param arr
+   249→ * @param getKey
+   250→ * @param onDuplicate
+   251→ */
+   252→export function keyBy<
+   253→  T extends Record<any, any>,
+   254→  GetKey extends ((current: T) => T[keyof T]) | CastUnknown<keyof T, string>,
+   255→>(
+   256→  arr: T[],
+   257→  getKey: GetKey,
+   258→  onDuplicate?: <K extends keyof T>(key: K, value: T[K]) => any,
+   259→): Record<
+   260→  GetKey extends (current: any) => any ? ReturnType<GetKey> : GetKey,
+   261→  T
+   262→> {
+   263→  const temp: Record<any, any> = {};
+   264→
+   265→  const get =
+   266→    typeof getKey === 'string'
+   267→      ? (el: T) => getProperty(el, getKey, true) as keyof T
+   268→      : typeof getKey === 'function'
+   269→        ? getKey
+   270→        : undefined;
+   271→
+   272→  invariant(
+   273→    typeof get === 'function',
+   274→    `Expected parameter getKey to be a function or an object key string; found ${getTypeOf(getKey)} instead.`,
+   275→  );
+   276→
+   277→  arr.forEach(el => {
+   278→    const key = get(el);
+   279→    if (onDuplicate && temp.hasOwnProperty(key)) {
+   280→      onDuplicate(key, el as never);
+   281→    }
+   282→    temp[key] = el;
+   283→  });
+   284→
+   285→  return temp;
+   286→}
+   287→
+   288→export function reduceObject<Result, O extends object>(
+   289→  items: O,
+   290→  reducer: (pair: ObjectEntries<O>[number]) => Partial<Result>,
+   291→): Result {
+   292→  return objectEntries(items).reduce(
+   293→    (acc, entry) => ({
+   294→      ...acc,
+   295→      ...reducer(entry),
+   296→    }),
+   297→    {} as Result,
+   298→  );
+   299→}
+   300→
+   301→/**
+   302→ * Flattens a two-level nested record into a single-level record,
+   303→ * concatenating keys with a prefix in CamelCase format.
+   304→ *
+   305→ * @example
+   306→ * flatRecordRecords('MyMachine', {
+   307→ * user: { load: 'load_action' },
+   308→ * cart: { addItem: 'add_item_action' }
+   309→ * })
+   310→ * // Returns:
+   311→ * // {
+   312→ * //   MyMachineUserLoad: 'load_action',
+   313→ * //   MyMachineCartAddItem: 'add_item_action'
+   314→ * // }
+   315→ *
+   316→ * @param prefix The prefix string for the new keys.
+   317→ * @param record The nested record to flatten.
+   318→ * @returns A new, flattened object.
+   319→ */
+   320→export function flatRecordRecords<
+   321→  const Prefix extends string,
+   322→  const Record extends { [K: string]: { [K: string]: any } },
+   323→>(prefix: Prefix, record: Record): FlatRecordRecords<Prefix, Record> {
+   324→  return reduceObject(record, ([rootKey, rootValue]) => {
+   325→    return reduceObject(rootValue, ([subKey, subValue]) => {
+   326→      return {
+   327→        [`${prefix}${capitalize(rootKey)}${capitalize(subKey)}`]: subValue,
+   328→      };
+   329→    });
+   330→  }) as never;
+   331→}
+   332→
+   333→/**
+   334→ * Deeply freeze an object
+   335→ * @see: http://mzl.la/4n60J0d
+   336→ * @param object
+   337→ */
+   338→export function deepFreeze<T extends Record<any, any>>(object: T) {
+   339→  const propNames = Object.getOwnPropertyNames(object);
+   340→  for (const name of propNames) {
+   341→    const value = object[name];
+   342→    if (value && typeof value === 'object') {
+   343→      deepFreeze(value);
+   344→    }
+   345→  }
+   346→  return Object.freeze(object) as DeepFreeze<T>;
+   347→}
+   348→
+   349→export type DeepFreeze<O> = {
+   350→  +readonly [K in keyof O]: O[K] extends BuiltIn ? O[K] : DeepFreeze<O[K]>;
+   351→};
+   352→
+   353→export type DeepWritable<T> = {
+   354→  -readonly [K in keyof T]: T[K] extends object
+   355→    ? { [L in keyof DeepWritable<T[K]>]: DeepWritable<T[K]>[L] }
+   356→    : T[K];
+   357→};
+   358→
+   359→/**
+   360→ * Utility type that flattens a nested record and re-keys it based on a prefix
+   361→ * and the original keys, formatted in CamelCase.
+   362→ *
+   363→ * @example
+   364→ * FlatRecordRecords<'MyMachine', {
+   365→ * user: { load: string },
+   366→ * cart: { addItem: Function }
+   367→ * }>
+   368→ * // Result type:
+   369→ * // {
+   370→ * //   MyMachineUserLoad: string,
+   371→ * //   MyMachineCartAddItem: Function
+   372→ * // }
+   373→ */
+   374→export type FlatRecordRecords<
+   375→  ID extends string,
+   376→  Record extends { [K: string]: { [K: string]: any } },
+   377→> = Compute<
+   378→  UnionToIntersection<
+   379→    {
+   380→      [K in keyof Record]: {
+   381→        [L in keyof Record[K] as `${ID}${Capitalize<AsString<K>>}${Capitalize<AsString<L>>}`]: Record[K][L];
+   382→      };
+   383→    }[keyof Record]
+   384→  >
+   385→>;
+   386→
+   387→export function createObject<Type>(): { [K: string]: Type } {
+   388→  return Object.create(null);
+   389→}
+   390→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

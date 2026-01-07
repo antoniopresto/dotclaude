@@ -1,0 +1,703 @@
+---
+stepsCompleted: [1, 2, 3, 4, 5, 6, 7]
+inputDocuments:
+  - _bmad-output/planning-artifacts/prd.md
+  - _bmad-output/planning-artifacts/ux-design-specification.md
+  - docs/MMS_DEMO_PLAYBOOK.md
+workflowType: 'architecture'
+project_name: 'MMS - Metro Mileage Management System'
+user_name: 'MMS_PROGRAMMER'
+date: '2025-12-28'
+---
+
+# Architecture Decision Document - MMS Metro Mileage Management System
+
+_This document defines the technical architecture for the MMS railway fleet management demo system._
+
+---
+
+## 1. System Overview
+
+### 1.1 Architecture Vision
+
+MMS is a **demo-focused system** designed to win a competitive bid through a 15-minute presentation. The architecture prioritizes:
+
+1. **Demo Stability** - 15 minutes without crashes
+2. **Visual Impact** - Fast rendering, smooth interactions
+3. **Domain Credibility** - Correct railway terminology, realistic behavior
+4. **Technical Proof** - Working solver, real-time recommendations
+
+### 1.2 High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         BROWSER                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                    Next.js 14 App                        │    │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐    │    │
+│  │  │Dashboard │ │   Map    │ │Allocation│ │ Analysis │    │    │
+│  │  │  Page    │ │Component │ │  Page    │ │   Page   │    │    │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘    │    │
+│  │                      ↓ HTTP/REST                         │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         SERVER                                   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                  Fastify API Server                      │    │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐    │    │
+│  │  │Dashboard │ │  Trains  │ │Allocation│ │Simulation│    │    │
+│  │  │  Routes  │ │  Routes  │ │  Routes  │ │  Routes  │    │    │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘    │    │
+│  │                      ↓                                   │    │
+│  │  ┌─────────────────────────────────────────────────┐    │    │
+│  │  │              Service Layer                       │    │    │
+│  │  │  TrainService | AllocationService | SolverClient│    │    │
+│  │  └─────────────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                    ↓                           ↓                 │
+│  ┌─────────────────────┐       ┌─────────────────────────┐      │
+│  │    PostgreSQL 16    │       │   Python Solver Service │      │
+│  │  ┌───────────────┐  │       │  ┌───────────────────┐  │      │
+│  │  │    trains     │  │       │  │  OR-Tools CP-SAT  │  │      │
+│  │  │    depots     │  │       │  │  Recommendation   │  │      │
+│  │  │   services    │  │       │  │     Engine        │  │      │
+│  │  │  allocations  │  │       │  └───────────────────┘  │      │
+│  │  └───────────────┘  │       │         ↑ HTTP          │      │
+│  └─────────────────────┘       └─────────────────────────┘      │
+│            ↑                                                     │
+│  ┌─────────────────────┐                                        │
+│  │       Redis         │ (session cache, solver results)        │
+│  └─────────────────────┘                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 Key Architectural Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Frontend Framework | Next.js 14 (App Router) | SSR for initial load, React ecosystem |
+| Styling | Tailwind CSS + shadcn/ui | Rapid development, consistent design |
+| Backend Framework | Fastify | Performance, TypeScript support |
+| Database | PostgreSQL 16 | Reliable, JSON support, demo-proven |
+| Solver | Python + OR-Tools | Best-in-class optimization, justifications |
+| State Management | @zazcart/toolkit | Avoids React hook pitfalls |
+| API Style | REST | Simplicity for demo scope |
+
+---
+
+## 2. Component Architecture
+
+### 2.1 Frontend Structure
+
+```
+src/
+├── app/                      # Next.js App Router
+│   ├── layout.tsx            # Root layout with nav
+│   ├── page.tsx              # Dashboard (home)
+│   ├── fleet/
+│   │   ├── page.tsx          # Train list
+│   │   └── [id]/page.tsx     # Train details
+│   ├── allocation/
+│   │   └── page.tsx          # Service allocation
+│   ├── analysis/
+│   │   └── page.tsx          # Km balancing, simulation
+│   └── schedule/
+│       └── page.tsx          # Maintenance Gantt
+│
+├── components/
+│   ├── ui/                   # shadcn/ui components
+│   ├── dashboard/
+│   │   ├── KPICard.tsx
+│   │   ├── KPIGrid.tsx
+│   │   └── DepotCapacity.tsx
+│   ├── map/
+│   │   ├── FleetMap.tsx
+│   │   ├── TrainMarker.tsx
+│   │   └── DepotMarker.tsx
+│   ├── allocation/
+│   │   ├── ServiceList.tsx
+│   │   ├── RecommendationCard.tsx
+│   │   └── JustificationPanel.tsx
+│   ├── analysis/
+│   │   ├── DistributionChart.tsx
+│   │   ├── ScenarioComparison.tsx
+│   │   └── TrainRanking.tsx
+│   └── gantt/
+│       ├── MaintenanceGantt.tsx
+│       └── GanttBlock.tsx
+│
+├── lib/
+│   ├── api.ts                # API client
+│   ├── types.ts              # TypeScript interfaces
+│   └── utils.ts              # Utilities
+│
+└── stores/                   # @zazcart/toolkit state
+    ├── fleetStore.ts
+    ├── allocationStore.ts
+    └── simulationStore.ts
+```
+
+### 2.2 Backend Structure
+
+```
+server/
+├── src/
+│   ├── index.ts              # Fastify server entry
+│   ├── routes/
+│   │   ├── dashboard.ts      # GET /api/dashboard/*
+│   │   ├── trains.ts         # GET/POST /api/trains/*
+│   │   ├── depots.ts         # GET /api/depots/*
+│   │   ├── services.ts       # GET /api/services/*
+│   │   ├── allocations.ts    # GET/POST /api/allocations/*
+│   │   └── simulation.ts     # POST /api/simulation/*
+│   │
+│   ├── services/
+│   │   ├── trainService.ts
+│   │   ├── depotService.ts
+│   │   ├── allocationService.ts
+│   │   ├── simulationService.ts
+│   │   └── solverClient.ts   # HTTP client to Python solver
+│   │
+│   ├── db/
+│   │   ├── client.ts         # PostgreSQL client (pg or drizzle)
+│   │   ├── schema.ts         # Table definitions
+│   │   └── seed.ts           # Seed data loader
+│   │
+│   └── types/
+│       └── index.ts          # Shared types
+│
+└── package.json
+```
+
+### 2.3 Solver Structure
+
+```
+solver/
+├── src/
+│   ├── main.py               # FastAPI server
+│   ├── models/
+│   │   ├── train.py          # Train dataclass
+│   │   ├── service.py        # Service dataclass
+│   │   └── recommendation.py # Output dataclass
+│   │
+│   ├── engine/
+│   │   ├── allocator.py      # CP-SAT allocation model
+│   │   ├── scorer.py         # Train scoring logic
+│   │   └── justifier.py      # Justification generator
+│   │
+│   └── api/
+│       └── routes.py         # POST /recommend, POST /simulate
+│
+├── requirements.txt
+└── Dockerfile
+```
+
+---
+
+## 3. Data Architecture
+
+### 3.1 Database Schema
+
+```sql
+-- Core entities
+CREATE TABLE fleets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    manufacturer VARCHAR(50),
+    pm1_interval_km INTEGER NOT NULL,
+    pm2_interval_km INTEGER NOT NULL,
+    hm_interval_km INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE depots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    code VARCHAR(10) UNIQUE NOT NULL,
+    latitude DECIMAL(10, 6),
+    longitude DECIMAL(10, 6),
+    capacity_tracks INTEGER DEFAULT 5,
+    capacity_manhours INTEGER DEFAULT 80,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE trains (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id VARCHAR(20) UNIQUE NOT NULL,  -- Business ID: UTE-3400-012
+    fleet_id UUID REFERENCES fleets(id),
+    base_depot_id UUID REFERENCES depots(id),
+    current_km INTEGER DEFAULT 0,
+    target_km INTEGER DEFAULT 0,
+    fitness_status VARCHAR(10) DEFAULT 'fit' CHECK (fitness_status IN ('fit', 'unfit')),
+    last_maintenance_date DATE,
+    next_maintenance_km INTEGER,
+    latitude DECIMAL(10, 6),
+    longitude DECIMAL(10, 6),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE services (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    service_code VARCHAR(20) UNIQUE NOT NULL,  -- IC 501
+    origin VARCHAR(100) NOT NULL,
+    destination VARCHAR(100) NOT NULL,
+    distance_km INTEGER NOT NULL,
+    departure_time TIME NOT NULL,
+    arrival_time TIME NOT NULL,
+    service_type VARCHAR(20) DEFAULT 'regional',  -- regional, intercity
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE allocations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    service_id UUID REFERENCES services(id),
+    train_id UUID REFERENCES trains(id),
+    allocation_date DATE NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'completed', 'cancelled')),
+    score INTEGER,
+    justifications JSONB,  -- Array of reason strings
+    created_by VARCHAR(100),
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(service_id, allocation_date)
+);
+
+-- Mileage history for trends
+CREATE TABLE mileage_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id UUID REFERENCES trains(id),
+    recorded_date DATE NOT NULL,
+    km_value INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Maintenance schedules
+CREATE TABLE maintenance_schedules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    train_id UUID REFERENCES trains(id),
+    depot_id UUID REFERENCES depots(id),
+    maintenance_type VARCHAR(10) CHECK (maintenance_type IN ('PM1', 'PM2', 'HM', 'OVH')),
+    scheduled_date DATE NOT NULL,
+    duration_days INTEGER DEFAULT 1,
+    status VARCHAR(20) DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'in_progress', 'completed', 'cancelled')),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for performance
+CREATE INDEX idx_trains_fleet ON trains(fleet_id);
+CREATE INDEX idx_trains_depot ON trains(base_depot_id);
+CREATE INDEX idx_allocations_date ON allocations(allocation_date);
+CREATE INDEX idx_allocations_status ON allocations(status);
+CREATE INDEX idx_mileage_train_date ON mileage_history(train_id, recorded_date);
+```
+
+### 3.2 Data Flow
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Frontend  │────▶│   API       │────▶│  Database   │
+│   (React)   │◀────│  (Fastify)  │◀────│ (PostgreSQL)│
+└─────────────┘     └──────┬──────┘     └─────────────┘
+                           │
+                           ▼
+                   ┌─────────────┐
+                   │   Solver    │
+                   │  (Python)   │
+                   └─────────────┘
+```
+
+**Read Path (Dashboard):**
+1. Frontend requests `/api/dashboard/summary`
+2. API queries aggregated KPIs from DB
+3. Response cached in Redis (60s TTL)
+4. Frontend renders immediately
+
+**Write Path (Allocation):**
+1. User selects service, clicks "Recommend"
+2. Frontend calls `POST /api/allocations/recommend`
+3. API calls Solver service with service details
+4. Solver returns ranked recommendations with justifications
+5. User confirms, API writes to allocations table
+6. Frontend updates optimistically
+
+---
+
+## 4. API Specification
+
+### 4.1 REST Endpoints
+
+#### Dashboard
+```
+GET /api/dashboard/summary
+Response: {
+  totalTrains: number,
+  availableTrains: number,
+  inMaintenanceCount: number,
+  kmVariance: number,
+  varianceStatus: 'green' | 'yellow' | 'red'
+}
+
+GET /api/dashboard/depot-capacity
+Response: {
+  depots: [{
+    id: string,
+    name: string,
+    code: string,
+    currentOccupancy: number,
+    maxCapacity: number,
+    percentUsed: number
+  }]
+}
+```
+
+#### Trains
+```
+GET /api/trains
+Query: ?fleet=uuid&depot=uuid&status=fit
+Response: { trains: Train[] }
+
+GET /api/trains/:id
+Response: Train
+
+GET /api/trains/:id/history
+Response: { history: MileagePoint[] }
+```
+
+#### Allocation
+```
+GET /api/services/pending
+Query: ?date=2025-01-15
+Response: { services: Service[] }
+
+POST /api/allocations/recommend
+Body: { serviceId: string, date: string }
+Response: {
+  recommendations: [{
+    trainId: string,
+    score: number,
+    justifications: string[]
+  }],
+  solverTimeMs: number
+}
+
+POST /api/allocations
+Body: { serviceId: string, trainId: string, date: string }
+Response: { allocation: Allocation }
+```
+
+#### Analysis
+```
+GET /api/balancing/distribution
+Query: ?fleet=uuid
+Response: {
+  average: number,
+  variance: number,
+  distribution: { kmRange: string, count: number }[],
+  outliers: { trainId: string, delta: number }[]
+}
+
+POST /api/simulation/create
+Body: { name: string, baseDate: string }
+Response: { scenarioId: string }
+
+POST /api/simulation/:id/run
+Body: { changes: AllocationChange[] }
+Response: {
+  projectedVariance: number,
+  projectedDeadRunning: number,
+  comparison: MetricComparison[]
+}
+```
+
+### 4.2 Solver API (Internal)
+
+```
+POST /recommend
+Body: {
+  service: { id, distance_km, origin, destination },
+  candidates: Train[],
+  constraints: {
+    prioritize_balancing: boolean,
+    max_dead_running_km: number
+  }
+}
+Response: {
+  recommendations: [{
+    train_id: string,
+    score: number,
+    justifications: string[],
+    dead_running_km: number
+  }],
+  solver_time_ms: number
+}
+```
+
+---
+
+## 5. Technology Decisions
+
+### 5.1 Frontend Stack
+
+| Technology | Version | Decision Rationale |
+|------------|---------|-------------------|
+| Next.js | 14.x | App Router, RSC, SSR |
+| React | 18.x | Concurrent features, suspense |
+| TypeScript | 5.x | Type safety, IDE support |
+| Tailwind CSS | 3.x | Utility-first, rapid prototyping |
+| shadcn/ui | latest | Pre-built accessible components |
+| @zazcart/toolkit | local | State management without React hook issues |
+| Recharts | 2.x | Simple charting, React integration |
+| Mapbox GL / Leaflet | latest | Interactive maps |
+
+### 5.2 Backend Stack
+
+| Technology | Version | Decision Rationale |
+|------------|---------|-------------------|
+| Node.js | 20.x LTS | Stable, TypeScript support |
+| Fastify | 4.x | Performance, schema validation |
+| TypeScript | 5.x | Shared types with frontend |
+| PostgreSQL | 16.x | JSONB, reliability |
+| Redis | 7.x | Caching, session storage |
+| Drizzle ORM | latest | Type-safe SQL, migrations |
+
+### 5.3 Solver Stack
+
+| Technology | Version | Decision Rationale |
+|------------|---------|-------------------|
+| Python | 3.11 | OR-Tools compatibility |
+| FastAPI | 0.100+ | Async, auto-docs |
+| OR-Tools | 9.x | Google's optimization suite |
+| Pydantic | 2.x | Data validation |
+| uvicorn | latest | ASGI server |
+
+---
+
+## 6. Integration Architecture
+
+### 6.1 Frontend ↔ Backend
+
+```
+[Next.js App]
+     │
+     │  fetch('/api/...')
+     │  Headers: Content-Type: application/json
+     ▼
+[Fastify Server]
+     │
+     │  Route handlers call services
+     ▼
+[Service Layer]
+     │
+     │  Drizzle ORM queries
+     ▼
+[PostgreSQL]
+```
+
+**Error Handling:**
+- API returns standardized error format: `{ error: string, code: string, details?: object }`
+- Frontend uses try/catch with toast notifications
+- Network errors show retry option
+
+### 6.2 Backend ↔ Solver
+
+```
+[Fastify Service]
+     │
+     │  HTTP POST (axios/fetch)
+     │  Timeout: 30 seconds
+     ▼
+[Python FastAPI]
+     │
+     │  CP-SAT model execution
+     ▼
+[Response with justifications]
+```
+
+**Resilience:**
+- Solver timeout: 30 seconds hard limit
+- Fallback: Return top 3 trains by simple scoring if solver fails
+- Cache: Store recent recommendations in Redis (5 min TTL)
+
+---
+
+## 7. Non-Functional Architecture
+
+### 7.1 Performance
+
+| Metric | Target | Implementation |
+|--------|--------|----------------|
+| Dashboard load | < 2s | SSR + cache |
+| API response | < 500ms | Index optimization |
+| Map render | < 2s | Tile caching, clustering |
+| Solver response | < 30s | CP-SAT with timeout |
+
+### 7.2 Caching Strategy
+
+```
+Redis Cache:
+├── dashboard:summary (TTL: 60s)
+├── trains:list (TTL: 30s)
+├── depots:list (TTL: 300s)
+├── solver:recommend:{hash} (TTL: 300s)
+└── session:{id} (TTL: 3600s)
+```
+
+### 7.3 Demo Stability
+
+| Scenario | Mitigation |
+|----------|------------|
+| Database down | Pre-loaded fallback JSON |
+| Solver timeout | Simple ranking fallback |
+| Network issue | Service worker cache |
+| UI crash | Error boundary with retry |
+
+---
+
+## 8. Development Setup
+
+### 8.1 Monorepo Structure
+
+```
+mms/
+├── package.json              # Root package (workspaces)
+├── apps/
+│   ├── web/                  # Next.js frontend
+│   └── api/                  # Fastify backend
+├── packages/
+│   ├── types/                # Shared TypeScript types
+│   └── utils/                # Shared utilities
+├── solver/                   # Python solver (separate)
+├── docker-compose.yml        # Local dev environment
+└── scripts/
+    ├── seed.ts               # Database seeding
+    └── dev.sh                # Start all services
+```
+
+### 8.2 Local Development
+
+```bash
+# Start infrastructure
+docker-compose up -d postgres redis
+
+# Start API
+cd apps/api && bun run dev
+
+# Start Solver
+cd solver && uvicorn src.main:app --reload
+
+# Start Frontend
+cd apps/web && bun run dev
+```
+
+### 8.3 Environment Variables
+
+```env
+# Database
+DATABASE_URL=postgresql://mms:mms@localhost:5432/mms
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Solver
+SOLVER_URL=http://localhost:8000
+
+# Mapbox (optional, can use Leaflet)
+NEXT_PUBLIC_MAPBOX_TOKEN=pk.xxx
+```
+
+---
+
+## 9. Security Considerations (Demo Scope)
+
+### 9.1 Demo Simplifications
+
+| Production Need | Demo Approach |
+|-----------------|---------------|
+| Authentication | None (demo mode) |
+| Authorization | None (single user) |
+| HTTPS | HTTP for local dev |
+| Input validation | Basic schema validation |
+| Rate limiting | None |
+
+### 9.2 Data Protection
+
+- No real customer data (seed data only)
+- No PII in seed data
+- Demo reset between presentations
+
+---
+
+## 10. Deployment Architecture (Demo)
+
+### 10.1 Demo Environment
+
+```
+┌─────────────────────────────────────────┐
+│           Demo Laptop                    │
+│  ┌───────────────────────────────────┐  │
+│  │  Docker Compose                    │  │
+│  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ │  │
+│  │  │Next │ │API  │ │Solver│ │PG   │ │  │
+│  │  │:3000│ │:4000│ │:8000 │ │:5432│ │  │
+│  │  └─────┘ └─────┘ └─────┘ └─────┘ │  │
+│  └───────────────────────────────────┘  │
+│                                          │
+│  Browser → http://localhost:3000        │
+└─────────────────────────────────────────┘
+```
+
+### 10.2 Demo Reset Script
+
+```bash
+#!/bin/bash
+# Reset demo to clean state
+docker-compose down -v
+docker-compose up -d
+sleep 5
+bun run seed
+echo "Demo ready!"
+```
+
+---
+
+## 11. AI Agent Guidelines
+
+### 11.1 Code Patterns
+
+**DO:**
+- Use TypeScript strict mode
+- Use Drizzle ORM for database access
+- Use @zazcart/toolkit for frontend state
+- Use shadcn/ui components
+- Follow existing file naming conventions
+- Add JSDoc comments for public functions
+
+**DON'T:**
+- Use useState for application state (use toolkit)
+- Create new component libraries
+- Add authentication logic
+- Implement features outside PRD scope
+- Add time estimates to code comments
+
+### 11.2 File Naming
+
+```
+Components: PascalCase.tsx (e.g., TrainCard.tsx)
+Utilities: camelCase.ts (e.g., formatKm.ts)
+Routes: lowercase/route.ts (e.g., trains/route.ts)
+Types: PascalCase.ts (e.g., Train.ts)
+```
+
+### 11.3 Testing Priority
+
+1. Solver logic (unit tests)
+2. API endpoints (integration tests)
+3. Critical UI flows (Playwright)
+
+---
+
+*Document generated by BMAD Architecture Workflow*
+*Date: 2025-12-28*

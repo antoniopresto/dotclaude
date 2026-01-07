@@ -1,0 +1,303 @@
+pub mod db;
+mod pty;
+mod watcher;
+
+#[cfg(debug_assertions)]
+mod dev_bridge;
+
+use pty::PtyManager;
+use watcher::WatcherManager;
+use std::path::Path;
+use std::sync::Arc;
+use tauri::menu::{MenuBuilder, SubmenuBuilder};
+use tauri::{Emitter, Manager};
+#[cfg(not(debug_assertions))]
+use tauri_plugin_prevent_default::Flags;
+
+#[cfg(target_os = "macos")]
+use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+/// Check if a directory is a valid harness project (contains .harness folder)
+#[tauri::command]
+fn check_harness_exists(path: String) -> bool {
+    let harness_path = Path::new(&path).join(".harness");
+    harness_path.is_dir()
+}
+
+/// Read project info from package.json if available
+#[tauri::command]
+fn get_project_info(path: String) -> Option<serde_json::Value> {
+    let package_json_path = Path::new(&path).join("package.json");
+    if package_json_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&package_json_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                return Some(json);
+            }
+        }
+    }
+    None
+}
+
+/// Run harness CLI command in a project directory
+#[tauri::command]
+fn run_harness_command(project_path: String, args: Vec<String>) -> Result<String, String> {
+    use std::process::Command;
+
+    // Get the harness binary path (same directory as this executable)
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let harness_path = current_exe.parent()
+        .ok_or("Cannot find parent directory")?
+        .join("harness");
+
+    // Run harness command
+    let output = Command::new(&harness_path)
+        .current_dir(&project_path)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to run harness: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Harness command failed: {}", stderr))
+    }
+}
+
+/// Get git info for a project (last commit)
+#[tauri::command]
+fn get_git_info(project_path: String) -> Result<String, String> {
+    use std::process::Command;
+
+    // Run git log to get the last commit
+    let output = Command::new("git")
+        .current_dir(&project_path)
+        .args(["log", "-1", "--format=%H|%s|%an|%aI"])
+        .output()
+        .map_err(|e| format!("Failed to run git: {}", e))?;
+
+    if !output.status.success() {
+        return Err("Not a git repository".to_string());
+    }
+
+    let line = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = line.trim().split('|').collect();
+
+    if parts.len() >= 4 {
+        let json = serde_json::json!({
+            "hash": parts[0],
+            "message": parts[1],
+            "author": parts[2],
+            "date": parts[3]
+        });
+        Ok(json.to_string())
+    } else {
+        Err("Failed to parse git output".to_string())
+    }
+}
+
+/// Create native macOS-style application menu
+fn setup_app_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // HQ (App) menu - macOS first menu is always the app menu
+    let app_menu = SubmenuBuilder::new(app, "HQ")
+        .about(None)
+        .separator()
+        .text("settings", "Settings…")
+        .separator()
+        .services()
+        .separator()
+        .hide()
+        .hide_others()
+        .show_all()
+        .separator()
+        .quit()
+        .build()?;
+
+    // File menu
+    let file_menu = SubmenuBuilder::new(app, "File")
+        .text("open_project", "Open Project…")
+        .separator()
+        .text("new_tab", "New Tab")
+        .text("close_tab", "Close Tab")
+        .separator()
+        .close_window()
+        .build()?;
+
+    // Edit menu
+    let edit_menu = SubmenuBuilder::new(app, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .separator()
+        .select_all()
+        .build()?;
+
+    // View menu
+    let view_menu = SubmenuBuilder::new(app, "View")
+        .text("toggle_sidebar", "Toggle Sidebar")
+        .text("toggle_logs", "Toggle Logs")
+        .separator()
+        .fullscreen()
+        .build()?;
+
+    // Window menu
+    let window_menu = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .maximize()
+        .separator()
+        .text("prev_tab", "Previous Tab")
+        .text("next_tab", "Next Tab")
+        .separator()
+        .close_window()
+        .build()?;
+
+    // Help menu
+    let help_menu = SubmenuBuilder::new(app, "Help")
+        .text("documentation", "Documentation")
+        .text("github", "GitHub Repository")
+        .build()?;
+
+    // Build the complete menu
+    let menu = MenuBuilder::new(app)
+        .items(&[
+            &app_menu,
+            &file_menu,
+            &edit_menu,
+            &view_menu,
+            &window_menu,
+            &help_menu,
+        ])
+        .build()?;
+
+    // Set as global app menu
+    app.set_menu(menu)?;
+
+    Ok(())
+}
+
+/// Handle menu events
+fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id().0.as_str() {
+        "settings" => {
+            let _ = app.emit("menu:settings", ());
+        }
+        "open_project" => {
+            let _ = app.emit("menu:open_project", ());
+        }
+        "new_tab" => {
+            let _ = app.emit("menu:new_tab", ());
+        }
+        "close_tab" => {
+            let _ = app.emit("menu:close_tab", ());
+        }
+        "toggle_sidebar" => {
+            let _ = app.emit("menu:toggle_sidebar", ());
+        }
+        "toggle_logs" => {
+            let _ = app.emit("menu:toggle_logs", ());
+        }
+        "prev_tab" => {
+            let _ = app.emit("menu:prev_tab", ());
+        }
+        "next_tab" => {
+            let _ = app.emit("menu:next_tab", ());
+        }
+        "documentation" => {
+            // Open documentation URL
+            let _ = open::that("https://github.com/your-org/hq#readme");
+        }
+        "github" => {
+            // Open GitHub URL
+            let _ = open::that("https://github.com/your-org/hq");
+        }
+        _ => {}
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let pty_manager = Arc::new(PtyManager::new());
+    let watcher_manager = Arc::new(WatcherManager::new());
+
+    // Start dev bridge in debug mode
+    #[cfg(debug_assertions)]
+    {
+        let pty_for_bridge = pty_manager.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (_token, handle) = dev_bridge::start_dev_bridge(pty_for_bridge, None).await;
+                handle.await.unwrap();
+            });
+        });
+    }
+
+    // Configure browser behavior prevention
+    // In debug mode: disable prevent_default entirely for easier debugging
+    // In release mode: disable browser shortcuts for native feel
+    #[cfg(not(debug_assertions))]
+    let prevent_default = tauri_plugin_prevent_default::Builder::new()
+        .with_flags(Flags::all())
+        .build();
+
+    #[cfg(debug_assertions)]
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    #[cfg(not(debug_assertions))]
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(prevent_default);
+
+    builder
+        .manage(pty_manager)
+        .manage(watcher_manager)
+        .setup(|app| {
+            // Setup native menu bar
+            if let Err(e) = setup_app_menu(app) {
+                eprintln!("Failed to setup app menu: {}", e);
+            }
+
+            // Apply window vibrancy on macOS
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    // Use Sidebar material for a nice translucent effect
+                    if let Err(e) = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None) {
+                        eprintln!("Failed to apply vibrancy: {}", e);
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .on_menu_event(handle_menu_event)
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            check_harness_exists,
+            get_project_info,
+            run_harness_command,
+            get_git_info,
+            pty::pty_spawn,
+            pty::pty_write,
+            pty::pty_resize,
+            pty::pty_kill,
+            pty::pty_list,
+            pty::pty_get,
+            watcher::harness_watch_start,
+            watcher::harness_watch_stop,
+            watcher::harness_watch_list,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

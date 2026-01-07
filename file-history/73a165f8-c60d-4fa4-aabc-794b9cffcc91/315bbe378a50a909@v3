@@ -1,0 +1,296 @@
+/**
+ * Popup main script - handles UI interactions and video detection
+ */
+
+import { type DetectedVideo, formatDuration } from '../../utils/video-detector';
+
+// DOM Elements
+const loadingEl = document.getElementById('loading')!;
+const videoListEl = document.getElementById('video-list')!;
+const noVideosEl = document.getElementById('no-videos')!;
+const errorEl = document.getElementById('error')!;
+const errorMessageEl = document.getElementById('error-message')!;
+const refreshBtn = document.getElementById('refresh-btn');
+const retryBtn = document.getElementById('retry-btn');
+
+// State
+let detectedVideos: DetectedVideo[] = [];
+
+/**
+ * Initialize popup
+ */
+async function init(): Promise<void> {
+  // Bind event listeners
+  refreshBtn?.addEventListener('click', () => scanForVideos());
+  retryBtn?.addEventListener('click', () => scanForVideos());
+
+  // Initial scan
+  await scanForVideos();
+}
+
+/**
+ * Scan current tab for videos
+ */
+async function scanForVideos(): Promise<void> {
+  showLoading();
+
+  try {
+    // Get active tab
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+
+    if (!tab?.id) {
+      showError('Could not access current tab');
+      return;
+    }
+
+    // Check if we can access the page
+    if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('chrome-extension://')) {
+      showError('Cannot scan browser internal pages');
+      return;
+    }
+
+    // Collect videos from multiple sources
+    const allVideos: DetectedVideo[] = [];
+
+    // 1. Get intercepted videos from background (network requests)
+    try {
+      const interceptedResponse = await browser.runtime.sendMessage({
+        action: 'getInterceptedVideos',
+        tabId: tab.id,
+      });
+      if (interceptedResponse?.videos) {
+        allVideos.push(...interceptedResponse.videos);
+      }
+    } catch (e) {
+      console.log('[Video Downloader] Could not get intercepted videos:', e);
+    }
+
+    // 2. Get videos from content script (DOM analysis)
+    try {
+      const contentResponse = await browser.tabs.sendMessage(tab.id, { action: 'detectVideos' });
+      if (contentResponse?.videos) {
+        allVideos.push(...contentResponse.videos);
+      }
+    } catch (e) {
+      console.log('[Video Downloader] Content script not available:', e);
+      // Content script might not be loaded, that's OK if we have intercepted videos
+    }
+
+    // Deduplicate by URL
+    const seen = new Set<string>();
+    detectedVideos = allVideos.filter((video) => {
+      const normalizedUrl = video.url.split('?')[0];
+      if (seen.has(normalizedUrl)) return false;
+      seen.add(normalizedUrl);
+      return true;
+    });
+
+    if (detectedVideos.length > 0) {
+      renderVideoList();
+    } else {
+      showNoVideos();
+    }
+  } catch (error) {
+    console.error('[Video Downloader] Error scanning for videos:', error);
+    showError('Failed to scan page for videos. Try refreshing the page.');
+  }
+}
+
+/**
+ * Show loading state
+ */
+function showLoading(): void {
+  loadingEl.style.display = 'flex';
+  videoListEl.style.display = 'none';
+  noVideosEl.style.display = 'none';
+  errorEl.style.display = 'none';
+}
+
+/**
+ * Show no videos state
+ */
+function showNoVideos(): void {
+  loadingEl.style.display = 'none';
+  videoListEl.style.display = 'none';
+  noVideosEl.style.display = 'flex';
+  errorEl.style.display = 'none';
+}
+
+/**
+ * Show error state
+ */
+function showError(message: string): void {
+  loadingEl.style.display = 'none';
+  videoListEl.style.display = 'none';
+  noVideosEl.style.display = 'none';
+  errorEl.style.display = 'flex';
+  errorMessageEl.textContent = message;
+}
+
+/**
+ * Render the video list
+ */
+function renderVideoList(): void {
+  loadingEl.style.display = 'none';
+  noVideosEl.style.display = 'none';
+  errorEl.style.display = 'none';
+  videoListEl.style.display = 'flex';
+
+  videoListEl.innerHTML = detectedVideos.map((video) => createVideoItemHTML(video)).join('');
+
+  // Bind download buttons
+  videoListEl.querySelectorAll('.download-btn').forEach((btn) => {
+    btn.addEventListener('click', handleDownloadClick);
+  });
+}
+
+/**
+ * Create HTML for a video item
+ */
+function createVideoItemHTML(video: DetectedVideo): string {
+  const thumbnailHTML = video.thumbnail
+    ? `<img src="${escapeHTML(video.thumbnail)}" alt="" loading="lazy">`
+    : `<div class="video-thumbnail-placeholder">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="23 7 16 12 23 17 23 7"></polygon>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+      </div>`;
+
+  const durationHTML = video.duration
+    ? `<span>${formatDuration(video.duration)}</span>`
+    : '';
+
+  const qualityHTML = video.quality && video.quality !== 'Unknown'
+    ? `<span>${video.quality}</span>`
+    : '';
+
+  const sourceHTML = video.source
+    ? `<span class="video-source">${getSourceLabel(video.source)}</span>`
+    : '';
+
+  return `
+    <div class="video-item" data-video-id="${escapeHTML(video.id)}">
+      <div class="video-thumbnail">${thumbnailHTML}</div>
+      <div class="video-info">
+        <div class="video-title" title="${escapeHTML(video.title)}">${escapeHTML(truncateTitle(video.title, 50))}</div>
+        <div class="video-meta">
+          ${durationHTML}
+          ${qualityHTML}
+          <span>${getTypeLabel(video.type)}</span>
+          ${sourceHTML}
+        </div>
+        <div class="video-actions">
+          <button class="btn btn-primary btn-small download-btn" data-video-id="${escapeHTML(video.id)}">
+            Download
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * Truncate title to max length
+ */
+function truncateTitle(title: string, maxLength: number): string {
+  if (title.length <= maxLength) return title;
+  return title.substring(0, maxLength - 3) + '...';
+}
+
+/**
+ * Get human-readable source label
+ */
+function getSourceLabel(source: string): string {
+  if (source.startsWith('network')) return 'Network';
+  if (source === 'instagram') return 'Instagram';
+  if (source === 'twitter') return 'Twitter';
+  if (source === 'tiktok') return 'TikTok';
+  if (source === 'video-element') return 'DOM';
+  if (source === 'og-meta') return 'Meta';
+  if (source === 'json-ld') return 'Schema';
+  return '';
+}
+
+/**
+ * Handle download button click
+ */
+async function handleDownloadClick(event: Event): Promise<void> {
+  const btn = event.currentTarget as HTMLButtonElement;
+  const videoId = btn.dataset.videoId;
+
+  if (!videoId) return;
+
+  const video = detectedVideos.find((v) => v.id === videoId);
+  if (!video) return;
+
+  // Update button state
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+
+  try {
+    const response = await browser.runtime.sendMessage({
+      action: 'download',
+      options: { video },
+    });
+
+    if (response?.success) {
+      btn.textContent = 'Started!';
+      btn.classList.remove('btn-primary');
+      btn.classList.add('btn-secondary');
+
+      // Reset after delay
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.textContent = 'Download';
+        btn.classList.remove('btn-secondary');
+        btn.classList.add('btn-primary');
+      }, 2000);
+    } else {
+      throw new Error(response?.error || 'Download failed');
+    }
+  } catch (error) {
+    console.error('[Video Downloader] Download error:', error);
+    btn.textContent = 'Failed';
+    btn.classList.remove('btn-primary');
+    btn.classList.add('btn-secondary');
+
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+      btn.classList.remove('btn-secondary');
+      btn.classList.add('btn-primary');
+    }, 2000);
+  }
+}
+
+/**
+ * Get human-readable type label
+ */
+function getTypeLabel(mimeType: string): string {
+  const types: Record<string, string> = {
+    'video/mp4': 'MP4',
+    'video/webm': 'WebM',
+    'video/ogg': 'OGG',
+    'video/quicktime': 'MOV',
+    'video/x-msvideo': 'AVI',
+    'video/x-matroska': 'MKV',
+    'video/mp2t': 'TS',
+    'application/x-mpegURL': 'HLS',
+    'application/dash+xml': 'DASH',
+  };
+
+  return types[mimeType] || 'Video';
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHTML(str: string): string {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// Initialize when DOM is ready
+document.addEventListener('DOMContentLoaded', init);

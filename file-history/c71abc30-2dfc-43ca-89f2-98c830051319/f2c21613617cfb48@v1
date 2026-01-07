@@ -1,0 +1,353 @@
+"""Visual testing tools for PHAROS agents.
+
+These tools allow agents to capture and analyze screenshots.
+Uses Playwright for browser automation and Claude Vision for analysis.
+"""
+
+import asyncio
+import base64
+import os
+import subprocess
+import signal
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from langchain_core.tools import tool
+from langchain_anthropic import ChatAnthropic
+
+import sys
+sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
+from config.settings import get_settings
+
+
+# Global dev server process
+_dev_server_process: subprocess.Popen | None = None
+
+
+def _get_screenshot_dir() -> Path:
+    """Get screenshot directory."""
+    settings = get_settings()
+    pharos_dir = Path(__file__).parent.parent.parent
+    root = (pharos_dir / settings.project_root).resolve()
+    screenshot_dir = root / settings.screenshot_dir
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    return screenshot_dir
+
+
+@tool
+def start_dev_server() -> dict[str, Any]:
+    """Start the development server for visual testing.
+
+    Returns:
+        Dict with server status
+    """
+    global _dev_server_process
+
+    if _dev_server_process is not None:
+        return {
+            "success": True,
+            "message": "Dev server already running",
+            "pid": _dev_server_process.pid,
+        }
+
+    try:
+        settings = get_settings()
+        pharos_dir = Path(__file__).parent.parent.parent
+        root = (pharos_dir / settings.project_root).resolve()
+
+        _dev_server_process = subprocess.Popen(
+            settings.dev_server_command,
+            shell=True,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,  # Create new process group
+        )
+
+        # Wait for server to start
+        time.sleep(5)
+
+        return {
+            "success": True,
+            "message": f"Dev server started",
+            "pid": _dev_server_process.pid,
+            "url": settings.dev_server_url,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to start dev server: {str(e)}",
+        }
+
+
+@tool
+def stop_dev_server() -> dict[str, Any]:
+    """Stop the development server.
+
+    Returns:
+        Dict with status
+    """
+    global _dev_server_process
+
+    if _dev_server_process is None:
+        return {
+            "success": True,
+            "message": "Dev server not running",
+        }
+
+    try:
+        # Kill the process group
+        os.killpg(os.getpgid(_dev_server_process.pid), signal.SIGTERM)
+        _dev_server_process = None
+
+        return {
+            "success": True,
+            "message": "Dev server stopped",
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to stop dev server: {str(e)}",
+        }
+
+
+@tool
+async def capture_screenshot(
+    url: str | None = None,
+    viewport_width: int = 1920,
+    viewport_height: int = 1080,
+    wait_for_selector: str | None = None,
+    wait_ms: int = 2000,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Capture a screenshot of the application.
+
+    Args:
+        url: URL to capture (default: dev server URL)
+        viewport_width: Viewport width in pixels
+        viewport_height: Viewport height in pixels
+        wait_for_selector: CSS selector to wait for before capture
+        wait_ms: Additional wait time in milliseconds
+        name: Optional name for the screenshot file
+
+    Returns:
+        Dict with screenshot path and metadata
+    """
+    try:
+        from playwright.async_api import async_playwright
+
+        settings = get_settings()
+        target_url = url or settings.dev_server_url
+
+        # Generate filename
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{name or 'screenshot'}_{timestamp}.png"
+        screenshot_dir = _get_screenshot_dir()
+        screenshot_path = screenshot_dir / filename
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page(
+                viewport={"width": viewport_width, "height": viewport_height}
+            )
+
+            # Navigate to URL
+            await page.goto(target_url, wait_until="networkidle")
+
+            # Wait for selector if specified
+            if wait_for_selector:
+                await page.wait_for_selector(wait_for_selector, timeout=10000)
+
+            # Additional wait
+            if wait_ms > 0:
+                await asyncio.sleep(wait_ms / 1000)
+
+            # Capture screenshot
+            await page.screenshot(path=str(screenshot_path), full_page=False)
+
+            # Get page info
+            title = await page.title()
+
+            await browser.close()
+
+        return {
+            "success": True,
+            "path": str(screenshot_path),
+            "relative_path": str(screenshot_path.relative_to(screenshot_dir.parent.parent)),
+            "url": target_url,
+            "viewport": f"{viewport_width}x{viewport_height}",
+            "page_title": title,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@tool
+async def analyze_screenshot(
+    screenshot_path: str,
+    analysis_prompt: str,
+) -> dict[str, Any]:
+    """Analyze a screenshot using Claude Vision.
+
+    Args:
+        screenshot_path: Path to the screenshot file
+        analysis_prompt: What to analyze/look for in the image
+
+    Returns:
+        Dict with analysis results
+    """
+    try:
+        settings = get_settings()
+
+        # Read and encode image
+        with open(screenshot_path, "rb") as f:
+            image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+        # Create Claude client
+        llm = ChatAnthropic(
+            model=settings.anthropic_model,
+            api_key=settings.anthropic_api_key,
+        )
+
+        # Prepare message with image
+        message = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_data,
+                }
+            },
+            {
+                "type": "text",
+                "text": analysis_prompt,
+            }
+        ]
+
+        # Get analysis
+        response = await llm.ainvoke([{"role": "user", "content": message}])
+
+        return {
+            "success": True,
+            "analysis": response.content,
+            "screenshot": screenshot_path,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@tool
+def compare_screenshots(
+    baseline_path: str,
+    current_path: str,
+    threshold: float = 0.1,
+) -> dict[str, Any]:
+    """Compare two screenshots for visual differences.
+
+    Uses pixelmatch for pixel-level comparison.
+
+    Args:
+        baseline_path: Path to baseline screenshot
+        current_path: Path to current screenshot
+        threshold: Acceptable difference threshold (0-1)
+
+    Returns:
+        Dict with comparison results
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+
+        # Load images
+        baseline = Image.open(baseline_path)
+        current = Image.open(current_path)
+
+        # Resize if different sizes
+        if baseline.size != current.size:
+            return {
+                "success": True,
+                "match": False,
+                "reason": f"Size mismatch: {baseline.size} vs {current.size}",
+                "difference_percent": 100.0,
+            }
+
+        # Convert to numpy arrays
+        baseline_arr = np.array(baseline)
+        current_arr = np.array(current)
+
+        # Calculate difference
+        diff = np.abs(baseline_arr.astype(float) - current_arr.astype(float))
+        diff_percent = (np.sum(diff > 0) / diff.size) * 100
+
+        match = diff_percent <= (threshold * 100)
+
+        return {
+            "success": True,
+            "match": match,
+            "difference_percent": round(diff_percent, 2),
+            "threshold_percent": threshold * 100,
+            "baseline": baseline_path,
+            "current": current_path,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@tool
+async def check_visual_criteria(
+    screenshot_path: str,
+    criteria: dict[str, Any],
+) -> dict[str, Any]:
+    """Check if a screenshot meets visual criteria.
+
+    Args:
+        screenshot_path: Path to screenshot
+        criteria: Dict with visual criteria to check:
+            - expected_elements: List of elements that should be visible
+            - canvas_not_uniform: Whether canvas should have variation (not solid color)
+            - expected_colors: List of colors that should be present
+
+    Returns:
+        Dict with check results
+    """
+    # Build analysis prompt from criteria
+    prompt_parts = ["Analyze this screenshot and answer the following questions:\n"]
+
+    if criteria.get("expected_elements"):
+        elements = ", ".join(criteria["expected_elements"])
+        prompt_parts.append(f"1. Are these elements visible: {elements}? List which ones are present and which are missing.")
+
+    if criteria.get("canvas_not_uniform"):
+        prompt_parts.append("2. Is the main canvas/content area showing actual data (not a solid color or blank)? Describe what you see.")
+
+    if criteria.get("expected_colors"):
+        colors = ", ".join(criteria["expected_colors"])
+        prompt_parts.append(f"3. Are these colors present in the visualization: {colors}?")
+
+    prompt_parts.append("\nProvide a JSON summary with: { 'all_criteria_met': true/false, 'details': {...} }")
+
+    analysis_prompt = "\n".join(prompt_parts)
+
+    result = await analyze_screenshot.ainvoke({
+        "screenshot_path": screenshot_path,
+        "analysis_prompt": analysis_prompt,
+    })
+
+    return result

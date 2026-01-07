@@ -1,0 +1,176 @@
+import { createStore } from 'zustand/vanilla';
+import { useStore } from 'zustand';
+
+/**
+ * Maintenance block types (stored as Uint8 enum).
+ */
+export const BlockType = {
+  PM: 0,          // Preventive Maintenance
+  OVERHAUL: 1,    // Major overhaul
+  INSPECTION: 2,  // Regular inspection
+  REPAIR: 3,      // Unplanned repair
+  CLEANING: 4,    // Cleaning/detailing
+} as const;
+
+export type BlockTypeValue = typeof BlockType[keyof typeof BlockType];
+
+/**
+ * Structure of Arrays (SoA) for high-performance schedule data.
+ * Pre-allocated TypedArrays for cache-friendly iteration.
+ */
+export interface ScheduleArrays {
+  /** Capacity of pre-allocated arrays */
+  capacity: number;
+  /** Current number of active blocks */
+  count: number;
+
+  /** Start time in milliseconds (epoch) */
+  startTimes: Float64Array;
+  /** End time in milliseconds (epoch) */
+  endTimes: Float64Array;
+  /** Train ID (index into train lookup table) */
+  trainIds: Int32Array;
+  /** Block type (see BlockType enum) */
+  types: Uint8Array;
+  /** Track/bay ID for workshop assignment */
+  trackIds: Int16Array;
+  /** Status flags: bit 0 = selected, bit 1 = dragging, bit 2 = conflict */
+  flags: Uint8Array;
+}
+
+export interface SimulationState {
+  schedule: ScheduleArrays;
+  /** Map of train index -> train metadata */
+  trainLookup: Map<number, { id: string; name: string; fleet: string }>;
+  /** Set of currently selected block indices */
+  selectedBlocks: Set<number>;
+  /** Index of block being dragged, or -1 */
+  draggingBlock: number;
+}
+
+export interface SimulationActions {
+  /** Initialize schedule arrays with capacity */
+  initializeSchedule: (capacity: number) => void;
+  /** Add a schedule block, returns index */
+  addBlock: (
+    startTime: number,
+    endTime: number,
+    trainId: number,
+    type: BlockTypeValue,
+    trackId: number
+  ) => number;
+  /** Update block times (for drag operations) */
+  updateBlockTimes: (index: number, startTime: number, endTime: number) => void;
+  /** Select/deselect a block */
+  toggleBlockSelection: (index: number) => void;
+  /** Clear all selections */
+  clearSelection: () => void;
+  /** Start dragging a block */
+  startDrag: (index: number) => void;
+  /** Stop dragging */
+  stopDrag: () => void;
+}
+
+const DEFAULT_CAPACITY = 100000;
+
+function createEmptySchedule(capacity: number): ScheduleArrays {
+  return {
+    capacity,
+    count: 0,
+    startTimes: new Float64Array(capacity),
+    endTimes: new Float64Array(capacity),
+    trainIds: new Int32Array(capacity),
+    types: new Uint8Array(capacity),
+    trackIds: new Int16Array(capacity),
+    flags: new Uint8Array(capacity),
+  };
+}
+
+export const simulationStore = createStore<SimulationState & SimulationActions>((set, get) => ({
+  schedule: createEmptySchedule(DEFAULT_CAPACITY),
+  trainLookup: new Map(),
+  selectedBlocks: new Set(),
+  draggingBlock: -1,
+
+  initializeSchedule: (capacity: number) => {
+    set({ schedule: createEmptySchedule(capacity) });
+  },
+
+  addBlock: (startTime, endTime, trainId, type, trackId) => {
+    const { schedule } = get();
+    const index = schedule.count;
+
+    if (index >= schedule.capacity) {
+      console.warn('Schedule capacity exceeded');
+      return -1;
+    }
+
+    schedule.startTimes[index] = startTime;
+    schedule.endTimes[index] = endTime;
+    schedule.trainIds[index] = trainId;
+    schedule.types[index] = type;
+    schedule.trackIds[index] = trackId;
+    schedule.flags[index] = 0;
+
+    set({ schedule: { ...schedule, count: index + 1 } });
+    return index;
+  },
+
+  updateBlockTimes: (index: number, startTime: number, endTime: number) => {
+    const { schedule } = get();
+    if (index < 0 || index >= schedule.count) return;
+
+    schedule.startTimes[index] = startTime;
+    schedule.endTimes[index] = endTime;
+    // Trigger update without reallocating arrays
+    set({ schedule: { ...schedule } });
+  },
+
+  toggleBlockSelection: (index: number) => {
+    const { selectedBlocks, schedule } = get();
+    const newSelection = new Set(selectedBlocks);
+
+    if (newSelection.has(index)) {
+      newSelection.delete(index);
+      schedule.flags[index] &= ~1; // Clear selected bit
+    } else {
+      newSelection.add(index);
+      schedule.flags[index] |= 1; // Set selected bit
+    }
+
+    set({ selectedBlocks: newSelection });
+  },
+
+  clearSelection: () => {
+    const { selectedBlocks, schedule } = get();
+    for (const index of selectedBlocks) {
+      schedule.flags[index] &= ~1;
+    }
+    set({ selectedBlocks: new Set() });
+  },
+
+  startDrag: (index: number) => {
+    const { schedule } = get();
+    if (index >= 0 && index < schedule.count) {
+      schedule.flags[index] |= 2; // Set dragging bit
+      set({ draggingBlock: index });
+    }
+  },
+
+  stopDrag: () => {
+    const { draggingBlock, schedule } = get();
+    if (draggingBlock >= 0) {
+      schedule.flags[draggingBlock] &= ~2; // Clear dragging bit
+    }
+    set({ draggingBlock: -1 });
+  },
+}));
+
+/** React hook for simulation state */
+export function useSimulation<T>(selector: (state: SimulationState & SimulationActions) => T): T {
+  return useStore(simulationStore, selector);
+}
+
+/** Direct access for non-React contexts */
+export const getSimulationState = simulationStore.getState;
+export const subscribeSimulation = simulationStore.subscribe;

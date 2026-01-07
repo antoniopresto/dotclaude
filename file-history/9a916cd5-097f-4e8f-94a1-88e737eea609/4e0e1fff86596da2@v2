@@ -1,0 +1,312 @@
+# Belt Project - Senior Research Report
+
+## Executive Summary
+
+This document consolidates research findings for preparing Belt monorepo for NPM publishing with Claude Code automation. The term "Anthropic Harness" refers to Anthropic's agent harness architecture documented in their engineering blog, specifically the patterns for building long-running AI agents that persist work across context windows.
+
+---
+
+## 1. Anthropic Harness Architecture
+
+### What It Is
+
+The "harness" is the orchestration layer that manages agent execution, context, and state persistence. Anthropic's Claude Agent SDK implements this pattern.
+
+### Core Problem Solved
+
+Long-running agents lose context between sessions. Each new context window starts blank. The harness provides mechanisms for agents to:
+- Resume work from previous sessions
+- Track progress across multiple sessions
+- Avoid duplicate work or premature completion claims
+
+### Two-Agent Pattern
+
+1. **Initializer Agent** (first session):
+   - Creates `init.sh` for environment setup
+   - Writes `claude-progress.txt` for human-readable state
+   - Generates comprehensive feature list (JSON format)
+   - Establishes git baseline
+
+2. **Coding Agent** (subsequent sessions):
+   - Follows startup ritual (pwd, read progress, review features)
+   - Implements one feature per session
+   - Updates progress file and commits changes
+   - Runs verification tests
+
+### Key Artifacts
+
+| Artifact | Purpose |
+|----------|---------|
+| `claude-progress.txt` | Human-readable progress summary |
+| `features.json` | Structured requirements (200+ items) |
+| `init.sh` | Environment initialization |
+| Git history | Technical change record |
+
+### Failure Patterns to Avoid
+
+1. **Premature completion** - Agent declares "done" without verification
+2. **Context exhaustion** - Trying too much in single session
+3. **Lost state** - Poor handoff documentation between sessions
+4. **Scope drift** - Agent removes tests or requirements
+
+---
+
+## 2. Claude Code Hooks (Official Documentation)
+
+### Configuration Location
+
+```
+~/.claude/settings.json          # User-level
+.claude/settings.json            # Project-level (version controlled)
+```
+
+### Available Events
+
+| Event | Description | Matcher Support |
+|-------|-------------|-----------------|
+| PreToolUse | Before tool execution | Yes |
+| PostToolUse | After tool completion | Yes |
+| PermissionRequest | Permission dialog shown | Yes |
+| UserPromptSubmit | User submits prompt | No |
+| Stop | Agent finishes | No |
+| SubagentStop | Subagent finishes | No |
+| SessionStart | Session begins | startup/resume/clear/compact |
+| SessionEnd | Session ends | clear/logout/exit/other |
+| PreCompact | Before context compaction | manual/auto |
+
+### Hook Schema
+
+```json
+{
+  "hooks": {
+    "EventName": [
+      {
+        "matcher": "ToolPattern",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "shell-command",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Exit Codes
+
+- `0` - Success (output processed)
+- `2` - Blocking error (stops execution)
+- Other - Non-blocking warning
+
+### Critical Environment Variables
+
+- `CLAUDE_PROJECT_DIR` - Project root (use for portable scripts)
+- `CLAUDE_ENV_FILE` - Persist variables (SessionStart only)
+
+---
+
+## 3. NPM Publishing - Senior Gotchas
+
+### Organization Scope (@belt/*)
+
+**Requirements:**
+1. Organization must exist on npmjs.com BEFORE first publish
+2. First publish requires `--access public` flag
+3. User must have "maintainer" role with publish rights
+4. Email must be verified on npm account
+
+**Command sequence:**
+```bash
+# First time only
+npm login
+npm org add belt <username>
+
+# Each publish
+cd packages/core
+pnpm publish --access public  # --access only needed first time
+```
+
+### workspace:* Protocol Resolution
+
+pnpm automatically converts `workspace:*` to actual versions at publish time:
+
+```json
+// Before publish (package.json)
+"dependencies": {
+  "@belt/core": "workspace:*"
+}
+
+// After publish (in npm registry)
+"dependencies": {
+  "@belt/core": "^0.1.0"
+}
+```
+
+**Known Issue:** Publishing from subdirectory (e.g., `dist/`) fails with "Cannot resolve workspace protocol" because subdirectory isn't recognized as workspace member.
+
+**Solution:** Use `publishConfig.directory` in package.json or publish from package root.
+
+### Publish Order (Critical)
+
+Must publish in dependency order:
+1. `@belt/core` (no internal deps)
+2. `@belt/plugin-typecheck` (depends on core)
+3. `@belt/plugin-sync-types` (depends on core)
+4. `@belt/cli` (depends on all)
+
+Publishing out of order causes "package not found" errors.
+
+---
+
+## 4. Husky + pnpm Monorepo
+
+### Setup Pattern
+
+```bash
+# Install at root
+pnpm add -D husky -w
+pnpm exec husky init
+```
+
+### Common Issues
+
+1. **".git can't be found"** - Husky must be at monorepo root, not in packages
+2. **PATH issues in GUI apps** - Add to `~/.config/husky/init.sh`:
+   ```bash
+   export NVM_DIR="$HOME/.nvm"
+   [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+   ```
+3. **CI/Docker failures** - Set `HUSKY=0` to skip hooks
+
+### Monorepo Hook Pattern
+
+```bash
+#!/usr/bin/env sh
+# .husky/pre-commit - runs at monorepo root
+pnpm lint
+```
+
+For package-specific hooks, use turborepo filters:
+```bash
+pnpm turbo run lint --filter=@belt/core
+```
+
+---
+
+## 5. TypeScript ESM - .js Extensions
+
+### Why Required
+
+With `moduleResolution: "NodeNext"`:
+- Node.js ESM requires explicit file extensions
+- TypeScript compiles `.ts` to `.js`
+- Imports must reference output extension
+
+```typescript
+// Correct
+import { Belt } from './belt.js';
+
+// Wrong (fails at runtime)
+import { Belt } from './belt';
+```
+
+### Alternatives
+
+1. **bundler resolution** (TS 5.0+) - For bundled code only
+2. **allowImportingTsExtensions** - Uses `.ts` but requires noEmit
+
+Belt correctly uses NodeNext, so `.js` extensions are appropriate.
+
+---
+
+## 6. Changesets (Recommended for Future)
+
+### What It Provides
+
+- Declarative version bumps via markdown files
+- Automatic changelog generation
+- Coordinated monorepo releases
+- GitHub Actions integration
+
+### Why Not Immediate
+
+Adds complexity for initial release. Recommended after v0.1.0 stable when:
+- Multiple contributors
+- Frequent releases
+- Need automated changelog
+
+---
+
+## 7. Unknown Unknowns Identified
+
+### NPM Token Deprecation
+
+Classic NPM tokens are deprecated. Use **Granular Access Tokens** instead:
+- npm.com → Access Tokens → Generate New Token → Granular Access Token
+- Select packages and permissions explicitly
+
+### MCP Configuration Gotchas
+
+1. `.claude/.mcp.json` sometimes ignored - use `~/.claude.json` as fallback
+2. Each MCP server adds to context window usage even when unused
+3. Absolute paths required in configuration
+
+### Context Window Economics
+
+Each enabled tool/MCP server consumes context. For long sessions:
+- Disable unused MCP servers
+- Use progress files instead of relying on context
+- One feature per session prevents exhaustion
+
+### Git Hook Security
+
+Hooks execute with full user permissions. Never:
+- Process untrusted input without validation
+- Store secrets in hook scripts
+- Use unquoted variables (`$VAR` vs `"$VAR"`)
+
+---
+
+## 8. Sources
+
+### Primary Documentation
+- [Anthropic: Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- [Claude Code Hooks Reference](https://code.claude.com/docs/en/hooks)
+- [Claude Agent SDK Overview](https://platform.claude.com/docs/en/agent-sdk/overview)
+
+### NPM/pnpm
+- [pnpm Workspaces](https://pnpm.io/workspaces)
+- [NPM Scoped Packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/)
+- [Changesets GitHub](https://github.com/changesets/changesets)
+
+### Community Resources
+- [Husky Monorepo Guide](https://dev.to/mimafogeus2/enforce-git-hooks-in-monorepos-with-husky-but-how-3fma)
+- [TypeScript ESM Guide](https://dev.to/a0viedo/nodejs-typescript-and-esm-it-doesnt-have-to-be-painful-438e)
+
+---
+
+## 9. Recommendations for Belt
+
+### Immediate (v0.1.0 Release)
+
+1. **No Changesets** - Manual versioning is fine for initial release
+2. **Simple Hooks** - Pre-commit lint, pre-push build
+3. **Progress File** - `claude-progress.txt` for Claude Code sessions
+4. **Publish Order Script** - Automate dependency-order publishing
+
+### Future (v0.2.0+)
+
+1. Add Changesets for automated versioning
+2. GitHub Actions for CI/CD
+3. Specialized agents (test agent, docs agent)
+4. MCP server for Belt-specific tools
+
+### Anti-Patterns to Avoid
+
+1. Don't over-engineer hooks initially
+2. Don't add MCP servers you won't use
+3. Don't rely solely on context for state
+4. Don't publish without verifying build first

@@ -1,0 +1,256 @@
+/**
+ * Demo data generators for Dubai Metro MMS
+ *
+ * Fleet composition:
+ * - 79 Alstom trains (ALT-001 to ALT-079) - Red Line primary
+ * - 49 Kinki Sharyo trains (KNK-001 to KNK-049) - Green Line primary
+ *
+ * Total: 128 trains
+ */
+
+import type { Asset, MaintenanceType, SolverInput, SolverEvent, Depot, ResourceConstraints } from "@uptime/types";
+
+// Fleet constants
+export const ALSTOM_COUNT = 79;
+export const KINKI_COUNT = 49;
+export const TOTAL_FLEET = ALSTOM_COUNT + KINKI_COUNT; // 128
+
+export const maintenanceTypes: MaintenanceType[] = [
+  {
+    id: "mt-a",
+    level: "A",
+    name: "A-Check",
+    intervalKm: 10000,
+    toleranceKm: 2000,
+    durationHours: 4,
+    manHours: 8,
+    requiredTracks: 1,
+    estimatedCost: 2500,
+  },
+  {
+    id: "mt-b",
+    level: "B",
+    name: "B-Check",
+    intervalKm: 50000,
+    toleranceKm: 5000,
+    durationHours: 16,
+    manHours: 32,
+    requiredTracks: 1,
+    estimatedCost: 8500,
+  },
+  {
+    id: "mt-c",
+    level: "C",
+    name: "C-Check",
+    intervalKm: 200000,
+    toleranceKm: 20000,
+    durationHours: 72,
+    manHours: 160,
+    requiredTracks: 1,
+    estimatedCost: 45000,
+  },
+  {
+    id: "mt-d",
+    level: "D",
+    name: "D-Overhaul",
+    intervalKm: 800000,
+    toleranceKm: 50000,
+    durationHours: 480,
+    manHours: 1200,
+    requiredTracks: 2,
+    estimatedCost: 180000,
+  },
+];
+
+export const depots: Depot[] = [
+  {
+    id: "depot-red",
+    name: "Al Rashidiya Depot",
+    assetTypes: ["ALSTOM", "KINKI"],
+    trackCount: 5,
+    weeklyManHours: 2800,
+  },
+  {
+    id: "depot-green",
+    name: "Jebel Ali Depot",
+    assetTypes: ["ALSTOM", "KINKI"],
+    trackCount: 4,
+    weeklyManHours: 2400,
+  },
+];
+
+export const defaultConstraints: ResourceConstraints = {
+  weeklyManHours: 5200,
+  monthlyManHours: 20800,
+  maintenanceTracks: 9,
+  trackCapacityPerDay: 2,
+  depots,
+};
+
+/**
+ * Generate staggered mileage to avoid maintenance clustering
+ * Spreads trains across the maintenance cycle
+ */
+function staggerMileage(
+  index: number,
+  fleetSize: number,
+  baseKm: number,
+  rangeKm: number
+): number {
+  // Distribute evenly across the range
+  const phase = (index / fleetSize) * rangeKm;
+  // Add controlled randomness based on index
+  const noise = ((index * 7) % 13) * 1000;
+  return Math.round(baseKm + phase + noise);
+}
+
+/**
+ * Generate the Dubai Metro fleet
+ * When count = 128: 79 Alstom + 49 Kinki (exact)
+ * When count < 128: proportional split (62% Alstom, 38% Kinki)
+ */
+export function generateFleet(count: number): Asset[] {
+  const assets: Asset[] = [];
+
+  // Calculate proportional split
+  const alstomCount = count === TOTAL_FLEET
+    ? ALSTOM_COUNT
+    : Math.round(count * (ALSTOM_COUNT / TOTAL_FLEET));
+  const kinkiCount = count - alstomCount;
+
+  // Generate Alstom trains (ALT-001 to ALT-079)
+  for (let i = 0; i < alstomCount; i++) {
+    const trainNumber = String(i + 1).padStart(3, "0");
+    const currentKm = staggerMileage(i, alstomCount, 450000, 350000);
+
+    assets.push({
+      id: `ALT-${trainNumber}`,
+      assetNumber: `ALT-${trainNumber}`,
+      assetType: "ALSTOM",
+      carsCount: 5,
+      currentMileageKm: currentKm,
+      avgDailyMileageKm: 420 + (i % 12) * 5, // 420-475 km/day
+      lastMaintenanceDate: "2025-01-01",
+      status: "operational",
+      lastMaintenanceKm: {
+        "mt-a": currentKm - staggerMileage(i, alstomCount, 0, 10000),
+        "mt-b": currentKm - staggerMileage(i, alstomCount, 0, 50000),
+        "mt-c": currentKm - staggerMileage(i, alstomCount, 0, 200000),
+        "mt-d": currentKm - staggerMileage(i, alstomCount, 0, 800000),
+      },
+    });
+  }
+
+  // Generate Kinki Sharyo trains (KNK-001 to KNK-049)
+  for (let i = 0; i < kinkiCount; i++) {
+    const trainNumber = String(i + 1).padStart(3, "0");
+    // Kinki fleet is newer, so lower base mileage
+    const currentKm = staggerMileage(i, kinkiCount, 320000, 280000);
+
+    assets.push({
+      id: `KNK-${trainNumber}`,
+      assetNumber: `KNK-${trainNumber}`,
+      assetType: "KINKI",
+      carsCount: 5,
+      currentMileageKm: currentKm,
+      avgDailyMileageKm: 400 + (i % 10) * 6, // 400-454 km/day
+      lastMaintenanceDate: "2025-01-01",
+      status: "operational",
+      lastMaintenanceKm: {
+        "mt-a": currentKm - staggerMileage(i, kinkiCount, 0, 10000),
+        "mt-b": currentKm - staggerMileage(i, kinkiCount, 0, 50000),
+        "mt-c": currentKm - staggerMileage(i, kinkiCount, 0, 200000),
+        "mt-d": currentKm - staggerMileage(i, kinkiCount, 0, 800000),
+      },
+    });
+  }
+
+  return assets;
+}
+
+export function generateEvents(
+  assets: Asset[],
+  horizonWeeks: number
+): SolverEvent[] {
+  const events: SolverEvent[] = [];
+  let eventId = 0;
+
+  for (const asset of assets) {
+    for (const mt of maintenanceTypes) {
+      const currentKm = asset.currentMileageKm;
+      const lastMtKm = asset.lastMaintenanceKm?.[mt.id] ?? currentKm - mt.intervalKm;
+      const nextDueKm = lastMtKm + mt.intervalKm;
+
+      const weeklyKm = asset.avgDailyMileageKm * 7;
+      const weeksUntilDue = Math.max(0, Math.floor((nextDueKm - currentKm) / weeklyKm));
+
+      if (weeksUntilDue < horizonWeeks) {
+        const toleranceWeeks = Math.floor(mt.toleranceKm / weeklyKm);
+        events.push({
+          id: `evt-${String(eventId++).padStart(5, "0")}`,
+          assetId: asset.id,
+          maintenanceTypeId: mt.id,
+          manHours: mt.manHours,
+          earliestPeriod: Math.max(0, weeksUntilDue - toleranceWeeks),
+          latestPeriod: Math.min(horizonWeeks - 1, weeksUntilDue + toleranceWeeks),
+          targetPeriod: weeksUntilDue,
+          priority: mt.level === "A" || mt.level === "B" ? 5 : 7,
+        });
+      }
+    }
+  }
+
+  return events;
+}
+
+export function createSolverInput(
+  fleetSize: number,
+  horizonWeeks: number,
+  capacity?: number
+): SolverInput {
+  const assets = generateFleet(fleetSize);
+  const events = generateEvents(assets, horizonWeeks);
+  const constraints = { ...defaultConstraints };
+
+  if (capacity) {
+    constraints.weeklyManHours = capacity;
+  }
+
+  return {
+    events,
+    assets,
+    maintenanceTypes,
+    constraints,
+    planningHorizonWeeks: horizonWeeks,
+    objective: {
+      peakWorkloadWeight: 1.0,
+      levelingWeight: 0.5,
+      complianceWeight: 0.3,
+    },
+    settings: {
+      timeoutSeconds: 60,
+      gapTolerance: 0.01,
+    },
+  };
+}
+
+/**
+ * Get fleet summary statistics
+ */
+export function getFleetSummary(assets: Asset[]) {
+  const alstom = assets.filter(a => a.assetType === "ALSTOM");
+  const kinki = assets.filter(a => a.assetType === "KINKI");
+
+  return {
+    total: assets.length,
+    alstomCount: alstom.length,
+    kinkiCount: kinki.length,
+    avgMileage: Math.round(assets.reduce((sum, a) => sum + a.currentMileageKm, 0) / assets.length),
+    alstomAvgMileage: alstom.length > 0
+      ? Math.round(alstom.reduce((sum, a) => sum + a.currentMileageKm, 0) / alstom.length)
+      : 0,
+    kinkiAvgMileage: kinki.length > 0
+      ? Math.round(kinki.reduce((sum, a) => sum + a.currentMileageKm, 0) / kinki.length)
+      : 0,
+  };
+}

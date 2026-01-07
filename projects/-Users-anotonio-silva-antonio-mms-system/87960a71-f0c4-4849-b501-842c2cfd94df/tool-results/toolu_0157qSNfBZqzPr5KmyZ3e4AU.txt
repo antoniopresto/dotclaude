@@ -1,0 +1,240 @@
+     1→/**
+     2→ * Viewport State Slice
+     3→ *
+     4→ * External store for camera/viewport state using @zazcart/tools.
+     5→ * Solves the "stale closure" problem in animation loops by using
+     6→ * useSyncExternalStore instead of React useState.
+     7→ *
+     8→ * Benefits:
+     9→ * - State reads are synchronous (no batching delay)
+    10→ * - Animation loops always see current values
+    11→ * - No more cameraPosRef workaround needed
+    12→ *
+    13→ * @see TECH-DEBT-001
+    14→ * @see CLAUDE.md "React Hooks vs External Stores"
+    15→ */
+    16→
+    17→import { createSyncSlice } from '@zazcart/tools';
+    18→import type { LODLevel } from '../data/types';
+    19→
+    20→// ─────────────────────────────────────────────────────────────
+    21→// STATE TYPES
+    22→// ─────────────────────────────────────────────────────────────
+    23→
+    24→export interface CameraPosition {
+    25→  x: number;
+    26→  y: number;
+    27→}
+    28→
+    29→export interface MomentumState {
+    30→  velocityX: number;
+    31→  velocityY: number;
+    32→  isActive: boolean;
+    33→}
+    34→
+    35→export interface AnimationState {
+    36→  isAnimating: boolean;
+    37→  startTime: number;
+    38→  duration: number;
+    39→  startX: number;
+    40→  startY: number;
+    41→  startZoom: number;
+    42→  targetX: number;
+    43→  targetY: number;
+    44→  targetZoom: number;
+    45→}
+    46→
+    47→export interface CanvasSize {
+    48→  width: number;
+    49→  height: number;
+    50→}
+    51→
+    52→export interface ViewportSliceState {
+    53→  // Camera position in world coordinates
+    54→  camera: CameraPosition;
+    55→
+    56→  // Canvas dimensions (from R3F)
+    57→  canvasSize: CanvasSize;
+    58→
+    59→  // Initialization flag
+    60→  isInitialized: boolean;
+    61→
+    62→  // Momentum for inertial panning
+    63→  momentum: MomentumState;
+    64→
+    65→  // Smooth animation state
+    66→  animation: AnimationState;
+    67→
+    68→  // Interaction state
+    69→  isPanning: boolean;
+    70→  panStart: CameraPosition;
+    71→  cameraPosAtPanStart: CameraPosition;
+    72→}
+    73→
+    74→// ─────────────────────────────────────────────────────────────
+    75→// INITIAL STATE
+    76→// ─────────────────────────────────────────────────────────────
+    77→
+    78→const initialState: ViewportSliceState = {
+    79→  camera: { x: 0, y: 0 },
+    80→  canvasSize: { width: 800, height: 600 },
+    81→  isInitialized: false,
+    82→  momentum: {
+    83→    velocityX: 0,
+    84→    velocityY: 0,
+    85→    isActive: false,
+    86→  },
+    87→  animation: {
+    88→    isAnimating: false,
+    89→    startTime: 0,
+    90→    duration: 250,
+    91→    startX: 0,
+    92→    startY: 0,
+    93→    startZoom: 1,
+    94→    targetX: 0,
+    95→    targetY: 0,
+    96→    targetZoom: 1,
+    97→  },
+    98→  isPanning: false,
+    99→  panStart: { x: 0, y: 0 },
+   100→  cameraPosAtPanStart: { x: 0, y: 0 },
+   101→};
+   102→
+   103→// ─────────────────────────────────────────────────────────────
+   104→// VIEWPORT SLICE
+   105→// ─────────────────────────────────────────────────────────────
+   106→
+   107→export const viewportSlice = createSyncSlice({
+   108→  id: 'viewport',
+   109→  initial: initialState,
+   110→  cache: { policy: 'session' },  // Session-scoped: resets when app closes
+   111→  reducers: {
+   112→    // Camera position
+   113→    setCamera(state: ViewportSliceState, payload: CameraPosition) {
+   114→      state.camera = payload;
+   115→    },
+   116→
+   117→    setCameraX(state: ViewportSliceState, payload: number) {
+   118→      state.camera.x = payload;
+   119→    },
+   120→
+   121→    setCameraY(state: ViewportSliceState, payload: number) {
+   122→      state.camera.y = payload;
+   123→    },
+   124→
+   125→    // Canvas size
+   126→    setCanvasSize(state: ViewportSliceState, payload: CanvasSize) {
+   127→      state.canvasSize = payload;
+   128→    },
+   129→
+   130→    // Initialization
+   131→    initialize(
+   132→      state: ViewportSliceState,
+   133→      payload: { camera: CameraPosition; canvasSize: CanvasSize }
+   134→    ) {
+   135→      state.camera = payload.camera;
+   136→      state.canvasSize = payload.canvasSize;
+   137→      state.isInitialized = true;
+   138→    },
+   139→
+   140→    // Momentum
+   141→    setMomentum(state: ViewportSliceState, payload: MomentumState) {
+   142→      state.momentum = payload;
+   143→    },
+   144→
+   145→    startMomentum(
+   146→      state: ViewportSliceState,
+   147→      payload: { velocityX: number; velocityY: number }
+   148→    ) {
+   149→      state.momentum = {
+   150→        velocityX: payload.velocityX,
+   151→        velocityY: payload.velocityY,
+   152→        isActive: true,
+   153→      };
+   154→    },
+   155→
+   156→    updateMomentum(
+   157→      state: ViewportSliceState,
+   158→      payload: { velocityX: number; velocityY: number; camera: CameraPosition }
+   159→    ) {
+   160→      state.momentum.velocityX = payload.velocityX;
+   161→      state.momentum.velocityY = payload.velocityY;
+   162→      state.camera = payload.camera;
+   163→    },
+   164→
+   165→    stopMomentum(state: ViewportSliceState) {
+   166→      state.momentum = {
+   167→        velocityX: 0,
+   168→        velocityY: 0,
+   169→        isActive: false,
+   170→      };
+   171→    },
+   172→
+   173→    // Animation
+   174→    startAnimation(
+   175→      state: ViewportSliceState,
+   176→      payload: {
+   177→        startX: number;
+   178→        startY: number;
+   179→        startZoom: number;
+   180→        targetX: number;
+   181→        targetY: number;
+   182→        targetZoom: number;
+   183→        duration?: number;
+   184→      }
+   185→    ) {
+   186→      state.animation = {
+   187→        isAnimating: true,
+   188→        startTime: Date.now(),
+   189→        duration: payload.duration ?? 250,
+   190→        startX: payload.startX,
+   191→        startY: payload.startY,
+   192→        startZoom: payload.startZoom,
+   193→        targetX: payload.targetX,
+   194→        targetY: payload.targetY,
+   195→        targetZoom: payload.targetZoom,
+   196→      };
+   197→    },
+   198→
+   199→    updateAnimation(
+   200→      state: ViewportSliceState,
+   201→      payload: { camera: CameraPosition }
+   202→    ) {
+   203→      state.camera = payload.camera;
+   204→    },
+   205→
+   206→    stopAnimation(state: ViewportSliceState) {
+   207→      state.animation.isAnimating = false;
+   208→    },
+   209→
+   210→    // Panning
+   211→    startPan(
+   212→      state: ViewportSliceState,
+   213→      payload: { panStart: CameraPosition; cameraPosAtPanStart: CameraPosition }
+   214→    ) {
+   215→      state.isPanning = true;
+   216→      state.panStart = payload.panStart;
+   217→      state.cameraPosAtPanStart = payload.cameraPosAtPanStart;
+   218→    },
+   219→
+   220→    updatePan(state: ViewportSliceState, payload: { camera: CameraPosition }) {
+   221→      state.camera = payload.camera;
+   222→    },
+   223→
+   224→    endPan(state: ViewportSliceState) {
+   225→      state.isPanning = false;
+   226→    },
+   227→
+   228→    // Reset
+   229→    reset() {
+   230→      return initialState;
+   231→    },
+   232→  },
+   233→});
+   234→
+   235→export type ViewportSlice = typeof viewportSlice;
+   236→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

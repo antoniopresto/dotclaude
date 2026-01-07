@@ -1,0 +1,224 @@
+/**
+ * MMS - Metro Mileage Management System
+ * Database Schema using Drizzle ORM
+ *
+ * Based on Architecture Decision Document (2025-12-28)
+ */
+
+import {
+  pgTable,
+  uuid,
+  varchar,
+  integer,
+  decimal,
+  timestamp,
+  date,
+  time,
+  jsonb,
+  index,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
+import { relations } from 'drizzle-orm';
+
+// =============================================================================
+// Fleets Table
+// =============================================================================
+export const fleets = pgTable('fleets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: varchar('name', { length: 100 }).notNull(),
+  manufacturer: varchar('manufacturer', { length: 50 }),
+  pm1IntervalKm: integer('pm1_interval_km').notNull(),
+  pm2IntervalKm: integer('pm2_interval_km').notNull(),
+  hmIntervalKm: integer('hm_interval_km').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
+// =============================================================================
+// Depots Table
+// =============================================================================
+export const depots = pgTable(
+  'depots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    name: varchar('name', { length: 100 }).notNull(),
+    code: varchar('code', { length: 10 }).notNull(),
+    latitude: decimal('latitude', { precision: 10, scale: 6 }),
+    longitude: decimal('longitude', { precision: 10, scale: 6 }),
+    capacityTracks: integer('capacity_tracks').default(5),
+    capacityManhours: integer('capacity_manhours').default(80),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('depots_code_idx').on(table.code),
+  ]
+);
+
+// =============================================================================
+// Trains Table
+// =============================================================================
+export const trains = pgTable(
+  'trains',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    trainId: varchar('train_id', { length: 20 }).notNull(), // Business ID: UTE-3400-012
+    fleetId: uuid('fleet_id').references(() => fleets.id),
+    baseDepotId: uuid('base_depot_id').references(() => depots.id),
+    currentKm: integer('current_km').default(0),
+    targetKm: integer('target_km').default(0),
+    fitnessStatus: varchar('fitness_status', { length: 10 }).default('fit'),
+    lastMaintenanceDate: date('last_maintenance_date'),
+    nextMaintenanceKm: integer('next_maintenance_km'),
+    latitude: decimal('latitude', { precision: 10, scale: 6 }),
+    longitude: decimal('longitude', { precision: 10, scale: 6 }),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('trains_train_id_idx').on(table.trainId),
+    index('trains_fleet_idx').on(table.fleetId),
+    index('trains_depot_idx').on(table.baseDepotId),
+  ]
+);
+
+// =============================================================================
+// Services Table
+// =============================================================================
+export const services = pgTable(
+  'services',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    serviceCode: varchar('service_code', { length: 20 }).notNull(), // IC 501
+    origin: varchar('origin', { length: 100 }).notNull(),
+    destination: varchar('destination', { length: 100 }).notNull(),
+    distanceKm: integer('distance_km').notNull(),
+    departureTime: time('departure_time').notNull(),
+    arrivalTime: time('arrival_time').notNull(),
+    serviceType: varchar('service_type', { length: 20 }).default('regional'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('services_code_idx').on(table.serviceCode),
+  ]
+);
+
+// =============================================================================
+// Allocations Table
+// =============================================================================
+export const allocations = pgTable(
+  'allocations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    serviceId: uuid('service_id').references(() => services.id),
+    trainId: uuid('train_id').references(() => trains.id),
+    allocationDate: date('allocation_date').notNull(),
+    status: varchar('status', { length: 20 }).default('pending'),
+    score: integer('score'),
+    justifications: jsonb('justifications').$type<string[]>(),
+    createdBy: varchar('created_by', { length: 100 }),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('allocations_service_date_idx').on(table.serviceId, table.allocationDate),
+    index('allocations_date_idx').on(table.allocationDate),
+    index('allocations_status_idx').on(table.status),
+  ]
+);
+
+// =============================================================================
+// Mileage History Table
+// =============================================================================
+export const mileageHistory = pgTable(
+  'mileage_history',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    trainId: uuid('train_id').references(() => trains.id),
+    recordedDate: date('recorded_date').notNull(),
+    kmValue: integer('km_value').notNull(),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => [
+    index('mileage_train_date_idx').on(table.trainId, table.recordedDate),
+  ]
+);
+
+// =============================================================================
+// Maintenance Schedules Table
+// =============================================================================
+export const maintenanceSchedules = pgTable(
+  'maintenance_schedules',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    trainId: uuid('train_id').references(() => trains.id),
+    depotId: uuid('depot_id').references(() => depots.id),
+    maintenanceType: varchar('maintenance_type', { length: 10 }).notNull(), // PM1, PM2, HM, OVH
+    scheduledDate: date('scheduled_date').notNull(),
+    durationDays: integer('duration_days').default(1),
+    status: varchar('status', { length: 20 }).default('scheduled'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => [
+    index('maintenance_train_idx').on(table.trainId),
+    index('maintenance_depot_idx').on(table.depotId),
+    index('maintenance_date_idx').on(table.scheduledDate),
+  ]
+);
+
+// =============================================================================
+// Relations
+// =============================================================================
+
+export const fleetsRelations = relations(fleets, ({ many }) => ({
+  trains: many(trains),
+}));
+
+export const depotsRelations = relations(depots, ({ many }) => ({
+  trains: many(trains),
+  maintenanceSchedules: many(maintenanceSchedules),
+}));
+
+export const trainsRelations = relations(trains, ({ one, many }) => ({
+  fleet: one(fleets, {
+    fields: [trains.fleetId],
+    references: [fleets.id],
+  }),
+  baseDepot: one(depots, {
+    fields: [trains.baseDepotId],
+    references: [depots.id],
+  }),
+  allocations: many(allocations),
+  mileageHistory: many(mileageHistory),
+  maintenanceSchedules: many(maintenanceSchedules),
+}));
+
+export const servicesRelations = relations(services, ({ many }) => ({
+  allocations: many(allocations),
+}));
+
+export const allocationsRelations = relations(allocations, ({ one }) => ({
+  service: one(services, {
+    fields: [allocations.serviceId],
+    references: [services.id],
+  }),
+  train: one(trains, {
+    fields: [allocations.trainId],
+    references: [trains.id],
+  }),
+}));
+
+export const mileageHistoryRelations = relations(mileageHistory, ({ one }) => ({
+  train: one(trains, {
+    fields: [mileageHistory.trainId],
+    references: [trains.id],
+  }),
+}));
+
+export const maintenanceSchedulesRelations = relations(maintenanceSchedules, ({ one }) => ({
+  train: one(trains, {
+    fields: [maintenanceSchedules.trainId],
+    references: [trains.id],
+  }),
+  depot: one(depots, {
+    fields: [maintenanceSchedules.depotId],
+    references: [depots.id],
+  }),
+}));

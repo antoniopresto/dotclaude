@@ -1,0 +1,229 @@
+# MMS System Architecture
+
+## Overview
+
+The Metro Integrated Planning System is a high-performance WebGL application for metro fleet planning. It implements a "Semantic Zoom" UX similar to Google Earth, switching between three visualization layers based on camera zoom level.
+
+## Technology Choices
+
+### Why Vite?
+- Fast HMR (Hot Module Replacement)
+- Modern ESM-first architecture
+- Excellent TypeScript support
+- Simple configuration
+
+### Why React 18?
+- Required for BlueprintJS 6.x compatibility
+- Concurrent features for smooth UI
+- Improved hooks performance
+- Better Suspense support
+
+### Why BlueprintJS?
+- Enterprise-grade UI components from Palantir
+- Consistent design system (Intent colors, Icons)
+- Accessible out of the box
+- Dark theme support
+
+### Why React Three Fiber?
+- Declarative Three.js API
+- React component model for 3D scenes
+- Excellent ecosystem (drei, three-stdlib)
+
+**Version Pairing (Critical):**
+- React 18 → `@react-three/fiber@8.x` + `@react-three/drei@9.x`
+- React 19 → `@react-three/fiber@9.x` + `@react-three/drei@10.x`
+
+Since BlueprintJS 6 requires React 18, we use R3F 8.x.
+
+### Why Bun?
+- Faster package management
+- Native workspace support
+- Faster dev server startup
+
+## Project Structure
+
+```
+system/
+├── apps/
+│   └── canvas/                   # Production app (Vite + React 18 + R3F + BlueprintJS)
+│       ├── index.html            # HTML entry
+│       ├── vite.config.ts        # Vite configuration
+│       ├── package.json
+│       └── src/
+│           ├── main.tsx          # React entry point
+│           ├── App.tsx           # Main component with layout
+│           ├── components/       # BlueprintJS UI components
+│           │   ├── AppLayout.tsx     # Navbar, Sidebar, Canvas container
+│           │   ├── TrainSidebar.tsx  # Train IDs (Card)
+│           │   ├── ZoomControls.tsx  # ButtonGroup +/-
+│           │   └── LODIndicator.tsx  # Tag component
+│           ├── canvas/           # R3F rendering
+│           │   ├── InfiniteCanvas.tsx
+│           │   ├── CameraController.tsx
+│           │   └── layers/
+│           │       ├── MacroLayer.tsx    # Heatmap (InstancedMesh/Shader)
+│           │       ├── MesoLayer.tsx     # Task blocks (InstancedMesh)
+│           │       └── MicroLayer.tsx    # Detailed cards (Html)
+│           ├── data/
+│           │   ├── types.ts          # Train, Task interfaces
+│           │   └── generator.ts      # Mock data generation
+│           └── hooks/
+│               └── useViewport.ts    # zoom, pan, LOD state
+│
+├── packages/
+│   └── toolkit/              # State machine & utilities (React 18 || 19)
+│       └── src/
+│           └── state-machine/ # Core state management
+│
+└── design/
+    ├── reference/
+    │   └── semantic-zoom-poc.html  # POC for visual reference only
+    ├── screen-1.png          # Macro view reference
+    ├── screen-2.png          # Meso view reference
+    └── ...
+```
+
+## Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    User Interaction                          │
+│         (Mouse wheel, drag, keyboard, sidebar scroll)        │
+└─────────────────────────────────┬───────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    State Machine                             │
+│               (packages/gl-engine/state)                     │
+│                                                              │
+│  Slices:                                                     │
+│  ├── viewport: { zoom, x, y, lod }                          │
+│  ├── selection: { hovered, selected }                       │
+│  ├── schedule: { trains, tasks }                            │
+│  └── conflicts: { conflicts[] }                             │
+└─────────────────────────────────┬───────────────────────────┘
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                    ▼             ▼             ▼
+             ┌──────────┐  ┌──────────┐  ┌──────────┐
+             │  Macro   │  │   Meso   │  │  Micro   │
+             │  Layer   │  │   Layer  │  │  Layer   │
+             │ (shader) │  │(instanced│  │  (HTML)  │
+             └──────────┘  └──────────┘  └──────────┘
+```
+
+## Key Components
+
+### InfiniteCanvas
+- **Purpose**: Orchestrates the three rendering layers
+- **Location**: `apps/canvas/src/canvas/InfiniteCanvas.tsx`
+- **Dependencies**: CameraController, MacroLayer, MesoLayer, MicroLayer
+
+### CameraController
+- **Purpose**: Manages orthographic camera with pan/zoom
+- **Location**: `apps/canvas/src/canvas/CameraController.tsx`
+- **Dependencies**: useViewport hook, R3F hooks (useThree, useFrame)
+
+### MacroLayer (Zoom < 0.5)
+- **Purpose**: Renders 20-year strategic view as heatmap
+- **Location**: `apps/canvas/src/canvas/layers/MacroLayer.tsx`
+- **Implementation**:
+  - InstancedMesh with colored cells
+  - Or: ShaderMaterial with DataTexture
+  - Yellow→Orange→Red gradient based on task density
+- **Performance**: Minimal draw calls
+
+### MesoLayer (0.5 ≤ Zoom ≤ 2.0)
+- **Purpose**: Renders task blocks as instanced mesh
+- **Location**: `apps/canvas/src/canvas/layers/MesoLayer.tsx`
+- **Implementation**:
+  - InstancedMesh with BoxGeometry
+  - InstancedBufferAttribute for colors/transforms
+  - Conflict tasks: Intent.DANGER red (#cd4246)
+- **Performance**: Single draw call for all instances
+
+### MicroLayer (Zoom > 2.0)
+- **Purpose**: Renders detailed task cards with HTML
+- **Location**: `apps/canvas/src/canvas/layers/MicroLayer.tsx`
+- **Implementation**:
+  - drei's Html component with transform
+  - BlueprintJS styling (Card, Tag)
+  - Accessibility (tabIndex, ARIA)
+
+## Key Interfaces
+
+```typescript
+interface Train {
+  id: string;
+  name: string;
+  type: 'metro' | 'regional' | 'freight';
+}
+
+interface Task {
+  id: string;
+  trainId: string;
+  startDate: Date;
+  endDate: Date;
+  type: 'maintenance' | 'overhaul' | 'inspection';
+  conflict: boolean;
+  dependencies: string[];
+}
+
+interface Conflict {
+  id: string;
+  taskIds: [string, string];
+  type: 'overlap' | 'resource' | 'dependency';
+  severity: 'low' | 'medium' | 'high';
+}
+```
+
+## Configuration
+
+### Environment Variables
+```bash
+# No environment variables required for development
+# Production may need:
+VITE_API_URL=    # If backend is added
+```
+
+### Build Configuration
+- `apps/canvas/vite.config.ts` - Vite settings
+- `apps/canvas/tsconfig.json` - TypeScript config
+- `bunfig.toml` - Bun workspace settings
+
+## Performance Considerations
+
+### GPU Optimization
+- MacroLayer: Procedural shader (no geometry overhead)
+- MesoLayer: InstancedMesh (single draw call for 60k objects)
+- Spatial Hash Grid: O(1) hover detection
+
+### Memory Management
+- DataTexture: 4096x50 pixels = ~1MB
+- InstancedMesh: 60k instances = ~5MB GPU memory
+- Careful dispose() on unmount
+
+### React Optimization
+- useMemo for derived data
+- useCallback for event handlers
+- Stable keys for lists
+
+## Version Compatibility Matrix
+
+| Dependency | Version | Reason |
+|------------|---------|--------|
+| React | 18.3.1 | Required for BlueprintJS 6 |
+| @blueprintjs/core | 6.1.0 | UI components |
+| @react-three/fiber | 8.17.x | Pairs with React 18 |
+| @react-three/drei | 9.114.x | R3F 8.x helpers |
+| three | 0.170.x | WebGL engine |
+| vite | 5.4.x | Build tool |
+
+**Warning:** Do NOT upgrade to R3F 9.x or drei 10.x without also upgrading to React 19.
+
+## Security Considerations
+
+- No backend currently (client-only)
+- Mock data generation is deterministic
+- No user input validation needed (display only)

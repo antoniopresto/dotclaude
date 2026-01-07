@@ -1,0 +1,351 @@
+# @belt/ai
+
+TypeScript-based cascade rules enforcement for Claude Code. Define `.agentrc.ts` files that automatically enforce rules and execute hooks when the AI operates on your codebase.
+
+## Features
+
+- **Cascade Rules**: Rules in `.agentrc.ts` files cascade from parent to child directories (like `.gitignore`)
+- **Block Actions**: Prevent the AI from creating/modifying certain files (exit code 2)
+- **Warn on Actions**: Show warnings but allow the action to proceed
+- **Hook System**: Execute custom logic before/after tool usage
+- **Type-Safe**: Full TypeScript support with `defineAgent()`
+- **Easy Setup**: Single command to configure any project
+
+## Installation
+
+```bash
+npm install @belt/ai
+# or
+pnpm add @belt/ai
+# or
+bun add @belt/ai
+```
+
+## Quick Start
+
+### 1. Setup your project
+
+```bash
+npx @belt/ai setup
+```
+
+This creates:
+- `.agentrc.ts` - Your rules and hooks configuration
+- `.claude/settings.json` - Claude Code hook configuration
+- `.claude/hooks/agentrc-runner.ts` - The TypeScript runner
+- `.claude/hooks/agentrc-wrapper.sh` - Bash wrapper for Claude Code
+
+### 2. Define your rules
+
+Edit `.agentrc.ts`:
+
+```typescript
+import { defineAgent } from '@belt/ai';
+
+export default defineAgent({
+  rules: [
+    // Block certain file types
+    {
+      id: 'NO-ENV-FILES',
+      match: '.env',
+      action: 'block',
+      message: 'Cannot modify environment files',
+    },
+
+    // Warn on sensitive paths
+    {
+      id: 'WARN-CONFIG',
+      match: /\/config\//,
+      action: 'warn',
+      message: 'Modifying config - verify changes',
+    },
+
+    // Custom function matcher
+    {
+      id: 'NO-LARGE-FILES',
+      match: async (path, ctx) => {
+        // Custom async logic
+        return path.includes('generated');
+      },
+      action: 'block',
+      message: 'Cannot modify generated files',
+    },
+  ],
+
+  hooks: {
+    PreToolUse: ({ tool, filePath, inject, block, warn }) => {
+      // Inject context for the AI
+      inject(`Processing: ${filePath}`);
+
+      // Conditionally block
+      if (filePath.includes('protected')) {
+        block('This file is protected');
+      }
+    },
+
+    SessionStart: ({ inject }) => {
+      inject('Project rules are active');
+    },
+  },
+});
+```
+
+### 3. Start using Claude Code
+
+When you run Claude Code in your project, your rules will be automatically enforced!
+
+## API Reference
+
+### `defineAgent(config)`
+
+Creates a type-safe agent configuration.
+
+```typescript
+import { defineAgent } from '@belt/ai';
+
+export default defineAgent(config as {
+  rules?: AgentRule[];
+  hooks?: AgentHooks;
+  extend?: (parent: AgentConfig) => AgentConfig;
+});
+```
+
+### Rule Definition
+
+```typescript
+type AgentRule = {
+  id: string;                    // Unique identifier
+  match: RuleMatcher;            // How to match files
+  action: 'block' | 'warn' | 'allow';
+  message?: string;              // Human-readable message
+};
+
+type RuleMatcher =
+  | string                       // Substring match
+  | RegExp                       // Regex match
+  | ((path: string, ctx: RuleContext) => boolean) | Promise<boolean>;
+```
+
+### Rule Context
+
+```typescript
+type RuleContext = {
+  tool: string;           // 'Write', 'Edit', 'Bash', etc.
+  input: Record<string, unknown>;
+  projectRoot: string;
+};
+```
+
+### Hooks
+
+```typescript
+type AgentHooks = {
+  PreToolUse?: (ctx: HookContext) => void | Promise<void>;
+  PostToolUse?: (ctx: HookContext) => void | Promise<void>;
+  SessionStart?: (ctx: HookContext) => void | Promise<void>;
+  SessionEnd?: (ctx: HookContext) => void | Promise<void>;
+};
+
+type HookContext = {
+  tool: string;
+  input: Record<string, unknown>;
+  projectRoot: string;
+  filePath: string;
+  block: (message: string) => void;   // Block the action (exit 2)
+  warn: (message: string) => void;    // Show warning
+  inject: (content: string) => void;  // Add to AI context
+};
+```
+
+## Cascade Behavior
+
+Rules cascade from parent directories to children:
+
+```
+project/
+├── .agentrc.ts              # Root rules (apply everywhere)
+├── src/
+│   ├── .agentrc.ts          # src rules (inherit + extend root)
+│   └── components/
+│       └── .agentrc.ts      # components rules (inherit all above)
+└── docs/
+    └── .agentrc.ts          # docs rules (inherit root only)
+```
+
+When operating on `src/components/Button.tsx`:
+1. Loads `project/.agentrc.ts`
+2. Loads `project/src/.agentrc.ts`
+3. Loads `project/src/components/.agentrc.ts`
+4. Merges all configs (rules append, hooks override)
+
+### Extending Parent Config
+
+Use `extend` to customize how parent config is merged:
+
+```typescript
+export default defineAgent({
+  extend: (parent) => ({
+    // Keep parent rules, add new ones
+    rules: [
+      ...(parent.rules || []),
+      { id: 'LOCAL-RULE', match: '.local', action: 'block' },
+    ],
+    // Wrap parent hook
+    hooks: {
+      PreToolUse: (ctx) => {
+        parent.hooks?.PreToolUse?.(ctx);
+        ctx.inject('Child hook ran');
+      },
+    },
+  }),
+});
+```
+
+## Action Priority
+
+When multiple rules match, priority is: **block > warn > allow**
+
+```typescript
+rules: [
+  { id: 'ALLOW-TS', match: '.ts', action: 'allow' },
+  { id: 'WARN-SRC', match: '/src/', action: 'warn' },
+  { id: 'BLOCK-SECRET', match: 'secret', action: 'block' },
+]
+
+// For 'src/secret.ts': BLOCKED (block wins)
+// For 'src/normal.ts': WARNED (warn > allow)
+// For 'lib/file.ts': ALLOWED
+```
+
+## Exit Codes
+
+The runner uses these exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Action allowed |
+| 2 | Action blocked (rule violation) |
+| 1 | Runner error |
+
+## Examples
+
+### Block Package Lock Files
+
+```typescript
+const Example = {
+  id: 'NO-LOCK-FILES',
+  match: /package-lock\.json|yarn\.lock|pnpm-lock\.yaml/,
+  action: 'block',
+  message: 'Lock files should not be modified by AI',
+}
+```
+
+### Warn on Test Files
+
+```typescript
+const Example = {
+  id: 'WARN-TESTS',
+  match: /\.(test|spec)\.(ts|js)x?$/,
+  action: 'warn',
+  message: 'Modifying test file - ensure tests still pass',
+}
+```
+
+### Block Based on Content
+
+```typescript
+const Example = {
+  id: 'NO-API-KEYS',
+  match: async (path, ctx) => {
+    const content = ctx.input.content as string;
+    return content?.includes('API_KEY=') || false;
+  },
+  action: 'block',
+  message: 'Cannot write files containing API keys',
+}
+```
+
+### Inject Project Context
+
+```typescript
+const hooks = {
+  SessionStart: ({ inject }) => {
+    inject('='.repeat(50));
+    inject('PROJECT: My Awesome App');
+    inject('STACK: React + TypeScript + Vite');
+    inject('RULES: No env files, no lock files');
+    inject('='.repeat(50));
+  },
+}
+```
+
+### Conditional Blocking by Tool
+
+```typescript
+const hooks = {
+  PreToolUse: ({ tool, filePath, block }) => {
+    // Only allow Edit, not Write, for certain files
+    if (tool === 'Write' && filePath.includes('/migrations/')) {
+      block('Use Edit for migration files, not Write');
+    }
+  },
+}
+```
+
+## Debugging
+
+Debug logs are written to `/tmp/agentrc-runner-debug.log`:
+
+```bash
+tail -f /tmp/agentrc-runner-debug.log
+```
+
+Log format:
+```
+[2024-01-07T12:00:00.000Z] === AGENTRC RUNNER START ===
+[2024-01-07T12:00:00.001Z] Tool: Write, FilePath: /project/src/file.ts
+[2024-01-07T12:00:00.002Z] Found 1 agentrc files
+[2024-01-07T12:00:00.003Z] Loading: /project/.agentrc.ts
+[2024-01-07T12:00:00.010Z] ALLOWED: /project/src/file.ts
+```
+
+## Requirements
+
+- **bun**: Required for running TypeScript hooks
+  ```bash
+  curl -fsSL https://bun.sh/install | bash
+  ```
+
+## File Pattern
+
+The runner looks for these files (in order):
+- `.agentrc.ts`
+- `agentrc.ts`
+- `.agentrc.js`
+- `agentrc.js`
+
+## Integration with Existing Projects
+
+Running `npx @belt/ai setup` on an existing project will:
+
+1. **Merge** with existing `.claude/settings.json` (preserves your hooks)
+2. **Skip** `.agentrc.ts` if it already exists
+3. **Overwrite** runner files (they're regenerated each time)
+
+## TypeScript Support
+
+Full type definitions are included:
+
+```typescript
+import type {
+  AgentConfig,
+  AgentRule,
+  AgentHooks,
+  AgentHookContext,
+  RuleContext,
+} from '@belt/ai';
+```
+
+## License
+
+MIT

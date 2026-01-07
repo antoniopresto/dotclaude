@@ -1,0 +1,124 @@
+/**
+ * Instagram debug test - verifica interceptação diretamente
+ *
+ * Este teste acessa o background script para verificar os vídeos interceptados
+ */
+
+import { test, expect, chromium, type BrowserContext } from '@playwright/test';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const extensionPath = path.join(__dirname, '../.output/chrome-mv3');
+
+test('debug Instagram video interception', async () => {
+  const context = await chromium.launchPersistentContext('', {
+    headless: false,
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+      '--no-sandbox',
+    ],
+  });
+
+  try {
+    // Aguarda o service worker carregar
+    let [background] = context.serviceWorkers();
+    if (!background) {
+      background = await context.waitForEvent('serviceworker');
+    }
+    const extensionId = background.url().split('/')[2];
+    console.log(`Extension ID: ${extensionId}`);
+
+    // Abre a página do Instagram
+    const page = await context.newPage();
+    const reelUrl = process.env.INSTAGRAM_REEL_URL || 'https://www.instagram.com/reels/DIQ7_K6RHcW/';
+
+    console.log(`\nNavigating to: ${reelUrl}`);
+
+    // Monitora requisições de rede
+    const videoUrls: string[] = [];
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('cdninstagram.com') && url.includes('.mp4')) {
+        videoUrls.push(url);
+      }
+    });
+
+    await page.goto(reelUrl, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(5000);
+
+    console.log(`\n=== Network intercepted ${videoUrls.length} .mp4 URLs ===`);
+    videoUrls.slice(0, 5).forEach((url, i) => {
+      const hasDashinit = url.includes('dashinit');
+      const hasProgressive = url.includes('progressive');
+      const hasDuration = url.includes('duration_s');
+      console.log(`${i + 1}. dashinit=${hasDashinit}, progressive=${hasProgressive}, duration_s=${hasDuration}`);
+      console.log(`   ${url.substring(0, 120)}...`);
+    });
+
+    // Pega o tabId
+    const pages = context.pages();
+    const instagramPage = pages.find(p => p.url().includes('instagram.com'));
+
+    if (!instagramPage) {
+      console.log('Instagram page not found');
+      return;
+    }
+
+    // Abre o popup na mesma "sessão" mas passa o tabId manualmente
+    // Vamos acessar o background script via página de extensão
+    const bgPage = await context.newPage();
+    await bgPage.goto(`chrome-extension://${extensionId}/popup.html`);
+
+    // Injeta script para pegar os vídeos diretamente do background
+    // Primeiro, vamos ver o que o content script detecta na página do Instagram
+
+    console.log('\n=== Checking content script detection ===');
+
+    const contentResult = await instagramPage.evaluate(async () => {
+      // Tenta enviar mensagem para o content script
+      // @ts-ignore
+      if (typeof browser !== 'undefined' || typeof chrome !== 'undefined') {
+        return 'Extension APIs available';
+      }
+
+      // Verifica elementos de vídeo na página
+      const videos = document.querySelectorAll('video');
+      const sources: string[] = [];
+      videos.forEach(v => {
+        if (v.src) sources.push(v.src);
+        if (v.currentSrc) sources.push(v.currentSrc);
+      });
+
+      return {
+        videoElements: videos.length,
+        sources: sources.slice(0, 3),
+      };
+    });
+
+    console.log('Content result:', contentResult);
+
+    // Mostra URLs únicas encontradas
+    const uniqueUrls = [...new Set(videoUrls)];
+    console.log(`\n=== ${uniqueUrls.length} unique .mp4 URLs found ===`);
+
+    // Filtra para mostrar apenas URLs que deveriam ser válidas
+    const validUrls = uniqueUrls.filter(url => {
+      if (url.includes('dashinit')) return false;
+      return true;
+    });
+
+    console.log(`\n=== ${validUrls.length} valid video URLs (no dashinit) ===`);
+    validUrls.slice(0, 3).forEach((url, i) => {
+      console.log(`${i + 1}. ${url.substring(0, 150)}...`);
+    });
+
+    // Mantém browser aberto por um momento para debug visual
+    console.log('\n=== Browser will close in 3 seconds ===');
+    await page.waitForTimeout(3000);
+
+  } finally {
+    await context.close();
+  }
+});

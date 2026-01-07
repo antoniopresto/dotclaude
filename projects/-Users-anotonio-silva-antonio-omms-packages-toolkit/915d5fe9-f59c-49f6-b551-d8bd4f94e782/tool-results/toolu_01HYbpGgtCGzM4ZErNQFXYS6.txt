@@ -1,0 +1,361 @@
+     1→import { produce } from 'immer';
+     2→
+     3→import {
+     4→  assertObject,
+     5→  flatRecordRecords,
+     6→  objectEntries,
+     7→} from '../helpers/object-utils';
+     8→
+     9→import { Cache } from './cache';
+    10→import { Context } from './context';
+    11→import { GLOBAL_APP_SESSION_ID } from './helpers';
+    12→
+    13→import {
+    14→  CombineSlicesContext,
+    15→  CombineSlicesState,
+    16→  MachineAction,
+    17→  MachineConfig,
+    18→  MachineMetadata,
+    19→  MachineReducer,
+    20→  MachineSelectors,
+    21→  MachineSlices,
+    22→  MachineState,
+    23→  MachineUserID,
+    24→  METADATA_FIELD_NAME,
+    25→  SliceContext,
+    26→  StateMachine,
+    27→  StringTypes,
+    28→  UpsertMetadataOperation,
+    29→} from './models';
+    30→
+    31→import { capitalize } from '../helpers/string-utils';
+    32→import { Hooks } from './hooks';
+    33→import { Slices } from './slice';
+    34→import { Store } from './store';
+    35→
+    36→export namespace Machine {
+    37→  export function GetSelectorsWrapper(params: {
+    38→    selectors: MachineSelectors<any> | undefined;
+    39→  }) {
+    40→    const { selectors } = params;
+    41→    const selectorEntries = selectors ? objectEntries(selectors) : null;
+    42→    return function injectSelectorValues(state: MachineState) {
+    43→      if (!selectorEntries?.length) return state;
+    44→      return produce(state, draft => {
+    45→        selectorEntries.forEach(([key, fn]) => {
+    46→          draft[key] = fn(draft);
+    47→        });
+    48→      });
+    49→    };
+    50→  }
+    51→
+    52→  export function UpsertStateMetadata(params: {
+    53→    operation: UpsertMetadataOperation;
+    54→    userID: MachineUserID;
+    55→    mappedSlices: Slices.SlicesMap;
+    56→    currentSessionID: string;
+    57→  }) {
+    58→    const { operation, userID, mappedSlices, currentSessionID } = params;
+    59→
+    60→    if (operation.op === 'update') {
+    61→      const { originActionType, state, override } = operation;
+    62→      const previousMetadata = state[METADATA_FIELD_NAME] as MachineMetadata;
+    63→
+    64→      assertObject(
+    65→        previousMetadata,
+    66→        'UpsertStateMetadata failed. No metadata found in state.',
+    67→      );
+    68→
+    69→      const meta = {
+    70→        /** NOT updated fields, used for cache invalidation **/
+    71→        userID: previousMetadata.userID, // not updated, used by cache strategy
+    72→        startedAt: previousMetadata.startedAt, // not updated, used by cache strategy
+    73→        slicesCacheStrategy: previousMetadata.slicesCacheStrategy, // not updated, used by cache strategy
+    74→        sessionID: previousMetadata.sessionID, // not updated, used by cache strategy
+    75→        /** Updated fields **/
+    76→        updatedByActionType: originActionType,
+    77→        changes: previousMetadata.changes + 1,
+    78→        updatedAt: Date.now(),
+    79→        ...override,
+    80→      } satisfies MachineMetadata;
+    81→
+    82→      return {
+    83→        ...state,
+    84→        [METADATA_FIELD_NAME]: meta,
+    85→      };
+    86→    }
+    87→
+    88→    // Handling new state
+    89→    // prettier-ignore
+    90→    const slicesCacheStrategy = {} as MachineMetadata['slicesCacheStrategy'];
+    91→
+    92→    for (let { slice, sliceKey } of mappedSlices.info) {
+    93→      slicesCacheStrategy[sliceKey] = slice['cache'];
+    94→    }
+    95→
+    96→    const { state, override } = operation;
+    97→    const now = new Date().getTime();
+    98→
+    99→    const metadata: MachineMetadata = {
+   100→      userID,
+   101→      updatedAt: now,
+   102→      startedAt: now,
+   103→      updatedByActionType: '',
+   104→      changes: 0,
+   105→      slicesCacheStrategy,
+   106→      sessionID: currentSessionID,
+   107→      ...override,
+   108→    };
+   109→
+   110→    return {
+   111→      ...state,
+   112→      [METADATA_FIELD_NAME]: metadata,
+   113→    };
+   114→  }
+   115→
+   116→  export function RootReducer(params: {
+   117→    mappedSlices: Slices.SlicesMap;
+   118→    selectors: MachineSelectors<any> | undefined;
+   119→    getContext: () => SliceContext;
+   120→    getInitialState: () => MachineState;
+   121→    machineID: string;
+   122→    sessionID: string; // current sessionID
+   123→  }): MachineReducer<any> {
+   124→    const {
+   125→      machineID,
+   126→      getContext,
+   127→      getInitialState,
+   128→      selectors,
+   129→      mappedSlices,
+   130→      sessionID,
+   131→    } = params;
+   132→
+   133→    const withSelectorValues = GetSelectorsWrapper({ selectors });
+   134→
+   135→    return function reducer(rootState = getInitialState(), action) {
+   136→      if (action.type === `@@${machineID}/reset`) {
+   137→        return action.payload;
+   138→      }
+   139→
+   140→      // prettier-ignore
+   141→      const reducer = mappedSlices.reducerByActionType[action.type as StringTypes.ActionType];
+   142→
+   143→      if (!reducer) {
+   144→        return rootState;
+   145→      }
+   146→
+   147→      const sliceKey = reducer.info.sliceKey;
+   148→      const previousSliceState = rootState[sliceKey] as MachineState;
+   149→      const nextSliceState = reducer(previousSliceState, action);
+   150→
+   151→      if (previousSliceState === nextSliceState) {
+   152→        return rootState;
+   153→      }
+   154→
+   155→      let next = {
+   156→        ...rootState,
+   157→        [sliceKey]: nextSliceState,
+   158→      };
+   159→
+   160→      next = UpsertStateMetadata({
+   161→        currentSessionID: sessionID,
+   162→        mappedSlices,
+   163→        userID: getContext().userID,
+   164→        operation: {
+   165→          op: 'update',
+   166→          state: next,
+   167→          originActionType: action.type,
+   168→          override: {},
+   169→        },
+   170→      });
+   171→
+   172→      return withSelectorValues(next);
+   173→    };
+   174→  }
+   175→
+   176→  /**
+   177→   * Factory function to create a new state machine definition.
+   178→   * @returns A frozen, read-only state machine definition object.
+   179→   * @param config
+   180→   */
+   181→  export function Create<
+   182→    const Slices extends MachineSlices,
+   183→    const Selectors extends MachineSelectors<CombineSlicesState<Slices>>,
+   184→    const State extends CombineSlicesState<Slices>,
+   185→    const Context extends CombineSlicesContext<Slices>,
+   186→    const ID extends string,
+   187→  >(
+   188→    config: MachineConfig<Slices, State, Selectors, Context, ID>,
+   189→  ): StateMachine<Slices, State, Selectors, Context, ID> {
+   190→    /**
+   191→     * Internal values
+   192→     */
+   193→    const {
+   194→      id: ID,
+   195→      slices,
+   196→      sessionID: currentSessionID = GLOBAL_APP_SESSION_ID,
+   197→    } = config;
+   198→
+   199→    const mappedSlices = Slices.MapSlices(ID, slices);
+   200→
+   201→    const context = Context.Handler({
+   202→      ...mappedSlices.mergedSlicesInitialContext,
+   203→      ...config.context,
+   204→    });
+   205→
+   206→    let cacheInvalidationsReport: Cache.StateInvalidationsReport | null = null;
+   207→
+   208→    let initialState = (() => {
+   209→      const { initial, selectors } = config;
+   210→      const injectSelectorValues = GetSelectorsWrapper({ selectors });
+   211→
+   212→      const oldMetadata = initial?.[METADATA_FIELD_NAME];
+   213→
+   214→      let state = {
+   215→        ...mappedSlices.mergedSlicesInitialState,
+   216→        ...initial,
+   217→      };
+   218→
+   219→      if (!oldMetadata) {
+   220→        state = UpsertStateMetadata({
+   221→          userID: config.context?.userID,
+   222→          currentSessionID,
+   223→          mappedSlices,
+   224→          operation: {
+   225→            op: 'create',
+   226→            state,
+   227→            override: {},
+   228→          },
+   229→        });
+   230→        return injectSelectorValues(state);
+   231→      }
+   232→
+   233→      cacheInvalidationsReport = Cache.StateInvalidations({
+   234→        mappedSlices,
+   235→        currentSessionID,
+   236→        getContext: context.get,
+   237→        cachedState: initial,
+   238→        cachedMetadata: oldMetadata,
+   239→      });
+   240→
+   241→      state = cacheInvalidationsReport.cleanState;
+   242→
+   243→      state = UpsertStateMetadata({
+   244→        userID: config.context?.userID,
+   245→        currentSessionID,
+   246→        mappedSlices,
+   247→        operation: {
+   248→          op: 'update',
+   249→          originActionType: `@@${ID}/remove_invalid_cache`,
+   250→          state,
+   251→          override: {},
+   252→        },
+   253→      });
+   254→
+   255→      return injectSelectorValues(state);
+   256→    })();
+   257→
+   258→    const getInitialState = () => initialState;
+   259→
+   260→    const reducer = RootReducer({
+   261→      machineID: ID,
+   262→      selectors: config.selectors,
+   263→      getInitialState,
+   264→      getContext: context.get,
+   265→      mappedSlices,
+   266→      sessionID: currentSessionID,
+   267→    });
+   268→
+   269→    // prettier-ignore
+   270→    const { actionCreatorsSliceKey, info, actionTypesBySliceKey } = mappedSlices;
+   271→
+   272→    type Machine = StateMachine<Slices, State, Selectors, Context, ID>;
+   273→
+   274→    const store = Store.create({
+   275→      reducer,
+   276→      getInitialState,
+   277→      machineID: ID,
+   278→    });
+   279→
+   280→    const stale = cacheInvalidationsReport?.stale.length
+   281→      ? [...cacheInvalidationsReport.stale]
+   282→      : null;
+   283→
+   284→    if (stale) {
+   285→      let handled = false;
+   286→      store.subscribe(() => {
+   287→        if (handled) return;
+   288→        handled = true;
+   289→        store.dispatch({
+   290→          type: `@@${ID}/refetch_stale_slices`,
+   291→          payload: stale,
+   292→        });
+   293→        cacheInvalidationsReport!.stale.length = 0;
+   294→      });
+   295→    }
+   296→
+   297→    const { useMachine, useSelector } = Hooks({
+   298→      mappedSlices: mappedSlices,
+   299→      machineID: ID,
+   300→      getContext: context.get,
+   301→      store,
+   302→    });
+   303→
+   304→    return {
+   305→      ID,
+   306→      config,
+   307→      invalidations: cacheInvalidationsReport ?? null,
+   308→      [`${ID}Reducer`]: reducer,
+   309→      [`${ID}Actions`]: flatRecordRecords(ID, actionCreatorsSliceKey),
+   310→      [`${ID}ActionTypes`]: flatRecordRecords(ID, actionTypesBySliceKey),
+   311→      [`use${capitalize(ID)}`]: useMachine,
+   312→      [`use${capitalize(ID)}Selector`]: useSelector,
+   313→      useMachine,
+   314→      useSelector,
+   315→      mappedSlices: info,
+   316→      reducer,
+   317→      actions: actionCreatorsSliceKey,
+   318→      actionTypes: actionTypesBySliceKey,
+   319→      reset() {
+   320→        store.dispatch({
+   321→          type: `@@${ID}/reset`,
+   322→          payload: getInitialState(),
+   323→        });
+   324→      },
+   325→      subscribe(listener: Store.Listener<State>) {
+   326→        return store.subscribe(listener as never);
+   327→      },
+   328→      getState() {
+   329→        return store.getState();
+   330→      },
+   331→      dispatch(action: MachineAction) {
+   332→        return store.dispatch(action);
+   333→      },
+   334→      getContext() {
+   335→        return context.get() as Context;
+   336→      },
+   337→      getInitialState() {
+   338→        return getInitialState();
+   339→      },
+   340→      provideContext(value: SliceContext) {
+   341→        context.assign(value);
+   342→        const metadata = initialState[METADATA_FIELD_NAME] as MachineMetadata;
+   343→        assertObject(metadata, 'Metadata was not provided by initialState');
+   344→        initialState = {
+   345→          ...initialState,
+   346→          [METADATA_FIELD_NAME]: {
+   347→            ...metadata,
+   348→            userID: context.get().userID,
+   349→          },
+   350→        };
+   351→      },
+   352→    } as Machine;
+   353→  }
+   354→}
+   355→
+   356→export const createMachine = Machine.Create;
+   357→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

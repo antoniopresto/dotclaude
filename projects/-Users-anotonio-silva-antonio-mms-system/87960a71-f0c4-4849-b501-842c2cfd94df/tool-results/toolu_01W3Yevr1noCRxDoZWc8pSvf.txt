@@ -1,0 +1,262 @@
+     1→# Notes for Claude - Future Reference
+     2→
+     3→This file contains learnings, gotchas, and solutions discovered during development. Read this to avoid repeating past mistakes.
+     4→
+     5→---
+     6→
+     7→## CRITICAL: Git Repository Check
+     8→
+     9→### Incident: 2025-12-17 - Missing Git Repository
+    10→
+    11→**What happened:**
+    12→The project was copied from `/mms/system/` to `/mms/deck/` WITHOUT the `.git` directory.
+    13→This broke the Harness protocol because:
+    14→- Commits couldn't be made
+    15→- Changes couldn't be reverted
+    16→- History was lost
+    17→
+    18→**How it was discovered:**
+    19→- `git status` returned "fatal: not a git repository"
+    20→- But `claude-progress.txt` referenced previous commits like `0f260d4`
+    21→
+    22→**Solution:**
+    23→```bash
+    24→# Copy .git from original project
+    25→cp -r /mms/system/.git /mms/deck/.git
+    26→git status  # Verify restoration
+    27→```
+    28→
+    29→**Prevention:**
+    30→1. **ALWAYS run `git status` at session start** - init.sh already does this
+    31→2. **If copying a project, ALWAYS include .git**: `cp -r project project-copy`
+    32→3. **Never use `cp -r` without .git** - use `git clone` or `git worktree` instead
+    33→4. **Add to init.sh**: Fail if not a git repository (not just warn)
+    34→
+    35→---
+    36→
+    37→## Technology-Specific Notes
+    38→
+    39→### React Three Fiber (R3F)
+    40→
+    41→#### Key Learning
+    42→R3F v9 has significant API changes from v8. Always check the latest documentation.
+    43→
+    44→#### Common Pitfalls
+    45→- Never use `useFrame` outside of Canvas context
+    46→- `Html` component from drei requires `transform` prop for 3D positioning
+    47→- InstancedMesh color changes require `needsUpdate = true` on the attribute
+    48→
+    49→#### Correct Usage
+    50→```typescript
+    51→// Correct way to update InstancedMesh colors
+    52→mesh.instanceColor!.needsUpdate = true;
+    53→
+    54→// Correct Html positioning in 3D
+    55→<Html position={[x, y, z]} transform occlude={false}>
+    56→  <div>Content</div>
+    57→</Html>
+    58→```
+    59→
+    60→---
+    61→
+    62→### Three.js Shaders (GLSL)
+    63→
+    64→#### Key Learning
+    65→Fragment shaders for heatmaps need careful color interpolation.
+    66→
+    67→#### Correct Usage
+    68→```glsl
+    69→// Color ramp for heatmap (Yellow → Orange → Red)
+    70→vec3 ramp(float t) {
+    71→  vec3 a = vec3(1.0, 0.95, 0.5); // light yellow
+    72→  vec3 b = vec3(1.0, 0.6, 0.0);  // orange
+    73→  vec3 c = vec3(0.85, 0.0, 0.0); // red
+    74→  return mix(mix(a, b, smoothstep(0.0, 0.5, t)), c, smoothstep(0.5, 1.0, t));
+    75→}
+    76→```
+    77→
+    78→---
+    79→
+    80→### Bun Workspaces / Monorepo
+    81→
+    82→#### Key Learning
+    83→Bun workspaces require proper package.json structure and cross-package imports.
+    84→
+    85→#### Important Configuration
+    86→```json
+    87→{
+    88→  "workspaces": ["packages/*", "apps/*"]
+    89→}
+    90→```
+    91→
+    92→#### CRITICAL: Running Scripts in Monorepos
+    93→
+    94→**If root scripts fail, try the direct approach:**
+    95→
+    96→```bash
+    97→# This ALWAYS works:
+    98→cd apps/canvas && bun run dev
+    99→
+   100→# Or check what the package is actually named:
+   101→cat apps/canvas/package.json | grep '"name"'
+   102→```
+   103→
+   104→#### Common Pitfalls
+   105→- **Never assume root scripts work** - verify first with `./init.sh --no-server`
+   106→- Root scripts use filters that must match exact package names
+   107→- Always use `bun add` from the correct directory
+   108→- Cross-package imports need proper exports in package.json
+   109→- Run `bun i` from root after adding new packages
+   110→
+   111→---
+   112→
+   113→## Package/Library Notes
+   114→
+   115→### @react-three/drei
+   116→
+   117→#### IMPORTANT: Html Component
+   118→
+   119→**Correct import**: `import { Html } from '@react-three/drei'`
+   120→
+   121→#### Why this matters
+   122→The Html component bridges WebGL and DOM, allowing real HTML elements to be positioned in 3D space.
+   123→
+   124→#### Correct usage
+   125→```tsx
+   126→<Html 
+   127→  position={[x, y, z]} 
+   128→  transform 
+   129→  occlude={false}
+   130→  style={{ pointerEvents: 'auto' }}
+   131→>
+   132→  <div tabIndex={0} role="button">
+   133→    Clickable content
+   134→  </div>
+   135→</Html>
+   136→```
+   137→
+   138→---
+   139→
+   140→### three-stdlib
+   141→
+   142→#### IMPORTANT: Line2 for Fat Lines
+   143→
+   144→**Correct import**: `import { Line2, LineGeometry, LineMaterial } from 'three-stdlib'`
+   145→
+   146→#### Why this matters
+   147→Standard Three.js Line has 1px width limit. Line2 supports variable width.
+   148→
+   149→#### Correct usage
+   150→```typescript
+   151→const geometry = new LineGeometry();
+   152→geometry.setPositions([x1, y1, z1, x2, y2, z2]);
+   153→
+   154→const material = new LineMaterial({
+   155→  color: 0x3b82f6,
+   156→  linewidth: 2,
+   157→  resolution: new Vector2(window.innerWidth, window.innerHeight)
+   158→});
+   159→```
+   160→
+   161→---
+   162→
+   163→## Error Solutions
+   164→
+   165→### Error: "No packages matched the filter" (Bun monorepo)
+   166→**Cause**: Root script uses `--filter` with wrong package name
+   167→**Solution**:
+   168→1. Check actual package name: `cat apps/canvas/package.json | grep '"name"'`
+   169→2. Run directly in the app folder: `cd apps/canvas && bun run dev`
+   170→3. Or fix the filter in root package.json to match the actual package name
+   171→
+   172→### Error: "Cannot use import statement outside a module"
+   173→**Cause**: Package trying to use CommonJS in ESM context
+   174→**Solution**: Ensure `"type": "module"` in package.json, use proper imports
+   175→
+   176→### Error: "useFrame must be called inside Canvas"
+   177→**Cause**: React hook called outside R3F context
+   178→**Solution**: Move component inside `<Canvas>` or pass state via props/context
+   179→
+   180→### Error: "THREE.WebGLRenderer: Context Lost"
+   181→**Cause**: GPU memory exhausted or too many textures
+   182→**Solution**: Dispose unused textures, reduce DataTexture size, check for memory leaks
+   183→
+   184→### Error: InstancedMesh colors not updating
+   185→**Cause**: Buffer attribute not marked for update
+   186→**Solution**: Set `mesh.instanceColor!.needsUpdate = true` after changing colors
+   187→
+   188→---
+   189→
+   190→## General Rules
+   191→
+   192→1. **Always research official documentation** before trying to resolve import/ESM errors
+   193→2. **Check for alternative versions** of packages for different bundlers
+   194→3. **Don't remove dependencies** the user explicitly requested - find the correct way to use them
+   195→4. **Test after every change** - don't batch multiple changes
+   196→5. **Commit frequently** - small, focused commits are better than large ones
+   197→6. **Use bun add** - never manually edit package.json for dependencies
+   198→
+   199→---
+   200→
+   201→## Project-Specific Gotchas
+   202→
+   203→### LOD State Machine
+   204→The LOD (Level of Detail) is controlled by zoom level:
+   205→- `zoom < 0.5` → 'macro' (shader heatmap)
+   206→- `0.5 ≤ zoom ≤ 2.0` → 'meso' (InstancedMesh)
+   207→- `zoom > 2.0` → 'micro' (HTML overlay)
+   208→
+   209→### Virtual Scroll Sync
+   210→Sidebar scroll is synced with camera Y using:
+   211→```typescript
+   212→const PX_PER_TRAIN = 24;
+   213→// DOM → Camera
+   214→const y = -el.scrollTop / PX_PER_TRAIN;
+   215→// Camera → DOM
+   216→el.scrollTop = -viewport.y * PX_PER_TRAIN;
+   217→```
+   218→
+   219→### Spatial Hash Grid
+   220→MesoLayer uses spatial hashing for O(1) instance picking:
+   221→- Grid cell size matches task dimensions
+   222→- Hash key: `${Math.floor(x / cellSize)}_${Math.floor(y / cellSize)}`
+   223→
+   224→---
+   225→
+   226→## Useful Commands
+   227→
+   228→```bash
+   229→# Install all workspace dependencies
+   230→bun i
+   231→
+   232→# Start development server
+   233→bun run dev
+   234→
+   235→# Type check all packages
+   236→bun run typecheck
+   237→
+   238→# Build for production
+   239→bun run build
+   240→
+   241→# Check git status
+   242→git status
+   243→
+   244→# View recent commits
+   245→git --no-pager log --oneline -10
+   246→```
+   247→
+   248→---
+   249→
+   250→## Resources
+   251→
+   252→- [React Three Fiber Docs](https://docs.pmnd.rs/react-three-fiber)
+   253→- [Drei Docs](https://github.com/pmndrs/drei)
+   254→- [Three.js Docs](https://threejs.org/docs/)
+   255→- [BlueprintJS Docs](https://blueprintjs.com/docs/)
+   256→- [Bun Docs](https://bun.sh/docs)
+   257→- [Vite Docs](https://vitejs.dev/guide/)
+   258→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

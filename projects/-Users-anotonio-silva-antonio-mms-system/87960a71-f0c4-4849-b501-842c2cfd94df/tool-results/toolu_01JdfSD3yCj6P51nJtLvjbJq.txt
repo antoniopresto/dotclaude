@@ -1,0 +1,233 @@
+     1→"""
+     2→MMS - Metro Mileage Management System
+     3→Python Solver Service using Google OR-Tools CP-SAT
+     4→
+     5→This service provides train allocation recommendations
+     6→optimized for mileage balancing using real CP-SAT optimization.
+     7→"""
+     8→
+     9→from contextlib import asynccontextmanager
+    10→from datetime import datetime
+    11→from fastapi import FastAPI, HTTPException
+    12→from fastapi.middleware.cors import CORSMiddleware
+    13→import ortools
+    14→
+    15→from .models.schemas import (
+    16→    RecommendationRequest,
+    17→    RecommendationResponse,
+    18→    SimulationRequest,
+    19→    SimulationResponse,
+    20→    AllocationChange,
+    21→)
+    22→from .db.client import db
+    23→from .engine.allocator import generate_recommendations
+    24→from .engine.simulator import simulate_allocations
+    25→
+    26→
+    27→@asynccontextmanager
+    28→async def lifespan(app: FastAPI):
+    29→    """Manage database connection lifecycle."""
+    30→    await db.connect()
+    31→    yield
+    32→    await db.close()
+    33→
+    34→
+    35→app = FastAPI(
+    36→    title="MMS Solver Service",
+    37→    description="Train allocation optimization using OR-Tools CP-SAT",
+    38→    version="1.0.0",
+    39→    lifespan=lifespan,
+    40→)
+    41→
+    42→# CORS for API server access
+    43→app.add_middleware(
+    44→    CORSMiddleware,
+    45→    allow_origins=[
+    46→        "http://localhost:3000",  # Web frontend
+    47→        "http://localhost:4000",  # API server
+    48→    ],
+    49→    allow_credentials=True,
+    50→    allow_methods=["*"],
+    51→    allow_headers=["*"],
+    52→)
+    53→
+    54→
+    55→@app.get("/health")
+    56→async def health():
+    57→    """Health check endpoint with OR-Tools version."""
+    58→    return {
+    59→        "status": "ok",
+    60→        "service": "mms-solver",
+    61→        "ortools_version": ortools.__version__,
+    62→        "timestamp": datetime.utcnow().isoformat(),
+    63→    }
+    64→
+    65→
+    66→@app.post("/recommend", response_model=RecommendationResponse)
+    67→async def recommend(request: RecommendationRequest):
+    68→    """
+    69→    Generate train recommendations for a service using CP-SAT optimization.
+    70→
+    71→    The solver optimizes for:
+    72→    1. Km balancing - prioritize underutilized trains
+    73→    2. Dead running - minimize empty travel distance
+    74→    3. Maintenance proximity - consider upcoming maintenance
+    75→    """
+    76→    try:
+    77→        # Parse date
+    78→        allocation_date = datetime.strptime(request.date, "%Y-%m-%d").date()
+    79→
+    80→        # Get service details
+    81→        service = await db.get_service(request.service_id)
+    82→        if not service:
+    83→            raise HTTPException(status_code=404, detail="Service not found")
+    84→
+    85→        # Get available trains
+    86→        trains = await db.get_available_trains(allocation_date)
+    87→        if not trains:
+    88→            return RecommendationResponse(
+    89→                recommendations=[],
+    90→                solver_time_ms=0,
+    91→                constraints_satisfied=False,
+    92→                warning="No trains available for this date"
+    93→            )
+    94→
+    95→        # Get fleet average km (use first train's fleet)
+    96→        fleet_id = trains[0].get('fleet_id') if trains else None
+    97→        fleet_avg_km = 0.0
+    98→        if fleet_id:
+    99→            fleet_avg_km = await db.get_fleet_average_km(str(fleet_id))
+   100→
+   101→        # Get upcoming maintenance for each train
+   102→        upcoming_maintenance = {}
+   103→        for train in trains:
+   104→            maint = await db.get_upcoming_maintenance(str(train['id']))
+   105→            if maint:
+   106→                upcoming_maintenance[str(train['id'])] = maint
+   107→
+   108→        # Run CP-SAT solver
+   109→        recommendations, solver_time = generate_recommendations(
+   110→            trains=trains,
+   111→            service=service,
+   112→            fleet_avg_km=fleet_avg_km,
+   113→            upcoming_maintenance=upcoming_maintenance,
+   114→            top_n=5
+   115→        )
+   116→
+   117→        return RecommendationResponse(
+   118→            recommendations=recommendations,
+   119→            solver_time_ms=solver_time,
+   120→            constraints_satisfied=True
+   121→        )
+   122→
+   123→    except HTTPException:
+   124→        raise
+   125→    except Exception as e:
+   126→        raise HTTPException(status_code=500, detail=str(e))
+   127→
+   128→
+   129→@app.post("/simulate", response_model=SimulationResponse)
+   130→async def simulate(request: SimulationRequest):
+   131→    """
+   132→    Run a what-if simulation for allocation changes.
+   133→
+   134→    Projects the impact of allocation changes over the specified
+   135→    number of days, calculating:
+   136→    - Projected km variance
+   137→    - Total dead running
+   138→    - Affected trains count
+   139→    - Km spread improvement
+   140→    """
+   141→    try:
+   142→        # Get current km values for all trains
+   143→        trains_km = await db.get_all_trains_km()
+   144→        if not trains_km:
+   145→            raise HTTPException(
+   146→                status_code=404,
+   147→                detail="No trains found in database"
+   148→            )
+   149→
+   150→        # Convert request changes to internal format
+   151→        changes = [
+   152→            AllocationChange(
+   153→                service_id=c.service_id,
+   154→                service_code=c.service_code,
+   155→                original_train_id=c.original_train_id,
+   156→                new_train_id=c.new_train_id,
+   157→                service_km=c.service_km
+   158→            )
+   159→            for c in request.changes
+   160→        ]
+   161→
+   162→        # Run simulation
+   163→        result = simulate_allocations(
+   164→            trains_km=trains_km,
+   165→            changes=changes,
+   166→            projection_days=request.projection_days
+   167→        )
+   168→
+   169→        # Override scenario_id with request's
+   170→        result.scenario_id = request.scenario_id
+   171→
+   172→        return result
+   173→
+   174→    except HTTPException:
+   175→        raise
+   176→    except Exception as e:
+   177→        raise HTTPException(status_code=500, detail=str(e))
+   178→
+   179→
+   180→@app.get("/trains/stats")
+   181→async def train_stats():
+   182→    """
+   183→    Get aggregate statistics for all trains.
+   184→    Useful for dashboard and balancing analysis.
+   185→    """
+   186→    try:
+   187→        trains_km = await db.get_all_trains_km()
+   188→        if not trains_km:
+   189→            return {
+   190→                "total_trains": 0,
+   191→                "avg_km": 0,
+   192→                "min_km": 0,
+   193→                "max_km": 0,
+   194→                "variance_pct": 0
+   195→            }
+   196→
+   197→        km_values = [t['current_km'] for t in trains_km]
+   198→
+   199→        import statistics
+   200→        avg_km = statistics.mean(km_values)
+   201→        variance_pct = 0.0
+   202→        if avg_km > 0 and len(km_values) > 1:
+   203→            std_dev = statistics.stdev(km_values)
+   204→            variance_pct = (std_dev / avg_km) * 100
+   205→
+   206→        return {
+   207→            "total_trains": len(trains_km),
+   208→            "avg_km": round(avg_km, 0),
+   209→            "min_km": min(km_values),
+   210→            "max_km": max(km_values),
+   211→            "variance_pct": round(variance_pct, 1),
+   212→            "trains": [
+   213→                {
+   214→                    "train_id": t['train_id'],
+   215→                    "current_km": t['current_km'],
+   216→                    "fleet": t.get('fleet_name', 'Unknown')
+   217→                }
+   218→                for t in sorted(trains_km, key=lambda x: x['current_km'])
+   219→            ]
+   220→        }
+   221→
+   222→    except Exception as e:
+   223→        raise HTTPException(status_code=500, detail=str(e))
+   224→
+   225→
+   226→if __name__ == "__main__":
+   227→    import uvicorn
+   228→    uvicorn.run(app, host="0.0.0.0", port=8000)
+   229→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

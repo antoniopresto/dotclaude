@@ -1,0 +1,700 @@
+     1→//! Database schema initialization and migrations.
+     2→//!
+     3→//! This module contains the SQLite schema definition for the Harness storage layer.
+     4→//! Key features:
+     5→//! - WAL mode for better concurrency
+     6→//! - FTS5 virtual tables for full-text search
+     7→//! - Triggers to sync FTS5 with source tables
+     8→//! - Schema versioning for migrations
+     9→
+    10→use rusqlite::Connection;
+    11→
+    12→use super::DbResult;
+    13→
+    14→/// Current schema version (semantic versioning).
+    15→pub const SCHEMA_VERSION: &str = "1.0.0";
+    16→
+    17→/// SQLite pragmas to run on every connection.
+    18→pub const PRAGMAS: &str = r#"
+    19→PRAGMA journal_mode = WAL;
+    20→PRAGMA synchronous = NORMAL;
+    21→PRAGMA foreign_keys = OFF;
+    22→"#;
+    23→
+    24→/// Core schema creation SQL.
+    25→pub const SCHEMA_SQL: &str = r#"
+    26→-- ============================================================================
+    27→-- SCHEMA METADATA
+    28→-- ============================================================================
+    29→CREATE TABLE IF NOT EXISTS schema_metadata (
+    30→    key TEXT PRIMARY KEY,
+    31→    value TEXT NOT NULL
+    32→) WITHOUT ROWID;
+    33→
+    34→-- ============================================================================
+    35→-- CORE TABLES
+    36→-- ============================================================================
+    37→
+    38→-- Project Tasks (replaces features.json)
+    39→CREATE TABLE IF NOT EXISTS project_tasks (
+    40→    id TEXT PRIMARY KEY CHECK(length(id) = 26),
+    41→    title TEXT NOT NULL,
+    42→    description TEXT,
+    43→    status TEXT NOT NULL DEFAULT 'BACKLOG'
+    44→        CHECK(status IN ('BACKLOG', 'TODO', 'DOING', 'REVIEW', 'QA', 'DONE')),
+    45→    category TEXT,
+    46→    sort_order REAL NOT NULL DEFAULT 0.0,
+    47→    is_passed TEXT NOT NULL DEFAULT 'false'
+    48→        CHECK(is_passed IN ('true', 'false')),
+    49→    created_at TEXT NOT NULL,
+    50→    updated_at TEXT NOT NULL
+    51→);
+    52→
+    53→-- Task Steps (checklist items within a task)
+    54→-- ID format: task#{task_ulid}#{step_ulid}
+    55→CREATE TABLE IF NOT EXISTS task_steps (
+    56→    id TEXT PRIMARY KEY,
+    57→    description TEXT NOT NULL,
+    58→    is_completed TEXT NOT NULL DEFAULT 'false'
+    59→        CHECK(is_completed IN ('true', 'false')),
+    60→    created_at TEXT NOT NULL
+    61→) WITHOUT ROWID;
+    62→
+    63→-- Work Sessions (AI/human work periods)
+    64→CREATE TABLE IF NOT EXISTS work_sessions (
+    65→    id TEXT PRIMARY KEY CHECK(length(id) = 26),
+    66→    summary TEXT,
+    67→    started_at TEXT NOT NULL,
+    68→    ended_at TEXT
+    69→);
+    70→
+    71→-- Project Progress (session log entries)
+    72→-- ID format: session#{session_ulid}#{progress_ulid}
+    73→-- Note: No WITHOUT ROWID - needs implicit rowid for FTS5 sync
+    74→CREATE TABLE IF NOT EXISTS project_progress (
+    75→    id TEXT PRIMARY KEY,
+    76→    content TEXT NOT NULL,
+    77→    created_at TEXT NOT NULL
+    78→);
+    79→
+    80→-- Test Screenshots (F015)
+    81→-- Stores metadata for visual test screenshots
+    82→CREATE TABLE IF NOT EXISTS test_screenshots (
+    83→    id TEXT PRIMARY KEY CHECK(length(id) = 26),
+    84→    task_id TEXT,
+    85→    step_id TEXT,
+    86→    file_name TEXT NOT NULL,
+    87→    caption TEXT,
+    88→    created_at TEXT NOT NULL,
+    89→    FOREIGN KEY (task_id) REFERENCES project_tasks(id) ON DELETE CASCADE
+    90→);
+    91→
+    92→-- ============================================================================
+    93→-- INDEXES
+    94→-- ============================================================================
+    95→
+    96→CREATE INDEX IF NOT EXISTS idx_test_screenshots_task_id ON test_screenshots(task_id);
+    97→CREATE INDEX IF NOT EXISTS idx_test_screenshots_created_at ON test_screenshots(created_at);
+    98→CREATE INDEX IF NOT EXISTS idx_project_tasks_status ON project_tasks(status);
+    99→CREATE INDEX IF NOT EXISTS idx_project_tasks_sort_order ON project_tasks(sort_order);
+   100→CREATE INDEX IF NOT EXISTS idx_project_tasks_created_at ON project_tasks(created_at);
+   101→CREATE INDEX IF NOT EXISTS idx_work_sessions_started_at ON work_sessions(started_at);
+   102→"#;
+   103→
+   104→/// FTS5 virtual tables for full-text search.
+   105→pub const FTS5_SCHEMA_SQL: &str = r#"
+   106→-- ============================================================================
+   107→-- FULL-TEXT SEARCH (FTS5)
+   108→-- ============================================================================
+   109→
+   110→CREATE VIRTUAL TABLE IF NOT EXISTS project_tasks_fts USING fts5(
+   111→    title,
+   112→    description,
+   113→    category,
+   114→    content='project_tasks',
+   115→    content_rowid='rowid'
+   116→);
+   117→
+   118→CREATE VIRTUAL TABLE IF NOT EXISTS project_progress_fts USING fts5(
+   119→    content,
+   120→    content='project_progress',
+   121→    content_rowid='rowid'
+   122→);
+   123→"#;
+   124→
+   125→/// Triggers to keep FTS5 tables in sync with source tables.
+   126→pub const FTS5_TRIGGERS_SQL: &str = r#"
+   127→-- ============================================================================
+   128→-- FTS SYNC TRIGGERS: project_tasks
+   129→-- ============================================================================
+   130→
+   131→CREATE TRIGGER IF NOT EXISTS project_tasks_fts_insert AFTER INSERT ON project_tasks BEGIN
+   132→    INSERT INTO project_tasks_fts(rowid, title, description, category)
+   133→    VALUES (NEW.rowid, NEW.title, NEW.description, NEW.category);
+   134→END;
+   135→
+   136→CREATE TRIGGER IF NOT EXISTS project_tasks_fts_delete AFTER DELETE ON project_tasks BEGIN
+   137→    INSERT INTO project_tasks_fts(project_tasks_fts, rowid, title, description, category)
+   138→    VALUES('delete', OLD.rowid, OLD.title, OLD.description, OLD.category);
+   139→END;
+   140→
+   141→CREATE TRIGGER IF NOT EXISTS project_tasks_fts_update AFTER UPDATE ON project_tasks BEGIN
+   142→    INSERT INTO project_tasks_fts(project_tasks_fts, rowid, title, description, category)
+   143→    VALUES('delete', OLD.rowid, OLD.title, OLD.description, OLD.category);
+   144→    INSERT INTO project_tasks_fts(rowid, title, description, category)
+   145→    VALUES (NEW.rowid, NEW.title, NEW.description, NEW.category);
+   146→END;
+   147→
+   148→-- ============================================================================
+   149→-- FTS SYNC TRIGGERS: project_progress
+   150→-- ============================================================================
+   151→
+   152→CREATE TRIGGER IF NOT EXISTS project_progress_fts_insert AFTER INSERT ON project_progress BEGIN
+   153→    INSERT INTO project_progress_fts(rowid, content)
+   154→    VALUES (NEW.rowid, NEW.content);
+   155→END;
+   156→
+   157→CREATE TRIGGER IF NOT EXISTS project_progress_fts_delete AFTER DELETE ON project_progress BEGIN
+   158→    INSERT INTO project_progress_fts(project_progress_fts, rowid, content)
+   159→    VALUES('delete', OLD.rowid, OLD.content);
+   160→END;
+   161→
+   162→CREATE TRIGGER IF NOT EXISTS project_progress_fts_update AFTER UPDATE ON project_progress BEGIN
+   163→    INSERT INTO project_progress_fts(project_progress_fts, rowid, content)
+   164→    VALUES('delete', OLD.rowid, OLD.content);
+   165→    INSERT INTO project_progress_fts(rowid, content)
+   166→    VALUES (NEW.rowid, NEW.content);
+   167→END;
+   168→"#;
+   169→
+   170→/// Vector embedding tables for semantic search (sqlite-vec).
+   171→/// Uses AllMiniLML6V2 model which produces 384-dimensional embeddings.
+   172→pub const VEC_SCHEMA_SQL: &str = r#"
+   173→-- ============================================================================
+   174→-- VECTOR EMBEDDINGS (sqlite-vec)
+   175→-- ============================================================================
+   176→
+   177→-- Task embeddings (384 dims = AllMiniLML6V2)
+   178→-- rowid matches project_tasks.rowid for JOIN
+   179→CREATE VIRTUAL TABLE IF NOT EXISTS task_embeddings USING vec0(
+   180→    embedding float[384]
+   181→);
+   182→
+   183→-- Progress embeddings (384 dims = AllMiniLML6V2)
+   184→-- rowid matches project_progress.rowid for JOIN
+   185→CREATE VIRTUAL TABLE IF NOT EXISTS progress_embeddings USING vec0(
+   186→    embedding float[384]
+   187→);
+   188→"#;
+   189→
+   190→/// Initialize database schema.
+   191→///
+   192→/// Creates all tables, indexes, FTS5 virtual tables, vec0 tables, and triggers.
+   193→/// Safe to call multiple times (uses IF NOT EXISTS).
+   194→pub fn init_schema(conn: &Connection) -> DbResult<()> {
+   195→    // Execute pragmas
+   196→    conn.execute_batch(PRAGMAS)?;
+   197→
+   198→    // Create core tables and indexes
+   199→    conn.execute_batch(SCHEMA_SQL)?;
+   200→
+   201→    // Create FTS5 virtual tables
+   202→    conn.execute_batch(FTS5_SCHEMA_SQL)?;
+   203→
+   204→    // Create FTS sync triggers
+   205→    conn.execute_batch(FTS5_TRIGGERS_SQL)?;
+   206→
+   207→    // Create vec0 embedding tables (sqlite-vec)
+   208→    conn.execute_batch(VEC_SCHEMA_SQL)?;
+   209→
+   210→    // Insert or update schema version
+   211→    conn.execute(
+   212→        "INSERT OR REPLACE INTO schema_metadata (key, value) VALUES ('version', ?1)",
+   213→        [SCHEMA_VERSION],
+   214→    )?;
+   215→
+   216→    Ok(())
+   217→}
+   218→
+   219→/// Get the current schema version from the database.
+   220→pub fn get_schema_version(conn: &Connection) -> DbResult<Option<String>> {
+   221→    let result = conn.query_row(
+   222→        "SELECT value FROM schema_metadata WHERE key = 'version'",
+   223→        [],
+   224→        |row| row.get::<_, String>(0),
+   225→    );
+   226→
+   227→    match result {
+   228→        Ok(version) => Ok(Some(version)),
+   229→        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+   230→        Err(e) => Err(e.into()),
+   231→    }
+   232→}
+   233→
+   234→/// Check if schema is initialized.
+   235→pub fn is_initialized(conn: &Connection) -> bool {
+   236→    get_schema_version(conn).unwrap_or(None).is_some()
+   237→}
+   238→
+   239→/// Get list of all tables in the database.
+   240→pub fn list_tables(conn: &Connection) -> DbResult<Vec<String>> {
+   241→    let mut stmt = conn.prepare(
+   242→        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+   243→    )?;
+   244→
+   245→    let tables = stmt
+   246→        .query_map([], |row| row.get::<_, String>(0))?
+   247→        .collect::<Result<Vec<_>, _>>()?;
+   248→
+   249→    Ok(tables)
+   250→}
+   251→
+   252→/// Get list of all indexes in the database.
+   253→pub fn list_indexes(conn: &Connection) -> DbResult<Vec<String>> {
+   254→    let mut stmt = conn.prepare(
+   255→        "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+   256→    )?;
+   257→
+   258→    let indexes = stmt
+   259→        .query_map([], |row| row.get::<_, String>(0))?
+   260→        .collect::<Result<Vec<_>, _>>()?;
+   261→
+   262→    Ok(indexes)
+   263→}
+   264→
+   265→/// Get list of all triggers in the database.
+   266→pub fn list_triggers(conn: &Connection) -> DbResult<Vec<String>> {
+   267→    let mut stmt = conn.prepare(
+   268→        "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
+   269→    )?;
+   270→
+   271→    let triggers = stmt
+   272→        .query_map([], |row| row.get::<_, String>(0))?
+   273→        .collect::<Result<Vec<_>, _>>()?;
+   274→
+   275→    Ok(triggers)
+   276→}
+   277→
+   278→// =============================================================================
+   279→// TESTS
+   280→// =============================================================================
+   281→
+   282→#[cfg(test)]
+   283→mod tests {
+   284→    use super::*;
+   285→    use rusqlite::Connection;
+   286→
+   287→    fn create_test_db() -> Connection {
+   288→        // Register sqlite-vec extension before creating connection
+   289→        super::super::connection::register_sqlite_vec();
+   290→        Connection::open_in_memory().expect("Failed to create in-memory database")
+   291→    }
+   292→
+   293→    // -------------------------------------------------------------------------
+   294→    // Schema initialization tests
+   295→    // -------------------------------------------------------------------------
+   296→
+   297→    #[test]
+   298→    fn test_init_schema_creates_tables() {
+   299→        let conn = create_test_db();
+   300→        init_schema(&conn).expect("Failed to initialize schema");
+   301→
+   302→        let tables = list_tables(&conn).expect("Failed to list tables");
+   303→
+   304→        assert!(tables.contains(&"project_tasks".to_string()));
+   305→        assert!(tables.contains(&"task_steps".to_string()));
+   306→        assert!(tables.contains(&"work_sessions".to_string()));
+   307→        assert!(tables.contains(&"project_progress".to_string()));
+   308→        assert!(tables.contains(&"schema_metadata".to_string()));
+   309→    }
+   310→
+   311→    #[test]
+   312→    fn test_init_schema_creates_fts_tables() {
+   313→        let conn = create_test_db();
+   314→        init_schema(&conn).expect("Failed to initialize schema");
+   315→
+   316→        let tables = list_tables(&conn).expect("Failed to list tables");
+   317→
+   318→        assert!(tables.contains(&"project_tasks_fts".to_string()));
+   319→        assert!(tables.contains(&"project_progress_fts".to_string()));
+   320→    }
+   321→
+   322→    #[test]
+   323→    fn test_init_schema_creates_vec_tables() {
+   324→        let conn = create_test_db();
+   325→        init_schema(&conn).expect("Failed to initialize schema");
+   326→
+   327→        let tables = list_tables(&conn).expect("Failed to list tables");
+   328→
+   329→        assert!(tables.contains(&"task_embeddings".to_string()));
+   330→        assert!(tables.contains(&"progress_embeddings".to_string()));
+   331→    }
+   332→
+   333→    #[test]
+   334→    fn test_init_schema_creates_indexes() {
+   335→        let conn = create_test_db();
+   336→        init_schema(&conn).expect("Failed to initialize schema");
+   337→
+   338→        let indexes = list_indexes(&conn).expect("Failed to list indexes");
+   339→
+   340→        assert!(indexes.contains(&"idx_project_tasks_status".to_string()));
+   341→        assert!(indexes.contains(&"idx_project_tasks_sort_order".to_string()));
+   342→        assert!(indexes.contains(&"idx_project_tasks_created_at".to_string()));
+   343→        assert!(indexes.contains(&"idx_work_sessions_started_at".to_string()));
+   344→    }
+   345→
+   346→    #[test]
+   347→    fn test_init_schema_creates_triggers() {
+   348→        let conn = create_test_db();
+   349→        init_schema(&conn).expect("Failed to initialize schema");
+   350→
+   351→        let triggers = list_triggers(&conn).expect("Failed to list triggers");
+   352→
+   353→        // project_tasks triggers
+   354→        assert!(triggers.contains(&"project_tasks_fts_insert".to_string()));
+   355→        assert!(triggers.contains(&"project_tasks_fts_delete".to_string()));
+   356→        assert!(triggers.contains(&"project_tasks_fts_update".to_string()));
+   357→
+   358→        // project_progress triggers
+   359→        assert!(triggers.contains(&"project_progress_fts_insert".to_string()));
+   360→        assert!(triggers.contains(&"project_progress_fts_delete".to_string()));
+   361→        assert!(triggers.contains(&"project_progress_fts_update".to_string()));
+   362→    }
+   363→
+   364→    #[test]
+   365→    fn test_init_schema_sets_version() {
+   366→        let conn = create_test_db();
+   367→        init_schema(&conn).expect("Failed to initialize schema");
+   368→
+   369→        let version = get_schema_version(&conn).expect("Failed to get version");
+   370→        assert_eq!(version, Some(SCHEMA_VERSION.to_string()));
+   371→    }
+   372→
+   373→    #[test]
+   374→    fn test_init_schema_is_idempotent() {
+   375→        let conn = create_test_db();
+   376→
+   377→        // Call init_schema multiple times
+   378→        init_schema(&conn).expect("Failed to initialize schema first time");
+   379→        init_schema(&conn).expect("Failed to initialize schema second time");
+   380→        init_schema(&conn).expect("Failed to initialize schema third time");
+   381→
+   382→        // Should still have correct schema
+   383→        let tables = list_tables(&conn).expect("Failed to list tables");
+   384→        assert!(tables.contains(&"project_tasks".to_string()));
+   385→    }
+   386→
+   387→    #[test]
+   388→    fn test_is_initialized_false_for_empty_db() {
+   389→        let conn = create_test_db();
+   390→        assert!(!is_initialized(&conn));
+   391→    }
+   392→
+   393→    #[test]
+   394→    fn test_is_initialized_true_after_init() {
+   395→        let conn = create_test_db();
+   396→        init_schema(&conn).expect("Failed to initialize schema");
+   397→        assert!(is_initialized(&conn));
+   398→    }
+   399→
+   400→    // -------------------------------------------------------------------------
+   401→    // Table constraint tests
+   402→    // -------------------------------------------------------------------------
+   403→
+   404→    #[test]
+   405→    fn test_project_tasks_id_length_constraint() {
+   406→        let conn = create_test_db();
+   407→        init_schema(&conn).expect("Failed to initialize schema");
+   408→
+   409→        // Valid ULID (26 chars)
+   410→        let result = conn.execute(
+   411→            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+   412→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Test', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   413→            [],
+   414→        );
+   415→        assert!(result.is_ok());
+   416→
+   417→        // Invalid ID (too short)
+   418→        let result = conn.execute(
+   419→            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+   420→             VALUES ('short', 'Test', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   421→            [],
+   422→        );
+   423→        assert!(result.is_err());
+   424→    }
+   425→
+   426→    #[test]
+   427→    fn test_project_tasks_status_constraint() {
+   428→        let conn = create_test_db();
+   429→        init_schema(&conn).expect("Failed to initialize schema");
+   430→
+   431→        // Valid status
+   432→        let result = conn.execute(
+   433→            "INSERT INTO project_tasks (id, title, status, created_at, updated_at)
+   434→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Test', 'DOING', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   435→            [],
+   436→        );
+   437→        assert!(result.is_ok());
+   438→
+   439→        // Invalid status
+   440→        let result = conn.execute(
+   441→            "INSERT INTO project_tasks (id, title, status, created_at, updated_at)
+   442→             VALUES ('01BSZ3NDEKTSV4RRFFQ69G5FBV', 'Test', 'INVALID', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   443→            [],
+   444→        );
+   445→        assert!(result.is_err());
+   446→    }
+   447→
+   448→    #[test]
+   449→    fn test_project_tasks_is_passed_constraint() {
+   450→        let conn = create_test_db();
+   451→        init_schema(&conn).expect("Failed to initialize schema");
+   452→
+   453→        // Valid is_passed
+   454→        let result = conn.execute(
+   455→            "INSERT INTO project_tasks (id, title, is_passed, created_at, updated_at)
+   456→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Test', 'true', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   457→            [],
+   458→        );
+   459→        assert!(result.is_ok());
+   460→
+   461→        // Invalid is_passed
+   462→        let result = conn.execute(
+   463→            "INSERT INTO project_tasks (id, title, is_passed, created_at, updated_at)
+   464→             VALUES ('01BSZ3NDEKTSV4RRFFQ69G5FBV', 'Test', 'yes', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   465→            [],
+   466→        );
+   467→        assert!(result.is_err());
+   468→    }
+   469→
+   470→    #[test]
+   471→    fn test_task_steps_is_completed_constraint() {
+   472→        let conn = create_test_db();
+   473→        init_schema(&conn).expect("Failed to initialize schema");
+   474→
+   475→        // Valid is_completed
+   476→        let result = conn.execute(
+   477→            "INSERT INTO task_steps (id, description, is_completed, created_at)
+   478→             VALUES ('task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV', 'Step 1', 'false', '2026-01-04T12:00:00Z')",
+   479→            [],
+   480→        );
+   481→        assert!(result.is_ok());
+   482→
+   483→        // Invalid is_completed
+   484→        let result = conn.execute(
+   485→            "INSERT INTO task_steps (id, description, is_completed, created_at)
+   486→             VALUES ('task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01CSZ3NDEKTSV4RRFFQ69G5FCV', 'Step 2', '1', '2026-01-04T12:00:00Z')",
+   487→            [],
+   488→        );
+   489→        assert!(result.is_err());
+   490→    }
+   491→
+   492→    #[test]
+   493→    fn test_work_sessions_id_length_constraint() {
+   494→        let conn = create_test_db();
+   495→        init_schema(&conn).expect("Failed to initialize schema");
+   496→
+   497→        // Valid ULID
+   498→        let result = conn.execute(
+   499→            "INSERT INTO work_sessions (id, started_at)
+   500→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '2026-01-04T12:00:00Z')",
+   501→            [],
+   502→        );
+   503→        assert!(result.is_ok());
+   504→
+   505→        // Invalid ID (too short)
+   506→        let result = conn.execute(
+   507→            "INSERT INTO work_sessions (id, started_at)
+   508→             VALUES ('short', '2026-01-04T12:00:00Z')",
+   509→            [],
+   510→        );
+   511→        assert!(result.is_err());
+   512→    }
+   513→
+   514→    // -------------------------------------------------------------------------
+   515→    // FTS5 sync tests
+   516→    // -------------------------------------------------------------------------
+   517→
+   518→    #[test]
+   519→    fn test_fts5_insert_trigger_project_tasks() {
+   520→        let conn = create_test_db();
+   521→        init_schema(&conn).expect("Failed to initialize schema");
+   522→
+   523→        // Insert a task
+   524→        conn.execute(
+   525→            "INSERT INTO project_tasks (id, title, description, category, created_at, updated_at)
+   526→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Fix bug', 'Critical fix', 'core', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   527→            [],
+   528→        )
+   529→        .expect("Failed to insert task");
+   530→
+   531→        // Search via FTS
+   532→        let count: i32 = conn
+   533→            .query_row(
+   534→                "SELECT COUNT(*) FROM project_tasks_fts WHERE project_tasks_fts MATCH 'bug'",
+   535→                [],
+   536→                |row| row.get(0),
+   537→            )
+   538→            .expect("Failed to search FTS");
+   539→
+   540→        assert_eq!(count, 1);
+   541→    }
+   542→
+   543→    #[test]
+   544→    fn test_fts5_delete_trigger_project_tasks() {
+   545→        let conn = create_test_db();
+   546→        init_schema(&conn).expect("Failed to initialize schema");
+   547→
+   548→        // Insert and delete a task
+   549→        conn.execute(
+   550→            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+   551→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Temp task', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   552→            [],
+   553→        )
+   554→        .expect("Failed to insert task");
+   555→
+   556→        conn.execute(
+   557→            "DELETE FROM project_tasks WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'",
+   558→            [],
+   559→        )
+   560→        .expect("Failed to delete task");
+   561→
+   562→        // Search should return nothing
+   563→        let count: i32 = conn
+   564→            .query_row(
+   565→                "SELECT COUNT(*) FROM project_tasks_fts WHERE project_tasks_fts MATCH 'Temp'",
+   566→                [],
+   567→                |row| row.get(0),
+   568→            )
+   569→            .expect("Failed to search FTS");
+   570→
+   571→        assert_eq!(count, 0);
+   572→    }
+   573→
+   574→    #[test]
+   575→    fn test_fts5_update_trigger_project_tasks() {
+   576→        let conn = create_test_db();
+   577→        init_schema(&conn).expect("Failed to initialize schema");
+   578→
+   579→        // Insert a task
+   580→        conn.execute(
+   581→            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+   582→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Old title', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   583→            [],
+   584→        )
+   585→        .expect("Failed to insert task");
+   586→
+   587→        // Update title
+   588→        conn.execute(
+   589→            "UPDATE project_tasks SET title = 'New title' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'",
+   590→            [],
+   591→        )
+   592→        .expect("Failed to update task");
+   593→
+   594→        // Old title should not match
+   595→        let old_count: i32 = conn
+   596→            .query_row(
+   597→                "SELECT COUNT(*) FROM project_tasks_fts WHERE project_tasks_fts MATCH 'Old'",
+   598→                [],
+   599→                |row| row.get(0),
+   600→            )
+   601→            .expect("Failed to search FTS");
+   602→        assert_eq!(old_count, 0);
+   603→
+   604→        // New title should match
+   605→        let new_count: i32 = conn
+   606→            .query_row(
+   607→                "SELECT COUNT(*) FROM project_tasks_fts WHERE project_tasks_fts MATCH 'New'",
+   608→                [],
+   609→                |row| row.get(0),
+   610→            )
+   611→            .expect("Failed to search FTS");
+   612→        assert_eq!(new_count, 1);
+   613→    }
+   614→
+   615→    #[test]
+   616→    fn test_fts5_insert_trigger_project_progress() {
+   617→        let conn = create_test_db();
+   618→        init_schema(&conn).expect("Failed to initialize schema");
+   619→
+   620→        // Insert progress
+   621→        conn.execute(
+   622→            "INSERT INTO project_progress (id, content, created_at)
+   623→             VALUES ('session#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV', 'Implemented feature X', '2026-01-04T12:00:00Z')",
+   624→            [],
+   625→        )
+   626→        .expect("Failed to insert progress");
+   627→
+   628→        // Search via FTS
+   629→        let count: i32 = conn
+   630→            .query_row(
+   631→                "SELECT COUNT(*) FROM project_progress_fts WHERE project_progress_fts MATCH 'feature'",
+   632→                [],
+   633→                |row| row.get(0),
+   634→            )
+   635→            .expect("Failed to search FTS");
+   636→
+   637→        assert_eq!(count, 1);
+   638→    }
+   639→
+   640→    // -------------------------------------------------------------------------
+   641→    // Default value tests
+   642→    // -------------------------------------------------------------------------
+   643→
+   644→    #[test]
+   645→    fn test_project_tasks_default_values() {
+   646→        let conn = create_test_db();
+   647→        init_schema(&conn).expect("Failed to initialize schema");
+   648→
+   649→        // Insert with minimal fields
+   650→        conn.execute(
+   651→            "INSERT INTO project_tasks (id, title, created_at, updated_at)
+   652→             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Task', '2026-01-04T12:00:00Z', '2026-01-04T12:00:00Z')",
+   653→            [],
+   654→        )
+   655→        .expect("Failed to insert task");
+   656→
+   657→        // Check defaults
+   658→        let (status, sort_order, is_passed): (String, f64, String) = conn
+   659→            .query_row(
+   660→                "SELECT status, sort_order, is_passed FROM project_tasks WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'",
+   661→                [],
+   662→                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+   663→            )
+   664→            .expect("Failed to query task");
+   665→
+   666→        assert_eq!(status, "BACKLOG");
+   667→        assert_eq!(sort_order, 0.0);
+   668→        assert_eq!(is_passed, "false");
+   669→    }
+   670→
+   671→    #[test]
+   672→    fn test_task_steps_default_values() {
+   673→        let conn = create_test_db();
+   674→        init_schema(&conn).expect("Failed to initialize schema");
+   675→
+   676→        // Insert with minimal fields
+   677→        conn.execute(
+   678→            "INSERT INTO task_steps (id, description, created_at)
+   679→             VALUES ('task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV', 'Step', '2026-01-04T12:00:00Z')",
+   680→            [],
+   681→        )
+   682→        .expect("Failed to insert step");
+   683→
+   684→        // Check defaults
+   685→        let is_completed: String = conn
+   686→            .query_row(
+   687→                "SELECT is_completed FROM task_steps WHERE id = 'task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV'",
+   688→                [],
+   689→                |row| row.get(0),
+   690→            )
+   691→            .expect("Failed to query step");
+   692→
+   693→        assert_eq!(is_completed, "false");
+   694→    }
+   695→}
+   696→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

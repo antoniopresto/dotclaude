@@ -1,0 +1,415 @@
+'use client';
+
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { apiFetch } from '@/lib/api';
+
+interface MaintenanceEvent {
+  id: string;
+  trainId: string;
+  trainCode: string;
+  type: 'PM1' | 'PM2' | 'HM' | 'OVH';
+  startDate: string;
+  endDate: string;
+  depotId: string;
+  depotName: string;
+  kmAtMaintenance: number;
+}
+
+interface TrainRow {
+  id: string;
+  trainId: string;
+  fleetName: string;
+  depotCode: string;
+  events: MaintenanceEvent[];
+}
+
+interface GanttData {
+  trains: TrainRow[];
+  startDate: string;
+  endDate: string;
+}
+
+type ViewMode = 'week' | '2-week' | '4-week';
+
+const MAINTENANCE_COLORS: Record<string, { bg: string; border: string; text: string }> = {
+  PM1: { bg: 'bg-blue-200', border: 'border-blue-400', text: 'text-blue-800' },
+  PM2: { bg: 'bg-blue-500', border: 'border-blue-700', text: 'text-white' },
+  HM: { bg: 'bg-red-400', border: 'border-red-600', text: 'text-white' },
+  OVH: { bg: 'bg-purple-400', border: 'border-purple-600', text: 'text-white' },
+};
+
+/**
+ * Maintenance Gantt Component
+ *
+ * Interactive Gantt chart for maintenance scheduling.
+ * Features:
+ * - Timeline view with trains as rows
+ * - Color-coded maintenance blocks
+ * - Drag-drop scheduling (with constraints)
+ * - Real-time validation
+ */
+export function MaintenanceGantt() {
+  const [ganttData, setGanttData] = useState<GanttData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>('4-week');
+  const [selectedFleet, setSelectedFleet] = useState<string>('all');
+  const [draggingEvent, setDraggingEvent] = useState<MaintenanceEvent | null>(null);
+  const [dragOffset, setDragOffset] = useState(0);
+  const [validDropZones, setValidDropZones] = useState<Set<string>>(new Set());
+  const [undoAction, setUndoAction] = useState<{ event: MaintenanceEvent; originalDate: string } | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Generate dates array based on view mode
+  const generateDates = useCallback(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const dates: Date[] = [];
+    const days = viewMode === 'week' ? 7 : viewMode === '2-week' ? 14 : 28;
+
+    for (let i = 0; i < days; i++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() + i);
+      dates.push(date);
+    }
+    return dates;
+  }, [viewMode]);
+
+  const dates = generateDates();
+
+  const fetchGanttData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+
+    const { data, error } = await apiFetch<GanttData>('/api/maintenance/gantt');
+
+    if (error) {
+      setError(error);
+    } else if (data) {
+      setGanttData(data);
+    }
+
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchGanttData();
+  }, [fetchGanttData]);
+
+  // Clear undo after 10 seconds
+  useEffect(() => {
+    if (undoAction) {
+      const timer = setTimeout(() => setUndoAction(null), 10000);
+      return () => clearTimeout(timer);
+    }
+  }, [undoAction]);
+
+  const handleDragStart = (event: MaintenanceEvent, e: React.DragEvent) => {
+    setDraggingEvent(event);
+    e.dataTransfer.effectAllowed = 'move';
+    // Calculate which zones are valid
+    const validZones = new Set<string>();
+    dates.forEach((date) => {
+      const dateStr = date.toISOString().split('T')[0];
+      // Simple validation: not in past, not overlapping
+      if (date >= new Date()) {
+        validZones.add(`${event.trainId}-${dateStr}`);
+      }
+    });
+    setValidDropZones(validZones);
+  };
+
+  const handleDragEnd = () => {
+    setDraggingEvent(null);
+    setValidDropZones(new Set());
+  };
+
+  const handleDragOver = (trainId: string, dateStr: string, e: React.DragEvent) => {
+    e.preventDefault();
+    const zoneKey = `${trainId}-${dateStr}`;
+    if (validDropZones.has(zoneKey)) {
+      e.dataTransfer.dropEffect = 'move';
+    } else {
+      e.dataTransfer.dropEffect = 'none';
+    }
+  };
+
+  const handleDrop = async (trainId: string, newDateStr: string, e: React.DragEvent) => {
+    e.preventDefault();
+    if (!draggingEvent) return;
+
+    const zoneKey = `${trainId}-${newDateStr}`;
+    if (!validDropZones.has(zoneKey)) {
+      return; // Invalid drop zone
+    }
+
+    const originalDate = draggingEvent.startDate;
+
+    // Optimistic update
+    setGanttData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        trains: prev.trains.map((train) => ({
+          ...train,
+          events: train.events.map((evt) =>
+            evt.id === draggingEvent.id
+              ? { ...evt, startDate: newDateStr, endDate: newDateStr }
+              : evt
+          ),
+        })),
+      };
+    });
+
+    // Save undo action
+    setUndoAction({ event: draggingEvent, originalDate });
+
+    // API call to persist
+    await apiFetch(`/api/maintenance/schedule/${draggingEvent.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ startDate: newDateStr }),
+    });
+
+    setDraggingEvent(null);
+    setValidDropZones(new Set());
+  };
+
+  const handleUndo = async () => {
+    if (!undoAction) return;
+
+    // Revert to original date
+    setGanttData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        trains: prev.trains.map((train) => ({
+          ...train,
+          events: train.events.map((evt) =>
+            evt.id === undoAction.event.id
+              ? { ...evt, startDate: undoAction.originalDate, endDate: undoAction.originalDate }
+              : evt
+          ),
+        })),
+      };
+    });
+
+    await apiFetch(`/api/maintenance/schedule/${undoAction.event.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ startDate: undoAction.originalDate }),
+    });
+
+    setUndoAction(null);
+  };
+
+  // Filter trains by fleet
+  const filteredTrains = ganttData?.trains.filter((train) =>
+    selectedFleet === 'all' || train.fleetName === selectedFleet
+  ) || [];
+
+  // Get unique fleets for filter
+  const fleets = Array.from(new Set(ganttData?.trains.map((t) => t.fleetName) || []));
+
+  // Check if a date is today
+  const isToday = (date: Date) => {
+    const today = new Date();
+    return date.toDateString() === today.toDateString();
+  };
+
+  if (loading) {
+    return (
+      <div className="bg-white shadow rounded-lg p-6 animate-pulse">
+        <div className="h-6 bg-gray-200 rounded w-1/4 mb-4"></div>
+        <div className="h-96 bg-gray-200 rounded"></div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="bg-red-50 border border-red-200 rounded-lg p-6">
+        <p className="text-red-800">
+          <strong>Error:</strong> {error}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white shadow rounded-lg overflow-hidden">
+      {/* Header with Controls */}
+      <div className="p-4 border-b border-gray-200 flex items-center justify-between flex-wrap gap-4">
+        <h2 className="text-lg font-semibold text-gray-900">Maintenance Timeline</h2>
+
+        <div className="flex items-center gap-4 flex-wrap">
+          {/* View Mode Toggle */}
+          <div className="flex rounded-lg border border-gray-300 overflow-hidden">
+            {(['week', '2-week', '4-week'] as ViewMode[]).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setViewMode(mode)}
+                className={`px-3 py-1 text-sm transition-colors ${
+                  viewMode === mode
+                    ? 'bg-primary-600 text-white'
+                    : 'bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {mode === 'week' ? '1 Week' : mode === '2-week' ? '2 Weeks' : '4 Weeks'}
+              </button>
+            ))}
+          </div>
+
+          {/* Fleet Filter */}
+          <select
+            value={selectedFleet}
+            onChange={(e) => setSelectedFleet(e.target.value)}
+            className="px-3 py-1 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
+          >
+            <option value="all">All Fleets</option>
+            {fleets.map((fleet) => (
+              <option key={fleet} value={fleet}>
+                {fleet}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* Undo Toast */}
+      {undoAction && (
+        <div className="fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-4 z-50">
+          <span>Moved {undoAction.event.type} for {undoAction.event.trainCode}</span>
+          <button
+            onClick={handleUndo}
+            className="px-3 py-1 bg-white text-gray-800 rounded hover:bg-gray-100 text-sm font-medium"
+          >
+            Undo
+          </button>
+        </div>
+      )}
+
+      {/* Legend */}
+      <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 flex items-center gap-4 flex-wrap">
+        <span className="text-sm text-gray-600 font-medium">Legend:</span>
+        {Object.entries(MAINTENANCE_COLORS).map(([type, colors]) => (
+          <span
+            key={type}
+            className={`px-2 py-1 text-xs font-medium rounded ${colors.bg} ${colors.text}`}
+          >
+            {type}
+          </span>
+        ))}
+      </div>
+
+      {/* Gantt Chart */}
+      <div ref={containerRef} className="overflow-x-auto">
+        <div style={{ minWidth: `${dates.length * 60 + 200}px` }}>
+          {/* Header Row - Dates */}
+          <div className="flex border-b border-gray-200 bg-gray-50 sticky top-0 z-10">
+            <div className="w-48 flex-shrink-0 px-4 py-2 font-medium text-gray-700 border-r border-gray-200">
+              Train
+            </div>
+            {dates.map((date) => {
+              const dateStr = date.toISOString().split('T')[0];
+              const dayName = date.toLocaleDateString('en-US', { weekday: 'short' });
+              const dayNum = date.getDate();
+              const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+
+              return (
+                <div
+                  key={dateStr}
+                  className={`w-14 flex-shrink-0 text-center py-2 text-xs border-r border-gray-100 ${
+                    isToday(date)
+                      ? 'bg-primary-100 font-bold text-primary-800'
+                      : isWeekend
+                      ? 'bg-gray-100'
+                      : ''
+                  }`}
+                >
+                  <div className="font-medium">{dayName}</div>
+                  <div>{dayNum}</div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Train Rows */}
+          {filteredTrains.length === 0 ? (
+            <div className="p-8 text-center text-gray-500">
+              No trains match the selected filter
+            </div>
+          ) : (
+            filteredTrains.map((train) => (
+              <div key={train.id} className="flex border-b border-gray-100 hover:bg-gray-50">
+                {/* Train Info */}
+                <div className="w-48 flex-shrink-0 px-4 py-3 border-r border-gray-200">
+                  <div className="font-mono font-semibold text-gray-900">{train.trainId}</div>
+                  <div className="text-xs text-gray-500">
+                    {train.fleetName} • {train.depotCode}
+                  </div>
+                </div>
+
+                {/* Date Cells */}
+                {dates.map((date) => {
+                  const dateStr = date.toISOString().split('T')[0];
+                  const event = train.events.find((e) => e.startDate === dateStr);
+                  const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+                  const zoneKey = `${train.trainId}-${dateStr}`;
+                  const isValidDrop = validDropZones.has(zoneKey);
+                  const isInvalidDrop = draggingEvent && !isValidDrop && draggingEvent.trainId === train.trainId;
+
+                  return (
+                    <div
+                      key={`${train.id}-${dateStr}`}
+                      className={`w-14 h-12 flex-shrink-0 border-r border-gray-100 relative ${
+                        isToday(date)
+                          ? 'bg-primary-50'
+                          : isWeekend
+                          ? 'bg-gray-50'
+                          : ''
+                      } ${
+                        draggingEvent && isValidDrop
+                          ? 'bg-green-100 ring-2 ring-green-400 ring-inset'
+                          : ''
+                      } ${isInvalidDrop ? 'bg-red-50' : ''}`}
+                      onDragOver={(e) => handleDragOver(train.trainId, dateStr, e)}
+                      onDrop={(e) => handleDrop(train.trainId, dateStr, e)}
+                    >
+                      {/* Today Line */}
+                      {isToday(date) && (
+                        <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-primary-500 z-10"></div>
+                      )}
+
+                      {/* Maintenance Block */}
+                      {event && (
+                        <div
+                          draggable
+                          onDragStart={(e) => handleDragStart(event, e)}
+                          onDragEnd={handleDragEnd}
+                          className={`absolute inset-1 rounded cursor-move flex items-center justify-center text-xs font-medium ${
+                            MAINTENANCE_COLORS[event.type]?.bg || 'bg-gray-300'
+                          } ${MAINTENANCE_COLORS[event.type]?.text || 'text-gray-800'} ${
+                            MAINTENANCE_COLORS[event.type]?.border || 'border-gray-400'
+                          } border shadow-sm hover:shadow-md transition-shadow`}
+                          title={`${event.type}\nDepot: ${event.depotName}\nKm: ${event.kmAtMaintenance.toLocaleString()}`}
+                        >
+                          {event.type}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* Empty State */}
+      {!ganttData?.trains.length && (
+        <div className="p-8 text-center text-gray-500">
+          No maintenance schedules to display
+        </div>
+      )}
+    </div>
+  );
+}

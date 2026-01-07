@@ -1,0 +1,277 @@
+     1→/**
+     2→ * Mock Data Generator
+     3→ *
+     4→ * Generates test data for the MMS visualization:
+     5→ * - 50 trains (30 ALSTOM + 20 KINKI)
+     6→ * - 10 years of tasks per train
+     7→ * - ~10-12 tasks per train per year
+     8→ * - ~5% of tasks have conflict flags
+     9→ */
+    10→
+    11→import type {
+    12→  Train,
+    13→  Task,
+    14→  TaskRender,
+    15→  GeneratedData,
+    16→  DatasetMeta,
+    17→  TaskType,
+    18→  AssetType,
+    19→} from './types';
+    20→import { TYPE_TO_COLOR, DEFAULT_DATASET_META } from './types';
+    21→
+    22→// ─────────────────────────────────────────────────────────────
+    23→// DATE HELPERS
+    24→// ─────────────────────────────────────────────────────────────
+    25→
+    26→/**
+    27→ * Format date as ISO 8601 string (YYYY-MM-DD)
+    28→ */
+    29→function formatISO(date: Date): string {
+    30→  return date.toISOString().split('T')[0];
+    31→}
+    32→
+    33→/**
+    34→ * Add days to a date
+    35→ */
+    36→function addDays(date: Date | string, days: number): Date {
+    37→  const d = typeof date === 'string' ? new Date(date) : new Date(date);
+    38→  d.setDate(d.getDate() + days);
+    39→  return d;
+    40→}
+    41→
+    42→/**
+    43→ * Calculate days between two dates
+    44→ */
+    45→function daysBetween(start: Date | string, end: Date | string): number {
+    46→  const s = typeof start === 'string' ? new Date(start) : start;
+    47→  const e = typeof end === 'string' ? new Date(end) : end;
+    48→  const diffTime = e.getTime() - s.getTime();
+    49→  return Math.floor(diffTime / (1000 * 60 * 60 * 24));
+    50→}
+    51→
+    52→// ─────────────────────────────────────────────────────────────
+    53→// DATA GENERATION
+    54→// ─────────────────────────────────────────────────────────────
+    55→
+    56→/**
+    57→ * Generate train entities
+    58→ */
+    59→function generateTrains(count: number): Train[] {
+    60→  return Array.from({ length: count }, (_, i) => {
+    61→    const isAlstom = i < Math.floor(count * 0.6); // 60% Alstom
+    62→    return {
+    63→      id: `TRAIN-${String(i + 1).padStart(3, '0')}`,
+    64→      name: `Train ${i + 1}`,
+    65→      assetType: (isAlstom ? 'ALSTOM' : 'KINKI') as AssetType,
+    66→    };
+    67→  });
+    68→}
+    69→
+    70→/**
+    71→ * Generate tasks for all trains
+    72→ */
+    73→function generateTasks(trains: Train[], meta: DatasetMeta): Task[] {
+    74→  const tasks: Task[] = [];
+    75→  const types: TaskType[] = ['maintenance', 'overhaul', 'inspection'];
+    76→
+    77→  trains.forEach((train, trainIndex) => {
+    78→    for (let year = 0; year < meta.years; year++) {
+    79→      // 8-12 tasks per year per train
+    80→      const tasksPerYear = 8 + Math.floor(Math.random() * 5);
+    81→
+    82→      for (let t = 0; t < tasksPerYear; t++) {
+    83→        // First task of year 0 for each train starts early (within first 60 days)
+    84→        // This ensures data is visible at initial camera position
+    85→        let dayOffset: number;
+    86→        if (year === 0 && t === 0) {
+    87→          dayOffset = trainIndex * 3 + Math.floor(Math.random() * 30);
+    88→        } else {
+    89→          dayOffset = year * 365 + Math.floor(Math.random() * 360);
+    90→        }
+    91→        const duration = 2 + Math.floor(Math.random() * 10);
+    92→        const startDate = addDays(meta.startDate, dayOffset);
+    93→        const endDate = addDays(startDate, duration);
+    94→
+    95→        tasks.push({
+    96→          id: `${train.id}-${year}-${t}`,
+    97→          trainId: train.id,
+    98→          startDate: formatISO(startDate),
+    99→          endDate: formatISO(endDate),
+   100→          type: types[Math.floor(Math.random() * types.length)],
+   101→          hasConflict: Math.random() < 0.05, // 5% conflict rate
+   102→        });
+   103→      }
+   104→    }
+   105→  });
+   106→
+   107→  // Add dependencies between tasks (F023)
+   108→  // ~10-15% of tasks will have a predecessor
+   109→  // Dependencies can be within the same train or across different trains
+   110→  addDependencies(tasks, meta);
+   111→
+   112→  return tasks;
+   113→}
+   114→
+   115→/**
+   116→ * Add dependency relationships between tasks (F023)
+   117→ *
+   118→ * Strategy:
+   119→ * - ~10-15% of tasks get a predecessor
+   120→ * - Predecessor must end before the current task starts (valid dependency)
+   121→ * - Mix of same-train and cross-train dependencies
+   122→ * - Overhauls often depend on inspections (realistic pattern)
+   123→ */
+   124→function addDependencies(tasks: Task[], meta: DatasetMeta): void {
+   125→  // Build a lookup by start date for efficient predecessor search
+   126→  const sortedTasks = [...tasks].sort(
+   127→    (a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime()
+   128→  );
+   129→
+   130→  // Create a map for quick task lookup
+   131→  const taskMap = new Map<string, Task>(tasks.map((t) => [t.id, t]));
+   132→
+   133→  // Group tasks by train for same-train dependencies
+   134→  const tasksByTrain = new Map<string, Task[]>();
+   135→  for (const task of sortedTasks) {
+   136→    const list = tasksByTrain.get(task.trainId) || [];
+   137→    list.push(task);
+   138→    tasksByTrain.set(task.trainId, list);
+   139→  }
+   140→
+   141→  // Assign dependencies
+   142→  for (const task of tasks) {
+   143→    // Skip if already has conflict (to avoid visual clutter)
+   144→    if (task.hasConflict) continue;
+   145→
+   146→    // ~12% chance of having a dependency
+   147→    if (Math.random() >= 0.12) continue;
+   148→
+   149→    const taskStartTime = new Date(task.startDate).getTime();
+   150→
+   151→    // 70% same-train dependency, 30% cross-train dependency
+   152→    const sameTrain = Math.random() < 0.7;
+   153→
+   154→    let candidates: Task[];
+   155→    if (sameTrain) {
+   156→      // Find tasks on the same train that end before this one starts
+   157→      candidates = (tasksByTrain.get(task.trainId) || []).filter((t) => {
+   158→        const endTime = new Date(t.endDate).getTime();
+   159→        // Predecessor must end at least 1 day before (gap for realism)
+   160→        // and within 60 days (reasonable dependency window)
+   161→        const gap = (taskStartTime - endTime) / (1000 * 60 * 60 * 24);
+   162→        return t.id !== task.id && gap >= 1 && gap <= 60;
+   163→      });
+   164→    } else {
+   165→      // Find tasks on different trains that end before this one starts
+   166→      candidates = sortedTasks.filter((t) => {
+   167→        if (t.trainId === task.trainId || t.id === task.id) return false;
+   168→        const endTime = new Date(t.endDate).getTime();
+   169→        const gap = (taskStartTime - endTime) / (1000 * 60 * 60 * 24);
+   170→        return gap >= 1 && gap <= 30; // Tighter window for cross-train
+   171→      });
+   172→    }
+   173→
+   174→    if (candidates.length > 0) {
+   175→      // Pick a random predecessor from candidates
+   176→      const predecessor = candidates[Math.floor(Math.random() * candidates.length)];
+   177→      task.predecessorId = predecessor.id;
+   178→    }
+   179→  }
+   180→}
+   181→
+   182→/**
+   183→ * Generate complete dataset
+   184→ */
+   185→export function generateData(meta: DatasetMeta = DEFAULT_DATASET_META): GeneratedData {
+   186→  const trains = generateTrains(meta.trainCount);
+   187→  const tasks = generateTasks(trains, meta);
+   188→
+   189→  return { trains, tasks, meta };
+   190→}
+   191→
+   192→// ─────────────────────────────────────────────────────────────
+   193→// RENDER DATA PREPARATION
+   194→// ─────────────────────────────────────────────────────────────
+   195→
+   196→/**
+   197→ * Transform persistent data to render-ready format
+   198→ *
+   199→ * Converts:
+   200→ * - trainId → trainIndex (Y position)
+   201→ * - startDate/endDate → startDay/duration (X position and width)
+   202→ * - type → color
+   203→ */
+   204→export function prepareRenderData(data: GeneratedData): {
+   205→  trains: Train[];
+   206→  tasks: TaskRender[];
+   207→} {
+   208→  // Create train index lookup map
+   209→  const trainIndexMap = new Map<string, number>(
+   210→    data.trains.map((t, i) => [t.id, i])
+   211→  );
+   212→
+   213→  // Transform tasks to render format
+   214→  const tasks: TaskRender[] = data.tasks.map((task) => {
+   215→    const trainIndex = trainIndexMap.get(task.trainId);
+   216→    if (trainIndex === undefined) {
+   217→      throw new Error(`Train not found: ${task.trainId}`);
+   218→    }
+   219→
+   220→    const startDay = daysBetween(data.meta.startDate, task.startDate);
+   221→    const duration = daysBetween(task.startDate, task.endDate);
+   222→
+   223→    return {
+   224→      id: task.id,
+   225→      trainIndex,
+   226→      startDay,
+   227→      duration,
+   228→      color: TYPE_TO_COLOR[task.type],
+   229→      hasConflict: task.hasConflict,
+   230→      type: task.type,
+   231→      predecessorId: task.predecessorId, // F023: dependency lines
+   232→    };
+   233→  });
+   234→
+   235→  return { trains: data.trains, tasks };
+   236→}
+   237→
+   238→// ─────────────────────────────────────────────────────────────
+   239→// PRE-GENERATED DATA (for immediate use)
+   240→// ─────────────────────────────────────────────────────────────
+   241→
+   242→// Generate data once at module load for consistent results
+   243→const _generatedData = generateData();
+   244→const _renderData = prepareRenderData(_generatedData);
+   245→
+   246→/**
+   247→ * Get pre-generated dataset (persistent format)
+   248→ */
+   249→export function getData(): GeneratedData {
+   250→  return _generatedData;
+   251→}
+   252→
+   253→/**
+   254→ * Get pre-generated render data (canvas-ready format)
+   255→ */
+   256→export function getRenderData(): { trains: Train[]; tasks: TaskRender[] } {
+   257→  return _renderData;
+   258→}
+   259→
+   260→/**
+   261→ * Get just the trains array
+   262→ */
+   263→export function getTrains(): Train[] {
+   264→  return _generatedData.trains;
+   265→}
+   266→
+   267→/**
+   268→ * Get just the render tasks array
+   269→ */
+   270→export function getTasks(): TaskRender[] {
+   271→  return _renderData.tasks;
+   272→}
+   273→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

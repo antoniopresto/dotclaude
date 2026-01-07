@@ -1,0 +1,388 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { AgentRule, AgentConfig, AgentHookContext, RuleContext } from '../types/agent';
+
+/**
+ * Simulates the rule evaluation and action execution from agentrc-runner.ts
+ */
+type ActionResult = {
+  action: 'block' | 'warn' | 'allow' | 'none';
+  ruleId?: string;
+  message?: string;
+};
+
+async function evaluateRules(
+  rules: AgentRule[],
+  filePath: string,
+  ctx: RuleContext
+): Promise<ActionResult[]> {
+  const results: ActionResult[] = [];
+
+  for (const rule of rules) {
+    const { match } = rule;
+    let matches = false;
+
+    if (typeof match === 'string') {
+      matches = filePath.includes(match);
+    } else if (match instanceof RegExp) {
+      matches = match.test(filePath);
+    } else if (typeof match === 'function') {
+      matches = await match(filePath, ctx);
+    }
+
+    if (matches) {
+      results.push({
+        action: rule.action,
+        ruleId: rule.id,
+        message: rule.message,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Determines the final action based on all matched rules
+ * Priority: block > warn > allow
+ */
+function determineFinalAction(results: ActionResult[]): ActionResult {
+  const blocked = results.find((r) => r.action === 'block');
+  if (blocked) return blocked;
+
+  const warned = results.find((r) => r.action === 'warn');
+  if (warned) return warned;
+
+  const allowed = results.find((r) => r.action === 'allow');
+  if (allowed) return allowed;
+
+  return { action: 'none' };
+}
+
+describe('Rule Actions', () => {
+  const defaultContext: RuleContext = {
+    tool: 'Write',
+    input: { file_path: '/test/path' },
+    projectRoot: '/project',
+  };
+
+  describe('block action', () => {
+    it('should return block result when rule matches', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'BLOCK-FORBIDDEN',
+          match: '.forbidden',
+          action: 'block',
+          message: 'Forbidden files are not allowed',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/path/file.forbidden', defaultContext);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].action).toBe('block');
+      expect(results[0].ruleId).toBe('BLOCK-FORBIDDEN');
+      expect(results[0].message).toBe('Forbidden files are not allowed');
+    });
+
+    it('should block even if other rules allow', async () => {
+      const rules: AgentRule[] = [
+        { id: 'ALLOW-ALL', match: '', action: 'allow' }, // Matches everything
+        { id: 'BLOCK-SECRET', match: 'secret', action: 'block' },
+      ];
+
+      const results = await evaluateRules(rules, '/path/secret.txt', defaultContext);
+      const final = determineFinalAction(results);
+
+      expect(final.action).toBe('block');
+      expect(final.ruleId).toBe('BLOCK-SECRET');
+    });
+
+    it('should include message in block result', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'CUSTOM-MESSAGE',
+          match: '.env',
+          action: 'block',
+          message: 'Environment files must not be modified by AI',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/path/.env', defaultContext);
+
+      expect(results[0].message).toBe('Environment files must not be modified by AI');
+    });
+
+    it('should handle block without message', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'NO-MESSAGE',
+          match: '.lock',
+          action: 'block',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/path/package-lock.json', defaultContext);
+
+      expect(results[0].action).toBe('block');
+      expect(results[0].message).toBeUndefined();
+    });
+  });
+
+  describe('warn action', () => {
+    it('should return warn result when rule matches', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'WARN-SENSITIVE',
+          match: /password|secret/i,
+          action: 'warn',
+          message: 'Sensitive path detected',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/path/password.txt', defaultContext);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].action).toBe('warn');
+      expect(results[0].ruleId).toBe('WARN-SENSITIVE');
+    });
+
+    it('should warn but not block', async () => {
+      const rules: AgentRule[] = [
+        { id: 'WARN-OLD', match: '/legacy/', action: 'warn', message: 'Legacy code' },
+      ];
+
+      const results = await evaluateRules(rules, '/path/legacy/old.js', defaultContext);
+      const final = determineFinalAction(results);
+
+      expect(final.action).toBe('warn');
+      // Process should continue (not exit 2)
+    });
+
+    it('should be overridden by block', async () => {
+      const rules: AgentRule[] = [
+        { id: 'WARN-FIRST', match: 'file', action: 'warn' },
+        { id: 'BLOCK-SECOND', match: '.forbidden', action: 'block' },
+      ];
+
+      const results = await evaluateRules(rules, '/path/file.forbidden', defaultContext);
+      const final = determineFinalAction(results);
+
+      expect(results).toHaveLength(2);
+      expect(final.action).toBe('block');
+    });
+
+    it('should override allow', async () => {
+      const rules: AgentRule[] = [
+        { id: 'ALLOW-JS', match: '.js', action: 'allow' },
+        { id: 'WARN-LEGACY', match: 'legacy', action: 'warn' },
+      ];
+
+      const results = await evaluateRules(rules, '/legacy/old.js', defaultContext);
+      const final = determineFinalAction(results);
+
+      expect(results).toHaveLength(2);
+      expect(final.action).toBe('warn');
+    });
+  });
+
+  describe('allow action', () => {
+    it('should return allow result when rule matches', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'ALLOW-SRC',
+          match: '/src/',
+          action: 'allow',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/project/src/file.ts', defaultContext);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].action).toBe('allow');
+    });
+
+    it('should have lowest priority', async () => {
+      const rules: AgentRule[] = [
+        { id: 'ALLOW-ALL', match: '', action: 'allow' },
+        { id: 'WARN-CONFIG', match: 'config', action: 'warn' },
+        { id: 'BLOCK-SECRET', match: 'secret', action: 'block' },
+      ];
+
+      // Test with path matching all three
+      const results1 = await evaluateRules(rules, '/config/secret.json', defaultContext);
+      expect(determineFinalAction(results1).action).toBe('block');
+
+      // Test with path matching allow and warn
+      const results2 = await evaluateRules(rules, '/config/app.json', defaultContext);
+      expect(determineFinalAction(results2).action).toBe('warn');
+
+      // Test with path matching only allow
+      const results3 = await evaluateRules(rules, '/src/file.ts', defaultContext);
+      expect(determineFinalAction(results3).action).toBe('allow');
+    });
+  });
+
+  describe('multiple rules evaluation', () => {
+    it('should evaluate all rules', async () => {
+      const rules: AgentRule[] = [
+        { id: 'RULE-1', match: 'a', action: 'allow' },
+        { id: 'RULE-2', match: 'b', action: 'warn' },
+        { id: 'RULE-3', match: 'c', action: 'block' },
+      ];
+
+      const results = await evaluateRules(rules, '/abc/file.txt', defaultContext);
+
+      expect(results).toHaveLength(3);
+    });
+
+    it('should maintain rule order in results', async () => {
+      const rules: AgentRule[] = [
+        { id: 'FIRST', match: 'x', action: 'allow' },
+        { id: 'SECOND', match: 'x', action: 'warn' },
+        { id: 'THIRD', match: 'x', action: 'block' },
+      ];
+
+      const results = await evaluateRules(rules, '/x/file.txt', defaultContext);
+
+      expect(results[0].ruleId).toBe('FIRST');
+      expect(results[1].ruleId).toBe('SECOND');
+      expect(results[2].ruleId).toBe('THIRD');
+    });
+
+    it('should only include matching rules', async () => {
+      const rules: AgentRule[] = [
+        { id: 'MATCH-1', match: 'src', action: 'allow' },
+        { id: 'NO-MATCH', match: 'node_modules', action: 'block' },
+        { id: 'MATCH-2', match: '.ts', action: 'allow' },
+      ];
+
+      const results = await evaluateRules(rules, '/src/file.ts', defaultContext);
+
+      expect(results).toHaveLength(2);
+      expect(results.find((r) => r.ruleId === 'NO-MATCH')).toBeUndefined();
+    });
+
+    it('should handle empty rules array', async () => {
+      const results = await evaluateRules([], '/any/path', defaultContext);
+
+      expect(results).toHaveLength(0);
+      expect(determineFinalAction(results).action).toBe('none');
+    });
+  });
+
+  describe('real-world scenarios', () => {
+    it('should handle typical project rules', async () => {
+      const rules: AgentRule[] = [
+        // Block dangerous files
+        { id: 'NO-ENV', match: '.env', action: 'block', message: 'Cannot modify env files' },
+        { id: 'NO-LOCK', match: '.lock', action: 'block', message: 'Cannot modify lock files' },
+
+        // Warn on sensitive areas
+        { id: 'WARN-CONFIG', match: '/config/', action: 'warn', message: 'Config change detected' },
+        { id: 'WARN-AUTH', match: '/auth/', action: 'warn', message: 'Auth module change' },
+
+        // Allow source files
+        { id: 'ALLOW-SRC', match: '/src/', action: 'allow' },
+      ];
+
+      // Should block .env
+      const envResults = await evaluateRules(rules, '/project/.env.local', defaultContext);
+      expect(determineFinalAction(envResults).action).toBe('block');
+
+      // Should warn on config
+      const configResults = await evaluateRules(rules, '/project/config/app.ts', defaultContext);
+      expect(determineFinalAction(configResults).action).toBe('warn');
+
+      // Should allow regular src files
+      const srcResults = await evaluateRules(rules, '/project/src/utils.ts', defaultContext);
+      expect(determineFinalAction(srcResults).action).toBe('allow');
+
+      // Should have no action on unmatched
+      const otherResults = await evaluateRules(rules, '/project/docs/readme.md', defaultContext);
+      expect(determineFinalAction(otherResults).action).toBe('none');
+    });
+
+    it('should handle conditional blocking by tool type', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'BLOCK-DELETE',
+          match: (_, ctx) => ctx.tool === 'Bash' && ctx.input.command?.includes('rm'),
+          action: 'block',
+          message: 'Delete operations require manual approval',
+        },
+      ];
+
+      const deleteCtx: RuleContext = {
+        ...defaultContext,
+        tool: 'Bash',
+        input: { command: 'rm -rf /path' },
+      };
+
+      const results = await evaluateRules(rules, '/any', deleteCtx);
+      expect(determineFinalAction(results).action).toBe('block');
+    });
+
+    it('should handle whitelist pattern', async () => {
+      const rules: AgentRule[] = [
+        // Block everything by default
+        { id: 'BLOCK-ALL', match: '', action: 'block', message: 'Blocked by default' },
+        // But allow specific patterns (note: this won't work with current priority system)
+        // In real implementation, you'd need to check allow rules first
+      ];
+
+      // This test shows the limitation - block always wins
+      const results = await evaluateRules(rules, '/allowed/path.ts', defaultContext);
+      expect(determineFinalAction(results).action).toBe('block');
+    });
+  });
+
+  describe('action result messages', () => {
+    it('should preserve custom messages', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'CUSTOM',
+          match: 'test',
+          action: 'block',
+          message: 'This is a detailed explanation of why this is blocked',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/test/file', defaultContext);
+
+      expect(results[0].message).toBe('This is a detailed explanation of why this is blocked');
+    });
+
+    it('should handle multiline messages', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'MULTILINE',
+          match: 'protected',
+          action: 'block',
+          message: `This file is protected.
+Reason: Security sensitive
+Contact: admin@example.com`,
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/protected/file', defaultContext);
+
+      expect(results[0].message).toContain('Reason:');
+      expect(results[0].message).toContain('Contact:');
+    });
+
+    it('should handle emoji in messages', async () => {
+      const rules: AgentRule[] = [
+        {
+          id: 'EMOJI',
+          match: 'danger',
+          action: 'block',
+          message: '🚫 Danger zone! Do not modify.',
+        },
+      ];
+
+      const results = await evaluateRules(rules, '/danger/zone', defaultContext);
+
+      expect(results[0].message).toContain('🚫');
+    });
+  });
+});

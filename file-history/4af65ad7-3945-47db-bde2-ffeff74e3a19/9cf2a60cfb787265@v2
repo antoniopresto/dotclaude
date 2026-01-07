@@ -1,0 +1,203 @@
+/**
+ * useCanvasGestures - Cross-platform gesture handling with @use-gesture/react
+ *
+ * DECK-COMPLETE-002: Implements gesture handling for:
+ * - Smooth pinch-to-zoom on Mac trackpad (Safari and Chrome)
+ * - Two-finger scroll pans (not zooms)
+ * - Mouse wheel zooms toward cursor
+ * - Ctrl+wheel zooms (handled by pinch)
+ *
+ * @see docs/deck-research/mms-deck-research.md
+ */
+
+import { useCallback, useRef } from 'react';
+import { useGesture } from '@use-gesture/react';
+
+// ─────────────────────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────────────────────
+
+export interface GestureCallbacks {
+  /** Called when zoom changes */
+  onZoom: (zoom: number, cursorX?: number, cursorY?: number) => void;
+  /** Called when pan changes */
+  onPan: (deltaX: number, deltaY: number) => void;
+  /** Called when gesture ends (for momentum) */
+  onGestureEnd?: () => void;
+}
+
+export interface GestureConfig {
+  /** Current zoom level */
+  zoom: number;
+  /** Minimum zoom level */
+  minZoom: number;
+  /** Maximum zoom level */
+  maxZoom: number;
+}
+
+// ─────────────────────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────────────────────
+
+/** Maximum delta per frame to prevent wild jumps */
+const MAX_DELTA = 50;
+
+/** Zoom sensitivity for wheel events */
+const WHEEL_ZOOM_SENSITIVITY = 0.002;
+
+/** Minimum time between wheel events to detect trackpad vs mouse */
+const TRACKPAD_DETECTION_THRESHOLD = 50; // ms
+
+// ─────────────────────────────────────────────────────────────
+// HOOK
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Custom hook for cross-platform gesture handling
+ *
+ * @param callbacks - Functions to call when gestures occur
+ * @param config - Configuration including zoom limits
+ * @returns bind function to spread onto container element: {...bindGestures()}
+ */
+export function useCanvasGestures(
+  callbacks: GestureCallbacks,
+  config: GestureConfig
+) {
+  const { onZoom, onPan, onGestureEnd } = callbacks;
+  const { zoom, minZoom, maxZoom } = config;
+
+  // Track last wheel event time for trackpad detection
+  const lastWheelTimeRef = useRef(0);
+  const isTrackpadRef = useRef(false);
+
+  // Track cumulative pinch scale for smooth zoom
+  const pinchStartZoomRef = useRef(zoom);
+
+  // Store current zoom in ref for use in callbacks
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+
+  // Clamp delta to prevent wild jumps
+  const clampDelta = useCallback((value: number): number => {
+    return Math.max(-MAX_DELTA, Math.min(MAX_DELTA, value));
+  }, []);
+
+  // Clamp zoom to limits
+  const clampZoom = useCallback(
+    (newZoom: number): number => {
+      return Math.max(minZoom, Math.min(maxZoom, newZoom));
+    },
+    [minZoom, maxZoom]
+  );
+
+  // Detect if user is using trackpad vs mouse
+  const detectTrackpad = useCallback((event: WheelEvent) => {
+    const now = performance.now();
+    const timeSinceLastWheel = now - lastWheelTimeRef.current;
+    lastWheelTimeRef.current = now;
+
+    // Trackpads fire many small events in quick succession
+    // Mice fire fewer, larger events
+    if (timeSinceLastWheel < TRACKPAD_DETECTION_THRESHOLD) {
+      isTrackpadRef.current = true;
+    } else if (timeSinceLastWheel > 200) {
+      // Reset detection after a pause
+      isTrackpadRef.current = Math.abs(event.deltaY) < 50;
+    }
+
+    return isTrackpadRef.current;
+  }, []);
+
+  // Main gesture binding - returns bind function to spread on element
+  const bind = useGesture(
+    {
+      // ─────────────────────────────────────────────────────────
+      // PINCH (trackpad pinch, ctrl+wheel)
+      // ─────────────────────────────────────────────────────────
+      onPinchStart: () => {
+        pinchStartZoomRef.current = zoomRef.current;
+      },
+
+      onPinch: ({ offset: [scale], origin: [ox, oy], event }) => {
+        event?.preventDefault();
+
+        // Calculate new zoom from pinch scale
+        // scale is the cumulative scale factor since pinch start
+        const newZoom = clampZoom(pinchStartZoomRef.current * scale);
+
+        // Pass cursor position for zoom-toward-cursor
+        onZoom(newZoom, ox, oy);
+      },
+
+      onPinchEnd: () => {
+        onGestureEnd?.();
+      },
+
+      // ─────────────────────────────────────────────────────────
+      // WHEEL (scroll to pan, with modifier to zoom)
+      // ─────────────────────────────────────────────────────────
+      onWheel: ({ event, delta: [dx, dy], ctrlKey }) => {
+        // Ctrl+wheel is handled by onPinch, skip here
+        if (ctrlKey) return;
+
+        event.preventDefault();
+
+        const wheelEvent = event as WheelEvent;
+        const isTrackpad = detectTrackpad(wheelEvent);
+
+        // On trackpad: two-finger scroll = pan
+        // On mouse: scroll wheel = zoom
+        if (isTrackpad) {
+          // Trackpad: pan with clamped deltas
+          const clampedDx = clampDelta(dx);
+          const clampedDy = clampDelta(dy);
+          onPan(-clampedDx, -clampedDy);
+        } else {
+          // Mouse wheel: zoom toward cursor
+          const zoomDelta = -dy * WHEEL_ZOOM_SENSITIVITY;
+          const newZoom = clampZoom(zoomRef.current * (1 + zoomDelta));
+
+          onZoom(newZoom, wheelEvent.clientX, wheelEvent.clientY);
+        }
+      },
+
+      // ─────────────────────────────────────────────────────────
+      // DRAG (click and drag to pan)
+      // ─────────────────────────────────────────────────────────
+      onDrag: ({ delta: [dx, dy], event, pinching }) => {
+        // Don't pan while pinching
+        if (pinching) return;
+
+        event?.preventDefault();
+
+        // Pan with clamped deltas
+        const clampedDx = clampDelta(dx);
+        const clampedDy = clampDelta(dy);
+        onPan(clampedDx, clampedDy);
+      },
+
+      onDragEnd: () => {
+        onGestureEnd?.();
+      },
+    },
+    {
+      // Gesture configuration - NO target, returns bind function
+      eventOptions: { passive: false }, // Required for preventDefault
+      drag: {
+        filterTaps: true, // Don't trigger drag on clicks
+        threshold: 3, // Minimum movement before drag starts
+      },
+      pinch: {
+        scaleBounds: { min: minZoom, max: maxZoom },
+        rubberband: true, // Smooth bounce at limits
+      },
+      wheel: {
+        eventOptions: { passive: false },
+      },
+    }
+  );
+
+  return bind;
+}
+
+export default useCanvasGestures;

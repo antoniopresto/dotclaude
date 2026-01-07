@@ -1,0 +1,90 @@
+#!/bin/bash
+# Hook: UserPromptSubmit - Harness Checkpoint Verification (BLOCKING)
+# Purpose: Before each user prompt, verify harness is being maintained
+# Exit 2 = BLOCK (forces agent to save), Exit 0 = Allow
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR" 2>/dev/null || exit 0
+
+PROGRESS_FILE="claude-progress.txt"
+COUNTER_FILE=".claude/.harness-counter"
+
+# Initialize counter file if not exists
+if [ ! -f "$COUNTER_FILE" ]; then
+  echo "0" > "$COUNTER_FILE"
+fi
+
+# Increment counter (tracks user prompts as proxy for work done)
+COUNTER=$(cat "$COUNTER_FILE" 2>/dev/null || echo "0")
+COUNTER=$((COUNTER + 1))
+echo "$COUNTER" > "$COUNTER_FILE"
+
+# Count uncommitted changes
+UNCOMMITTED=0
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  UNCOMMITTED=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# Check time since last progress update
+MINUTES_SINCE_UPDATE=0
+if [ -f "$PROGRESS_FILE" ]; then
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    LAST_MOD=$(stat -f %m "$PROGRESS_FILE" 2>/dev/null)
+  else
+    LAST_MOD=$(stat -c %Y "$PROGRESS_FILE" 2>/dev/null)
+  fi
+  NOW=$(date +%s)
+  DIFF_SECONDS=$((NOW - LAST_MOD))
+  MINUTES_SINCE_UPDATE=$((DIFF_SECONDS / 60))
+fi
+
+# BLOCK CONDITIONS (any of these triggers block):
+# 1. 5+ prompts since last commit with 3+ uncommitted files
+# 2. 10+ minutes stale with 3+ uncommitted files
+# 3. 8+ uncommitted files (regardless of time)
+SHOULD_BLOCK=false
+REASON=""
+
+if [ "$COUNTER" -ge 5 ] && [ "$UNCOMMITTED" -ge 3 ]; then
+  SHOULD_BLOCK=true
+  REASON="$COUNTER prompts since last save + $UNCOMMITTED uncommitted files"
+elif [ "$MINUTES_SINCE_UPDATE" -ge 10 ] && [ "$UNCOMMITTED" -ge 3 ]; then
+  SHOULD_BLOCK=true
+  REASON="${MINUTES_SINCE_UPDATE}min stale + $UNCOMMITTED uncommitted files"
+elif [ "$UNCOMMITTED" -ge 8 ]; then
+  SHOULD_BLOCK=true
+  REASON="$UNCOMMITTED uncommitted files (too many)"
+fi
+
+if [ "$SHOULD_BLOCK" = true ]; then
+  echo "" >&2
+  echo "🔴🔴🔴 BLOCKED: HARNESS CHECKPOINT REQUIRED 🔴🔴🔴" >&2
+  echo "" >&2
+  echo "   Reason: $REASON" >&2
+  echo "   Prompts since save: $COUNTER" >&2
+  echo "   Progress last updated: ${MINUTES_SINCE_UPDATE}min ago" >&2
+  echo "   Uncommitted files: $UNCOMMITTED" >&2
+  echo "" >&2
+  echo "   YOU MUST SAVE BEFORE CONTINUING:" >&2
+  echo "   1. Update claude-progress.txt" >&2
+  echo "   2. git add -A && git commit -m 'checkpoint: ...'" >&2
+  echo "" >&2
+  exit 2
+fi
+
+# Reset counter on commit (check if HEAD changed)
+LAST_COMMIT_FILE=".claude/.last-commit"
+CURRENT_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
+LAST_HEAD=$(cat "$LAST_COMMIT_FILE" 2>/dev/null || echo "")
+
+if [ "$CURRENT_HEAD" != "$LAST_HEAD" ]; then
+  echo "0" > "$COUNTER_FILE"
+  echo "$CURRENT_HEAD" > "$LAST_COMMIT_FILE"
+fi
+
+# Soft warning (not blocking)
+if [ "$COUNTER" -ge 3 ] || [ "$UNCOMMITTED" -ge 4 ]; then
+  echo "⚠️  HARNESS: $COUNTER prompts, ${MINUTES_SINCE_UPDATE}min, $UNCOMMITTED uncommitted. Consider saving."
+fi
+
+exit 0

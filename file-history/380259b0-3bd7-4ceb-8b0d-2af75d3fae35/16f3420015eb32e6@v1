@@ -1,0 +1,321 @@
+/**
+ * TacticalLayer Component
+ *
+ * Displays monthly workload as stacked bars showing maintenance type distribution.
+ * Each bar represents a train-month combination with segments for each task type.
+ *
+ * LOD: Tactical (0.3x - 1.0x zoom)
+ */
+
+import React, { useMemo } from 'react';
+import DeckGL from '@deck.gl/react';
+import { OrthographicView } from '@deck.gl/core';
+import { SolidPolygonLayer } from '@deck.gl/layers';
+import type { PickingInfo } from '@deck.gl/core';
+import type { AggregatedCell, Train } from '../../data/mock-generator';
+import { MAINTENANCE_TYPES, TIME_RANGE } from '../../data/mock-config';
+import type { MaintenanceTypeId } from '../../data/mock-config';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+export interface TacticalLayerProps {
+  /** Aggregated cell data (by month) */
+  cells: AggregatedCell[];
+  /** Train data for labels */
+  trains: Train[];
+  /** Width of the viewport */
+  width: number;
+  /** Height of the viewport */
+  height: number;
+  /** Camera X position (pan) */
+  cameraX?: number;
+  /** Camera Y position (pan) */
+  cameraY?: number;
+  /** Zoom level */
+  zoom?: number;
+  /** Opacity for crossfade transitions */
+  opacity?: number;
+  /** Callback when a cell is clicked */
+  onCellClick?: (cell: AggregatedCell) => void;
+  /** Callback when a cell is hovered */
+  onCellHover?: (cell: AggregatedCell | null, segment?: MaintenanceTypeId) => void;
+  /** Currently hovered cell */
+  hoveredCell?: AggregatedCell | null;
+}
+
+interface BarSegment {
+  polygon: [number, number][];
+  cell: AggregatedCell;
+  type: MaintenanceTypeId;
+  color: [number, number, number, number];
+  taskCount: number;
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const CELL_WIDTH = 20; // pixels per month
+const CELL_HEIGHT = 16; // pixels per train
+const CELL_GAP = 1;
+const MAX_BAR_HEIGHT = CELL_HEIGHT - 2;
+
+// Parse hex color to RGBA
+function hexToRgba(hex: string, alpha: number = 255): [number, number, number, number] {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (result) {
+    return [
+      parseInt(result[1], 16),
+      parseInt(result[2], 16),
+      parseInt(result[3], 16),
+      alpha,
+    ];
+  }
+  return [128, 128, 128, alpha];
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+function createBarSegments(cells: AggregatedCell[]): BarSegment[] {
+  const segments: BarSegment[] = [];
+
+  for (const cell of cells) {
+    const x = cell.periodIndex * CELL_WIDTH;
+    const y = cell.trainIndex * CELL_HEIGHT;
+    const barWidth = CELL_WIDTH - CELL_GAP;
+
+    // Calculate total tasks for height scaling
+    const totalTasks = cell.totalTasks;
+    if (totalTasks === 0) continue;
+
+    // Stack segments for each maintenance type
+    let currentY = y + CELL_HEIGHT - 1; // Start from bottom
+
+    for (const mt of MAINTENANCE_TYPES) {
+      const taskCount = cell.tasksByType[mt.id];
+      if (taskCount === 0) continue;
+
+      // Calculate segment height proportional to task count
+      const segmentHeight = Math.max(2, (taskCount / totalTasks) * MAX_BAR_HEIGHT);
+
+      segments.push({
+        polygon: [
+          [x, currentY],
+          [x + barWidth, currentY],
+          [x + barWidth, currentY - segmentHeight],
+          [x, currentY - segmentHeight],
+        ],
+        cell,
+        type: mt.id,
+        color: hexToRgba(mt.color),
+        taskCount,
+      });
+
+      currentY -= segmentHeight;
+    }
+  }
+
+  return segments;
+}
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+export const TacticalLayer: React.FC<TacticalLayerProps> = ({
+  cells,
+  trains,
+  width,
+  height,
+  cameraX = 0,
+  cameraY = 0,
+  zoom = 1,
+  opacity = 1,
+  onCellClick,
+  onCellHover,
+  hoveredCell,
+}) => {
+  // Calculate total dimensions
+  const totalWidth = TIME_RANGE.months * CELL_WIDTH;
+  const totalHeight = trains.length * CELL_HEIGHT;
+
+  // Create bar segments
+  const barSegments = useMemo(() => createBarSegments(cells), [cells]);
+
+  // Create deck.gl layers
+  const layers = useMemo(() => {
+    return [
+      // Background grid
+      new SolidPolygonLayer<{ polygon: [number, number][]; trainIndex: number }>({
+        id: 'tactical-grid',
+        data: trains.map((_, i) => ({
+          polygon: [
+            [0, i * CELL_HEIGHT],
+            [totalWidth, i * CELL_HEIGHT],
+            [totalWidth, i * CELL_HEIGHT + CELL_HEIGHT - CELL_GAP],
+            [0, i * CELL_HEIGHT + CELL_HEIGHT - CELL_GAP],
+          ] as [number, number][],
+          trainIndex: i,
+        })),
+        getPolygon: (d) => d.polygon,
+        getFillColor: (d) => d.trainIndex % 2 === 0
+          ? [248, 250, 252, 100] as [number, number, number, number]
+          : [241, 245, 249, 100] as [number, number, number, number],
+        pickable: false,
+        opacity: opacity * 0.5,
+      }),
+
+      // Stacked bars
+      new SolidPolygonLayer<BarSegment>({
+        id: 'tactical-bars',
+        data: barSegments,
+        getPolygon: (d) => d.polygon,
+        getFillColor: (d) => {
+          // Highlight on hover
+          if (hoveredCell &&
+              d.cell.trainIndex === hoveredCell.trainIndex &&
+              d.cell.periodIndex === hoveredCell.periodIndex) {
+            return [d.color[0], d.color[1], d.color[2], 255] as [number, number, number, number];
+          }
+          return d.color;
+        },
+        pickable: true,
+        opacity,
+        updateTriggers: {
+          getFillColor: [hoveredCell],
+        },
+      }),
+    ];
+  }, [barSegments, trains, totalWidth, hoveredCell, opacity]);
+
+  // Handle picking
+  const handleClick = (info: PickingInfo) => {
+    if (info.object && onCellClick) {
+      const segment = info.object as BarSegment;
+      onCellClick(segment.cell);
+    }
+  };
+
+  const handleHover = (info: PickingInfo) => {
+    if (onCellHover) {
+      if (info.object) {
+        const segment = info.object as BarSegment;
+        onCellHover(segment.cell, segment.type);
+      } else {
+        onCellHover(null);
+      }
+    }
+  };
+
+  // Create orthographic view
+  const views = new OrthographicView({
+    id: 'tactical-view',
+    flipY: false,
+    controller: false,
+  });
+
+  const viewState = {
+    target: [totalWidth / 2 - cameraX, totalHeight / 2 - cameraY, 0],
+    zoom: Math.log2(zoom),
+  };
+
+  return (
+    <div style={{ width, height, position: 'relative' }}>
+      <DeckGL
+        width={width}
+        height={height}
+        views={views}
+        viewState={viewState}
+        layers={layers}
+        onClick={handleClick}
+        onHover={handleHover}
+        getCursor={() => 'pointer'}
+      />
+
+      {/* Legend */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 16,
+          right: 16,
+          background: 'white',
+          padding: '8px 12px',
+          borderRadius: 8,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+          fontSize: 11,
+          opacity,
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>Task Types</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {MAINTENANCE_TYPES.map((mt) => (
+            <div key={mt.id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div
+                style={{
+                  width: 14,
+                  height: 10,
+                  backgroundColor: mt.color,
+                  borderRadius: 2,
+                }}
+              />
+              <span>{mt.name}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Hover tooltip */}
+      {hoveredCell && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 16,
+            left: 16,
+            background: 'white',
+            padding: '8px 12px',
+            borderRadius: 8,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            fontSize: 12,
+            opacity,
+            minWidth: 180,
+          }}
+        >
+          <div style={{ fontWeight: 600 }}>
+            {trains[hoveredCell.trainIndex]?.name ?? `Train ${hoveredCell.trainIndex}`}
+          </div>
+          <div style={{ color: '#666', marginTop: 2 }}>
+            {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][hoveredCell.periodIndex % 12]} {2024 + Math.floor(hoveredCell.periodIndex / 12)}
+          </div>
+          <div style={{ marginTop: 8, borderTop: '1px solid #eee', paddingTop: 8 }}>
+            {MAINTENANCE_TYPES.map((mt) => {
+              const count = hoveredCell.tasksByType[mt.id];
+              if (count === 0) return null;
+              return (
+                <div key={mt.id} style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+                  <span style={{ color: mt.color }}>{mt.name}</span>
+                  <span style={{ fontWeight: 500 }}>{count}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ marginTop: 8, borderTop: '1px solid #eee', paddingTop: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span>Total Tasks</span>
+              <span style={{ fontWeight: 600 }}>{hoveredCell.totalTasks}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+              <span>Man-Hours</span>
+              <span style={{ fontWeight: 600 }}>{hoveredCell.totalManHours.toLocaleString()}</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default TacticalLayer;

@@ -1,0 +1,451 @@
+//! Task step CRUD operations.
+//!
+//! This module provides Create, Read, Update, Delete operations for task steps.
+//! Steps are checklist items within a task, using composite IDs for efficient querying.
+//!
+//! ## Composite ID Format
+//!
+//! `task#{task_ulid}#{step_ulid}`
+//!
+//! This allows efficient prefix queries: `WHERE id GLOB 'task#<task_id>#*'`
+
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
+
+use super::types::TaskStep;
+use super::DbResult;
+
+// =============================================================================
+// CREATE
+// =============================================================================
+
+/// Create a new step for a task.
+pub fn create_step(conn: &Connection, step: &TaskStep) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO task_steps (id, description, is_completed, created_at)
+        VALUES (?1, ?2, ?3, ?4)
+        "#,
+        params![
+            step.id,
+            step.description,
+            if step.is_completed { "true" } else { "false" },
+            step.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Create a new step for a task with just description.
+///
+/// Generates the step ID automatically.
+pub fn add_step(conn: &Connection, task_id: &str, description: &str) -> DbResult<TaskStep> {
+    let step = TaskStep::new(task_id, description)?;
+    create_step(conn, &step)?;
+    Ok(step)
+}
+
+// =============================================================================
+// READ
+// =============================================================================
+
+/// Get a step by ID.
+pub fn get_step(conn: &Connection, id: &str) -> DbResult<Option<TaskStep>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT id, description, is_completed, created_at
+            FROM task_steps
+            WHERE id = ?1
+            "#,
+            [id],
+            |row| row_to_step(row),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// List all steps for a task.
+///
+/// Returns steps ordered by creation time (ULID order).
+pub fn list_steps(conn: &Connection, task_id: &str) -> DbResult<Vec<TaskStep>> {
+    let pattern = TaskStep::glob_pattern(task_id);
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, description, is_completed, created_at
+        FROM task_steps
+        WHERE id GLOB ?1
+        ORDER BY id ASC
+        "#,
+    )?;
+
+    let rows = stmt.query_map([pattern], |row| row_to_step(row))?;
+
+    let mut steps = Vec::new();
+    for row in rows {
+        steps.push(row?);
+    }
+
+    Ok(steps)
+}
+
+/// Count steps for a task.
+pub fn count_steps(conn: &Connection, task_id: &str) -> DbResult<i64> {
+    let pattern = TaskStep::glob_pattern(task_id);
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_steps WHERE id GLOB ?1",
+        [pattern],
+        |row| row.get(0),
+    )?;
+
+    Ok(count)
+}
+
+/// Count completed steps for a task.
+pub fn count_completed_steps(conn: &Connection, task_id: &str) -> DbResult<i64> {
+    let pattern = TaskStep::glob_pattern(task_id);
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_steps WHERE id GLOB ?1 AND is_completed = 'true'",
+        [pattern],
+        |row| row.get(0),
+    )?;
+
+    Ok(count)
+}
+
+/// Get step completion progress for a task.
+///
+/// Returns (completed, total).
+pub fn get_step_progress(conn: &Connection, task_id: &str) -> DbResult<(i64, i64)> {
+    let total = count_steps(conn, task_id)?;
+    let completed = count_completed_steps(conn, task_id)?;
+    Ok((completed, total))
+}
+
+// =============================================================================
+// UPDATE
+// =============================================================================
+
+/// Update step description.
+pub fn update_step_description(conn: &Connection, id: &str, description: &str) -> DbResult<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE task_steps SET description = ?1 WHERE id = ?2",
+        params![description, id],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+/// Set step completion status.
+pub fn set_step_completed(conn: &Connection, id: &str, completed: bool) -> DbResult<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE task_steps SET is_completed = ?1 WHERE id = ?2",
+        params![if completed { "true" } else { "false" }, id],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+/// Mark step as completed.
+pub fn complete_step(conn: &Connection, id: &str) -> DbResult<bool> {
+    set_step_completed(conn, id, true)
+}
+
+/// Mark step as not completed.
+pub fn uncomplete_step(conn: &Connection, id: &str) -> DbResult<bool> {
+    set_step_completed(conn, id, false)
+}
+
+/// Toggle step completion status.
+pub fn toggle_step(conn: &Connection, id: &str) -> DbResult<bool> {
+    let step = get_step(conn, id)?;
+    if let Some(step) = step {
+        set_step_completed(conn, id, !step.is_completed)
+    } else {
+        Ok(false)
+    }
+}
+
+// =============================================================================
+// DELETE
+// =============================================================================
+
+/// Delete a step by ID.
+pub fn delete_step(conn: &Connection, id: &str) -> DbResult<bool> {
+    let rows_affected = conn.execute("DELETE FROM task_steps WHERE id = ?1", [id])?;
+    Ok(rows_affected > 0)
+}
+
+/// Delete all steps for a task.
+pub fn delete_steps_for_task(conn: &Connection, task_id: &str) -> DbResult<i64> {
+    let pattern = TaskStep::glob_pattern(task_id);
+    let rows_affected = conn.execute("DELETE FROM task_steps WHERE id GLOB ?1", [pattern])?;
+    Ok(rows_affected as i64)
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn row_to_step(row: &rusqlite::Row) -> rusqlite::Result<TaskStep> {
+    let is_completed_str: String = row.get(2)?;
+    let created_at_str: String = row.get(3)?;
+
+    Ok(TaskStep {
+        id: row.get(0)?,
+        description: row.get(1)?,
+        is_completed: is_completed_str == "true",
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::connection::open_in_memory;
+    use crate::db::types::ProjectTask;
+    use crate::db::tasks::create_task;
+
+    fn create_test_task(conn: &Connection, title: &str) -> ProjectTask {
+        let task = ProjectTask::new(title);
+        create_task(conn, &task).expect("Failed to create task");
+        task
+    }
+
+    // -------------------------------------------------------------------------
+    // Create tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_add_step() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "First step").expect("Failed to add step");
+
+        assert!(step.id.starts_with(&format!("task#{}#", task.id)));
+        assert_eq!(step.description, "First step");
+        assert!(!step.is_completed);
+    }
+
+    #[test]
+    fn test_add_multiple_steps() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        add_step(&conn, &task.id, "Step 1").expect("Add step 1");
+        add_step(&conn, &task.id, "Step 2").expect("Add step 2");
+        add_step(&conn, &task.id, "Step 3").expect("Add step 3");
+
+        let steps = list_steps(&conn, &task.id).expect("List steps");
+        assert_eq!(steps.len(), 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Read tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_step() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "My step").expect("Add step");
+        let retrieved = get_step(&conn, &step.id).expect("Get step").unwrap();
+
+        assert_eq!(retrieved.id, step.id);
+        assert_eq!(retrieved.description, "My step");
+    }
+
+    #[test]
+    fn test_get_step_not_found() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let result = get_step(&conn, "task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV")
+            .expect("Query failed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_steps_empty() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let steps = list_steps(&conn, &task.id).expect("List steps");
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn test_list_steps_ordered_by_creation() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step1 = add_step(&conn, &task.id, "First").expect("Add step 1");
+        std::thread::sleep(std::time::Duration::from_millis(2)); // Ensure different ULID
+        let step2 = add_step(&conn, &task.id, "Second").expect("Add step 2");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let step3 = add_step(&conn, &task.id, "Third").expect("Add step 3");
+
+        let steps = list_steps(&conn, &task.id).expect("List steps");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].id, step1.id);
+        assert_eq!(steps[1].id, step2.id);
+        assert_eq!(steps[2].id, step3.id);
+    }
+
+    #[test]
+    fn test_list_steps_only_for_task() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task1 = create_test_task(&conn, "Task 1");
+        let task2 = create_test_task(&conn, "Task 2");
+
+        add_step(&conn, &task1.id, "T1 Step 1").expect("Add step");
+        add_step(&conn, &task1.id, "T1 Step 2").expect("Add step");
+        add_step(&conn, &task2.id, "T2 Step 1").expect("Add step");
+
+        let task1_steps = list_steps(&conn, &task1.id).expect("List task1 steps");
+        let task2_steps = list_steps(&conn, &task2.id).expect("List task2 steps");
+
+        assert_eq!(task1_steps.len(), 2);
+        assert_eq!(task2_steps.len(), 1);
+    }
+
+    #[test]
+    fn test_count_steps() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        add_step(&conn, &task.id, "Step 1").expect("Add step");
+        add_step(&conn, &task.id, "Step 2").expect("Add step");
+
+        let count = count_steps(&conn, &task.id).expect("Count steps");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_get_step_progress() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step1 = add_step(&conn, &task.id, "Step 1").expect("Add step");
+        add_step(&conn, &task.id, "Step 2").expect("Add step");
+        let step3 = add_step(&conn, &task.id, "Step 3").expect("Add step");
+
+        // Complete 2 of 3
+        complete_step(&conn, &step1.id).expect("Complete step");
+        complete_step(&conn, &step3.id).expect("Complete step");
+
+        let (completed, total) = get_step_progress(&conn, &task.id).expect("Get progress");
+        assert_eq!(total, 3);
+        assert_eq!(completed, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Update tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_update_step_description() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "Original").expect("Add step");
+        update_step_description(&conn, &step.id, "Updated").expect("Update step");
+
+        let retrieved = get_step(&conn, &step.id).expect("Get step").unwrap();
+        assert_eq!(retrieved.description, "Updated");
+    }
+
+    #[test]
+    fn test_complete_step() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "Step").expect("Add step");
+        assert!(!step.is_completed);
+
+        complete_step(&conn, &step.id).expect("Complete step");
+
+        let retrieved = get_step(&conn, &step.id).expect("Get step").unwrap();
+        assert!(retrieved.is_completed);
+    }
+
+    #[test]
+    fn test_uncomplete_step() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "Step").expect("Add step");
+        complete_step(&conn, &step.id).expect("Complete step");
+        uncomplete_step(&conn, &step.id).expect("Uncomplete step");
+
+        let retrieved = get_step(&conn, &step.id).expect("Get step").unwrap();
+        assert!(!retrieved.is_completed);
+    }
+
+    #[test]
+    fn test_toggle_step() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "Step").expect("Add step");
+
+        // Toggle on
+        toggle_step(&conn, &step.id).expect("Toggle step");
+        let retrieved = get_step(&conn, &step.id).expect("Get step").unwrap();
+        assert!(retrieved.is_completed);
+
+        // Toggle off
+        toggle_step(&conn, &step.id).expect("Toggle step");
+        let retrieved = get_step(&conn, &step.id).expect("Get step").unwrap();
+        assert!(!retrieved.is_completed);
+    }
+
+    // -------------------------------------------------------------------------
+    // Delete tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_step() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        let step = add_step(&conn, &task.id, "Step").expect("Add step");
+        let deleted = delete_step(&conn, &step.id).expect("Delete step");
+        assert!(deleted);
+
+        let retrieved = get_step(&conn, &step.id).expect("Get step");
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_delete_step_not_found() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let deleted = delete_step(&conn, "task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV")
+            .expect("Delete should not error");
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn test_delete_steps_for_task() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task = create_test_task(&conn, "Test task");
+
+        add_step(&conn, &task.id, "Step 1").expect("Add step");
+        add_step(&conn, &task.id, "Step 2").expect("Add step");
+        add_step(&conn, &task.id, "Step 3").expect("Add step");
+
+        let deleted = delete_steps_for_task(&conn, &task.id).expect("Delete steps");
+        assert_eq!(deleted, 3);
+
+        let steps = list_steps(&conn, &task.id).expect("List steps");
+        assert!(steps.is_empty());
+    }
+}

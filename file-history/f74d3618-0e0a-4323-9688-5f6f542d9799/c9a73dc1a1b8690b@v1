@@ -1,0 +1,279 @@
+import { describe, it, expect } from 'vitest';
+import { defineAgent } from '../types/agent';
+import type { AgentConfig, AgentRule, AgentHooks } from '../types/agent';
+
+describe('defineAgent', () => {
+  describe('basic configuration', () => {
+    it('should return the same config object (identity function)', () => {
+      const config: AgentConfig = {
+        rules: [],
+        hooks: {},
+      };
+
+      const result = defineAgent(config);
+
+      expect(result).toBe(config);
+    });
+
+    it('should accept empty config', () => {
+      const config: AgentConfig = {};
+
+      const result = defineAgent(config);
+
+      expect(result).toEqual({});
+    });
+
+    it('should accept config with only rules', () => {
+      const config: AgentConfig = {
+        rules: [
+          {
+            id: 'TEST-001',
+            match: '.forbidden',
+            action: 'block',
+          },
+        ],
+      };
+
+      const result = defineAgent(config);
+
+      expect(result.rules).toHaveLength(1);
+      expect(result.rules![0].id).toBe('TEST-001');
+    });
+
+    it('should accept config with only hooks', () => {
+      const config: AgentConfig = {
+        hooks: {
+          PreToolUse: () => {},
+          SessionStart: () => {},
+        },
+      };
+
+      const result = defineAgent(config);
+
+      expect(result.hooks).toBeDefined();
+      expect(typeof result.hooks!.PreToolUse).toBe('function');
+      expect(typeof result.hooks!.SessionStart).toBe('function');
+    });
+  });
+
+  describe('rules configuration', () => {
+    it('should accept rule with string match', () => {
+      const rule: AgentRule = {
+        id: 'STRING-MATCH',
+        match: '.forbidden',
+        action: 'block',
+        message: 'Forbidden extension',
+      };
+
+      const config = defineAgent({ rules: [rule] });
+
+      expect(config.rules![0].match).toBe('.forbidden');
+    });
+
+    it('should accept rule with regex match', () => {
+      const rule: AgentRule = {
+        id: 'REGEX-MATCH',
+        match: /\.secret\./i,
+        action: 'warn',
+      };
+
+      const config = defineAgent({ rules: [rule] });
+
+      expect(config.rules![0].match).toBeInstanceOf(RegExp);
+    });
+
+    it('should accept rule with function match', () => {
+      const matchFn = (path: string) => path.endsWith('.forbidden');
+
+      const rule: AgentRule = {
+        id: 'FUNCTION-MATCH',
+        match: matchFn,
+        action: 'block',
+      };
+
+      const config = defineAgent({ rules: [rule] });
+
+      expect(typeof config.rules![0].match).toBe('function');
+    });
+
+    it('should accept rule with async function match', () => {
+      const asyncMatchFn = async (path: string) => {
+        await Promise.resolve();
+        return path.includes('secret');
+      };
+
+      const rule: AgentRule = {
+        id: 'ASYNC-MATCH',
+        match: asyncMatchFn,
+        action: 'block',
+      };
+
+      const config = defineAgent({ rules: [rule] });
+
+      expect(typeof config.rules![0].match).toBe('function');
+    });
+
+    it('should accept all action types', () => {
+      const rules: AgentRule[] = [
+        { id: 'BLOCK', match: '.block', action: 'block' },
+        { id: 'WARN', match: '.warn', action: 'warn' },
+        { id: 'ALLOW', match: '.allow', action: 'allow' },
+      ];
+
+      const config = defineAgent({ rules });
+
+      expect(config.rules![0].action).toBe('block');
+      expect(config.rules![1].action).toBe('warn');
+      expect(config.rules![2].action).toBe('allow');
+    });
+
+    it('should accept multiple rules', () => {
+      const config = defineAgent({
+        rules: [
+          { id: 'RULE-1', match: '.a', action: 'block' },
+          { id: 'RULE-2', match: '.b', action: 'warn' },
+          { id: 'RULE-3', match: '.c', action: 'allow' },
+        ],
+      });
+
+      expect(config.rules).toHaveLength(3);
+    });
+  });
+
+  describe('hooks configuration', () => {
+    it('should accept all hook types', () => {
+      const hooks: AgentHooks = {
+        PreToolUse: () => {},
+        PostToolUse: () => {},
+        SessionStart: () => {},
+        SessionEnd: () => {},
+        Notification: () => {},
+        UserPromptSubmit: () => {},
+        PreCompact: () => {},
+        Stop: () => {},
+        SubagentStop: () => {},
+      };
+
+      const config = defineAgent({ hooks });
+
+      expect(Object.keys(config.hooks!)).toHaveLength(9);
+    });
+
+    it('should accept async hooks', () => {
+      const config = defineAgent({
+        hooks: {
+          PreToolUse: async () => {
+            await Promise.resolve();
+          },
+        },
+      });
+
+      expect(typeof config.hooks!.PreToolUse).toBe('function');
+    });
+
+    it('should accept hooks with context parameters', () => {
+      const config = defineAgent({
+        hooks: {
+          PreToolUse: ({ tool, filePath, block, warn, inject }) => {
+            expect(tool).toBeDefined();
+            expect(filePath).toBeDefined();
+            expect(block).toBeDefined();
+            expect(warn).toBeDefined();
+            expect(inject).toBeDefined();
+          },
+        },
+      });
+
+      expect(config.hooks!.PreToolUse).toBeDefined();
+    });
+  });
+
+  describe('extend configuration', () => {
+    it('should accept extend function', () => {
+      const config = defineAgent({
+        extend: (parent) => ({
+          ...parent,
+          rules: [...(parent.rules || []), { id: 'NEW', match: '.new', action: 'block' }],
+        }),
+      });
+
+      expect(typeof config.extend).toBe('function');
+    });
+
+    it('should allow extend to modify parent config', () => {
+      const config = defineAgent({
+        rules: [{ id: 'CHILD', match: '.child', action: 'block' }],
+        extend: (parent) => ({
+          rules: [...(parent.rules || []), ...(config.rules || [])],
+          hooks: { ...parent.hooks },
+        }),
+      });
+
+      const parentConfig: AgentConfig = {
+        rules: [{ id: 'PARENT', match: '.parent', action: 'warn' }],
+      };
+
+      const merged = config.extend!(parentConfig);
+
+      expect(merged.rules).toHaveLength(2);
+    });
+  });
+
+  describe('real-world configurations', () => {
+    it('should handle typical project config', () => {
+      const config = defineAgent({
+        rules: [
+          {
+            id: 'NO-FORBIDDEN-FILES',
+            match: (path) => path.endsWith('.forbidden'),
+            action: 'block',
+            message: 'Cannot create .forbidden files',
+          },
+          {
+            id: 'SENSITIVE-PATH-WARNING',
+            match: /secret|password|credential|\.env/i,
+            action: 'warn',
+            message: 'Sensitive path detected',
+          },
+          {
+            id: 'ALLOW-TESTS',
+            match: '.test.',
+            action: 'allow',
+          },
+        ],
+        hooks: {
+          PreToolUse: async ({ tool, filePath, inject }) => {
+            inject(`Processing: ${filePath} with ${tool}`);
+          },
+          SessionStart: ({ inject }) => {
+            inject('AgentRC active');
+          },
+        },
+      });
+
+      expect(config.rules).toHaveLength(3);
+      expect(config.hooks!.PreToolUse).toBeDefined();
+      expect(config.hooks!.SessionStart).toBeDefined();
+    });
+
+    it('should handle subdirectory config with extend', () => {
+      const rootConfig = defineAgent({
+        rules: [{ id: 'ROOT-RULE', match: '.root', action: 'block' }],
+      });
+
+      const subConfig = defineAgent({
+        rules: [{ id: 'SUB-RULE', match: '.sub', action: 'warn' }],
+        extend: (parent) => ({
+          rules: [...(parent.rules || []), { id: 'SUB-RULE', match: '.sub', action: 'warn' }],
+          hooks: parent.hooks,
+        }),
+      });
+
+      const merged = subConfig.extend!(rootConfig);
+
+      expect(merged.rules).toHaveLength(2);
+      expect(merged.rules![0].id).toBe('ROOT-RULE');
+      expect(merged.rules![1].id).toBe('SUB-RULE');
+    });
+  });
+});

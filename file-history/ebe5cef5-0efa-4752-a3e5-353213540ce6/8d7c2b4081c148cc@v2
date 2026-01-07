@@ -1,0 +1,503 @@
+import { useState, useEffect, useCallback } from 'react';
+import {
+  Modal,
+  ModalBody,
+  ModalHeader,
+  ModalVariant,
+  Button,
+  Card,
+  CardBody,
+  Content,
+  EmptyState,
+  EmptyStateBody,
+  EmptyStateFooter,
+  EmptyStateActions,
+  Split,
+  SplitItem,
+  Stack,
+  StackItem,
+  Label,
+  Alert,
+  AlertActionCloseButton,
+  Spinner,
+  Icon,
+} from '@patternfly/react-core';
+import {
+  FolderIcon,
+  FolderOpenIcon,
+  TimesIcon,
+  PlusCircleIcon,
+} from '@patternfly/react-icons';
+import { open } from '@tauri-apps/plugin-dialog';
+import { invoke } from '@tauri-apps/api/core';
+import { motion, AnimatePresence } from 'motion/react';
+
+// Local storage key for recent projects
+const RECENT_PROJECTS_KEY = 'hq_recent_projects';
+const MAX_RECENT_PROJECTS = 10;
+
+export interface RecentProject {
+  path: string;
+  name: string;
+  lastOpened: number;
+  isValid?: boolean;
+}
+
+interface ProjectSelectorProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelectProject: (path: string, name: string) => void;
+}
+
+// Validate if a folder is a valid harness project (has .harness folder)
+async function validateHarnessProject(path: string): Promise<boolean> {
+  try {
+    // Use Tauri invoke to check if .harness directory exists
+    const exists = await invoke<boolean>('check_harness_exists', { path });
+    return exists;
+  } catch {
+    // Fallback: assume valid if we can't check
+    return true;
+  }
+}
+
+// Get project name from path
+function getProjectName(path: string): string {
+  const parts = path.split(/[/\\]/);
+  return parts[parts.length - 1] || 'Unknown Project';
+}
+
+// Load recent projects from localStorage
+function loadRecentProjects(): RecentProject[] {
+  try {
+    const stored = localStorage.getItem(RECENT_PROJECTS_KEY);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (e) {
+    console.error('Failed to load recent projects:', e);
+  }
+  return [];
+}
+
+// Save recent projects to localStorage
+function saveRecentProjects(projects: RecentProject[]): void {
+  try {
+    localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(projects));
+  } catch (e) {
+    console.error('Failed to save recent projects:', e);
+  }
+}
+
+// Add a project to recent projects
+function addToRecentProjects(path: string, name: string): void {
+  const projects = loadRecentProjects();
+
+  // Remove if already exists
+  const filtered = projects.filter((p) => p.path !== path);
+
+  // Add to front
+  filtered.unshift({
+    path,
+    name,
+    lastOpened: Date.now(),
+    isValid: true,
+  });
+
+  // Keep only MAX_RECENT_PROJECTS
+  const trimmed = filtered.slice(0, MAX_RECENT_PROJECTS);
+
+  saveRecentProjects(trimmed);
+}
+
+// Remove a project from recent projects
+function removeFromRecentProjects(path: string): RecentProject[] {
+  const projects = loadRecentProjects();
+  const filtered = projects.filter((p) => p.path !== path);
+  saveRecentProjects(filtered);
+  return filtered;
+}
+
+export function ProjectSelector({
+  isOpen,
+  onClose,
+  onSelectProject,
+}: ProjectSelectorProps): React.JSX.Element {
+  const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [validatingProjects, setValidatingProjects] = useState(false);
+
+  // State for "init harness" confirmation
+  const [pendingInitPath, setPendingInitPath] = useState<string | null>(null);
+  const [isInitializing, setIsInitializing] = useState(false);
+
+  // Load recent projects on mount
+  useEffect(() => {
+    if (isOpen) {
+      const projects = loadRecentProjects();
+      setRecentProjects(projects);
+      setError(null);
+
+      // Validate projects in background
+      validateRecentProjects(projects);
+    }
+  }, [isOpen]);
+
+  // Validate recent projects in background
+  const validateRecentProjects = useCallback(async (projects: RecentProject[]) => {
+    if (projects.length === 0) return;
+
+    setValidatingProjects(true);
+
+    const validated = await Promise.all(
+      projects.map(async (project) => ({
+        ...project,
+        isValid: await validateHarnessProject(project.path),
+      }))
+    );
+
+    setRecentProjects(validated);
+    setValidatingProjects(false);
+  }, []);
+
+  // Handle browse folder
+  const handleBrowse = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    setPendingInitPath(null);
+
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: 'Select Project Folder',
+      });
+
+      if (selected && typeof selected === 'string') {
+        // Validate it's a harness project
+        const isValid = await validateHarnessProject(selected);
+
+        if (!isValid) {
+          // Ask if user wants to initialize harness
+          setPendingInitPath(selected);
+          setIsLoading(false);
+          return;
+        }
+
+        const name = getProjectName(selected);
+        addToRecentProjects(selected, name);
+        onSelectProject(selected, name);
+        onClose();
+      }
+    } catch (e) {
+      console.error('Failed to open directory:', e);
+      setError('Failed to open folder picker. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [onSelectProject, onClose]);
+
+  // Handle initializing harness in a folder
+  const handleInitHarness = useCallback(async () => {
+    if (!pendingInitPath) return;
+
+    setIsInitializing(true);
+    setError(null);
+
+    try {
+      // Run harness init command
+      await invoke('run_harness_command', {
+        projectPath: pendingInitPath,
+        args: ['init'],
+      });
+
+      // Verify it worked
+      const isValid = await validateHarnessProject(pendingInitPath);
+      if (!isValid) {
+        setError('Failed to initialize harness. Please try again.');
+        setIsInitializing(false);
+        return;
+      }
+
+      const name = getProjectName(pendingInitPath);
+      addToRecentProjects(pendingInitPath, name);
+      onSelectProject(pendingInitPath, name);
+      setPendingInitPath(null);
+      onClose();
+    } catch (e) {
+      console.error('Failed to initialize harness:', e);
+      setError(`Failed to initialize harness: ${e}`);
+    } finally {
+      setIsInitializing(false);
+    }
+  }, [pendingInitPath, onSelectProject, onClose]);
+
+  // Cancel pending init
+  const handleCancelInit = useCallback(() => {
+    setPendingInitPath(null);
+  }, []);
+
+  // Handle select recent project
+  const handleSelectRecent = useCallback(async (project: RecentProject) => {
+    setError(null);
+
+    // Re-validate before opening
+    const isValid = await validateHarnessProject(project.path);
+
+    if (!isValid) {
+      setError(`Project "${project.name}" no longer contains a valid .harness directory.`);
+      return;
+    }
+
+    addToRecentProjects(project.path, project.name);
+    onSelectProject(project.path, project.name);
+    onClose();
+  }, [onSelectProject, onClose]);
+
+  // Handle remove recent project
+  const handleRemoveRecent = useCallback((e: React.MouseEvent, path: string) => {
+    e.stopPropagation();
+    const updated = removeFromRecentProjects(path);
+    setRecentProjects(updated);
+  }, []);
+
+  // Format relative time
+  const formatRelativeTime = (timestamp: number): string => {
+    const diff = Date.now() - timestamp;
+    const minutes = Math.floor(diff / 60000);
+    const hours = Math.floor(diff / 3600000);
+    const days = Math.floor(diff / 86400000);
+
+    if (minutes < 1) return 'Just now';
+    if (minutes < 60) return `${minutes}m ago`;
+    if (hours < 24) return `${hours}h ago`;
+    if (days < 7) return `${days}d ago`;
+    return new Date(timestamp).toLocaleDateString();
+  };
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      variant={ModalVariant.medium}
+      aria-label="Project Selector"
+    >
+      <ModalHeader title="Open Project" />
+      <ModalBody>
+        <Stack hasGutter>
+          {/* Error Alert */}
+          <AnimatePresence>
+            {error && (
+              <StackItem>
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                >
+                  <Alert
+                    variant="warning"
+                    title="Invalid Project"
+                    actionClose={
+                      <AlertActionCloseButton onClose={() => setError(null)} />
+                    }
+                  >
+                    {error}
+                  </Alert>
+                </motion.div>
+              </StackItem>
+            )}
+          </AnimatePresence>
+
+          {/* Init Harness Confirmation */}
+          <AnimatePresence>
+            {pendingInitPath && (
+              <StackItem>
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                >
+                  <Alert
+                    variant="info"
+                    title="Initialize Harness Project?"
+                    actionClose={
+                      <AlertActionCloseButton onClose={handleCancelInit} />
+                    }
+                  >
+                    <Stack hasGutter>
+                      <StackItem>
+                        <Content component="p">
+                          This folder does not contain a <code>.harness</code> directory.
+                          Would you like to initialize it as a Harness project?
+                        </Content>
+                        <Content component="small" style={{ color: 'var(--pf-t--global--text--color--subtle)' }}>
+                          {pendingInitPath}
+                        </Content>
+                      </StackItem>
+                      <StackItem>
+                        <Split hasGutter>
+                          <SplitItem>
+                            <Button
+                              variant="primary"
+                              onClick={handleInitHarness}
+                              isLoading={isInitializing}
+                              isDisabled={isInitializing}
+                            >
+                              {isInitializing ? 'Initializing...' : 'Initialize Harness'}
+                            </Button>
+                          </SplitItem>
+                          <SplitItem>
+                            <Button
+                              variant="secondary"
+                              onClick={handleCancelInit}
+                              isDisabled={isInitializing}
+                            >
+                              Cancel
+                            </Button>
+                          </SplitItem>
+                        </Split>
+                      </StackItem>
+                    </Stack>
+                  </Alert>
+                </motion.div>
+              </StackItem>
+            )}
+          </AnimatePresence>
+
+          {/* Browse Button */}
+          <StackItem>
+            <Button
+              variant="primary"
+              icon={<FolderOpenIcon />}
+              onClick={handleBrowse}
+              isLoading={isLoading}
+              isDisabled={isLoading || isInitializing}
+              isBlock
+            >
+              {isLoading ? 'Opening...' : 'Browse for Folder...'}
+            </Button>
+          </StackItem>
+
+          {/* Recent Projects */}
+          <StackItem>
+            <Content component="h3">
+              Recent Projects
+              {validatingProjects && (
+                <Spinner size="sm" style={{ marginLeft: 8 }} />
+              )}
+            </Content>
+          </StackItem>
+
+          <StackItem>
+            {recentProjects.length === 0 ? (
+              <EmptyState
+                titleText="No recent projects"
+                headingLevel="h4"
+                icon={FolderIcon}
+              >
+                <EmptyStateBody>
+                  Open a project folder to get started. Projects with a .harness
+                  directory will be shown here for quick access.
+                </EmptyStateBody>
+                <EmptyStateFooter>
+                  <EmptyStateActions>
+                    <Button
+                      variant="primary"
+                      icon={<PlusCircleIcon />}
+                      onClick={handleBrowse}
+                    >
+                      Open Project
+                    </Button>
+                  </EmptyStateActions>
+                </EmptyStateFooter>
+              </EmptyState>
+            ) : (
+              <Stack hasGutter>
+                <AnimatePresence>
+                  {recentProjects.map((project, index) => (
+                    <StackItem key={project.path}>
+                      <motion.div
+                        initial={{ opacity: 0, x: -20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 20 }}
+                        transition={{ delay: index * 0.05 }}
+                      >
+                        <Card
+                          isClickable
+                          isSelectable
+                          onClick={() => handleSelectRecent(project)}
+                          style={{
+                            opacity: project.isValid === false ? 0.5 : 1,
+                          }}
+                        >
+                          <CardBody>
+                            <Split hasGutter>
+                              <SplitItem>
+                                <Icon
+                                  status={project.isValid === false ? 'warning' : 'info'}
+                                  size="lg"
+                                >
+                                  <FolderIcon />
+                                </Icon>
+                              </SplitItem>
+                              <SplitItem isFilled>
+                                <Content>
+                                  <Content component="h4" style={{ marginBottom: 4 }}>
+                                    {project.name}
+                                  </Content>
+                                  <Content
+                                    component="small"
+                                    style={{
+                                      color: 'var(--pf-t--global--text--color--subtle)',
+                                      wordBreak: 'break-all',
+                                    }}
+                                  >
+                                    {project.path}
+                                  </Content>
+                                </Content>
+                              </SplitItem>
+                              <SplitItem>
+                                <Split hasGutter>
+                                  <SplitItem>
+                                    <Label isCompact color="grey">
+                                      {formatRelativeTime(project.lastOpened)}
+                                    </Label>
+                                  </SplitItem>
+                                  {project.isValid === false && (
+                                    <SplitItem>
+                                      <Label isCompact color="orange">
+                                        Invalid
+                                      </Label>
+                                    </SplitItem>
+                                  )}
+                                  <SplitItem>
+                                    <Button
+                                      variant="plain"
+                                      aria-label="Remove from recent"
+                                      onClick={(e) =>
+                                        handleRemoveRecent(e, project.path)
+                                      }
+                                    >
+                                      <TimesIcon />
+                                    </Button>
+                                  </SplitItem>
+                                </Split>
+                              </SplitItem>
+                            </Split>
+                          </CardBody>
+                        </Card>
+                      </motion.div>
+                    </StackItem>
+                  ))}
+                </AnimatePresence>
+              </Stack>
+            )}
+          </StackItem>
+        </Stack>
+      </ModalBody>
+    </Modal>
+  );
+}
+
+export default ProjectSelector;

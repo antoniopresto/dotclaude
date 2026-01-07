@@ -1,0 +1,410 @@
+     1→/**
+     2→ * PerfMonitor - Performance monitoring component for WebGL/R3F applications
+     3→ *
+     4→ * Features:
+     5→ * - Real-time FPS, MS, Memory, GPU, Draw Calls, Triangles display via r3f-perf
+     6→ * - Detailed logging system with circular buffer (60s of metrics)
+     7→ * - Session recording for performance testing
+     8→ * - Global API exposed via window for programmatic access
+     9→ *
+    10→ * Usage:
+    11→ * - Visual: Press 'P' key or use toggle button to show/hide panel
+    12→ * - Console: window.__PERF_LOG__ - access log buffer
+    13→ * - Console: window.__PERF_EXPORT__() - export full log as array
+    14→ * - Console: window.__PERF_START_SESSION__('test') - start recording session
+    15→ * - Console: window.__PERF_STOP_SESSION__() - stop and get session stats
+    16→ *
+    17→ * @see docs/PERFORMANCE_LOGGING.md for detailed documentation
+    18→ */
+    19→
+    20→import { useEffect, useRef, useCallback, useState } from 'react';
+    21→import { Perf, usePerf } from 'r3f-perf';
+    22→
+    23→// ─────────────────────────────────────────────────────────────
+    24→// TYPES
+    25→// ─────────────────────────────────────────────────────────────
+    26→
+    27→/**
+    28→ * Event type for performance logging
+    29→ */
+    30→type PerfEvent = 'idle' | 'panning' | 'zooming' | 'animating' | 'lod_transition' | 'unknown';
+    31→
+    32→/**
+    33→ * Single metric entry in the log buffer
+    34→ */
+    35→interface PerfLogEntry {
+    36→  timestamp: number;
+    37→  fps: {
+    38→    current: number;
+    39→    avg: number;
+    40→    min: number;
+    41→    max: number;
+    42→  };
+    43→  ms: {
+    44→    current: number;
+    45→    avg: number;
+    46→    max: number;
+    47→  };
+    48→  memory: number; // MB
+    49→  gpu: number | null; // GPU time in ms (may not be available)
+    50→  drawCalls: number;
+    51→  triangles: number;
+    52→  event: PerfEvent;
+    53→}
+    54→
+    55→/**
+    56→ * Session statistics returned by __PERF_STOP_SESSION__
+    57→ */
+    58→interface PerfSessionStats {
+    59→  name: string;
+    60→  duration: number; // seconds
+    61→  totalFrames: number;
+    62→  fps: {
+    63→    avg: number;
+    64→    min: number;
+    65→    max: number;
+    66→    p1: number; // 1st percentile (worst 1%)
+    67→    p99: number; // 99th percentile (best 99%)
+    68→  };
+    69→  ms: {
+    70→    avg: number;
+    71→    max: number;
+    72→  };
+    73→  framesBelow30: number;
+    74→  framesBelow60: number;
+    75→  entries: PerfLogEntry[];
+    76→}
+    77→
+    78→/**
+    79→ * Active session state
+    80→ */
+    81→interface PerfSession {
+    82→  name: string;
+    83→  startTime: number;
+    84→  entries: PerfLogEntry[];
+    85→  fpsValues: number[];
+    86→}
+    87→
+    88→// ─────────────────────────────────────────────────────────────
+    89→// CONSTANTS
+    90→// ─────────────────────────────────────────────────────────────
+    91→
+    92→const LOG_BUFFER_DURATION_MS = 60000; // 60 seconds of logs
+    93→const LOG_INTERVAL_FRAMES = 60; // Log every 60 frames (~1 second at 60fps)
+    94→
+    95→// ─────────────────────────────────────────────────────────────
+    96→// GLOBAL STATE (accessible via window)
+    97→// ─────────────────────────────────────────────────────────────
+    98→
+    99→// Circular buffer for performance logs
+   100→let perfLogBuffer: PerfLogEntry[] = [];
+   101→let currentSession: PerfSession | null = null;
+   102→let frameCounter = 0;
+   103→let fpsHistory: number[] = [];
+   104→let msHistory: number[] = [];
+   105→
+   106→// Rolling statistics for averaging
+   107→const rollingWindow = 60; // frames for rolling average
+   108→
+   109→/**
+   110→ * Clear old entries from buffer based on timestamp
+   111→ */
+   112→function pruneOldEntries() {
+   113→  const cutoff = Date.now() - LOG_BUFFER_DURATION_MS;
+   114→  perfLogBuffer = perfLogBuffer.filter((entry) => entry.timestamp > cutoff);
+   115→}
+   116→
+   117→/**
+   118→ * Calculate percentile from sorted array
+   119→ */
+   120→function percentile(sortedArr: number[], p: number): number {
+   121→  if (sortedArr.length === 0) return 0;
+   122→  const index = Math.ceil((p / 100) * sortedArr.length) - 1;
+   123→  return sortedArr[Math.max(0, Math.min(index, sortedArr.length - 1))];
+   124→}
+   125→
+   126→/**
+   127→ * Export the global performance API to window
+   128→ */
+   129→function setupGlobalAPI() {
+   130→  // Make log buffer accessible
+   131→  Object.defineProperty(window, '__PERF_LOG__', {
+   132→    get: () => [...perfLogBuffer],
+   133→    configurable: true,
+   134→  });
+   135→
+   136→  // Export full log
+   137→  (window as any).__PERF_EXPORT__ = (): PerfLogEntry[] => {
+   138→    return [...perfLogBuffer];
+   139→  };
+   140→
+   141→  // Start a named session
+   142→  (window as any).__PERF_START_SESSION__ = (name: string): void => {
+   143→    if (currentSession) {
+   144→      console.warn(`[PERF] Session "${currentSession.name}" already running. Stopping it first.`);
+   145→      (window as any).__PERF_STOP_SESSION__();
+   146→    }
+   147→    currentSession = {
+   148→      name,
+   149→      startTime: Date.now(),
+   150→      entries: [],
+   151→      fpsValues: [],
+   152→    };
+   153→    console.log(`[PERF] Session "${name}" started`);
+   154→  };
+   155→
+   156→  // Stop current session and return stats
+   157→  (window as any).__PERF_STOP_SESSION__ = (): PerfSessionStats | null => {
+   158→    if (!currentSession) {
+   159→      console.warn('[PERF] No active session to stop');
+   160→      return null;
+   161→    }
+   162→
+   163→    const session = currentSession;
+   164→    currentSession = null;
+   165→
+   166→    const duration = (Date.now() - session.startTime) / 1000;
+   167→    const sortedFps = [...session.fpsValues].sort((a, b) => a - b);
+   168→
+   169→    const stats: PerfSessionStats = {
+   170→      name: session.name,
+   171→      duration,
+   172→      totalFrames: session.fpsValues.length,
+   173→      fps: {
+   174→        avg: sortedFps.length > 0 ? sortedFps.reduce((a, b) => a + b, 0) / sortedFps.length : 0,
+   175→        min: sortedFps.length > 0 ? sortedFps[0] : 0,
+   176→        max: sortedFps.length > 0 ? sortedFps[sortedFps.length - 1] : 0,
+   177→        p1: percentile(sortedFps, 1),
+   178→        p99: percentile(sortedFps, 99),
+   179→      },
+   180→      ms: {
+   181→        avg: session.entries.length > 0
+   182→          ? session.entries.reduce((a, e) => a + e.ms.current, 0) / session.entries.length
+   183→          : 0,
+   184→        max: session.entries.length > 0
+   185→          ? Math.max(...session.entries.map((e) => e.ms.current))
+   186→          : 0,
+   187→      },
+   188→      framesBelow30: session.fpsValues.filter((fps) => fps < 30).length,
+   189→      framesBelow60: session.fpsValues.filter((fps) => fps < 60).length,
+   190→      entries: session.entries,
+   191→    };
+   192→
+   193→    console.log(`[PERF] Session "${session.name}" stopped:`, {
+   194→      duration: `${duration.toFixed(2)}s`,
+   195→      avgFPS: stats.fps.avg.toFixed(1),
+   196→      p1FPS: stats.fps.p1.toFixed(1),
+   197→      p99FPS: stats.fps.p99.toFixed(1),
+   198→      framesBelow30: stats.framesBelow30,
+   199→      framesBelow60: stats.framesBelow60,
+   200→    });
+   201→
+   202→    return stats;
+   203→  };
+   204→
+   205→  // Get current session status
+   206→  (window as any).__PERF_SESSION_STATUS__ = (): { active: boolean; name?: string; duration?: number } => {
+   207→    if (!currentSession) {
+   208→      return { active: false };
+   209→    }
+   210→    return {
+   211→      active: true,
+   212→      name: currentSession.name,
+   213→      duration: (Date.now() - currentSession.startTime) / 1000,
+   214→    };
+   215→  };
+   216→
+   217→  // Clear log buffer
+   218→  (window as any).__PERF_CLEAR__ = (): void => {
+   219→    perfLogBuffer = [];
+   220→    console.log('[PERF] Log buffer cleared');
+   221→  };
+   222→}
+   223→
+   224→// ─────────────────────────────────────────────────────────────
+   225→// PERF LOGGER COMPONENT (runs inside R3F Canvas)
+   226→// ─────────────────────────────────────────────────────────────
+   227→
+   228→/**
+   229→ * Internal component that reads r3f-perf data and logs it
+   230→ * Must be rendered inside R3F Canvas context
+   231→ */
+   232→function PerfLogger({ currentEvent }: { currentEvent: PerfEvent }) {
+   233→  const perfData = usePerf();
+   234→
+   235→  useEffect(() => {
+   236→    if (!perfData) return;
+   237→
+   238→    frameCounter++;
+   239→
+   240→    // Track FPS for rolling average
+   241→    const currentFps = perfData.log?.fps ?? 0;
+   242→    const currentMs = perfData.log?.ms ?? 16.67;
+   243→
+   244→    fpsHistory.push(currentFps);
+   245→    msHistory.push(currentMs);
+   246→
+   247→    // Keep rolling window
+   248→    if (fpsHistory.length > rollingWindow) {
+   249→      fpsHistory.shift();
+   250→      msHistory.shift();
+   251→    }
+   252→
+   253→    // Track for active session (every frame)
+   254→    if (currentSession) {
+   255→      currentSession.fpsValues.push(currentFps);
+   256→    }
+   257→
+   258→    // Log every N frames
+   259→    if (frameCounter >= LOG_INTERVAL_FRAMES) {
+   260→      frameCounter = 0;
+   261→
+   262→      // Calculate rolling stats
+   263→      const avgFps = fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length;
+   264→      const minFps = Math.min(...fpsHistory);
+   265→      const maxFps = Math.max(...fpsHistory);
+   266→      const avgMs = msHistory.reduce((a, b) => a + b, 0) / msHistory.length;
+   267→      const maxMs = Math.max(...msHistory);
+   268→
+   269→      const entry: PerfLogEntry = {
+   270→        timestamp: Date.now(),
+   271→        fps: {
+   272→          current: currentFps,
+   273→          avg: avgFps,
+   274→          min: minFps,
+   275→          max: maxFps,
+   276→        },
+   277→        ms: {
+   278→          current: currentMs,
+   279→          avg: avgMs,
+   280→          max: maxMs,
+   281→        },
+   282→        memory: perfData.log?.mem ?? 0,
+   283→        gpu: perfData.log?.gpu ?? null,
+   284→        drawCalls: perfData.log?.calls ?? 0,
+   285→        triangles: perfData.log?.triangles ?? 0,
+   286→        event: currentEvent,
+   287→      };
+   288→
+   289→      // Add to buffer
+   290→      perfLogBuffer.push(entry);
+   291→      pruneOldEntries();
+   292→
+   293→      // Add to active session
+   294→      if (currentSession) {
+   295→        currentSession.entries.push(entry);
+   296→      }
+   297→    }
+   298→  });
+   299→
+   300→  return null;
+   301→}
+   302→
+   303→// ─────────────────────────────────────────────────────────────
+   304→// MAIN PERF MONITOR COMPONENT
+   305→// ─────────────────────────────────────────────────────────────
+   306→
+   307→interface PerfMonitorProps {
+   308→  /** Whether the perf panel is visible */
+   309→  visible?: boolean;
+   310→  /** Callback when visibility changes (for external control) */
+   311→  onVisibilityChange?: (visible: boolean) => void;
+   312→  /** Current event type for logging context */
+   313→  currentEvent?: PerfEvent;
+   314→  /** Position of the panel */
+   315→  position?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+   316→}
+   317→
+   318→/**
+   319→ * Performance monitor component with r3f-perf panel and logging system
+   320→ *
+   321→ * This component should be rendered INSIDE the R3F Canvas.
+   322→ *
+   323→ * @example
+   324→ * <Canvas>
+   325→ *   <PerfMonitor visible={showPerf} />
+   326→ *   {... other scene content ...}
+   327→ * </Canvas>
+   328→ */
+   329→export function PerfMonitor({
+   330→  visible = true,
+   331→  currentEvent = 'idle',
+   332→  position = 'bottom-left', // BUG-006: Changed from top-right to avoid blocking navbar controls
+   333→}: PerfMonitorProps) {
+   334→  // Setup global API on mount
+   335→  useEffect(() => {
+   336→    setupGlobalAPI();
+   337→    console.log('[PERF] Performance monitor initialized. Available commands:');
+   338→    console.log('  window.__PERF_LOG__ - Access log buffer');
+   339→    console.log('  window.__PERF_EXPORT__() - Export full log');
+   340→    console.log('  window.__PERF_START_SESSION__(name) - Start recording');
+   341→    console.log('  window.__PERF_STOP_SESSION__() - Stop and get stats');
+   342→    console.log('  window.__PERF_CLEAR__() - Clear log buffer');
+   343→
+   344→    return () => {
+   345→      // Cleanup (optional - keep API available for debugging)
+   346→    };
+   347→  }, []);
+   348→
+   349→  return (
+   350→    <>
+   351→      {/* r3f-perf visual panel */}
+   352→      {visible && (
+   353→        <Perf
+   354→          position={position}
+   355→          minimal={false}
+   356→          showGraph={true}
+   357→          colorBlind={false}
+   358→          antialias={true}
+   359→          overClock={true}
+   360→          deepAnalyze={true}
+   361→          matrixUpdate={true}
+   362→        />
+   363→      )}
+   364→
+   365→      {/* Logger that runs continuously (even when panel is hidden) */}
+   366→      <PerfLogger currentEvent={currentEvent} />
+   367→    </>
+   368→  );
+   369→}
+   370→
+   371→/**
+   372→ * Hook to toggle perf monitor visibility with keyboard shortcut
+   373→ *
+   374→ * @example
+   375→ * const { visible, toggle } = usePerfMonitorToggle();
+   376→ */
+   377→export function usePerfMonitorToggle(initialVisible = false) {
+   378→  const [visible, setVisible] = useState(initialVisible);
+   379→
+   380→  useEffect(() => {
+   381→    const handleKeyDown = (e: KeyboardEvent) => {
+   382→      // Toggle on 'P' key (not when typing in input)
+   383→      if (
+   384→        e.key === 'p' &&
+   385→        !e.ctrlKey &&
+   386→        !e.metaKey &&
+   387→        !e.altKey &&
+   388→        !(e.target instanceof HTMLInputElement) &&
+   389→        !(e.target instanceof HTMLTextAreaElement)
+   390→      ) {
+   391→        setVisible((v) => !v);
+   392→      }
+   393→    };
+   394→
+   395→    window.addEventListener('keydown', handleKeyDown);
+   396→    return () => window.removeEventListener('keydown', handleKeyDown);
+   397→  }, []);
+   398→
+   399→  const toggle = useCallback(() => setVisible((v) => !v), []);
+   400→
+   401→  return { visible, toggle, setVisible };
+   402→}
+   403→
+   404→// Export types for external use
+   405→export type { PerfEvent, PerfLogEntry, PerfSessionStats };
+   406→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

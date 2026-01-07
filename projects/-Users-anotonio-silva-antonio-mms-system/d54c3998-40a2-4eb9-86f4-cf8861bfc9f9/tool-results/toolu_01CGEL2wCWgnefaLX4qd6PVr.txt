@@ -1,0 +1,2087 @@
+     1→/**
+     2→ * InfiniteCanvas - Professional-grade pan/zoom canvas
+     3→ *
+     4→ * Features:
+     5→ * - Pan with mouse drag (bounded to world limits)
+     6→ * - Zoom with scroll wheel (centers on cursor position)
+     7→ * - Initial view shows top-left of data (X=0, Y=0)
+     8→ * - Sidebar sync via onViewportChange callback
+     9→ *
+    10→ * Coordinate System:
+    11→ * - X: 0 = first day, positive = future (right)
+    12→ * - Y: 0 = first train (TRAIN-001), negative = more trains (down)
+    13→ *
+    14→ * References:
+    15→ * - D3.js zoom: https://d3js.org/d3-zoom
+    16→ * - Three.js OrthographicCamera: https://threejs.org/docs/api/en/cameras/OrthographicCamera.html
+    17→ * - pixi-viewport: https://github.com/pixijs-userland/pixi-viewport
+    18→ */
+    19→
+    20→import { Canvas, useThree } from '@react-three/fiber';
+    21→import { useCallback, useMemo, useEffect, useRef } from 'react';
+    22→import { MesoLayer } from './layers/MesoLayer';
+    23→import { MacroLayer } from './layers/MacroLayer';
+    24→import { MicroLayer } from './layers/MicroLayer';
+    25→import { PerfMonitor } from '../components/PerfMonitor';
+    26→import type { PerfEvent } from '../components/PerfMonitor';
+    27→import { getRenderData } from '../data/generator';
+    28→import type { LODLevel, WorldBounds } from '../data/types';
+    29→import { DEFAULT_VIEW_CONFIG, calculateWorldBounds } from '../data/types';
+    30→import { useCanvasSelector, canvasActions, canvasStore } from '../state';
+    31→
+    32→// ─────────────────────────────────────────────────────────────
+    33→// EXPORTED TYPES
+    34→// ─────────────────────────────────────────────────────────────
+    35→
+    36→/**
+    37→ * Viewport information passed to parent component
+    38→ */
+    39→export interface ViewportInfo {
+    40→  /** Y coordinate of the TOP of the viewport in world space */
+    41→  topY: number;
+    42→  /** Left edge of the viewport in world X coordinates */
+    43→  leftX: number;
+    44→  /** Right edge of the viewport in world X coordinates */
+    45→  rightX: number;
+    46→}
+    47→
+    48→/**
+    49→ * Viewport bounds in world coordinates
+    50→ * Used for frustum culling - only render tasks within these bounds
+    51→ */
+    52→export interface ViewportBounds {
+    53→  minX: number;
+    54→  maxX: number;
+    55→  minY: number;
+    56→  maxY: number;
+    57→}
+    58→
+    59→// ─────────────────────────────────────────────────────────────
+    60→// LOD CONFIGURATION
+    61→// ─────────────────────────────────────────────────────────────
+    62→
+    63→/**
+    64→ * LOD Transition Configuration
+    65→ *
+    66→ * Defines blend zones around LOD thresholds for smooth transitions.
+    67→ * During blend zones, both adjacent layers render with interpolated opacity.
+    68→ */
+    69→const LOD_THRESHOLDS = {
+    70→  macroToMeso: 0.5,  // Below 0.5 = MACRO
+    71→  mesoToMicro: 2.0,  // Above 2.0 = MICRO
+    72→};
+    73→
+    74→// Size of blend zone around each threshold (±this value)
+    75→const BLEND_ZONE_SIZE = 0.15;
+    76→
+    77→/**
+    78→ * Calculate layer opacities for smooth LOD transitions
+    79→ *
+    80→ * Returns opacity values for each layer (0-1).
+    81→ * During blend zones, adjacent layers overlap with interpolated opacity.
+    82→ */
+    83→function calculateLayerOpacities(zoom: number): {
+    84→  macro: number;
+    85→  meso: number;
+    86→  micro: number;
+    87→} {
+    88→  const { macroToMeso, mesoToMicro } = LOD_THRESHOLDS;
+    89→
+    90→  // Define blend zone boundaries
+    91→  const macroEnd = macroToMeso - BLEND_ZONE_SIZE; // 0.35
+    92→  const mesoStart = macroToMeso + BLEND_ZONE_SIZE; // 0.65
+    93→  const mesoEnd = mesoToMicro - BLEND_ZONE_SIZE; // 1.85
+    94→  const microStart = mesoToMicro + BLEND_ZONE_SIZE; // 2.15
+    95→
+    96→  let macro = 0;
+    97→  let meso = 0;
+    98→  let micro = 0;
+    99→
+   100→  // Calculate MACRO opacity
+   101→  if (zoom <= macroEnd) {
+   102→    macro = 1;
+   103→  } else if (zoom < mesoStart) {
+   104→    // Blend zone MACRO → MESO
+   105→    const t = (zoom - macroEnd) / (mesoStart - macroEnd);
+   106→    macro = 1 - t;
+   107→  }
+   108→
+   109→  // Calculate MESO opacity
+   110→  if (zoom < macroEnd) {
+   111→    meso = 0;
+   112→  } else if (zoom < mesoStart) {
+   113→    // Blend zone MACRO → MESO
+   114→    const t = (zoom - macroEnd) / (mesoStart - macroEnd);
+   115→    meso = t;
+   116→  } else if (zoom <= mesoEnd) {
+   117→    meso = 1;
+   118→  } else if (zoom < microStart) {
+   119→    // Blend zone MESO → MICRO
+   120→    const t = (zoom - mesoEnd) / (microStart - mesoEnd);
+   121→    meso = 1 - t;
+   122→  }
+   123→
+   124→  // Calculate MICRO opacity
+   125→  if (zoom <= mesoEnd) {
+   126→    micro = 0;
+   127→  } else if (zoom < microStart) {
+   128→    // Blend zone MESO → MICRO
+   129→    const t = (zoom - mesoEnd) / (microStart - mesoEnd);
+   130→    micro = t;
+   131→  } else {
+   132→    micro = 1;
+   133→  }
+   134→
+   135→  return { macro, meso, micro };
+   136→}
+   137→
+   138→/**
+   139→ * LODLayers - Orchestrates layer rendering with smooth transitions
+   140→ *
+   141→ * Renders multiple layers simultaneously during blend zones,
+   142→ * with opacity interpolation for smooth visual transitions.
+   143→ */
+   144→function LODLayers({
+   145→  tasks,
+   146→  trainCount,
+   147→  zoom,
+   148→  viewportBounds,
+   149→  hoveredTaskId,
+   150→  selectedTaskId,
+   151→  focusedTaskId,
+   152→}: {
+   153→  tasks: ReturnType<typeof getRenderData>['tasks'];
+   154→  trainCount: number;
+   155→  zoom: number;
+   156→  viewportBounds: ViewportBounds;
+   157→  hoveredTaskId: string | null;
+   158→  selectedTaskId: string | null;
+   159→  focusedTaskId: string | null;
+   160→}) {
+   161→  const opacities = useMemo(() => calculateLayerOpacities(zoom), [zoom]);
+   162→
+   163→  return (
+   164→    <group>
+   165→      {/* Render each layer if opacity > 0 */}
+   166→      {opacities.macro > 0 && (
+   167→        <MacroLayer
+   168→          tasks={tasks}
+   169→          trainCount={trainCount}
+   170→          opacity={opacities.macro}
+   171→        />
+   172→      )}
+   173→      {opacities.meso > 0 && (
+   174→        <MesoLayer
+   175→          tasks={tasks}
+   176→          trainCount={trainCount}
+   177→          opacity={opacities.meso}
+   178→          hoveredTaskId={hoveredTaskId}
+   179→          selectedTaskId={selectedTaskId}
+   180→          focusedTaskId={focusedTaskId}
+   181→        />
+   182→      )}
+   183→      {opacities.micro > 0 && (
+   184→        <MicroLayer
+   185→          tasks={tasks}
+   186→          trainCount={trainCount}
+   187→          opacity={opacities.micro}
+   188→          viewportBounds={viewportBounds}
+   189→          hoveredTaskId={hoveredTaskId}
+   190→          selectedTaskId={selectedTaskId}
+   191→          focusedTaskId={focusedTaskId}
+   192→        />
+   193→      )}
+   194→    </group>
+   195→  );
+   196→}
+   197→
+   198→/**
+   199→ * Navigation target for programmatic navigation
+   200→ * Can specify trainIndex, dayOffset, or both
+   201→ */
+   202→export interface NavigationTarget {
+   203→  /** Train index (0-based) to center on vertically */
+   204→  trainIndex?: number;
+   205→  /** Day offset from start date to center on horizontally */
+   206→  dayOffset?: number;
+   207→  /** Optional zoom level to set (defaults to current zoom) */
+   208→  zoom?: number;
+   209→}
+   210→
+   211→interface InfiniteCanvasProps {
+   212→  zoom: number;
+   213→  lod: LODLevel;
+   214→  onZoomChange: (zoom: number) => void;
+   215→  /**
+   216→   * Called when viewport position changes.
+   217→   * @param viewport - Object with topY, leftX, rightX coordinates
+   218→   */
+   219→  onViewportChange?: (viewport: ViewportInfo) => void;
+   220→  /**
+   221→   * Called when the effective minimum zoom changes.
+   222→   * Used by parent to enforce zoom limits on buttons.
+   223→   */
+   224→  onMinZoomChange?: (minZoom: number) => void;
+   225→  /**
+   226→   * Request a smooth animated zoom to target level.
+   227→   * Called by parent buttons for +/- zoom with animation.
+   228→   */
+   229→  animatedZoomTarget?: number | null;
+   230→  /**
+   231→   * Called when animated zoom completes or is acknowledged.
+   232→   */
+   233→  onAnimatedZoomComplete?: () => void;
+   234→  /**
+   235→   * Request navigation to a specific train/date.
+   236→   * Set to null after navigation completes.
+   237→   */
+   238→  navigationTarget?: NavigationTarget | null;
+   239→  /**
+   240→   * Called when navigation animation completes.
+   241→   */
+   242→  onNavigationComplete?: () => void;
+   243→  /**
+   244→   * Whether performance monitor panel is visible (PERF-001)
+   245→   */
+   246→  perfVisible?: boolean;
+   247→  /**
+   248→   * Current performance event type for logging context (PERF-001)
+   249→   */
+   250→  perfEvent?: PerfEvent;
+   251→}
+   252→
+   253→// Navigation limits
+   254→const ABSOLUTE_MIN_ZOOM = 0.05; // Absolute minimum to prevent extreme zoom out
+   255→const MAX_ZOOM = 5.0;
+   256→
+   257→// Momentum physics constants
+   258→const MOMENTUM_FRICTION = 0.93; // Per-frame velocity multiplier (0.93-0.95 recommended)
+   259→const MOMENTUM_MIN_VELOCITY = 0.5; // Stop threshold in world units
+   260→const MOMENTUM_VELOCITY_SAMPLES = 5; // Number of velocity samples to average
+   261→
+   262→// Smooth zoom constants
+   263→const ZOOM_ANIMATION_DURATION = 250; // ms for animated zoom transitions
+   264→const ZOOM_ACCUMULATION_TIMEOUT = 50; // ms to accumulate wheel events (trackpad smoothing)
+   265→const PINCH_ZOOM_SENSITIVITY = 0.01; // Sensitivity for pinch-to-zoom
+   266→
+   267→// Cross-platform scroll normalization constants (F121)
+   268→// Based on Facebook's normalizeWheel pattern and UX_RESEARCH.md
+   269→const LINE_HEIGHT = 40; // Pixels per line (for deltaMode === 1)
+   270→const PAGE_HEIGHT = 800; // Pixels per page (for deltaMode === 2)
+   271→const MOUSE_ZOOM_SENSITIVITY = 0.003; // Base zoom sensitivity for mouse wheel
+   272→const TRACKPAD_ZOOM_SENSITIVITY = 0.001; // Lower sensitivity for trackpad (many small events)
+   273→const MAX_ZOOM_DELTA_PER_EVENT = 0.5; // Cap zoom change per event to prevent jumps
+   274→const TRACKPAD_DETECTION_THRESHOLD = 20; // ms - events faster than this are trackpad
+   275→const TRACKPAD_EVENT_COUNT_THRESHOLD = 3; // Number of rapid events to confirm trackpad
+   276→
+   277→// Scroll modifier pan sensitivity (F016, F017)
+   278→// Convert wheel delta (pixels) to camera pan (world units)
+   279→const SCROLL_PAN_SENSITIVITY = 1.5;
+   280→
+   281→// Keyboard shortcuts constants (F027, F028)
+   282→const KEYBOARD_ZOOM_STEP = 1.5; // Zoom multiplier per keypress (1.5x = 150%)
+   283→const KEYBOARD_PAN_STEP = 100; // Pixels to pan per arrow key press (in world units)
+   284→const KEYBOARD_PAGE_STEP = 500; // Pixels for Page Up/Down (in world units)
+   285→
+   286→const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+   287→
+   288→/**
+   289→ * Velocity sample for momentum calculation
+   290→ * (Local type - only used for velocity tracking refs, not persisted state)
+   291→ */
+   292→interface VelocitySample {
+   293→  x: number;
+   294→  y: number;
+   295→  time: number;
+   296→}
+   297→
+   298→/**
+   299→ * Local momentum animation state (includes animationId which is not in store)
+   300→ * The actual momentum velocity is managed in canvasStore.viewport.momentum
+   301→ */
+   302→interface LocalMomentumState {
+   303→  animationId: number | null;
+   304→}
+   305→
+   306→/**
+   307→ * Local zoom animation state (includes animationId)
+   308→ * Animation parameters are stored in canvasStore.viewport.animation
+   309→ */
+   310→interface LocalZoomAnimationState {
+   311→  animationId: number | null;
+   312→}
+   313→
+   314→/**
+   315→ * Pinch-to-zoom state for touch gestures
+   316→ */
+   317→interface PinchState {
+   318→  active: boolean;
+   319→  initialDistance: number;
+   320→  initialZoom: number;
+   321→  centerX: number;
+   322→  centerY: number;
+   323→  pointers: Map<number, { x: number; y: number }>;
+   324→}
+   325→
+   326→/**
+   327→ * Easing functions for smooth animations
+   328→ * quadOut provides Google Maps-style smooth deceleration
+   329→ */
+   330→const Easing = {
+   331→  quadOut: (t: number) => t * (2 - t),
+   332→  cubicOut: (t: number) => 1 - Math.pow(1 - t, 3),
+   333→};
+   334→
+   335→// Task block dimensions for hit testing (matching MesoLayer)
+   336→const TASK_HEIGHT = pxPerTrain - 4;
+   337→
+   338→// ─────────────────────────────────────────────────────────────
+   339→// KEYBOARD NAVIGATION HELPERS (F021)
+   340→// ─────────────────────────────────────────────────────────────
+   341→
+   342→/**
+   343→ * Get tasks visible within the current viewport
+   344→ * Sorted by train index (Y) then start day (X) for logical tab order
+   345→ */
+   346→function getVisibleTasks(
+   347→  tasks: ReturnType<typeof getRenderData>['tasks'],
+   348→  viewportBounds: ViewportBounds
+   349→): ReturnType<typeof getRenderData>['tasks'] {
+   350→  const visibleTasks = tasks.filter((task) => {
+   351→    const taskStartX = task.startDay * pxPerDay;
+   352→    const taskEndX = taskStartX + task.duration * pxPerDay;
+   353→    const taskY = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+   354→
+   355→    // Check if task overlaps with viewport
+   356→    const xOverlap = taskEndX >= viewportBounds.minX && taskStartX <= viewportBounds.maxX;
+   357→    const yOverlap = taskY >= viewportBounds.minY - pxPerTrain && taskY <= viewportBounds.maxY + pxPerTrain;
+   358→
+   359→    return xOverlap && yOverlap;
+   360→  });
+   361→
+   362→  // Sort by train index (row), then by start day (column) for natural reading order
+   363→  return visibleTasks.sort((a, b) => {
+   364→    if (a.trainIndex !== b.trainIndex) {
+   365→      return a.trainIndex - b.trainIndex;
+   366→    }
+   367→    return a.startDay - b.startDay;
+   368→  });
+   369→}
+   370→
+   371→/**
+   372→ * Find next task in a specific direction from the current focused task
+   373→ * Direction: 'left' | 'right' | 'up' | 'down'
+   374→ */
+   375→function findNextTaskInDirection(
+   376→  tasks: ReturnType<typeof getRenderData>['tasks'],
+   377→  currentTaskId: string,
+   378→  direction: 'left' | 'right' | 'up' | 'down'
+   379→): string | null {
+   380→  const currentTask = tasks.find((t) => t.id === currentTaskId);
+   381→  if (!currentTask) return null;
+   382→
+   383→  const currentX = currentTask.startDay * pxPerDay + (currentTask.duration * pxPerDay) / 2;
+   384→  const currentY = -currentTask.trainIndex;
+   385→
+   386→  let bestMatch: typeof currentTask | null = null;
+   387→  let bestScore = Infinity;
+   388→
+   389→  for (const task of tasks) {
+   390→    if (task.id === currentTaskId) continue;
+   391→
+   392→    const taskX = task.startDay * pxPerDay + (task.duration * pxPerDay) / 2;
+   393→    const taskY = -task.trainIndex;
+   394→
+   395→    let isInDirection = false;
+   396→    let score = 0;
+   397→
+   398→    switch (direction) {
+   399→      case 'left':
+   400→        isInDirection = taskX < currentX;
+   401→        if (isInDirection) {
+   402→          // Prefer same row, then closest to the left
+   403→          const rowPenalty = Math.abs(taskY - currentY) * 10000;
+   404→          score = (currentX - taskX) + rowPenalty;
+   405→        }
+   406→        break;
+   407→      case 'right':
+   408→        isInDirection = taskX > currentX;
+   409→        if (isInDirection) {
+   410→          const rowPenalty = Math.abs(taskY - currentY) * 10000;
+   411→          score = (taskX - currentX) + rowPenalty;
+   412→        }
+   413→        break;
+   414→      case 'up':
+   415→        isInDirection = taskY > currentY;
+   416→        if (isInDirection) {
+   417→          // Prefer closest row above with similar X
+   418→          const xPenalty = Math.abs(taskX - currentX) / 100;
+   419→          score = (taskY - currentY) + xPenalty;
+   420→        }
+   421→        break;
+   422→      case 'down':
+   423→        isInDirection = taskY < currentY;
+   424→        if (isInDirection) {
+   425→          const xPenalty = Math.abs(taskX - currentX) / 100;
+   426→          score = (currentY - taskY) + xPenalty;
+   427→        }
+   428→        break;
+   429→    }
+   430→
+   431→    if (isInDirection && score < bestScore) {
+   432→      bestScore = score;
+   433→      bestMatch = task;
+   434→    }
+   435→  }
+   436→
+   437→  return bestMatch?.id || null;
+   438→}
+   439→
+   440→/**
+   441→ * Find task at screen position (hit testing for hover/click)
+   442→ *
+   443→ * Converts screen coordinates to world coordinates and finds
+   444→ * which task (if any) is under the cursor.
+   445→ *
+   446→ * @param screenX - Screen X coordinate (e.g., clientX)
+   447→ * @param screenY - Screen Y coordinate (e.g., clientY)
+   448→ * @param containerRect - Container element bounding rect
+   449→ * @param cameraX - Camera X position in world coordinates
+   450→ * @param cameraY - Camera Y position in world coordinates
+   451→ * @param zoom - Current zoom level
+   452→ * @param canvasWidth - Canvas width in pixels
+   453→ * @param canvasHeight - Canvas height in pixels
+   454→ * @param tasks - Array of tasks to test against
+   455→ * @returns Task ID if found, null otherwise
+   456→ */
+   457→function findTaskAtPosition(
+   458→  screenX: number,
+   459→  screenY: number,
+   460→  containerRect: DOMRect,
+   461→  cameraX: number,
+   462→  cameraY: number,
+   463→  zoom: number,
+   464→  canvasWidth: number,
+   465→  canvasHeight: number,
+   466→  tasks: ReturnType<typeof getRenderData>['tasks']
+   467→): string | null {
+   468→  // Convert screen coords to canvas coords (relative to container)
+   469→  const canvasX = screenX - containerRect.left;
+   470→  const canvasY = screenY - containerRect.top;
+   471→
+   472→  // Calculate half viewport in world units
+   473→  const halfViewX = canvasWidth / 2 / zoom;
+   474→  const halfViewY = canvasHeight / 2 / zoom;
+   475→
+   476→  // Convert canvas coords to world coords
+   477→  // canvasX=0 is left edge of viewport, which is cameraX - halfViewX in world
+   478→  // canvasY=0 is top edge of viewport, which is cameraY + halfViewY in world
+   479→  const worldX = cameraX - halfViewX + (canvasX / zoom);
+   480→  const worldY = cameraY + halfViewY - (canvasY / zoom);
+   481→
+   482→  // Find task at world position
+   483→  for (const task of tasks) {
+   484→    const taskStartX = task.startDay * pxPerDay;
+   485→    const taskEndX = taskStartX + task.duration * pxPerDay;
+   486→    const taskCenterY = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+   487→    const taskTopY = taskCenterY + TASK_HEIGHT / 2;
+   488→    const taskBottomY = taskCenterY - TASK_HEIGHT / 2;
+   489→
+   490→    if (
+   491→      worldX >= taskStartX &&
+   492→      worldX <= taskEndX &&
+   493→      worldY <= taskTopY &&
+   494→      worldY >= taskBottomY
+   495→    ) {
+   496→      return task.id;
+   497→    }
+   498→  }
+   499→
+   500→  return null;
+   501→}
+   502→
+   503→/**
+   504→ * Camera controller component (inside R3F context)
+   505→ * Handles initial positioning and syncs camera with external state
+   506→ *
+   507→ * IMPORTANT: Uses R3F's `size` from useThree() which is the actual canvas size,
+   508→ * not the container div size (which can differ due to flexbox/layout).
+   509→ */
+   510→function CameraController({
+   511→  cameraX,
+   512→  cameraY,
+   513→  zoom,
+   514→  worldBounds,
+   515→  isInitialized,
+   516→  onInitialized,
+   517→  onViewportChange,
+   518→}: {
+   519→  cameraX: number;
+   520→  cameraY: number;
+   521→  zoom: number;
+   522→  worldBounds: WorldBounds;
+   523→  isInitialized: boolean;
+   524→  onInitialized: (pos: { x: number; y: number }, size: { width: number; height: number }) => void;
+   525→  onViewportChange?: (viewport: ViewportInfo) => void;
+   526→}) {
+   527→  const { camera, size } = useThree();
+   528→
+   529→  // Initialize camera position on first render using actual R3F size
+   530→  useEffect(() => {
+   531→    if (isInitialized || size.width === 0 || size.height === 0) return;
+   532→
+   533→    const halfViewX = size.width / 2 / zoom;
+   534→    const halfViewY = size.height / 2 / zoom;
+   535→
+   536→    // Position camera to show top-left corner (X=0, Y=0)
+   537→    const initialCameraX = halfViewX;
+   538→    const initialCameraY = -halfViewY;
+   539→
+   540→    // Clamp to world bounds
+   541→    const minCameraX = worldBounds.minX + halfViewX;
+   542→    const maxCameraX = worldBounds.maxX - halfViewX;
+   543→    const minCameraY = worldBounds.minY + halfViewY;
+   544→    const maxCameraY = worldBounds.maxY - halfViewY;
+   545→
+   546→    const clampedX = Math.max(minCameraX, Math.min(maxCameraX, initialCameraX));
+   547→    const clampedY = Math.max(minCameraY, Math.min(maxCameraY, initialCameraY));
+   548→
+   549→    // Update camera
+   550→    camera.position.x = clampedX;
+   551→    camera.position.y = clampedY;
+   552→    (camera as any).zoom = zoom;
+   553→    camera.updateProjectionMatrix();
+   554→
+   555→    // Notify parent of initial position and actual canvas size
+   556→    onInitialized({ x: clampedX, y: clampedY }, { width: size.width, height: size.height });
+   557→
+   558→    // Notify viewport change with full viewport info
+   559→    const topY = clampedY + halfViewY;
+   560→    const leftX = clampedX - halfViewX;
+   561→    const rightX = clampedX + halfViewX;
+   562→    onViewportChange?.({ topY, leftX, rightX });
+   563→  }, [size, zoom, worldBounds, camera, isInitialized, onInitialized, onViewportChange]);
+   564→
+   565→  // Sync camera with external state changes (after initialization)
+   566→  useEffect(() => {
+   567→    if (!isInitialized) return;
+   568→
+   569→    camera.position.x = cameraX;
+   570→    camera.position.y = cameraY;
+   571→    (camera as any).zoom = zoom;
+   572→    camera.updateProjectionMatrix();
+   573→  }, [camera, cameraX, cameraY, zoom, isInitialized]);
+   574→
+   575→  return null;
+   576→}
+   577→
+   578→// ─────────────────────────────────────────────────────────────
+   579→// ARIA LABELS FOR ACCESSIBILITY (F022)
+   580→// ─────────────────────────────────────────────────────────────
+   581→
+   582→/**
+   583→ * Human-readable LOD level names for screen reader announcements
+   584→ */
+   585→const LOD_LABELS: Record<LODLevel, string> = {
+   586→  MACRO: 'Strategic view showing 10-year overview with heatmap',
+   587→  MESO: 'Tactical view showing task blocks across trains',
+   588→  MICRO: 'Detailed view showing individual task cards',
+   589→};
+   590→
+   591→/**
+   592→ * Format zoom level for screen reader announcement
+   593→ */
+   594→function formatZoomForAria(zoom: number): string {
+   595→  const percentage = Math.round(zoom * 100);
+   596→  return `${percentage} percent zoom`;
+   597→}
+   598→
+   599→export function InfiniteCanvas({
+   600→  zoom,
+   601→  lod,
+   602→  onZoomChange,
+   603→  onViewportChange,
+   604→  onMinZoomChange,
+   605→  animatedZoomTarget,
+   606→  onAnimatedZoomComplete,
+   607→  navigationTarget,
+   608→  onNavigationComplete,
+   609→  perfVisible = false,
+   610→  perfEvent = 'idle',
+   611→}: InfiniteCanvasProps) {
+   612→  const containerRef = useRef<HTMLDivElement>(null);
+   613→
+   614→  // ─────────────────────────────────────────────────────────────
+   615→  // ARIA LIVE REGION STATE (F022)
+   616→  // ─────────────────────────────────────────────────────────────
+   617→  const ariaLiveRef = useRef<HTMLDivElement>(null);
+   618→  const previousLodRef = useRef<LODLevel>(lod);
+   619→  const previousZoomRef = useRef<number>(zoom);
+   620→  const zoomAnnouncementTimeoutRef = useRef<number | null>(null);
+   621→
+   622→  // ─────────────────────────────────────────────────────────────
+   623→  // STATE FROM CANVAS MACHINE (replaces useState)
+   624→  // Using useSyncExternalStore under the hood - no stale closures!
+   625→  // ─────────────────────────────────────────────────────────────
+   626→  const isInitialized = useCanvasSelector((s) => s.viewport.isInitialized);
+   627→  const canvasSize = useCanvasSelector((s) => s.viewport.canvasSize);
+   628→  const cameraPos = useCanvasSelector((s) => s.viewport.camera);
+   629→  const isPanning = useCanvasSelector((s) => s.viewport.isPanning);
+   630→  const panStart = useCanvasSelector((s) => s.viewport.panStart);
+   631→  const cameraPosAtPanStart = useCanvasSelector((s) => s.viewport.cameraPosAtPanStart);
+   632→  const momentum = useCanvasSelector((s) => s.viewport.momentum);
+   633→
+   634→  // Interaction state (F018 hover, F019 selection)
+   635→  const hoveredTaskId = useCanvasSelector((s) => s.interaction.hoveredTaskId);
+   636→  const selectedTaskId = useCanvasSelector((s) => s.interaction.selectedTaskId);
+   637→  const focusedTaskId = useCanvasSelector((s) => s.interaction.focusedTaskId);
+   638→  const isHoverable = useCanvasSelector((s) => s.interaction.isHoverable);
+   639→
+   640→  // Get render data (memoized)
+   641→  const { trains, tasks } = useMemo(() => getRenderData(), []);
+   642→
+   643→  // Calculate world bounds (for pan clamping)
+   644→  const worldBounds = useMemo<WorldBounds>(() => {
+   645→    const totalDays = 365 * 10; // 10 years
+   646→    return calculateWorldBounds(trains.length, totalDays);
+   647→  }, [trains.length]);
+   648→
+   649→  /**
+   650→   * Calculate dynamic MIN_ZOOM to prevent white space around content.
+   651→   * MIN_ZOOM is set so the viewport never exceeds the world bounds.
+   652→   */
+   653→  const effectiveMinZoom = useMemo(() => {
+   654→    if (canvasSize.width === 0 || canvasSize.height === 0) {
+   655→      return ABSOLUTE_MIN_ZOOM;
+   656→    }
+   657→
+   658→    const worldWidth = worldBounds.maxX - worldBounds.minX;
+   659→    const worldHeight = Math.abs(worldBounds.maxY - worldBounds.minY);
+   660→
+   661→    // Calculate zoom levels where viewport equals world dimensions
+   662→    // At zoom Z: viewportWidth = canvasSize.width / Z
+   663→    // To fit world: canvasSize.width / Z = worldWidth → Z = canvasSize.width / worldWidth
+   664→    const minZoomX = canvasSize.width / worldWidth;
+   665→    const minZoomY = canvasSize.height / worldHeight;
+   666→
+   667→    // Use the maximum to ensure content fills viewport in both dimensions
+   668→    const dynamicMin = Math.max(minZoomX, minZoomY);
+   669→
+   670→    // Clamp to absolute minimum (safety) and return
+   671→    return Math.max(ABSOLUTE_MIN_ZOOM, dynamicMin);
+   672→  }, [canvasSize.width, canvasSize.height, worldBounds]);
+   673→
+   674→  // Notify parent when effective min zoom changes
+   675→  useEffect(() => {
+   676→    onMinZoomChange?.(effectiveMinZoom);
+   677→  }, [effectiveMinZoom, onMinZoomChange]);
+   678→
+   679→  // ─────────────────────────────────────────────────────────────
+   680→  // ARIA ANNOUNCEMENTS (F022)
+   681→  // ─────────────────────────────────────────────────────────────
+   682→
+   683→  /**
+   684→   * Announce message to screen readers via ARIA live region
+   685→   */
+   686→  const announceToScreenReader = useCallback((message: string) => {
+   687→    if (ariaLiveRef.current) {
+   688→      // Clear and set to trigger announcement even for same message
+   689→      ariaLiveRef.current.textContent = '';
+   690→      // Use setTimeout to ensure the clear is processed first
+   691→      setTimeout(() => {
+   692→        if (ariaLiveRef.current) {
+   693→          ariaLiveRef.current.textContent = message;
+   694→        }
+   695→      }, 50);
+   696→    }
+   697→  }, []);
+   698→
+   699→  // Announce LOD level changes
+   700→  useEffect(() => {
+   701→    if (lod !== previousLodRef.current) {
+   702→      previousLodRef.current = lod;
+   703→      announceToScreenReader(`View changed to ${LOD_LABELS[lod]}`);
+   704→    }
+   705→  }, [lod, announceToScreenReader]);
+   706→
+   707→  // Announce significant zoom changes (debounced to avoid spam)
+   708→  useEffect(() => {
+   709→    // Only announce if zoom changed significantly (>10%)
+   710→    const zoomDiff = Math.abs(zoom - previousZoomRef.current) / previousZoomRef.current;
+   711→    if (zoomDiff < 0.1) return;
+   712→
+   713→    // Clear previous timeout
+   714→    if (zoomAnnouncementTimeoutRef.current) {
+   715→      clearTimeout(zoomAnnouncementTimeoutRef.current);
+   716→    }
+   717→
+   718→    // Debounce zoom announcements (wait 500ms after last change)
+   719→    zoomAnnouncementTimeoutRef.current = window.setTimeout(() => {
+   720→      previousZoomRef.current = zoom;
+   721→      announceToScreenReader(formatZoomForAria(zoom));
+   722→    }, 500);
+   723→
+   724→    return () => {
+   725→      if (zoomAnnouncementTimeoutRef.current) {
+   726→        clearTimeout(zoomAnnouncementTimeoutRef.current);
+   727→      }
+   728→    };
+   729→  }, [zoom, announceToScreenReader]);
+   730→
+   731→  // ─────────────────────────────────────────────────────────────
+   732→  // LOCAL REFS (animation frame IDs, velocity samples - not state)
+   733→  // These are not state because they don't affect rendering
+   734→  // ─────────────────────────────────────────────────────────────
+   735→  const velocitySamplesRef = useRef<VelocitySample[]>([]);
+   736→  const momentumAnimationRef = useRef<LocalMomentumState>({
+   737→    animationId: null,
+   738→  });
+   739→  const lastPointerPosRef = useRef({ x: 0, y: 0, time: 0 });
+   740→  // Track if pointer moved significantly (to distinguish click from pan)
+   741→  const pointerMovedRef = useRef(false);
+   742→  const pointerDownPosRef = useRef({ x: 0, y: 0 });
+   743→
+   744→  // Smooth zoom animation state - only the animationId is local
+   745→  // Animation parameters are now in canvasStore.viewport.animation
+   746→  const zoomAnimationRef = useRef<LocalZoomAnimationState>({
+   747→    animationId: null,
+   748→  });
+   749→
+   750→  // Wheel event accumulation for trackpad smooth zoom + input detection (F121)
+   751→  const wheelAccumulatorRef = useRef({
+   752→    delta: 0,
+   753→    cursorX: 0,
+   754→    cursorY: 0,
+   755→    timeout: null as ReturnType<typeof setTimeout> | null,
+   756→    // Trackpad detection state
+   757→    lastEventTime: 0,
+   758→    rapidEventCount: 0,
+   759→    isTrackpad: false,
+   760→  });
+   761→
+   762→  // Pinch-to-zoom state
+   763→  const pinchRef = useRef<PinchState>({
+   764→    active: false,
+   765→    initialDistance: 0,
+   766→    initialZoom: 1,
+   767→    centerX: 0,
+   768→    centerY: 0,
+   769→    pointers: new Map(),
+   770→  });
+   771→
+   772→  /**
+   773→   * Update camera position in the canvas store
+   774→   * Using external store means no stale closures - getState() always returns current value
+   775→   */
+   776→  const updateCameraPos = useCallback((pos: { x: number; y: number }) => {
+   777→    canvasStore.dispatch(canvasActions.viewport.setCamera(pos));
+   778→  }, []);
+   779→
+   780→  /**
+   781→   * Called by CameraController when it initializes with actual R3F canvas size
+   782→   */
+   783→  const handleCameraInitialized = useCallback(
+   784→    (pos: { x: number; y: number }, size: { width: number; height: number }) => {
+   785→      canvasStore.dispatch(
+   786→        canvasActions.viewport.initialize({ camera: pos, canvasSize: size })
+   787→      );
+   788→    },
+   789→    []
+   790→  );
+   791→
+   792→  /**
+   793→   * Calculate and notify the viewport position (topY, leftX, rightX)
+   794→   */
+   795→  const notifyViewportChange = useCallback(
+   796→    (camX: number, camY: number, currentZoom: number) => {
+   797→      const halfViewX = canvasSize.width / 2 / currentZoom;
+   798→      const halfViewY = canvasSize.height / 2 / currentZoom;
+   799→      const topY = camY + halfViewY;
+   800→      const leftX = camX - halfViewX;
+   801→      const rightX = camX + halfViewX;
+   802→      onViewportChange?.({ topY, leftX, rightX });
+   803→    },
+   804→    [canvasSize.width, canvasSize.height, onViewportChange]
+   805→  );
+   806→
+   807→  /**
+   808→   * Calculate viewport bounds for frustum culling
+   809→   * This determines which tasks are visible and need to be rendered
+   810→   * IMPORTANT: Must be defined before handleKeyDown which uses it for F021
+   811→   */
+   812→  const viewportBounds = useMemo<ViewportBounds>(() => {
+   813→    const halfViewX = canvasSize.width / 2 / zoom;
+   814→    const halfViewY = canvasSize.height / 2 / zoom;
+   815→
+   816→    return {
+   817→      minX: cameraPos.x - halfViewX,
+   818→      maxX: cameraPos.x + halfViewX,
+   819→      minY: cameraPos.y - halfViewY,
+   820→      maxY: cameraPos.y + halfViewY,
+   821→    };
+   822→  }, [cameraPos.x, cameraPos.y, canvasSize.width, canvasSize.height, zoom]);
+   823→
+   824→  /**
+   825→   * Clamp camera position to world bounds
+   826→   */
+   827→  const clampCameraToWorld = useCallback(
+   828→    (x: number, y: number, currentZoom: number): { x: number; y: number } => {
+   829→      const halfViewX = canvasSize.width / 2 / currentZoom;
+   830→      const halfViewY = canvasSize.height / 2 / currentZoom;
+   831→
+   832→      const minCameraX = worldBounds.minX + halfViewX;
+   833→      const maxCameraX = worldBounds.maxX - halfViewX;
+   834→      const minCameraY = worldBounds.minY + halfViewY;
+   835→      const maxCameraY = worldBounds.maxY - halfViewY;
+   836→
+   837→      const clampedX =
+   838→        maxCameraX < minCameraX
+   839→          ? (worldBounds.minX + worldBounds.maxX) / 2
+   840→          : Math.max(minCameraX, Math.min(maxCameraX, x));
+   841→
+   842→      const clampedY =
+   843→        maxCameraY < minCameraY
+   844→          ? (worldBounds.minY + worldBounds.maxY) / 2
+   845→          : Math.max(minCameraY, Math.min(maxCameraY, y));
+   846→
+   847→      return { x: clampedX, y: clampedY };
+   848→    },
+   849→    [canvasSize, worldBounds]
+   850→  );
+   851→
+   852→  /**
+   853→   * Stop any active momentum animation
+   854→   */
+   855→  const stopMomentum = useCallback(() => {
+   856→    if (momentumAnimationRef.current.animationId) {
+   857→      cancelAnimationFrame(momentumAnimationRef.current.animationId);
+   858→      momentumAnimationRef.current.animationId = null;
+   859→    }
+   860→    canvasStore.dispatch(canvasActions.viewport.stopMomentum());
+   861→    velocitySamplesRef.current = [];
+   862→  }, []);
+   863→
+   864→  /**
+   865→   * Stop any active zoom animation
+   866→   */
+   867→  const stopZoomAnimation = useCallback(() => {
+   868→    if (zoomAnimationRef.current.animationId) {
+   869→      cancelAnimationFrame(zoomAnimationRef.current.animationId);
+   870→      zoomAnimationRef.current.animationId = null;
+   871→    }
+   872→    // Clear wheel accumulator
+   873→    if (wheelAccumulatorRef.current.timeout) {
+   874→      clearTimeout(wheelAccumulatorRef.current.timeout);
+   875→      wheelAccumulatorRef.current.timeout = null;
+   876→    }
+   877→    wheelAccumulatorRef.current.delta = 0;
+   878→  }, []);
+   879→
+   880→  /**
+   881→   * Animate zoom smoothly from current to target
+   882→   * Uses quadratic easing for Google Maps-like feel
+   883→   *
+   884→   * Now uses canvasStore for animation state - no stale closures in the animation loop
+   885→   */
+   886→  const animateZoomTo = useCallback(
+   887→    (
+   888→      targetZoom: number,
+   889→      targetCameraX: number,
+   890→      targetCameraY: number,
+   891→      duration: number = ZOOM_ANIMATION_DURATION
+   892→    ) => {
+   893→      // Stop any existing animation
+   894→      stopZoomAnimation();
+   895→
+   896→      // Get current state from store (always fresh)
+   897→      const currentState = canvasStore.getState();
+   898→      const currentCamera = currentState.viewport.camera;
+   899→
+   900→      // Start animation in store
+   901→      canvasStore.dispatch(
+   902→        canvasActions.viewport.startAnimation({
+   903→          startX: currentCamera.x,
+   904→          startY: currentCamera.y,
+   905→          startZoom: zoom,
+   906→          targetX: targetCameraX,
+   907→          targetY: targetCameraY,
+   908→          targetZoom: targetZoom,
+   909→          duration: duration,
+   910→        })
+   911→      );
+   912→
+   913→      const animate = () => {
+   914→        // Read animation state from store (always current, no stale closures)
+   915→        const state = canvasStore.getState();
+   916→        const anim = state.viewport.animation;
+   917→
+   918→        if (!anim.isAnimating) {
+   919→          zoomAnimationRef.current.animationId = null;
+   920→          return;
+   921→        }
+   922→
+   923→        const elapsed = Date.now() - anim.startTime;
+   924→        const progress = Math.min(elapsed / anim.duration, 1);
+   925→        const easedProgress = Easing.quadOut(progress);
+   926→
+   927→        const currentZoom = anim.startZoom + (anim.targetZoom - anim.startZoom) * easedProgress;
+   928→        const currentCameraX = anim.startX + (anim.targetX - anim.startX) * easedProgress;
+   929→        const currentCameraY = anim.startY + (anim.targetY - anim.startY) * easedProgress;
+   930→
+   931→        // Clamp camera position
+   932→        const clamped = clampCameraToWorld(currentCameraX, currentCameraY, currentZoom);
+   933→
+   934→        // Update store with new camera position
+   935→        canvasStore.dispatch(
+   936→          canvasActions.viewport.updateAnimation({ camera: clamped })
+   937→        );
+   938→        onZoomChange(currentZoom);
+   939→        notifyViewportChange(clamped.x, clamped.y, currentZoom);
+   940→
+   941→        if (progress < 1) {
+   942→          zoomAnimationRef.current.animationId = requestAnimationFrame(animate);
+   943→        } else {
+   944→          canvasStore.dispatch(canvasActions.viewport.stopAnimation());
+   945→          zoomAnimationRef.current.animationId = null;
+   946→        }
+   947→      };
+   948→
+   949→      zoomAnimationRef.current.animationId = requestAnimationFrame(animate);
+   950→    },
+   951→    [zoom, clampCameraToWorld, onZoomChange, notifyViewportChange, stopZoomAnimation]
+   952→  );
+   953→
+   954→  /**
+   955→   * Calculate average velocity from samples
+   956→   * Samples contain individual deltas (movement per event), not absolute positions
+   957→   */
+   958→  const calculateAverageVelocity = useCallback(() => {
+   959→    const samples = velocitySamplesRef.current;
+   960→    if (samples.length < 2) return { vx: 0, vy: 0 };
+   961→
+   962→    // Use only recent samples (last N samples)
+   963→    const recentSamples = samples.slice(-MOMENTUM_VELOCITY_SAMPLES);
+   964→    if (recentSamples.length < 2) return { vx: 0, vy: 0 };
+   965→
+   966→    // Calculate total displacement and time
+   967→    const first = recentSamples[0];
+   968→    const last = recentSamples[recentSamples.length - 1];
+   969→    const dt = last.time - first.time;
+   970→
+   971→    if (dt <= 0) return { vx: 0, vy: 0 };
+   972→
+   973→    // Sum all deltas to get total displacement
+   974→    let totalDx = 0;
+   975→    let totalDy = 0;
+   976→    for (const sample of recentSamples) {
+   977→      totalDx += sample.x;
+   978→      totalDy += sample.y;
+   979→    }
+   980→
+   981→    // Velocity in world units per millisecond
+   982→    const vx = totalDx / dt;
+   983→    const vy = totalDy / dt;
+   984→
+   985→    return { vx, vy };
+   986→  }, []);
+   987→
+   988→  /**
+   989→   * Start momentum animation after drag release
+   990→   *
+   991→   * Now uses canvasStore for momentum state - no stale closures in the animation loop
+   992→   */
+   993→  const startMomentum = useCallback(
+   994→    (vx: number, vy: number) => {
+   995→      // Convert velocity from world/ms to world/frame (at 60fps, ~16.67ms per frame)
+   996→      const frameTime = 16.67;
+   997→      const velocityX = vx * frameTime;
+   998→      const velocityY = vy * frameTime;
+   999→
+  1000→      // Start momentum in store
+  1001→      canvasStore.dispatch(
+  1002→        canvasActions.viewport.startMomentum({ velocityX, velocityY })
+  1003→      );
+  1004→
+  1005→      // Clear samples
+  1006→      velocitySamplesRef.current = [];
+  1007→
+  1008→      const animate = () => {
+  1009→        // Read momentum state from store (always current, no stale closures)
+  1010→        const state = canvasStore.getState();
+  1011→        const mom = state.viewport.momentum;
+  1012→
+  1013→        if (!mom.isActive) {
+  1014→          momentumAnimationRef.current.animationId = null;
+  1015→          return;
+  1016→        }
+  1017→
+  1018→        // Check if velocity is negligible
+  1019→        const speed = Math.sqrt(mom.velocityX ** 2 + mom.velocityY ** 2);
+  1020→        if (speed < MOMENTUM_MIN_VELOCITY) {
+  1021→          canvasStore.dispatch(canvasActions.viewport.stopMomentum());
+  1022→          momentumAnimationRef.current.animationId = null;
+  1023→          return;
+  1024→        }
+  1025→
+  1026→        // Apply velocity to camera position
+  1027→        // Using store.getState() - no stale closures!
+  1028→        const prevPos = state.viewport.camera;
+  1029→        const newX = prevPos.x + mom.velocityX;
+  1030→        const newY = prevPos.y - mom.velocityY; // Inverted for camera Y
+  1031→        const clamped = clampCameraToWorld(newX, newY, zoom);
+  1032→
+  1033→        // Update store with new position and apply friction
+  1034→        canvasStore.dispatch(
+  1035→          canvasActions.viewport.updateMomentum({
+  1036→            velocityX: mom.velocityX * MOMENTUM_FRICTION,
+  1037→            velocityY: mom.velocityY * MOMENTUM_FRICTION,
+  1038→            camera: clamped,
+  1039→          })
+  1040→        );
+  1041→        notifyViewportChange(clamped.x, clamped.y, zoom);
+  1042→
+  1043→        // Continue animation
+  1044→        momentumAnimationRef.current.animationId = requestAnimationFrame(animate);
+  1045→      };
+  1046→
+  1047→      // Start animation
+  1048→      momentumAnimationRef.current.animationId = requestAnimationFrame(animate);
+  1049→    },
+  1050→    [clampCameraToWorld, notifyViewportChange, zoom]
+  1051→  );
+  1052→
+  1053→  /**
+  1054→   * Calculate target camera position for zoom toward a point
+  1055→   */
+  1056→  const calculateZoomTowardPoint = useCallback(
+  1057→    (cursorX: number, cursorY: number, fromZoom: number, toZoom: number) => {
+  1058→      // Convert cursor to world coordinates (before zoom)
+  1059→      const worldX = cursorX / fromZoom + cameraPos.x;
+  1060→      const worldY = -cursorY / fromZoom + cameraPos.y;
+  1061→
+  1062→      // Calculate new camera position to keep cursor point fixed
+  1063→      const newCameraX = worldX - cursorX / toZoom;
+  1064→      const newCameraY = worldY + cursorY / toZoom;
+  1065→
+  1066→      return clampCameraToWorld(newCameraX, newCameraY, toZoom);
+  1067→    },
+  1068→    [cameraPos, clampCameraToWorld]
+  1069→  );
+  1070→
+  1071→  /**
+  1072→   * Execute accumulated zoom with smooth animation
+  1073→   * Called after wheel events are accumulated (for trackpad smoothing)
+  1074→   * With cross-platform normalized delta (F121)
+  1075→   *
+  1076→   * Now uses canvasStore to get current animation state
+  1077→   */
+  1078→  const executeAccumulatedZoom = useCallback(() => {
+  1079→    const accumulator = wheelAccumulatorRef.current;
+  1080→    if (Math.abs(accumulator.delta) < 0.001) {
+  1081→      accumulator.delta = 0;
+  1082→      return;
+  1083→    }
+  1084→
+  1085→    const rect = containerRef.current?.getBoundingClientRect();
+  1086→    if (!rect) return;
+  1087→
+  1088→    // Get current state from store (always fresh)
+  1089→    const state = canvasStore.getState();
+  1090→    const anim = state.viewport.animation;
+  1091→
+  1092→    // Get the current zoom (may be in animation)
+  1093→    const currentZoom = anim.isAnimating ? anim.targetZoom : zoom;
+  1094→
+  1095→    // Calculate zoom factor from accumulated normalized delta (F121)
+  1096→    // Normalized delta is already scaled by sensitivity, use exponential zoom
+  1097→    // Negative delta = zoom in, positive delta = zoom out
+  1098→    const zoomFactor = Math.exp(-accumulator.delta);
+  1099→    const newZoom = Math.max(effectiveMinZoom, Math.min(MAX_ZOOM, currentZoom * zoomFactor));
+  1100→
+  1101→    if (Math.abs(newZoom - currentZoom) < 0.001) {
+  1102→      accumulator.delta = 0;
+  1103→      return;
+  1104→    }
+  1105→
+  1106→    // Cursor position relative to canvas center
+  1107→    const cursorX = accumulator.cursorX - rect.left - rect.width / 2;
+  1108→    const cursorY = accumulator.cursorY - rect.top - rect.height / 2;
+  1109→
+  1110→    // Get current camera position (may be in animation)
+  1111→    const currentCameraX = anim.isAnimating ? anim.targetX : state.viewport.camera.x;
+  1112→    const currentCameraY = anim.isAnimating ? anim.targetY : state.viewport.camera.y;
+  1113→
+  1114→    // Calculate target camera position
+  1115→    const worldX = cursorX / currentZoom + currentCameraX;
+  1116→    const worldY = -cursorY / currentZoom + currentCameraY;
+  1117→    const newCameraX = worldX - cursorX / newZoom;
+  1118→    const newCameraY = worldY + cursorY / newZoom;
+  1119→    const clamped = clampCameraToWorld(newCameraX, newCameraY, newZoom);
+  1120→
+  1121→    // Reset accumulator
+  1122→    accumulator.delta = 0;
+  1123→    accumulator.timeout = null;
+  1124→
+  1125→    // Animate to new zoom
+  1126→    animateZoomTo(newZoom, clamped.x, clamped.y, ZOOM_ANIMATION_DURATION);
+  1127→  }, [zoom, effectiveMinZoom, clampCameraToWorld, animateZoomTo]);
+  1128→
+  1129→  /**
+  1130→   * Normalize wheel delta for cross-platform consistency (F121)
+  1131→   * Handles deltaMode (LINE/PAGE), detects trackpad vs mouse
+  1132→   * Returns normalized pixel delta
+  1133→   */
+  1134→  const normalizeWheelDelta = useCallback((e: WheelEvent): number => {
+  1135→    let delta = e.deltaY;
+  1136→
+  1137→    // Normalize deltaMode to pixels (F121: cross-platform normalization)
+  1138→    // deltaMode 0 = PIXEL, 1 = LINE, 2 = PAGE
+  1139→    if (e.deltaMode === 1) {
+  1140→      // LINE mode (Firefox on Windows)
+  1141→      delta *= LINE_HEIGHT;
+  1142→    } else if (e.deltaMode === 2) {
+  1143→      // PAGE mode (rare, but handle it)
+  1144→      delta *= PAGE_HEIGHT;
+  1145→    }
+  1146→
+  1147→    // Detect trackpad vs mouse by event frequency
+  1148→    const accumulator = wheelAccumulatorRef.current;
+  1149→    const now = performance.now();
+  1150→    const timeSinceLastEvent = now - accumulator.lastEventTime;
+  1151→
+  1152→    if (timeSinceLastEvent < TRACKPAD_DETECTION_THRESHOLD) {
+  1153→      accumulator.rapidEventCount++;
+  1154→      if (accumulator.rapidEventCount >= TRACKPAD_EVENT_COUNT_THRESHOLD) {
+  1155→        accumulator.isTrackpad = true;
+  1156→      }
+  1157→    } else {
+  1158→      // Reset detection if events are spaced out (mouse behavior)
+  1159→      accumulator.rapidEventCount = 1;
+  1160→      // Also check delta magnitude - trackpads produce small deltas
+  1161→      if (Math.abs(delta) > 50 && e.deltaMode === 0) {
+  1162→        accumulator.isTrackpad = false;
+  1163→      }
+  1164→    }
+  1165→    accumulator.lastEventTime = now;
+  1166→
+  1167→    // Apply sensitivity based on input type
+  1168→    const sensitivity = accumulator.isTrackpad
+  1169→      ? TRACKPAD_ZOOM_SENSITIVITY
+  1170→      : MOUSE_ZOOM_SENSITIVITY;
+  1171→
+  1172→    // Apply sensitivity and clamp to prevent jumps
+  1173→    const normalizedDelta = delta * sensitivity;
+  1174→    return Math.max(-MAX_ZOOM_DELTA_PER_EVENT, Math.min(MAX_ZOOM_DELTA_PER_EVENT, normalizedDelta));
+  1175→  }, []);
+  1176→
+  1177→/**
+  1178→   * Handle wheel events - Google Maps-like behavior (BUG-003)
+  1179→   *
+  1180→   * Behavior:
+  1181→   * - No modifier (2-finger scroll): Pan in both directions (deltaX → horizontal, deltaY → vertical)
+  1182→   * - Ctrl+scroll (pinch gesture): Zoom toward cursor position
+  1183→   *
+  1184→   * This follows Google Maps UX pattern where:
+  1185→   * - Trackpad 2-finger drag pans the map
+  1186→   * - Trackpad pinch (sends ctrlKey=true) zooms
+  1187→   * - Mouse Ctrl+scroll zooms
+  1188→   *
+  1189→   * With cross-platform normalization (F121)
+  1190→   */
+  1191→  const handleWheel = useCallback(
+  1192→    (e: WheelEvent) => {
+  1193→      e.preventDefault();
+  1194→      if (!isInitialized) return;
+  1195→
+  1196→      // Stop momentum on any wheel interaction
+  1197→      stopMomentum();
+  1198→
+  1199→      const rect = containerRef.current?.getBoundingClientRect();
+  1200→      if (!rect) return;
+  1201→
+  1202→      // Normalize deltas for cross-platform consistency
+  1203→      const getNormalizedDeltas = () => {
+  1204→        let deltaX = e.deltaX;
+  1205→        let deltaY = e.deltaY;
+  1206→        if (e.deltaMode === 1) {
+  1207→          deltaX *= LINE_HEIGHT;
+  1208→          deltaY *= LINE_HEIGHT;
+  1209→        } else if (e.deltaMode === 2) {
+  1210→          deltaX *= PAGE_HEIGHT;
+  1211→          deltaY *= PAGE_HEIGHT;
+  1212→        }
+  1213→        return { deltaX, deltaY };
+  1214→      };
+  1215→
+  1216→      // Ctrl+scroll = ZOOM (pinch gesture on trackpad sends ctrlKey=true)
+  1217→      if (e.ctrlKey) {
+  1218→        const accumulator = wheelAccumulatorRef.current;
+  1219→
+  1220→        // Normalize delta for cross-platform consistency (F121)
+  1221→        const normalizedDelta = normalizeWheelDelta(e);
+  1222→
+  1223→        // Accumulate normalized delta (positive = zoom out, negative = zoom in)
+  1224→        accumulator.delta += normalizedDelta;
+  1225→        accumulator.cursorX = e.clientX;
+  1226→        accumulator.cursorY = e.clientY;
+  1227→
+  1228→        // Clear existing timeout
+  1229→        if (accumulator.timeout) {
+  1230→          clearTimeout(accumulator.timeout);
+  1231→        }
+  1232→
+  1233→        // Set timeout to execute accumulated zoom
+  1234→        accumulator.timeout = setTimeout(() => {
+  1235→          executeAccumulatedZoom();
+  1236→        }, ZOOM_ACCUMULATION_TIMEOUT);
+  1237→        return;
+  1238→      }
+  1239→
+  1240→      // Default behavior: PAN in both directions (Google Maps style)
+  1241→      // 2-finger trackpad scroll sends both deltaX and deltaY
+  1242→      const { deltaX, deltaY } = getNormalizedDeltas();
+  1243→
+  1244→      // Apply pan sensitivity (scaled by zoom for consistent world movement)
+  1245→      const panDeltaX = (deltaX * SCROLL_PAN_SENSITIVITY) / zoom;
+  1246→      const panDeltaY = (deltaY * SCROLL_PAN_SENSITIVITY) / zoom;
+  1247→
+  1248→      const currentCamera = canvasStore.getState().viewport.camera;
+  1249→      const newX = currentCamera.x + panDeltaX;
+  1250→      const newY = currentCamera.y - panDeltaY; // Negative because Y is inverted in canvas coords
+  1251→      const clamped = clampCameraToWorld(newX, newY, zoom);
+  1252→
+  1253→      updateCameraPos(clamped);
+  1254→      notifyViewportChange(clamped.x, clamped.y, zoom);
+  1255→    },
+  1256→    [isInitialized, stopMomentum, normalizeWheelDelta, executeAccumulatedZoom, zoom, clampCameraToWorld, updateCameraPos, notifyViewportChange]
+  1257→  );
+  1258→
+  1259→  /**
+  1260→   * Handle pinch-to-zoom for touch devices
+  1261→   */
+  1262→  const handlePinchZoom = useCallback(
+  1263→    (scale: number, centerX: number, centerY: number) => {
+  1264→      const pinch = pinchRef.current;
+  1265→      const newZoom = Math.max(effectiveMinZoom, Math.min(MAX_ZOOM, pinch.initialZoom * scale));
+  1266→
+  1267→      const rect = containerRef.current?.getBoundingClientRect();
+  1268→      if (!rect) return;
+  1269→
+  1270→      // Center position relative to canvas center
+  1271→      const cursorX = centerX - rect.left - rect.width / 2;
+  1272→      const cursorY = centerY - rect.top - rect.height / 2;
+  1273→
+  1274→      // Calculate camera position to keep pinch center fixed
+  1275→      const worldX = cursorX / pinch.initialZoom + pinch.centerX;
+  1276→      const worldY = -cursorY / pinch.initialZoom + pinch.centerY;
+  1277→      const newCameraX = worldX - cursorX / newZoom;
+  1278→      const newCameraY = worldY + cursorY / newZoom;
+  1279→
+  1280→      const clamped = clampCameraToWorld(newCameraX, newCameraY, newZoom);
+  1281→
+  1282→      updateCameraPos(clamped);
+  1283→      onZoomChange(newZoom);
+  1284→      notifyViewportChange(clamped.x, clamped.y, newZoom);
+  1285→    },
+  1286→    [effectiveMinZoom, clampCameraToWorld, updateCameraPos, onZoomChange, notifyViewportChange]
+  1287→  );
+  1288→
+  1289→  // Register wheel event with { passive: false } to allow preventDefault
+  1290→  useEffect(() => {
+  1291→    const container = containerRef.current;
+  1292→    if (!container) return;
+  1293→
+  1294→    container.addEventListener('wheel', handleWheel, { passive: false });
+  1295→    return () => container.removeEventListener('wheel', handleWheel);
+  1296→  }, [handleWheel]);
+  1297→
+  1298→  /**
+  1299→   * Handle keyboard shortcuts (F027 + F028 + F021)
+  1300→   *
+  1301→   * F027 - Zoom shortcuts:
+  1302→   * - Plus/Equals (+/=): Zoom in 1.5x
+  1303→   * - Minus (-): Zoom out 1.5x
+  1304→   * - Zero (0): Reset zoom to 1.0x
+  1305→   *
+  1306→   * F028 - Pan shortcuts:
+  1307→   * - Arrow keys: Pan in direction (100px per press) when no task focused
+  1308→   * - Page Up/Down: Pan vertically (500px per press)
+  1309→   * - Home: Go to start (X=0)
+  1310→   * - End: Go to end (X=max)
+  1311→   *
+  1312→   * F021 - Task navigation:
+  1313→   * - Tab: Focus first/next visible task
+  1314→   * - Shift+Tab: Focus previous task
+  1315→   * - Enter/Space: Select focused task
+  1316→   * - Arrow keys (when task focused): Navigate between tasks
+  1317→   * - Escape: Clear focus
+  1318→   */
+  1319→  const handleKeyDown = useCallback(
+  1320→    (e: KeyboardEvent) => {
+  1321→      if (!isInitialized) return;
+  1322→
+  1323→      // Ignore if user is typing in an input/textarea
+  1324→      const target = e.target as HTMLElement;
+  1325→      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+  1326→        return;
+  1327→      }
+  1328→
+  1329→      const state = canvasStore.getState();
+  1330→      const currentCamera = state.viewport.camera;
+  1331→      const currentFocusedTaskId = state.interaction.focusedTaskId;
+  1332→
+  1333→      // F021: Escape clears focus
+  1334→      if (e.key === 'Escape') {
+  1335→        e.preventDefault();
+  1336→        if (currentFocusedTaskId) {
+  1337→          canvasStore.dispatch(canvasActions.interaction.clearFocus());
+  1338→        }
+  1339→        return;
+  1340→      }
+  1341→
+  1342→      // F021: Enter/Space selects focused task
+  1343→      if ((e.key === 'Enter' || e.key === ' ') && currentFocusedTaskId) {
+  1344→        e.preventDefault();
+  1345→        canvasStore.dispatch(canvasActions.interaction.setSelectedTask(currentFocusedTaskId));
+  1346→        return;
+  1347→      }
+  1348→
+  1349→      // F021: Tab / Shift+Tab for task navigation
+  1350→      if (e.key === 'Tab') {
+  1351→        e.preventDefault();
+  1352→
+  1353→        // Get visible tasks sorted by position
+  1354→        const visibleTasks = getVisibleTasks(tasks, viewportBounds);
+  1355→        if (visibleTasks.length === 0) return;
+  1356→
+  1357→        let nextTaskId: string | null = null;
+  1358→
+  1359→        if (e.shiftKey) {
+  1360→          // Shift+Tab: Move to previous task
+  1361→          if (currentFocusedTaskId) {
+  1362→            const currentIndex = visibleTasks.findIndex((t) => t.id === currentFocusedTaskId);
+  1363→            if (currentIndex > 0) {
+  1364→              nextTaskId = visibleTasks[currentIndex - 1].id;
+  1365→            } else {
+  1366→              // Wrap to last visible task
+  1367→              nextTaskId = visibleTasks[visibleTasks.length - 1].id;
+  1368→            }
+  1369→          } else {
+  1370→            // No focus: start from last visible task
+  1371→            nextTaskId = visibleTasks[visibleTasks.length - 1].id;
+  1372→          }
+  1373→        } else {
+  1374→          // Tab: Move to next task
+  1375→          if (currentFocusedTaskId) {
+  1376→            const currentIndex = visibleTasks.findIndex((t) => t.id === currentFocusedTaskId);
+  1377→            if (currentIndex >= 0 && currentIndex < visibleTasks.length - 1) {
+  1378→              nextTaskId = visibleTasks[currentIndex + 1].id;
+  1379→            } else {
+  1380→              // Wrap to first visible task
+  1381→              nextTaskId = visibleTasks[0].id;
+  1382→            }
+  1383→          } else {
+  1384→            // No focus: start from first visible task
+  1385→            nextTaskId = visibleTasks[0].id;
+  1386→          }
+  1387→        }
+  1388→
+  1389→        if (nextTaskId) {
+  1390→          canvasStore.dispatch(canvasActions.interaction.setFocusedTask(nextTaskId));
+  1391→        }
+  1392→        return;
+  1393→      }
+  1394→
+  1395→      // F027: Zoom shortcuts
+  1396→      if (e.key === '+' || e.key === '=' || e.key === 'Equal') {
+  1397→        // Zoom in
+  1398→        e.preventDefault();
+  1399→        stopMomentum();
+  1400→        stopZoomAnimation();
+  1401→        const targetZoom = Math.min(zoom * KEYBOARD_ZOOM_STEP, MAX_ZOOM);
+  1402→        const clamped = clampCameraToWorld(currentCamera.x, currentCamera.y, targetZoom);
+  1403→        animateZoomTo(targetZoom, clamped.x, clamped.y, ZOOM_ANIMATION_DURATION);
+  1404→        return;
+  1405→      }
+  1406→
+  1407→      if (e.key === '-' || e.key === 'Minus') {
+  1408→        // Zoom out
+  1409→        e.preventDefault();
+  1410→        stopMomentum();
+  1411→        stopZoomAnimation();
+  1412→        const targetZoom = Math.max(zoom / KEYBOARD_ZOOM_STEP, effectiveMinZoom);
+  1413→        const clamped = clampCameraToWorld(currentCamera.x, currentCamera.y, targetZoom);
+  1414→        animateZoomTo(targetZoom, clamped.x, clamped.y, ZOOM_ANIMATION_DURATION);
+  1415→        return;
+  1416→      }
+  1417→
+  1418→      if (e.key === '0') {
+  1419→        // Reset zoom to 1.0x
+  1420→        e.preventDefault();
+  1421→        stopMomentum();
+  1422→        stopZoomAnimation();
+  1423→        const targetZoom = Math.max(1.0, effectiveMinZoom);
+  1424→        const clamped = clampCameraToWorld(currentCamera.x, currentCamera.y, targetZoom);
+  1425→        animateZoomTo(targetZoom, clamped.x, clamped.y, ZOOM_ANIMATION_DURATION);
+  1426→        return;
+  1427→      }
+  1428→
+  1429→      // F028/F021: Arrow keys - navigate tasks if focused, pan otherwise
+  1430→      const panStep = KEYBOARD_PAN_STEP / zoom; // Adjust for zoom level
+  1431→      const pageStep = KEYBOARD_PAGE_STEP / zoom;
+  1432→
+  1433→      if (e.key === 'ArrowLeft') {
+  1434→        e.preventDefault();
+  1435→        // F021: If task focused, navigate to task on left
+  1436→        if (currentFocusedTaskId) {
+  1437→          const nextTaskId = findNextTaskInDirection(tasks, currentFocusedTaskId, 'left');
+  1438→          if (nextTaskId) {
+  1439→            canvasStore.dispatch(canvasActions.interaction.setFocusedTask(nextTaskId));
+  1440→          }
+  1441→        } else {
+  1442→          // F028: Pan left
+  1443→          stopMomentum();
+  1444→          const newX = currentCamera.x - panStep;
+  1445→          const clamped = clampCameraToWorld(newX, currentCamera.y, zoom);
+  1446→          updateCameraPos(clamped);
+  1447→          notifyViewportChange(clamped.x, clamped.y, zoom);
+  1448→        }
+  1449→        return;
+  1450→      }
+  1451→
+  1452→      if (e.key === 'ArrowRight') {
+  1453→        e.preventDefault();
+  1454→        // F021: If task focused, navigate to task on right
+  1455→        if (currentFocusedTaskId) {
+  1456→          const nextTaskId = findNextTaskInDirection(tasks, currentFocusedTaskId, 'right');
+  1457→          if (nextTaskId) {
+  1458→            canvasStore.dispatch(canvasActions.interaction.setFocusedTask(nextTaskId));
+  1459→          }
+  1460→        } else {
+  1461→          // F028: Pan right
+  1462→          stopMomentum();
+  1463→          const newX = currentCamera.x + panStep;
+  1464→          const clamped = clampCameraToWorld(newX, currentCamera.y, zoom);
+  1465→          updateCameraPos(clamped);
+  1466→          notifyViewportChange(clamped.x, clamped.y, zoom);
+  1467→        }
+  1468→        return;
+  1469→      }
+  1470→
+  1471→      if (e.key === 'ArrowUp') {
+  1472→        e.preventDefault();
+  1473→        // F021: If task focused, navigate to task above
+  1474→        if (currentFocusedTaskId) {
+  1475→          const nextTaskId = findNextTaskInDirection(tasks, currentFocusedTaskId, 'up');
+  1476→          if (nextTaskId) {
+  1477→            canvasStore.dispatch(canvasActions.interaction.setFocusedTask(nextTaskId));
+  1478→          }
+  1479→        } else {
+  1480→          // F028: Pan up
+  1481→          stopMomentum();
+  1482→          const newY = currentCamera.y + panStep;
+  1483→          const clamped = clampCameraToWorld(currentCamera.x, newY, zoom);
+  1484→          updateCameraPos(clamped);
+  1485→          notifyViewportChange(clamped.x, clamped.y, zoom);
+  1486→        }
+  1487→        return;
+  1488→      }
+  1489→
+  1490→      if (e.key === 'ArrowDown') {
+  1491→        e.preventDefault();
+  1492→        // F021: If task focused, navigate to task below
+  1493→        if (currentFocusedTaskId) {
+  1494→          const nextTaskId = findNextTaskInDirection(tasks, currentFocusedTaskId, 'down');
+  1495→          if (nextTaskId) {
+  1496→            canvasStore.dispatch(canvasActions.interaction.setFocusedTask(nextTaskId));
+  1497→          }
+  1498→        } else {
+  1499→          // F028: Pan down
+  1500→          stopMomentum();
+  1501→          const newY = currentCamera.y - panStep;
+  1502→          const clamped = clampCameraToWorld(currentCamera.x, newY, zoom);
+  1503→          updateCameraPos(clamped);
+  1504→          notifyViewportChange(clamped.x, clamped.y, zoom);
+  1505→        }
+  1506→        return;
+  1507→      }
+  1508→
+  1509→      if (e.key === 'PageUp') {
+  1510→        e.preventDefault();
+  1511→        stopMomentum();
+  1512→        const newY = currentCamera.y + pageStep;
+  1513→        const clamped = clampCameraToWorld(currentCamera.x, newY, zoom);
+  1514→        updateCameraPos(clamped);
+  1515→        notifyViewportChange(clamped.x, clamped.y, zoom);
+  1516→        return;
+  1517→      }
+  1518→
+  1519→      if (e.key === 'PageDown') {
+  1520→        e.preventDefault();
+  1521→        stopMomentum();
+  1522→        const newY = currentCamera.y - pageStep;
+  1523→        const clamped = clampCameraToWorld(currentCamera.x, newY, zoom);
+  1524→        updateCameraPos(clamped);
+  1525→        notifyViewportChange(clamped.x, clamped.y, zoom);
+  1526→        return;
+  1527→      }
+  1528→
+  1529→      if (e.key === 'Home') {
+  1530→        // Go to start (X=0)
+  1531→        e.preventDefault();
+  1532→        stopMomentum();
+  1533→        stopZoomAnimation();
+  1534→        const halfViewX = canvasSize.width / 2 / zoom;
+  1535→        const targetX = worldBounds.minX + halfViewX;
+  1536→        const clamped = clampCameraToWorld(targetX, currentCamera.y, zoom);
+  1537→        animateZoomTo(zoom, clamped.x, clamped.y, 350);
+  1538→        return;
+  1539→      }
+  1540→
+  1541→      if (e.key === 'End') {
+  1542→        // Go to end (X=max)
+  1543→        e.preventDefault();
+  1544→        stopMomentum();
+  1545→        stopZoomAnimation();
+  1546→        const halfViewX = canvasSize.width / 2 / zoom;
+  1547→        const targetX = worldBounds.maxX - halfViewX;
+  1548→        const clamped = clampCameraToWorld(targetX, currentCamera.y, zoom);
+  1549→        animateZoomTo(zoom, clamped.x, clamped.y, 350);
+  1550→        return;
+  1551→      }
+  1552→    },
+  1553→    [
+  1554→      isInitialized,
+  1555→      zoom,
+  1556→      effectiveMinZoom,
+  1557→      canvasSize.width,
+  1558→      worldBounds,
+  1559→      viewportBounds,
+  1560→      tasks,
+  1561→      clampCameraToWorld,
+  1562→      animateZoomTo,
+  1563→      updateCameraPos,
+  1564→      notifyViewportChange,
+  1565→      stopMomentum,
+  1566→      stopZoomAnimation,
+  1567→    ]
+  1568→  );
+  1569→
+  1570→  // Register keyboard event listener (F027 + F028)
+  1571→  useEffect(() => {
+  1572→    const container = containerRef.current;
+  1573→    if (!container) return;
+  1574→
+  1575→    // Make container focusable so it can receive keyboard events
+  1576→    container.setAttribute('tabindex', '0');
+  1577→
+  1578→    container.addEventListener('keydown', handleKeyDown);
+  1579→    return () => {
+  1580→      container.removeEventListener('keydown', handleKeyDown);
+  1581→    };
+  1582→  }, [handleKeyDown]);
+  1583→
+  1584→  // Cleanup animations on unmount
+  1585→  useEffect(() => {
+  1586→    return () => {
+  1587→      if (momentumAnimationRef.current.animationId) {
+  1588→        cancelAnimationFrame(momentumAnimationRef.current.animationId);
+  1589→      }
+  1590→      if (zoomAnimationRef.current.animationId) {
+  1591→        cancelAnimationFrame(zoomAnimationRef.current.animationId);
+  1592→      }
+  1593→      if (wheelAccumulatorRef.current.timeout) {
+  1594→        clearTimeout(wheelAccumulatorRef.current.timeout);
+  1595→      }
+  1596→    };
+  1597→  }, []);
+  1598→
+  1599→  // Handle animated zoom requests from parent (button +/-)
+  1600→  useEffect(() => {
+  1601→    if (animatedZoomTarget == null || !isInitialized) return;
+  1602→
+  1603→    // Calculate new camera position (zoom toward center of viewport)
+  1604→    const targetZoom = Math.max(effectiveMinZoom, Math.min(MAX_ZOOM, animatedZoomTarget));
+  1605→    if (Math.abs(targetZoom - zoom) < 0.001) {
+  1606→      onAnimatedZoomComplete?.();
+  1607→      return;
+  1608→    }
+  1609→
+  1610→    // Zoom toward center (no cursor offset)
+  1611→    const clamped = clampCameraToWorld(cameraPos.x, cameraPos.y, targetZoom);
+  1612→    animateZoomTo(targetZoom, clamped.x, clamped.y, ZOOM_ANIMATION_DURATION);
+  1613→
+  1614→    // Acknowledge the request
+  1615→    onAnimatedZoomComplete?.();
+  1616→  }, [animatedZoomTarget, isInitialized, zoom, effectiveMinZoom, cameraPos, clampCameraToWorld, animateZoomTo, onAnimatedZoomComplete]);
+  1617→
+  1618→  // Handle navigation requests from parent (F124: sidebar/timeline navigation)
+  1619→  useEffect(() => {
+  1620→    if (navigationTarget == null || !isInitialized) return;
+  1621→
+  1622→    // Stop any active animations
+  1623→    stopMomentum();
+  1624→    stopZoomAnimation();
+  1625→
+  1626→    // Calculate target camera position from trainIndex and/or dayOffset
+  1627→    // trainIndex → Y position: trainIndex * pxPerTrain (negative because Y goes down)
+  1628→    // dayOffset → X position: dayOffset * pxPerDay
+  1629→    let targetCameraX = cameraPos.x;
+  1630→    let targetCameraY = cameraPos.y;
+  1631→    const targetZoom = navigationTarget.zoom != null
+  1632→      ? Math.max(effectiveMinZoom, Math.min(MAX_ZOOM, navigationTarget.zoom))
+  1633→      : zoom;
+  1634→
+  1635→    if (navigationTarget.trainIndex != null) {
+  1636→      // Center on the train row
+  1637→      // Camera Y should be positioned so the train is in the center of viewport
+  1638→      // Train position in world: -trainIndex * pxPerTrain - pxPerTrain / 2
+  1639→      targetCameraY = -navigationTarget.trainIndex * pxPerTrain - pxPerTrain / 2;
+  1640→    }
+  1641→
+  1642→    if (navigationTarget.dayOffset != null) {
+  1643→      // Center on the date
+  1644→      // Day position in world: dayOffset * pxPerDay
+  1645→      targetCameraX = navigationTarget.dayOffset * pxPerDay;
+  1646→    }
+  1647→
+  1648→    // Clamp to world bounds
+  1649→    const clamped = clampCameraToWorld(targetCameraX, targetCameraY, targetZoom);
+  1650→
+  1651→    // Animate to target position
+  1652→    animateZoomTo(targetZoom, clamped.x, clamped.y, 350); // 350ms for navigation
+  1653→
+  1654→    // Acknowledge the request
+  1655→    onNavigationComplete?.();
+  1656→  }, [navigationTarget, isInitialized, zoom, effectiveMinZoom, cameraPos, clampCameraToWorld, animateZoomTo, stopMomentum, stopZoomAnimation, onNavigationComplete]);
+  1657→
+  1658→  /**
+  1659→   * Handle pan start / pinch start
+  1660→   *
+  1661→   * Now uses canvasStore to get camera position - no stale closures
+  1662→   */
+  1663→  const handlePointerDown = useCallback(
+  1664→    (e: React.PointerEvent) => {
+  1665→      if (!isInitialized) return;
+  1666→
+  1667→      const pinch = pinchRef.current;
+  1668→
+  1669→      // Track pointer for pinch detection
+  1670→      pinch.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  1671→
+  1672→      // Check for pinch gesture (2 pointers)
+  1673→      if (pinch.pointers.size === 2) {
+  1674→        // Stop pan and momentum when pinch starts
+  1675→        stopMomentum();
+  1676→        stopZoomAnimation();
+  1677→        canvasStore.dispatch(canvasActions.viewport.endPan());
+  1678→
+  1679→        const pointers = Array.from(pinch.pointers.values());
+  1680→        const dx = pointers[0].x - pointers[1].x;
+  1681→        const dy = pointers[0].y - pointers[1].y;
+  1682→        pinch.initialDistance = Math.sqrt(dx * dx + dy * dy);
+  1683→        pinch.initialZoom = zoom;
+  1684→        // Get camera position from store (always current, no stale closures)
+  1685→        const currentCamera = canvasStore.getState().viewport.camera;
+  1686→        pinch.centerX = currentCamera.x;
+  1687→        pinch.centerY = currentCamera.y;
+  1688→        pinch.active = true;
+  1689→        return;
+  1690→      }
+  1691→
+  1692→      // Single pointer = pan
+  1693→      if (pinch.pointers.size === 1) {
+  1694→        // Stop any active momentum and zoom animation
+  1695→        stopMomentum();
+  1696→        stopZoomAnimation();
+  1697→
+  1698→        // Get camera position from store (always current, no stale closures)
+  1699→        const currentCamera = canvasStore.getState().viewport.camera;
+  1700→
+  1701→        // Track pointer down position for click detection (F019)
+  1702→        pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+  1703→        pointerMovedRef.current = false;
+  1704→
+  1705→        // Start pan in store
+  1706→        canvasStore.dispatch(
+  1707→          canvasActions.viewport.startPan({
+  1708→            panStart: { x: e.clientX, y: e.clientY },
+  1709→            cameraPosAtPanStart: currentCamera,
+  1710→          })
+  1711→        );
+  1712→
+  1713→        // Initialize velocity tracking
+  1714→        const now = performance.now();
+  1715→        lastPointerPosRef.current = { x: e.clientX, y: e.clientY, time: now };
+  1716→        velocitySamplesRef.current = [];
+  1717→      }
+  1718→
+  1719→      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  1720→    },
+  1721→    [zoom, isInitialized, stopMomentum, stopZoomAnimation]
+  1722→  );
+  1723→
+  1724→  /**
+  1725→   * Handle hover detection (F018)
+  1726→   * Updates hovered task based on mouse position
+  1727→   */
+  1728→  const updateHover = useCallback(
+  1729→    (e: React.PointerEvent) => {
+  1730→      // Only update hover when not panning (avoid expensive calculations during drag)
+  1731→      const state = canvasStore.getState();
+  1732→      if (state.viewport.isPanning) {
+  1733→        // Clear hover during panning
+  1734→        if (state.interaction.hoveredTaskId !== null) {
+  1735→          canvasStore.dispatch(canvasActions.interaction.setHoveredTask(null));
+  1736→        }
+  1737→        return;
+  1738→      }
+  1739→
+  1740→      // Get container rect for coordinate conversion
+  1741→      const container = containerRef.current;
+  1742→      if (!container) return;
+  1743→
+  1744→      const rect = container.getBoundingClientRect();
+  1745→      const camera = state.viewport.camera;
+  1746→
+  1747→      // Find task under cursor
+  1748→      const taskId = findTaskAtPosition(
+  1749→        e.clientX,
+  1750→        e.clientY,
+  1751→        rect,
+  1752→        camera.x,
+  1753→        camera.y,
+  1754→        zoom,
+  1755→        canvasSize.width,
+  1756→        canvasSize.height,
+  1757→        tasks
+  1758→      );
+  1759→
+  1760→      // Only update if changed (avoid unnecessary state updates)
+  1761→      if (taskId !== state.interaction.hoveredTaskId) {
+  1762→        canvasStore.dispatch(canvasActions.interaction.setHoveredTask(taskId));
+  1763→      }
+  1764→    },
+  1765→    [zoom, canvasSize, tasks]
+  1766→  );
+  1767→
+  1768→  /**
+  1769→   * Handle pan move / pinch move
+  1770→   *
+  1771→   * Now uses canvasStore for pan state - values always current
+  1772→   */
+  1773→  const handlePointerMove = useCallback(
+  1774→    (e: React.PointerEvent) => {
+  1775→      const pinch = pinchRef.current;
+  1776→
+  1777→      // Update pointer position
+  1778→      if (pinch.pointers.has(e.pointerId)) {
+  1779→        pinch.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  1780→      }
+  1781→
+  1782→      // Handle pinch gesture
+  1783→      if (pinch.active && pinch.pointers.size === 2) {
+  1784→        const pointers = Array.from(pinch.pointers.values());
+  1785→        const dx = pointers[0].x - pointers[1].x;
+  1786→        const dy = pointers[0].y - pointers[1].y;
+  1787→        const currentDistance = Math.sqrt(dx * dx + dy * dy);
+  1788→
+  1789→        if (pinch.initialDistance > 0) {
+  1790→          const scale = currentDistance / pinch.initialDistance;
+  1791→          const centerX = (pointers[0].x + pointers[1].x) / 2;
+  1792→          const centerY = (pointers[0].y + pointers[1].y) / 2;
+  1793→          handlePinchZoom(scale, centerX, centerY);
+  1794→        }
+  1795→        return;
+  1796→      }
+  1797→
+  1798→      // Update hover state (F018) - always run to update cursor
+  1799→      updateHover(e);
+  1800→
+  1801→      // Handle pan - get current state from store
+  1802→      const state = canvasStore.getState();
+  1803→      if (!state.viewport.isPanning) return;
+  1804→
+  1805→      const dx = (e.clientX - state.viewport.panStart.x) / zoom;
+  1806→      const dy = (e.clientY - state.viewport.panStart.y) / zoom;
+  1807→
+  1808→      // Detect significant movement (F019: to distinguish click from pan)
+  1809→      // Using 8px threshold - movement greater than this is a pan, not a click
+  1810→      // Higher threshold helps with touchpad/mouse precision issues
+  1811→      const moveX = e.clientX - pointerDownPosRef.current.x;
+  1812→      const moveY = e.clientY - pointerDownPosRef.current.y;
+  1813→      const moveDistance = Math.sqrt(moveX * moveX + moveY * moveY);
+  1814→      if (moveDistance > 8) {
+  1815→        pointerMovedRef.current = true;
+  1816→      }
+  1817→
+  1818→      const newX = state.viewport.cameraPosAtPanStart.x - dx;
+  1819→      const newY = state.viewport.cameraPosAtPanStart.y + dy;
+  1820→
+  1821→      const clamped = clampCameraToWorld(newX, newY, zoom);
+  1822→
+  1823→      // Update pan in store
+  1824→      canvasStore.dispatch(canvasActions.viewport.updatePan({ camera: clamped }));
+  1825→      notifyViewportChange(clamped.x, clamped.y, zoom);
+  1826→
+  1827→      // Track velocity samples for momentum
+  1828→      const now = performance.now();
+  1829→      const worldDx = (e.clientX - lastPointerPosRef.current.x) / zoom;
+  1830→      const worldDy = (e.clientY - lastPointerPosRef.current.y) / zoom;
+  1831→
+  1832→      velocitySamplesRef.current.push({
+  1833→        x: worldDx,
+  1834→        y: worldDy,
+  1835→        time: now,
+  1836→      });
+  1837→
+  1838→      // Keep only recent samples
+  1839→      if (velocitySamplesRef.current.length > MOMENTUM_VELOCITY_SAMPLES * 2) {
+  1840→        velocitySamplesRef.current = velocitySamplesRef.current.slice(-MOMENTUM_VELOCITY_SAMPLES);
+  1841→      }
+  1842→
+  1843→      lastPointerPosRef.current = { x: e.clientX, y: e.clientY, time: now };
+  1844→    },
+  1845→    [zoom, clampCameraToWorld, notifyViewportChange, handlePinchZoom, updateHover]
+  1846→  );
+  1847→
+  1848→  /**
+  1849→   * Handle pan end / pinch end
+  1850→   *
+  1851→   * Now uses canvasStore for pan state
+  1852→   */
+  1853→  const handlePointerUp = useCallback(
+  1854→    (e: React.PointerEvent) => {
+  1855→      const pinch = pinchRef.current;
+  1856→
+  1857→      // Remove pointer from tracking
+  1858→      pinch.pointers.delete(e.pointerId);
+  1859→
+  1860→      // Release pointer capture
+  1861→      try {
+  1862→        (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+  1863→      } catch {
+  1864→        // Ignore if capture was already released
+  1865→      }
+  1866→
+  1867→      // Reset pinch state when all pointers released
+  1868→      if (pinch.pointers.size < 2) {
+  1869→        pinch.active = false;
+  1870→        pinch.initialDistance = 0;
+  1871→      }
+  1872→
+  1873→      // Handle pan end with momentum - check store for isPanning
+  1874→      const state = canvasStore.getState();
+  1875→      if (state.viewport.isPanning && pinch.pointers.size === 0) {
+  1876→        canvasStore.dispatch(canvasActions.viewport.endPan());
+  1877→
+  1878→        // BUG-008: Momentum disabled - was causing elastic/jumping behavior
+  1879→        // The momentum animation had stale closure issues despite the cameraPosRef fix
+  1880→        // TODO: Reimplement with proper state synchronization if momentum UX is desired
+  1881→        // Original code:
+  1882→        // const { vx, vy } = calculateAverageVelocity();
+  1883→        // const speed = Math.sqrt(vx ** 2 + vy ** 2);
+  1884→        // if (speed > 0.01) { startMomentum(vx, vy); }
+  1885→      }
+  1886→    },
+  1887→    [calculateAverageVelocity, startMomentum]
+  1888→  );
+  1889→
+  1890→  /**
+  1891→   * Handle double-click to zoom in at click location
+  1892→   * Zooms 2x toward the clicked point with smooth animation
+  1893→   *
+  1894→   * Now uses animateZoomTo which uses the canvasStore
+  1895→   */
+  1896→  const handleDoubleClick = useCallback(
+  1897→    (e: React.MouseEvent) => {
+  1898→      if (!isInitialized) return;
+  1899→
+  1900→      // Stop any active animations
+  1901→      stopMomentum();
+  1902→      stopZoomAnimation();
+  1903→
+  1904→      const rect = containerRef.current?.getBoundingClientRect();
+  1905→      if (!rect) return;
+  1906→
+  1907→      // Get current camera from store
+  1908→      const currentCamera = canvasStore.getState().viewport.camera;
+  1909→
+  1910→      // Calculate target zoom (2x, clamped to MAX_ZOOM)
+  1911→      const targetZoom = Math.min(zoom * 2, MAX_ZOOM);
+  1912→      if (Math.abs(targetZoom - zoom) < 0.001) return;
+  1913→
+  1914→      // Cursor position relative to canvas center
+  1915→      const cursorX = e.clientX - rect.left - rect.width / 2;
+  1916→      const cursorY = e.clientY - rect.top - rect.height / 2;
+  1917→
+  1918→      // Calculate target camera position (zoom toward click point)
+  1919→      const worldX = cursorX / zoom + currentCamera.x;
+  1920→      const worldY = -cursorY / zoom + currentCamera.y;
+  1921→      const newCameraX = worldX - cursorX / targetZoom;
+  1922→      const newCameraY = worldY + cursorY / targetZoom;
+  1923→
+  1924→      const clamped = clampCameraToWorld(newCameraX, newCameraY, targetZoom);
+  1925→
+  1926→      // Animate with slightly longer duration for double-click (350ms)
+  1927→      animateZoomTo(targetZoom, clamped.x, clamped.y, 350);
+  1928→    },
+  1929→    [zoom, isInitialized, stopMomentum, stopZoomAnimation, clampCameraToWorld, animateZoomTo]
+  1930→  );
+  1931→
+  1932→  /**
+  1933→   * Handle click to select/deselect task (F019)
+  1934→   * Clicks on tasks select them, clicks on background deselect
+  1935→   */
+  1936→  const handleClick = useCallback(
+  1937→    (e: React.MouseEvent) => {
+  1938→      if (!isInitialized) return;
+  1939→
+  1940→      // Don't process clicks that are part of a pan gesture
+  1941→      // If pointer moved significantly between down and up, this is a pan, not a click
+  1942→      if (pointerMovedRef.current) {
+  1943→        return;
+  1944→      }
+  1945→
+  1946→      const state = canvasStore.getState();
+  1947→
+  1948→      const container = containerRef.current;
+  1949→      if (!container) return;
+  1950→
+  1951→      const rect = container.getBoundingClientRect();
+  1952→      const camera = state.viewport.camera;
+  1953→
+  1954→      // Find task at click position
+  1955→      const taskId = findTaskAtPosition(
+  1956→        e.clientX,
+  1957→        e.clientY,
+  1958→        rect,
+  1959→        camera.x,
+  1960→        camera.y,
+  1961→        zoom,
+  1962→        canvasSize.width,
+  1963→        canvasSize.height,
+  1964→        tasks
+  1965→      );
+  1966→
+  1967→      if (taskId) {
+  1968→        // Toggle selection: if clicking same task, deselect; otherwise, select
+  1969→        if (taskId === state.interaction.selectedTaskId) {
+  1970→          canvasStore.dispatch(canvasActions.interaction.clearSelection());
+  1971→        } else {
+  1972→          canvasStore.dispatch(canvasActions.interaction.setSelectedTask(taskId));
+  1973→        }
+  1974→      } else {
+  1975→        // Clicked on background: clear selection
+  1976→        if (state.interaction.selectedTaskId !== null) {
+  1977→          canvasStore.dispatch(canvasActions.interaction.clearSelection());
+  1978→        }
+  1979→      }
+  1980→    },
+  1981→    [isInitialized, zoom, canvasSize, tasks]
+  1982→  );
+  1983→
+  1984→  /**
+  1985→   * Handle pointer leave - clear pan and hover state
+  1986→   */
+  1987→  const handlePointerLeave = useCallback(
+  1988→    (e: React.PointerEvent) => {
+  1989→      // Handle pan end
+  1990→      handlePointerUp(e);
+  1991→      // Clear hover state (F018)
+  1992→      canvasStore.dispatch(canvasActions.interaction.clearHover());
+  1993→    },
+  1994→    [handlePointerUp]
+  1995→  );
+  1996→
+  1997→  // Determine cursor style: grabbing when panning, pointer when hovering task, grab otherwise
+  1998→  const cursorStyle = isPanning ? 'grabbing' : isHoverable ? 'pointer' : 'grab';
+  1999→
+  2000→  // Generate aria-label with current state information (F022)
+  2001→  const ariaLabel = `Metro maintenance planning canvas. ${LOD_LABELS[lod]}. ${formatZoomForAria(zoom)}. Use Tab to navigate tasks, Enter to select, Arrow keys to pan, plus minus to zoom.`;
+  2002→
+  2003→  return (
+  2004→    <div
+  2005→      ref={containerRef}
+  2006→      // F022: ARIA attributes for accessibility
+  2007→      role="application"
+  2008→      aria-label={ariaLabel}
+  2009→      aria-roledescription="Interactive maintenance scheduling canvas"
+  2010→      style={{
+  2011→        width: '100%',
+  2012→        height: '100%',
+  2013→        cursor: cursorStyle,
+  2014→        touchAction: 'none',
+  2015→        position: 'relative', // For absolute positioning of live region
+  2016→      }}
+  2017→      onPointerDown={handlePointerDown}
+  2018→      onPointerMove={handlePointerMove}
+  2019→      onPointerUp={handlePointerUp}
+  2020→      onPointerLeave={handlePointerLeave}
+  2021→      onDoubleClick={handleDoubleClick}
+  2022→      onClick={handleClick}
+  2023→    >
+  2024→      {/* F022: ARIA Live Region for screen reader announcements */}
+  2025→      <div
+  2026→        ref={ariaLiveRef}
+  2027→        role="status"
+  2028→        aria-live="polite"
+  2029→        aria-atomic="true"
+  2030→        style={{
+  2031→          position: 'absolute',
+  2032→          width: '1px',
+  2033→          height: '1px',
+  2034→          padding: '0',
+  2035→          margin: '-1px',
+  2036→          overflow: 'hidden',
+  2037→          clip: 'rect(0, 0, 0, 0)',
+  2038→          whiteSpace: 'nowrap',
+  2039→          border: '0',
+  2040→        }}
+  2041→      />
+  2042→      <Canvas
+  2043→        gl={{ antialias: true, alpha: false }}
+  2044→        style={{ background: '#f4f4f5' }}
+  2045→        orthographic
+  2046→        camera={{
+  2047→          position: [cameraPos.x, cameraPos.y, 100],
+  2048→          zoom: zoom,
+  2049→          near: 0.1,
+  2050→          far: 1000,
+  2051→        }}
+  2052→      >
+  2053→        <CameraController
+  2054→          cameraX={cameraPos.x}
+  2055→          cameraY={cameraPos.y}
+  2056→          zoom={zoom}
+  2057→          worldBounds={worldBounds}
+  2058→          isInitialized={isInitialized}
+  2059→          onInitialized={handleCameraInitialized}
+  2060→          onViewportChange={onViewportChange}
+  2061→        />
+  2062→
+  2063→        <color attach="background" args={['#f4f4f5']} />
+  2064→
+  2065→        {/* LOD-based layer rendering with smooth transitions */}
+  2066→        <LODLayers
+  2067→          tasks={tasks}
+  2068→          trainCount={trains.length}
+  2069→          zoom={zoom}
+  2070→          viewportBounds={viewportBounds}
+  2071→          hoveredTaskId={hoveredTaskId}
+  2072→          selectedTaskId={selectedTaskId}
+  2073→          focusedTaskId={focusedTaskId}
+  2074→        />
+  2075→
+  2076→        {/* Performance monitor (PERF-001) */}
+  2077→        {/* r3f-perf disabled due to troika compatibility issue - using stats.js PerformancePanel instead */}
+  2078→        <PerfMonitor visible={false} currentEvent={perfEvent} />
+  2079→      </Canvas>
+  2080→    </div>
+  2081→  );
+  2082→}
+  2083→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

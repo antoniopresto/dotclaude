@@ -1,0 +1,432 @@
+/**
+ * HQ RPC Client
+ *
+ * Provides a unified API for communicating with the HQ backend server.
+ * Uses WebSocket for real-time communication and HTTP for fallback.
+ */
+
+// Types matching backend definitions
+export interface ProcessInfo {
+  id: string;
+  cmd: string;
+  args: string[];
+  cwd: string;
+  rows: number;
+  cols: number;
+  running: boolean;
+  createdAt: number;
+}
+
+export interface RpcRequest {
+  id: string;
+  cmd: string;
+  args: Record<string, unknown>;
+}
+
+export interface RpcResponse {
+  id: string;
+  success: boolean;
+  result?: unknown;
+  error?: string;
+}
+
+export interface RpcEvent {
+  event: string;
+  payload: unknown;
+}
+
+export interface PtyOutput {
+  id: string;
+  data: string;
+}
+
+export interface PtyExit {
+  id: string;
+  code: number | null;
+}
+
+export interface HarnessChangeEvent {
+  project_path: string;
+  change_type: "db" | "config" | "unknown";
+  file: string;
+}
+
+// Connection state
+let ws: WebSocket | null = null;
+let pendingRequests: Map<
+  string,
+  { resolve: (value: unknown) => void; reject: (error: Error) => void }
+> = new Map();
+let eventHandlers: Map<string, Set<(payload: unknown) => void>> = new Map();
+let reconnectAttempts = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+const MAX_RECONNECT_ATTEMPTS = 10;
+
+// Server configuration
+const BACKEND_PORT = 9876;
+const BACKEND_URL = `http://localhost:${BACKEND_PORT}`;
+const WS_URL = `ws://localhost:${BACKEND_PORT}/ws`;
+
+/**
+ * Generate unique request ID
+ */
+function generateId(): string {
+  return `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
+/**
+ * Check if backend server is available
+ */
+export async function isBackendAvailable(): Promise<boolean> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/health`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Connect to WebSocket server
+ */
+export async function connect(): Promise<boolean> {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    return true;
+  }
+
+  // Check if server is available first
+  const available = await isBackendAvailable();
+  if (!available) {
+    console.warn("[RPC] Backend server not available at", BACKEND_URL);
+    return false;
+  }
+
+  return new Promise((resolve) => {
+    try {
+      ws = new WebSocket(WS_URL);
+
+      ws.onopen = () => {
+        console.log("[RPC] Connected to backend");
+        reconnectAttempts = 0;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        resolve(true);
+      };
+
+      ws.onclose = () => {
+        console.log("[RPC] Disconnected from backend");
+        ws = null;
+
+        // Reject all pending requests
+        pendingRequests.forEach(({ reject }) => {
+          reject(new Error("Connection closed"));
+        });
+        pendingRequests.clear();
+
+        // Attempt reconnection
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+          console.log(`[RPC] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+          reconnectTimer = setTimeout(() => connect(), delay);
+        }
+
+        resolve(false);
+      };
+
+      ws.onerror = (error) => {
+        console.error("[RPC] WebSocket error:", error);
+        resolve(false);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data) as RpcEvent;
+
+          if (data.event === "rpc-response") {
+            const response = data.payload as RpcResponse;
+            const pending = pendingRequests.get(response.id);
+            if (pending) {
+              pendingRequests.delete(response.id);
+              if (response.success) {
+                pending.resolve(response.result);
+              } else {
+                pending.reject(new Error(response.error || "Unknown error"));
+              }
+            }
+          } else {
+            // Emit event to handlers
+            const handlers = eventHandlers.get(data.event);
+            if (handlers) {
+              handlers.forEach((handler) => handler(data.payload));
+            }
+
+            // Also emit to wildcard handlers
+            const wildcardHandlers = eventHandlers.get("*");
+            if (wildcardHandlers) {
+              wildcardHandlers.forEach((handler) => handler(data));
+            }
+          }
+        } catch (e) {
+          console.error("[RPC] Failed to parse message:", e);
+        }
+      };
+    } catch (e) {
+      console.error("[RPC] Failed to connect:", e);
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Disconnect from WebSocket server
+ */
+export function disconnect(): void {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  pendingRequests.clear();
+  eventHandlers.clear();
+}
+
+/**
+ * Invoke a command on the backend
+ */
+export async function invoke<T>(
+  cmd: string,
+  args: Record<string, unknown> = {}
+): Promise<T> {
+  // Try WebSocket first
+  const connected = await connect();
+
+  if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    return invokeViaWebSocket<T>(cmd, args);
+  }
+
+  // Fallback to HTTP
+  return invokeViaHttp<T>(cmd, args);
+}
+
+/**
+ * Invoke via WebSocket
+ */
+async function invokeViaWebSocket<T>(
+  cmd: string,
+  args: Record<string, unknown>
+): Promise<T> {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error("WebSocket not connected");
+  }
+
+  const id = generateId();
+  const request: RpcRequest = { id, cmd, args };
+
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(id, {
+      resolve: resolve as (value: unknown) => void,
+      reject,
+    });
+
+    ws!.send(JSON.stringify(request));
+
+    // Timeout after 30 seconds
+    setTimeout(() => {
+      if (pendingRequests.has(id)) {
+        pendingRequests.delete(id);
+        reject(new Error(`Request timeout: ${cmd}`));
+      }
+    }, 30000);
+  });
+}
+
+/**
+ * Invoke via HTTP (fallback)
+ */
+async function invokeViaHttp<T>(
+  cmd: string,
+  args: Record<string, unknown>
+): Promise<T> {
+  const id = generateId();
+  const request: RpcRequest = { id, cmd, args };
+
+  const response = await fetch(`${BACKEND_URL}/rpc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error: ${response.status}`);
+  }
+
+  const rpcResponse = (await response.json()) as RpcResponse;
+
+  if (!rpcResponse.success) {
+    throw new Error(rpcResponse.error || "Unknown error");
+  }
+
+  return rpcResponse.result as T;
+}
+
+/**
+ * Listen for events from backend
+ */
+export async function listen<T>(
+  event: string,
+  handler: (payload: T) => void
+): Promise<() => void> {
+  if (!eventHandlers.has(event)) {
+    eventHandlers.set(event, new Set());
+  }
+  eventHandlers.get(event)!.add(handler as (payload: unknown) => void);
+
+  // Ensure connection is established
+  await connect();
+
+  // Return unlisten function
+  return () => {
+    const handlers = eventHandlers.get(event);
+    if (handlers) {
+      handlers.delete(handler as (payload: unknown) => void);
+    }
+  };
+}
+
+// ============================================
+// PTY Commands (convenience wrappers)
+// ============================================
+
+export async function ptySpawn(
+  cmd: string,
+  args: string[] = [],
+  cwd: string = ".",
+  rows: number = 24,
+  cols: number = 80
+): Promise<ProcessInfo> {
+  return invoke<ProcessInfo>("pty_spawn", { cmd, args, cwd, rows, cols });
+}
+
+export async function ptyWrite(id: string, data: string): Promise<void> {
+  return invoke<void>("pty_write", { id, data });
+}
+
+export async function ptyResize(
+  id: string,
+  rows: number,
+  cols: number
+): Promise<void> {
+  return invoke<void>("pty_resize", { id, rows, cols });
+}
+
+export async function ptyKill(id: string): Promise<void> {
+  return invoke<void>("pty_kill", { id });
+}
+
+export async function ptyList(): Promise<ProcessInfo[]> {
+  return invoke<ProcessInfo[]>("pty_list", {});
+}
+
+export async function ptyGet(id: string): Promise<ProcessInfo | null> {
+  return invoke<ProcessInfo | null>("pty_get", { id });
+}
+
+// ============================================
+// Harness Commands
+// ============================================
+
+export async function runHarnessCommand(
+  projectPath: string,
+  args: string[]
+): Promise<string> {
+  return invoke<string>("run_harness_command", { projectPath, args });
+}
+
+export async function checkHarnessExists(path: string): Promise<boolean> {
+  return invoke<boolean>("check_harness_exists", { path });
+}
+
+export async function getProjectInfo(
+  path: string
+): Promise<{ name: string; version?: string } | null> {
+  return invoke<{ name: string; version?: string } | null>("get_project_info", { path });
+}
+
+export async function getGitInfo(
+  path: string
+): Promise<{ hash: string; message: string; author: string; date: string } | null> {
+  return invoke<{ hash: string; message: string; author: string; date: string } | null>(
+    "get_git_info",
+    { path }
+  );
+}
+
+// ============================================
+// Watcher Commands
+// ============================================
+
+export async function watcherStart(projectPath: string): Promise<boolean> {
+  return invoke<boolean>("harness_watch_start", { projectPath });
+}
+
+export async function watcherStop(projectPath: string): Promise<boolean> {
+  return invoke<boolean>("harness_watch_stop", { projectPath });
+}
+
+export async function watcherList(): Promise<string[]> {
+  return invoke<string[]>("harness_watch_list", {});
+}
+
+// ============================================
+// Event Listeners
+// ============================================
+
+export async function onPtyOutput(
+  handler: (output: PtyOutput) => void
+): Promise<() => void> {
+  return listen<PtyOutput>("pty-output", handler);
+}
+
+export async function onPtyExit(
+  handler: (exit: PtyExit) => void
+): Promise<() => void> {
+  return listen<PtyExit>("pty-exit", handler);
+}
+
+export async function onHarnessChange(
+  handler: (change: HarnessChangeEvent) => void
+): Promise<() => void> {
+  return listen<HarnessChangeEvent>("harness-change", handler);
+}
+
+// ============================================
+// Compatibility layer (for existing code)
+// ============================================
+
+// These functions are kept for compatibility with existing components
+
+export function isTauri(): boolean {
+  // Always return false since we're using web backend
+  return false;
+}
+
+export async function isDevBridgeAvailable(): Promise<boolean> {
+  return isBackendAvailable();
+}
+
+export function setDevBridgeToken(_token: string): void {
+  // No-op - tokens not needed for web backend
+}
+
+// Auto-connect on module load
+connect().catch(() => {
+  console.warn("[RPC] Initial connection failed. Will retry when invoke is called.");
+});

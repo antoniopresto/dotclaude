@@ -1,0 +1,191 @@
+/**
+ * Scenarios API Routes
+ *
+ * Save and load What-If scenarios with solver results.
+ */
+
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { getCollection, COLLECTIONS } from "../db/connection";
+import type { SolverInput, SolverOutput } from "@uptime/types";
+
+const scenarios = new Hono();
+
+// Scenario document type
+interface Scenario {
+  id: string;
+  name: string;
+  description?: string;
+  input: SolverInput;
+  output: SolverOutput;
+  createdAt: string;
+  updatedAt: string;
+  status: "draft" | "approved" | "archived";
+  approvedBy?: string;
+  approvedAt?: string;
+}
+
+// Validation schemas
+const createScenarioSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  input: z.any(), // SolverInput - complex, validated by solver
+  output: z.any(), // SolverOutput - complex, from solver
+});
+
+const updateScenarioSchema = z.object({
+  name: z.string().min(1).optional(),
+  description: z.string().optional(),
+  status: z.enum(["draft", "approved", "archived"]).optional(),
+  approvedBy: z.string().optional(),
+});
+
+/**
+ * GET /scenarios - List all scenarios
+ */
+scenarios.get("/", async (c) => {
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+  const status = c.req.query("status");
+
+  const filter = status ? { status } : {};
+  const results = await collection
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  return c.json({
+    data: results,
+    total: results.length,
+  });
+});
+
+/**
+ * GET /scenarios/:id - Get single scenario
+ */
+scenarios.get("/:id", async (c) => {
+  const id = c.req.param("id");
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+  const scenario = await collection.findOne({ id });
+
+  if (!scenario) {
+    return c.json({ error: "Scenario not found" }, 404);
+  }
+
+  return c.json(scenario);
+});
+
+/**
+ * POST /scenarios - Create new scenario
+ */
+scenarios.post("/", zValidator("json", createScenarioSchema), async (c) => {
+  const body = c.req.valid("json");
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+
+  const now = new Date().toISOString();
+  const scenario: Scenario = {
+    id: `scn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: body.name,
+    description: body.description,
+    input: body.input,
+    output: body.output,
+    createdAt: now,
+    updatedAt: now,
+    status: "draft",
+  };
+
+  await collection.insertOne(scenario);
+  return c.json(scenario, 201);
+});
+
+/**
+ * PUT /scenarios/:id - Update scenario
+ */
+scenarios.put("/:id", zValidator("json", updateScenarioSchema), async (c) => {
+  const id = c.req.param("id");
+  const updates = c.req.valid("json");
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+
+  const updateDoc: any = {
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  };
+
+  // If approving, set approval timestamp
+  if (updates.status === "approved" && updates.approvedBy) {
+    updateDoc.approvedAt = new Date().toISOString();
+  }
+
+  const result = await collection.findOneAndUpdate(
+    { id },
+    { $set: updateDoc },
+    { returnDocument: "after" }
+  );
+
+  if (!result) {
+    return c.json({ error: "Scenario not found" }, 404);
+  }
+
+  return c.json(result);
+});
+
+/**
+ * DELETE /scenarios/:id - Delete scenario
+ */
+scenarios.delete("/:id", async (c) => {
+  const id = c.req.param("id");
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+
+  const result = await collection.deleteOne({ id });
+
+  if (result.deletedCount === 0) {
+    return c.json({ error: "Scenario not found" }, 404);
+  }
+
+  return c.json({ message: "Scenario deleted", id });
+});
+
+/**
+ * POST /scenarios/:id/approve - Approve scenario
+ */
+scenarios.post("/:id/approve", async (c) => {
+  const id = c.req.param("id");
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+
+  const result = await collection.findOneAndUpdate(
+    { id },
+    {
+      $set: {
+        status: "approved",
+        approvedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    },
+    { returnDocument: "after" }
+  );
+
+  if (!result) {
+    return c.json({ error: "Scenario not found" }, 404);
+  }
+
+  return c.json(result);
+});
+
+/**
+ * GET /scenarios/latest/approved - Get latest approved scenario
+ */
+scenarios.get("/latest/approved", async (c) => {
+  const collection = getCollection<Scenario>(COLLECTIONS.SCENARIOS);
+  const scenario = await collection.findOne(
+    { status: "approved" },
+    { sort: { approvedAt: -1 } }
+  );
+
+  if (!scenario) {
+    return c.json({ error: "No approved scenario found" }, 404);
+  }
+
+  return c.json(scenario);
+});
+
+export { scenarios };

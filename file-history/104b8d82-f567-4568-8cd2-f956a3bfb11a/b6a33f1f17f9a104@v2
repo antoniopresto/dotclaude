@@ -1,0 +1,122 @@
+import { exec } from "child_process";
+import { promisify } from "util";
+import { z } from "zod";
+
+const execAsync = promisify(exec);
+
+export const bashInputSchema = z.object({
+  command: z.string().describe("The bash command to execute"),
+  timeout: z
+    .number()
+    .optional()
+    .default(30000)
+    .describe("Command timeout in milliseconds"),
+});
+
+export type BashInput = z.infer<typeof bashInputSchema>;
+
+export interface BashResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  cwd: string;
+}
+
+let currentWorkingDirectory = process.cwd();
+
+export function getCurrentWorkingDirectory(): string {
+  return currentWorkingDirectory;
+}
+
+export function setCurrentWorkingDirectory(path: string): void {
+  currentWorkingDirectory = path;
+}
+
+export async function executeBash(input: BashInput): Promise<BashResult> {
+  const { command, timeout } = input;
+
+  // Handle cd command specially to track directory changes
+  const cdMatch = command.match(/^cd\s+(.+)$/);
+  if (cdMatch) {
+    const targetPath = cdMatch[1].replace(/^["']|["']$/g, "").trim();
+    return await changeDirectory(targetPath);
+  }
+
+  try {
+    const { stdout, stderr } = await execAsync(command, {
+      cwd: currentWorkingDirectory,
+      timeout,
+      maxBuffer: 10 * 1024 * 1024, // 10MB
+      shell: "/bin/zsh",
+    });
+
+    return {
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode: 0,
+      cwd: currentWorkingDirectory,
+    };
+  } catch (error: any) {
+    return {
+      stdout: error.stdout?.trim() || "",
+      stderr: error.stderr?.trim() || error.message,
+      exitCode: error.code || 1,
+      cwd: currentWorkingDirectory,
+    };
+  }
+}
+
+async function changeDirectory(targetPath: string): Promise<BashResult> {
+  const { resolve, normalize } = await import("path");
+  const { access, constants } = await import("fs/promises");
+
+  let newPath: string;
+
+  if (targetPath === "~" || targetPath.startsWith("~/")) {
+    const homedir = (await import("os")).homedir();
+    newPath = targetPath === "~" ? homedir : resolve(homedir, targetPath.slice(2));
+  } else if (targetPath.startsWith("/")) {
+    newPath = normalize(targetPath);
+  } else {
+    newPath = resolve(currentWorkingDirectory, targetPath);
+  }
+
+  try {
+    await access(newPath, constants.R_OK);
+    currentWorkingDirectory = newPath;
+
+    return {
+      stdout: `Changed directory to: ${newPath}`,
+      stderr: "",
+      exitCode: 0,
+      cwd: newPath,
+    };
+  } catch {
+    return {
+      stdout: "",
+      stderr: `cd: no such file or directory: ${targetPath}`,
+      exitCode: 1,
+      cwd: currentWorkingDirectory,
+    };
+  }
+}
+
+export const bashToolDefinition = {
+  name: "bash",
+  description:
+    "Execute a bash command in the current working directory. Use this to run any shell command. When using 'cd', the working directory will be updated for subsequent commands.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      command: {
+        type: "string",
+        description: "The bash command to execute",
+      },
+      timeout: {
+        type: "number",
+        description: "Command timeout in milliseconds (default: 30000)",
+      },
+    },
+    required: ["command"],
+  },
+};

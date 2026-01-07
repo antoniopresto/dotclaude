@@ -1,0 +1,784 @@
+     1→//! Database types for the Harness storage layer.
+     2→//!
+     3→//! This module defines the core data structures used in the SQLite database:
+     4→//! - `TaskStatus` enum with 6 Kanban states
+     5→//! - `ProjectTask` for features/tasks
+     6→//! - `TaskStep` for checklist items (composite ID)
+     7→//! - `WorkSession` for work periods
+     8→//! - `ProjectProgress` for session log entries (composite ID)
+     9→//! - `DbError` for error handling
+    10→
+    11→use chrono::{DateTime, Utc};
+    12→use serde::{Deserialize, Serialize};
+    13→use thiserror::Error;
+    14→
+    15→// =============================================================================
+    16→// ERROR TYPES
+    17→// =============================================================================
+    18→
+    19→/// Database operation errors.
+    20→#[derive(Debug, Error)]
+    21→pub enum DbError {
+    22→    #[error("Database error: {0}")]
+    23→    Sqlite(#[from] rusqlite::Error),
+    24→
+    25→    #[error("Not found: {0}")]
+    26→    NotFound(String),
+    27→
+    28→    #[error("Invalid ID format: {0}")]
+    29→    InvalidId(String),
+    30→
+    31→    #[error("Validation error: {0}")]
+    32→    Validation(String),
+    33→
+    34→    #[error("IO error: {0}")]
+    35→    Io(#[from] std::io::Error),
+    36→
+    37→    #[error("Embedding error: {0}")]
+    38→    Embedding(String),
+    39→}
+    40→
+    41→pub type DbResult<T> = Result<T, DbError>;
+    42→
+    43→// =============================================================================
+    44→// ENUMS
+    45→// =============================================================================
+    46→
+    47→/// Task status representing Kanban columns.
+    48→///
+    49→/// Serializes to UPPERCASE strings for SQL compatibility.
+    50→#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    51→#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    52→pub enum TaskStatus {
+    53→    Backlog,
+    54→    Todo,
+    55→    Doing,
+    56→    Review,
+    57→    Qa,
+    58→    Done,
+    59→}
+    60→
+    61→impl TaskStatus {
+    62→    /// Returns the SQL string representation (UPPERCASE).
+    63→    pub fn as_str(&self) -> &'static str {
+    64→        match self {
+    65→            Self::Backlog => "BACKLOG",
+    66→            Self::Todo => "TODO",
+    67→            Self::Doing => "DOING",
+    68→            Self::Review => "REVIEW",
+    69→            Self::Qa => "QA",
+    70→            Self::Done => "DONE",
+    71→        }
+    72→    }
+    73→
+    74→    /// Parse from SQL string representation.
+    75→    pub fn from_str(s: &str) -> Option<Self> {
+    76→        match s {
+    77→            "BACKLOG" => Some(Self::Backlog),
+    78→            "TODO" => Some(Self::Todo),
+    79→            "DOING" => Some(Self::Doing),
+    80→            "REVIEW" => Some(Self::Review),
+    81→            "QA" => Some(Self::Qa),
+    82→            "DONE" => Some(Self::Done),
+    83→            _ => None,
+    84→        }
+    85→    }
+    86→
+    87→    /// Returns all status values in order.
+    88→    pub fn all() -> &'static [TaskStatus] {
+    89→        &[
+    90→            Self::Backlog,
+    91→            Self::Todo,
+    92→            Self::Doing,
+    93→            Self::Review,
+    94→            Self::Qa,
+    95→            Self::Done,
+    96→        ]
+    97→    }
+    98→}
+    99→
+   100→impl std::fmt::Display for TaskStatus {
+   101→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   102→        write!(f, "{}", self.as_str())
+   103→    }
+   104→}
+   105→
+   106→impl Default for TaskStatus {
+   107→    fn default() -> Self {
+   108→        Self::Backlog
+   109→    }
+   110→}
+   111→
+   112→// =============================================================================
+   113→// CORE STRUCTS
+   114→// =============================================================================
+   115→
+   116→/// A project task (replaces features.json entries).
+   117→///
+   118→/// Uses ULID for ID (26 characters, timestamp-sortable).
+   119→#[derive(Debug, Clone, Serialize, Deserialize)]
+   120→pub struct ProjectTask {
+   121→    /// ULID identifier (26 chars).
+   122→    pub id: String,
+   123→    /// Task title.
+   124→    pub title: String,
+   125→    /// Optional description.
+   126→    pub description: Option<String>,
+   127→    /// Current status (Kanban column).
+   128→    pub status: TaskStatus,
+   129→    /// Optional category for grouping.
+   130→    pub category: Option<String>,
+   131→    /// Sort order within status column (float for fractional ordering).
+   132→    pub sort_order: f64,
+   133→    /// Whether the task has passed validation/testing.
+   134→    pub is_passed: bool,
+   135→    /// Creation timestamp (ISO 8601).
+   136→    pub created_at: DateTime<Utc>,
+   137→    /// Last update timestamp (ISO 8601).
+   138→    pub updated_at: DateTime<Utc>,
+   139→}
+   140→
+   141→impl ProjectTask {
+   142→    /// Creates a new ProjectTask with the given title.
+   143→    ///
+   144→    /// Generates a new ULID and sets timestamps to now.
+   145→    pub fn new(title: impl Into<String>) -> Self {
+   146→        let now = Utc::now();
+   147→        Self {
+   148→            id: ulid::Ulid::new().to_string(),
+   149→            title: title.into(),
+   150→            description: None,
+   151→            status: TaskStatus::default(),
+   152→            category: None,
+   153→            sort_order: 0.0,
+   154→            is_passed: false,
+   155→            created_at: now,
+   156→            updated_at: now,
+   157→        }
+   158→    }
+   159→
+   160→    /// Builder method to set description.
+   161→    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+   162→        self.description = Some(desc.into());
+   163→        self
+   164→    }
+   165→
+   166→    /// Builder method to set status.
+   167→    pub fn with_status(mut self, status: TaskStatus) -> Self {
+   168→        self.status = status;
+   169→        self
+   170→    }
+   171→
+   172→    /// Builder method to set category.
+   173→    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+   174→        self.category = Some(category.into());
+   175→        self
+   176→    }
+   177→
+   178→    /// Builder method to set sort order.
+   179→    pub fn with_sort_order(mut self, order: f64) -> Self {
+   180→        self.sort_order = order;
+   181→        self
+   182→    }
+   183→}
+   184→
+   185→/// A checklist item within a task.
+   186→///
+   187→/// Uses composite ID: `task#{task_ulid}#{step_ulid}`
+   188→#[derive(Debug, Clone, Serialize, Deserialize)]
+   189→pub struct TaskStep {
+   190→    /// Composite ID: task#{task_ulid}#{step_ulid}
+   191→    pub id: String,
+   192→    /// Step description.
+   193→    pub description: String,
+   194→    /// Whether the step is completed.
+   195→    pub is_completed: bool,
+   196→    /// Creation timestamp (ISO 8601).
+   197→    pub created_at: DateTime<Utc>,
+   198→}
+   199→
+   200→impl TaskStep {
+   201→    /// Prefix for composite ID (parent table name, singular).
+   202→    pub const PREFIX: &'static str = "task";
+   203→
+   204→    /// Creates a new TaskStep for a given task.
+   205→    pub fn new(task_id: &str, description: impl Into<String>) -> DbResult<Self> {
+   206→        // Validate task_id is a valid ULID (26 chars)
+   207→        if task_id.len() != 26 {
+   208→            return Err(DbError::InvalidId(format!(
+   209→                "Task ID must be 26 characters (ULID), got: {}",
+   210→                task_id
+   211→            )));
+   212→        }
+   213→
+   214→        let step_ulid = ulid::Ulid::new().to_string();
+   215→        Ok(Self {
+   216→            id: Self::make_id(task_id, &step_ulid),
+   217→            description: description.into(),
+   218→            is_completed: false,
+   219→            created_at: Utc::now(),
+   220→        })
+   221→    }
+   222→
+   223→    /// Generate composite ID for a step.
+   224→    pub fn make_id(task_id: &str, step_ulid: &str) -> String {
+   225→        format!("{}#{}#{}", Self::PREFIX, task_id, step_ulid)
+   226→    }
+   227→
+   228→    /// Generate GLOB pattern to find all steps for a task.
+   229→    pub fn glob_pattern(task_id: &str) -> String {
+   230→        format!("{}#{}#*", Self::PREFIX, task_id)
+   231→    }
+   232→
+   233→    /// Extract parent task ULID from composite ID.
+   234→    pub fn task_id(&self) -> Option<&str> {
+   235→        self.extract_task_id(&self.id)
+   236→    }
+   237→
+   238→    /// Extract task ID from any composite step ID.
+   239→    pub fn extract_task_id<'a>(&self, id: &'a str) -> Option<&'a str> {
+   240→        let parts: Vec<&str> = id.split('#').collect();
+   241→        if parts.len() == 3 && parts[0] == Self::PREFIX {
+   242→            Some(parts[1])
+   243→        } else {
+   244→            None
+   245→        }
+   246→    }
+   247→
+   248→    /// Extract step ULID from composite ID.
+   249→    pub fn step_ulid(&self) -> Option<&str> {
+   250→        let parts: Vec<&str> = self.id.split('#').collect();
+   251→        if parts.len() == 3 {
+   252→            Some(parts[2])
+   253→        } else {
+   254→            None
+   255→        }
+   256→    }
+   257→
+   258→    /// Validate that an ID is a valid TaskStep composite ID.
+   259→    pub fn validate_id(id: &str) -> bool {
+   260→        let parts: Vec<&str> = id.split('#').collect();
+   261→        parts.len() == 3
+   262→            && parts[0] == Self::PREFIX
+   263→            && parts[1].len() == 26
+   264→            && parts[2].len() == 26
+   265→    }
+   266→}
+   267→
+   268→/// A work session (AI/human work period).
+   269→///
+   270→/// Uses ULID for ID.
+   271→#[derive(Debug, Clone, Serialize, Deserialize)]
+   272→pub struct WorkSession {
+   273→    /// ULID identifier (26 chars).
+   274→    pub id: String,
+   275→    /// Optional session summary.
+   276→    pub summary: Option<String>,
+   277→    /// Session start timestamp (ISO 8601).
+   278→    pub started_at: DateTime<Utc>,
+   279→    /// Session end timestamp (ISO 8601), None if ongoing.
+   280→    pub ended_at: Option<DateTime<Utc>>,
+   281→}
+   282→
+   283→impl WorkSession {
+   284→    /// Creates a new WorkSession starting now.
+   285→    pub fn new() -> Self {
+   286→        Self {
+   287→            id: ulid::Ulid::new().to_string(),
+   288→            summary: None,
+   289→            started_at: Utc::now(),
+   290→            ended_at: None,
+   291→        }
+   292→    }
+   293→
+   294→    /// Builder method to set summary.
+   295→    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
+   296→        self.summary = Some(summary.into());
+   297→        self
+   298→    }
+   299→
+   300→    /// End the session with current timestamp.
+   301→    pub fn end(&mut self) {
+   302→        self.ended_at = Some(Utc::now());
+   303→    }
+   304→
+   305→    /// Check if session is still active.
+   306→    pub fn is_active(&self) -> bool {
+   307→        self.ended_at.is_none()
+   308→    }
+   309→}
+   310→
+   311→impl Default for WorkSession {
+   312→    fn default() -> Self {
+   313→        Self::new()
+   314→    }
+   315→}
+   316→
+   317→/// A progress log entry within a session.
+   318→///
+   319→/// Uses composite ID: `session#{session_ulid}#{progress_ulid}`
+   320→#[derive(Debug, Clone, Serialize, Deserialize)]
+   321→pub struct ProjectProgress {
+   322→    /// Composite ID: session#{session_ulid}#{progress_ulid}
+   323→    pub id: String,
+   324→    /// Progress content/note.
+   325→    pub content: String,
+   326→    /// Creation timestamp (ISO 8601).
+   327→    pub created_at: DateTime<Utc>,
+   328→}
+   329→
+   330→impl ProjectProgress {
+   331→    /// Prefix for composite ID (parent table name, singular).
+   332→    pub const PREFIX: &'static str = "session";
+   333→
+   334→    /// Creates a new ProjectProgress entry for a session.
+   335→    pub fn new(session_id: &str, content: impl Into<String>) -> DbResult<Self> {
+   336→        // Validate session_id is a valid ULID (26 chars)
+   337→        if session_id.len() != 26 {
+   338→            return Err(DbError::InvalidId(format!(
+   339→                "Session ID must be 26 characters (ULID), got: {}",
+   340→                session_id
+   341→            )));
+   342→        }
+   343→
+   344→        let progress_ulid = ulid::Ulid::new().to_string();
+   345→        Ok(Self {
+   346→            id: Self::make_id(session_id, &progress_ulid),
+   347→            content: content.into(),
+   348→            created_at: Utc::now(),
+   349→        })
+   350→    }
+   351→
+   352→    /// Generate composite ID for a progress entry.
+   353→    pub fn make_id(session_id: &str, progress_ulid: &str) -> String {
+   354→        format!("{}#{}#{}", Self::PREFIX, session_id, progress_ulid)
+   355→    }
+   356→
+   357→    /// Generate GLOB pattern to find all progress for a session.
+   358→    pub fn glob_pattern(session_id: &str) -> String {
+   359→        format!("{}#{}#*", Self::PREFIX, session_id)
+   360→    }
+   361→
+   362→    /// Extract parent session ULID from composite ID.
+   363→    pub fn session_id(&self) -> Option<&str> {
+   364→        self.extract_session_id(&self.id)
+   365→    }
+   366→
+   367→    /// Extract session ID from any composite progress ID.
+   368→    pub fn extract_session_id<'a>(&self, id: &'a str) -> Option<&'a str> {
+   369→        let parts: Vec<&str> = id.split('#').collect();
+   370→        if parts.len() == 3 && parts[0] == Self::PREFIX {
+   371→            Some(parts[1])
+   372→        } else {
+   373→            None
+   374→        }
+   375→    }
+   376→
+   377→    /// Extract progress ULID from composite ID.
+   378→    pub fn progress_ulid(&self) -> Option<&str> {
+   379→        let parts: Vec<&str> = self.id.split('#').collect();
+   380→        if parts.len() == 3 {
+   381→            Some(parts[2])
+   382→        } else {
+   383→            None
+   384→        }
+   385→    }
+   386→
+   387→    /// Validate that an ID is a valid ProjectProgress composite ID.
+   388→    pub fn validate_id(id: &str) -> bool {
+   389→        let parts: Vec<&str> = id.split('#').collect();
+   390→        parts.len() == 3
+   391→            && parts[0] == Self::PREFIX
+   392→            && parts[1].len() == 26
+   393→            && parts[2].len() == 26
+   394→    }
+   395→}
+   396→
+   397→// =============================================================================
+   398→// PAGINATION
+   399→// =============================================================================
+   400→
+   401→/// Paginated result for list queries.
+   402→#[derive(Debug, Clone, Serialize, Deserialize)]
+   403→pub struct PaginatedResult<T> {
+   404→    /// Items in current page.
+   405→    pub items: Vec<T>,
+   406→    /// Whether there are more items after current page.
+   407→    pub has_next: bool,
+   408→    /// Whether there are items before current page.
+   409→    pub has_prev: bool,
+   410→    /// Cursor for next page (base64 encoded).
+   411→    pub next_cursor: Option<String>,
+   412→    /// Cursor for previous page (base64 encoded).
+   413→    pub prev_cursor: Option<String>,
+   414→}
+   415→
+   416→impl<T> PaginatedResult<T> {
+   417→    /// Create an empty result.
+   418→    pub fn empty() -> Self {
+   419→        Self {
+   420→            items: Vec::new(),
+   421→            has_next: false,
+   422→            has_prev: false,
+   423→            next_cursor: None,
+   424→            prev_cursor: None,
+   425→        }
+   426→    }
+   427→
+   428→    /// Create result from items with pagination info.
+   429→    pub fn new(
+   430→        items: Vec<T>,
+   431→        has_next: bool,
+   432→        has_prev: bool,
+   433→        next_cursor: Option<String>,
+   434→        prev_cursor: Option<String>,
+   435→    ) -> Self {
+   436→        Self {
+   437→            items,
+   438→            has_next,
+   439→            has_prev,
+   440→            next_cursor,
+   441→            prev_cursor,
+   442→        }
+   443→    }
+   444→}
+   445→
+   446→impl<T> Default for PaginatedResult<T> {
+   447→    fn default() -> Self {
+   448→        Self::empty()
+   449→    }
+   450→}
+   451→
+   452→// =============================================================================
+   453→// TESTS
+   454→// =============================================================================
+   455→
+   456→#[cfg(test)]
+   457→mod tests {
+   458→    use super::*;
+   459→
+   460→    // -------------------------------------------------------------------------
+   461→    // TaskStatus tests
+   462→    // -------------------------------------------------------------------------
+   463→
+   464→    #[test]
+   465→    fn test_task_status_as_str() {
+   466→        assert_eq!(TaskStatus::Backlog.as_str(), "BACKLOG");
+   467→        assert_eq!(TaskStatus::Todo.as_str(), "TODO");
+   468→        assert_eq!(TaskStatus::Doing.as_str(), "DOING");
+   469→        assert_eq!(TaskStatus::Review.as_str(), "REVIEW");
+   470→        assert_eq!(TaskStatus::Qa.as_str(), "QA");
+   471→        assert_eq!(TaskStatus::Done.as_str(), "DONE");
+   472→    }
+   473→
+   474→    #[test]
+   475→    fn test_task_status_from_str() {
+   476→        assert_eq!(TaskStatus::from_str("BACKLOG"), Some(TaskStatus::Backlog));
+   477→        assert_eq!(TaskStatus::from_str("TODO"), Some(TaskStatus::Todo));
+   478→        assert_eq!(TaskStatus::from_str("DOING"), Some(TaskStatus::Doing));
+   479→        assert_eq!(TaskStatus::from_str("REVIEW"), Some(TaskStatus::Review));
+   480→        assert_eq!(TaskStatus::from_str("QA"), Some(TaskStatus::Qa));
+   481→        assert_eq!(TaskStatus::from_str("DONE"), Some(TaskStatus::Done));
+   482→        assert_eq!(TaskStatus::from_str("invalid"), None);
+   483→        assert_eq!(TaskStatus::from_str("backlog"), None); // case sensitive
+   484→    }
+   485→
+   486→    #[test]
+   487→    fn test_task_status_all() {
+   488→        let all = TaskStatus::all();
+   489→        assert_eq!(all.len(), 6);
+   490→        assert_eq!(all[0], TaskStatus::Backlog);
+   491→        assert_eq!(all[5], TaskStatus::Done);
+   492→    }
+   493→
+   494→    #[test]
+   495→    fn test_task_status_default() {
+   496→        assert_eq!(TaskStatus::default(), TaskStatus::Backlog);
+   497→    }
+   498→
+   499→    #[test]
+   500→    fn test_task_status_display() {
+   501→        assert_eq!(format!("{}", TaskStatus::Done), "DONE");
+   502→    }
+   503→
+   504→    #[test]
+   505→    fn test_task_status_serde_serialize() {
+   506→        let status = TaskStatus::Doing;
+   507→        let json = serde_json::to_string(&status).unwrap();
+   508→        assert_eq!(json, "\"DOING\"");
+   509→    }
+   510→
+   511→    #[test]
+   512→    fn test_task_status_serde_deserialize() {
+   513→        let status: TaskStatus = serde_json::from_str("\"REVIEW\"").unwrap();
+   514→        assert_eq!(status, TaskStatus::Review);
+   515→    }
+   516→
+   517→    // -------------------------------------------------------------------------
+   518→    // ProjectTask tests
+   519→    // -------------------------------------------------------------------------
+   520→
+   521→    #[test]
+   522→    fn test_project_task_new() {
+   523→        let task = ProjectTask::new("Test task");
+   524→        assert_eq!(task.title, "Test task");
+   525→        assert_eq!(task.id.len(), 26); // ULID length
+   526→        assert!(task.description.is_none());
+   527→        assert_eq!(task.status, TaskStatus::Backlog);
+   528→        assert!(task.category.is_none());
+   529→        assert_eq!(task.sort_order, 0.0);
+   530→        assert!(!task.is_passed);
+   531→    }
+   532→
+   533→    #[test]
+   534→    fn test_project_task_builder() {
+   535→        let task = ProjectTask::new("Task")
+   536→            .with_description("Description")
+   537→            .with_status(TaskStatus::Doing)
+   538→            .with_category("core")
+   539→            .with_sort_order(1.5);
+   540→
+   541→        assert_eq!(task.description, Some("Description".to_string()));
+   542→        assert_eq!(task.status, TaskStatus::Doing);
+   543→        assert_eq!(task.category, Some("core".to_string()));
+   544→        assert_eq!(task.sort_order, 1.5);
+   545→    }
+   546→
+   547→    #[test]
+   548→    fn test_project_task_ulid_is_sortable() {
+   549→        let task1 = ProjectTask::new("First");
+   550→        std::thread::sleep(std::time::Duration::from_millis(2));
+   551→        let task2 = ProjectTask::new("Second");
+   552→
+   553→        // Later ULID should be lexicographically greater
+   554→        assert!(task2.id > task1.id);
+   555→    }
+   556→
+   557→    // -------------------------------------------------------------------------
+   558→    // TaskStep tests
+   559→    // -------------------------------------------------------------------------
+   560→
+   561→    #[test]
+   562→    fn test_task_step_prefix() {
+   563→        assert_eq!(TaskStep::PREFIX, "task");
+   564→    }
+   565→
+   566→    #[test]
+   567→    fn test_task_step_make_id() {
+   568→        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   569→        let step_ulid = "01BRZXYZ0000000000000000";
+   570→        let id = TaskStep::make_id(task_id, step_ulid);
+   571→        assert_eq!(id, "task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BRZXYZ0000000000000000");
+   572→    }
+   573→
+   574→    #[test]
+   575→    fn test_task_step_glob_pattern() {
+   576→        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   577→        let pattern = TaskStep::glob_pattern(task_id);
+   578→        assert_eq!(pattern, "task#01ARZ3NDEKTSV4RRFFQ69G5FAV#*");
+   579→    }
+   580→
+   581→    #[test]
+   582→    fn test_task_step_new() {
+   583→        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   584→        let step = TaskStep::new(task_id, "Do something").unwrap();
+   585→
+   586→        assert!(step.id.starts_with("task#01ARZ3NDEKTSV4RRFFQ69G5FAV#"));
+   587→        assert_eq!(step.description, "Do something");
+   588→        assert!(!step.is_completed);
+   589→    }
+   590→
+   591→    #[test]
+   592→    fn test_task_step_new_invalid_task_id() {
+   593→        let result = TaskStep::new("short", "Step");
+   594→        assert!(result.is_err());
+   595→        assert!(matches!(result.unwrap_err(), DbError::InvalidId(_)));
+   596→    }
+   597→
+   598→    #[test]
+   599→    fn test_task_step_extract_task_id() {
+   600→        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   601→        let step = TaskStep::new(task_id, "Step").unwrap();
+   602→
+   603→        assert_eq!(step.task_id(), Some(task_id));
+   604→    }
+   605→
+   606→    #[test]
+   607→    fn test_task_step_extract_step_ulid() {
+   608→        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   609→        let step = TaskStep::new(task_id, "Step").unwrap();
+   610→
+   611→        let step_ulid = step.step_ulid().unwrap();
+   612→        assert_eq!(step_ulid.len(), 26);
+   613→    }
+   614→
+   615→    #[test]
+   616→    fn test_task_step_validate_id() {
+   617→        // Valid (both parts must be 26 chars)
+   618→        assert!(TaskStep::validate_id(
+   619→            "task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV"
+   620→        ));
+   621→
+   622→        // Invalid prefix
+   623→        assert!(!TaskStep::validate_id(
+   624→            "step#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV"
+   625→        ));
+   626→
+   627→        // Wrong format (ULIDs too short)
+   628→        assert!(!TaskStep::validate_id("task#short#short"));
+   629→
+   630→        // Missing parts
+   631→        assert!(!TaskStep::validate_id("task#01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+   632→    }
+   633→
+   634→    // -------------------------------------------------------------------------
+   635→    // WorkSession tests
+   636→    // -------------------------------------------------------------------------
+   637→
+   638→    #[test]
+   639→    fn test_work_session_new() {
+   640→        let session = WorkSession::new();
+   641→        assert_eq!(session.id.len(), 26);
+   642→        assert!(session.summary.is_none());
+   643→        assert!(session.ended_at.is_none());
+   644→        assert!(session.is_active());
+   645→    }
+   646→
+   647→    #[test]
+   648→    fn test_work_session_with_summary() {
+   649→        let session = WorkSession::new().with_summary("Initial setup");
+   650→        assert_eq!(session.summary, Some("Initial setup".to_string()));
+   651→    }
+   652→
+   653→    #[test]
+   654→    fn test_work_session_end() {
+   655→        let mut session = WorkSession::new();
+   656→        assert!(session.is_active());
+   657→
+   658→        session.end();
+   659→        assert!(!session.is_active());
+   660→        assert!(session.ended_at.is_some());
+   661→    }
+   662→
+   663→    // -------------------------------------------------------------------------
+   664→    // ProjectProgress tests
+   665→    // -------------------------------------------------------------------------
+   666→
+   667→    #[test]
+   668→    fn test_project_progress_prefix() {
+   669→        assert_eq!(ProjectProgress::PREFIX, "session");
+   670→    }
+   671→
+   672→    #[test]
+   673→    fn test_project_progress_make_id() {
+   674→        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   675→        let progress_ulid = "01BRZXYZ0000000000000000";
+   676→        let id = ProjectProgress::make_id(session_id, progress_ulid);
+   677→        assert_eq!(
+   678→            id,
+   679→            "session#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BRZXYZ0000000000000000"
+   680→        );
+   681→    }
+   682→
+   683→    #[test]
+   684→    fn test_project_progress_glob_pattern() {
+   685→        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   686→        let pattern = ProjectProgress::glob_pattern(session_id);
+   687→        assert_eq!(pattern, "session#01ARZ3NDEKTSV4RRFFQ69G5FAV#*");
+   688→    }
+   689→
+   690→    #[test]
+   691→    fn test_project_progress_new() {
+   692→        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   693→        let progress = ProjectProgress::new(session_id, "Did something").unwrap();
+   694→
+   695→        assert!(progress
+   696→            .id
+   697→            .starts_with("session#01ARZ3NDEKTSV4RRFFQ69G5FAV#"));
+   698→        assert_eq!(progress.content, "Did something");
+   699→    }
+   700→
+   701→    #[test]
+   702→    fn test_project_progress_new_invalid_session_id() {
+   703→        let result = ProjectProgress::new("short", "Progress");
+   704→        assert!(result.is_err());
+   705→        assert!(matches!(result.unwrap_err(), DbError::InvalidId(_)));
+   706→    }
+   707→
+   708→    #[test]
+   709→    fn test_project_progress_extract_session_id() {
+   710→        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+   711→        let progress = ProjectProgress::new(session_id, "Content").unwrap();
+   712→
+   713→        assert_eq!(progress.session_id(), Some(session_id));
+   714→    }
+   715→
+   716→    #[test]
+   717→    fn test_project_progress_validate_id() {
+   718→        // Valid (both parts must be 26 chars)
+   719→        assert!(ProjectProgress::validate_id(
+   720→            "session#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV"
+   721→        ));
+   722→
+   723→        // Invalid prefix
+   724→        assert!(!ProjectProgress::validate_id(
+   725→            "progress#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV"
+   726→        ));
+   727→
+   728→        // Wrong format (ULIDs too short)
+   729→        assert!(!ProjectProgress::validate_id("session#short#short"));
+   730→    }
+   731→
+   732→    // -------------------------------------------------------------------------
+   733→    // PaginatedResult tests
+   734→    // -------------------------------------------------------------------------
+   735→
+   736→    #[test]
+   737→    fn test_paginated_result_empty() {
+   738→        let result: PaginatedResult<String> = PaginatedResult::empty();
+   739→        assert!(result.items.is_empty());
+   740→        assert!(!result.has_next);
+   741→        assert!(!result.has_prev);
+   742→        assert!(result.next_cursor.is_none());
+   743→        assert!(result.prev_cursor.is_none());
+   744→    }
+   745→
+   746→    #[test]
+   747→    fn test_paginated_result_new() {
+   748→        let items = vec!["a", "b", "c"];
+   749→        let result = PaginatedResult::new(
+   750→            items,
+   751→            true,
+   752→            false,
+   753→            Some("cursor_next".to_string()),
+   754→            None,
+   755→        );
+   756→
+   757→        assert_eq!(result.items.len(), 3);
+   758→        assert!(result.has_next);
+   759→        assert!(!result.has_prev);
+   760→        assert_eq!(result.next_cursor, Some("cursor_next".to_string()));
+   761→        assert!(result.prev_cursor.is_none());
+   762→    }
+   763→
+   764→    // -------------------------------------------------------------------------
+   765→    // DbError tests
+   766→    // -------------------------------------------------------------------------
+   767→
+   768→    #[test]
+   769→    fn test_db_error_display() {
+   770→        let err = DbError::NotFound("task 123".to_string());
+   771→        assert_eq!(format!("{}", err), "Not found: task 123");
+   772→
+   773→        let err = DbError::InvalidId("bad-id".to_string());
+   774→        assert_eq!(format!("{}", err), "Invalid ID format: bad-id");
+   775→
+   776→        let err = DbError::Validation("title required".to_string());
+   777→        assert_eq!(format!("{}", err), "Validation error: title required");
+   778→    }
+   779→}
+   780→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

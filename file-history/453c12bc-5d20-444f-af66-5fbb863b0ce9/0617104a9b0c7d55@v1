@@ -1,0 +1,228 @@
+"""
+MMS - Metro Mileage Management System
+Python Solver Service using Google OR-Tools CP-SAT
+
+This service provides train allocation recommendations
+optimized for mileage balancing using real CP-SAT optimization.
+"""
+
+from contextlib import asynccontextmanager
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import ortools
+
+from .models.schemas import (
+    RecommendationRequest,
+    RecommendationResponse,
+    SimulationRequest,
+    SimulationResponse,
+    AllocationChange,
+)
+from .db.client import db
+from .engine.allocator import generate_recommendations
+from .engine.simulator import simulate_allocations
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage database connection lifecycle."""
+    await db.connect()
+    yield
+    await db.close()
+
+
+app = FastAPI(
+    title="MMS Solver Service",
+    description="Train allocation optimization using OR-Tools CP-SAT",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS for API server access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # Web frontend
+        "http://localhost:4000",  # API server
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint with OR-Tools version."""
+    return {
+        "status": "ok",
+        "service": "mms-solver",
+        "ortools_version": ortools.__version__,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/recommend", response_model=RecommendationResponse)
+async def recommend(request: RecommendationRequest):
+    """
+    Generate train recommendations for a service using CP-SAT optimization.
+
+    The solver optimizes for:
+    1. Km balancing - prioritize underutilized trains
+    2. Dead running - minimize empty travel distance
+    3. Maintenance proximity - consider upcoming maintenance
+    """
+    try:
+        # Parse date
+        allocation_date = datetime.strptime(request.date, "%Y-%m-%d").date()
+
+        # Get service details
+        service = await db.get_service(request.service_id)
+        if not service:
+            raise HTTPException(status_code=404, detail="Service not found")
+
+        # Get available trains
+        trains = await db.get_available_trains(allocation_date)
+        if not trains:
+            return RecommendationResponse(
+                recommendations=[],
+                solver_time_ms=0,
+                constraints_satisfied=False,
+                warning="No trains available for this date"
+            )
+
+        # Get fleet average km (use first train's fleet)
+        fleet_id = trains[0].get('fleet_id') if trains else None
+        fleet_avg_km = 0.0
+        if fleet_id:
+            fleet_avg_km = await db.get_fleet_average_km(str(fleet_id))
+
+        # Get upcoming maintenance for each train
+        upcoming_maintenance = {}
+        for train in trains:
+            maint = await db.get_upcoming_maintenance(str(train['id']))
+            if maint:
+                upcoming_maintenance[str(train['id'])] = maint
+
+        # Run CP-SAT solver
+        recommendations, solver_time = generate_recommendations(
+            trains=trains,
+            service=service,
+            fleet_avg_km=fleet_avg_km,
+            upcoming_maintenance=upcoming_maintenance,
+            top_n=5
+        )
+
+        return RecommendationResponse(
+            recommendations=recommendations,
+            solver_time_ms=solver_time,
+            constraints_satisfied=True
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/simulate", response_model=SimulationResponse)
+async def simulate(request: SimulationRequest):
+    """
+    Run a what-if simulation for allocation changes.
+
+    Projects the impact of allocation changes over the specified
+    number of days, calculating:
+    - Projected km variance
+    - Total dead running
+    - Affected trains count
+    - Km spread improvement
+    """
+    try:
+        # Get current km values for all trains
+        trains_km = await db.get_all_trains_km()
+        if not trains_km:
+            raise HTTPException(
+                status_code=404,
+                detail="No trains found in database"
+            )
+
+        # Convert request changes to internal format
+        changes = [
+            AllocationChange(
+                service_id=c.service_id,
+                service_code=c.service_code,
+                original_train_id=c.original_train_id,
+                new_train_id=c.new_train_id,
+                service_km=c.service_km
+            )
+            for c in request.changes
+        ]
+
+        # Run simulation
+        result = simulate_allocations(
+            trains_km=trains_km,
+            changes=changes,
+            projection_days=request.projection_days
+        )
+
+        # Override scenario_id with request's
+        result.scenario_id = request.scenario_id
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/trains/stats")
+async def train_stats():
+    """
+    Get aggregate statistics for all trains.
+    Useful for dashboard and balancing analysis.
+    """
+    try:
+        trains_km = await db.get_all_trains_km()
+        if not trains_km:
+            return {
+                "total_trains": 0,
+                "avg_km": 0,
+                "min_km": 0,
+                "max_km": 0,
+                "variance_pct": 0
+            }
+
+        km_values = [t['current_km'] for t in trains_km]
+
+        import statistics
+        avg_km = statistics.mean(km_values)
+        variance_pct = 0.0
+        if avg_km > 0 and len(km_values) > 1:
+            std_dev = statistics.stdev(km_values)
+            variance_pct = (std_dev / avg_km) * 100
+
+        return {
+            "total_trains": len(trains_km),
+            "avg_km": round(avg_km, 0),
+            "min_km": min(km_values),
+            "max_km": max(km_values),
+            "variance_pct": round(variance_pct, 1),
+            "trains": [
+                {
+                    "train_id": t['train_id'],
+                    "current_km": t['current_km'],
+                    "fleet": t.get('fleet_name', 'Unknown')
+                }
+                for t in sorted(trains_km, key=lambda x: x['current_km'])
+            ]
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

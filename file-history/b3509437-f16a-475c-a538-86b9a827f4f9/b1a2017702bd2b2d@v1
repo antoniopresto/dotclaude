@@ -1,0 +1,189 @@
+import Anthropic from "@anthropic-ai/sdk";
+import {
+  executeBash,
+  bashToolDefinition,
+  getCurrentWorkingDirectory,
+  type BashInput,
+} from "../tools/bash";
+import {
+  openInFinder,
+  getCurrentFinderPath,
+  revealInFinder,
+  syncFinderToPath,
+  finderToolDefinition,
+} from "../tools/finder";
+
+export interface AgentConfig {
+  apiKey?: string;
+  model?: string;
+  maxTokens?: number;
+  syncFinderOnCd?: boolean;
+}
+
+export interface Message {
+  role: "user" | "assistant";
+  content: string;
+}
+
+const SYSTEM_PROMPT = `You are MD (macOS DevTools), an AI assistant integrated into macOS Finder.
+You help users navigate their filesystem, run commands, and manage files.
+
+Key capabilities:
+- Execute bash commands in the current directory
+- Navigate directories (cd) - this will also update the Finder window
+- Control Finder windows (navigate, reveal files)
+- Help with file management, git, and development tasks
+
+When the user uses 'cd' to change directories, the Finder window will automatically sync to show that directory.
+
+Always be helpful, concise, and efficient. When running commands, explain what they do if the user might not know.
+
+Current working directory: {{CWD}}`;
+
+export class MDAgent {
+  private client: Anthropic;
+  private model: string;
+  private maxTokens: number;
+  private messages: Anthropic.MessageParam[] = [];
+  private syncFinderOnCd: boolean;
+
+  constructor(config: AgentConfig = {}) {
+    this.client = new Anthropic({
+      apiKey: config.apiKey || process.env.ANTHROPIC_API_KEY,
+    });
+    this.model = config.model || "claude-sonnet-4-5-20250514";
+    this.maxTokens = config.maxTokens || 4096;
+    this.syncFinderOnCd = config.syncFinderOnCd ?? true;
+  }
+
+  private getSystemPrompt(): string {
+    return SYSTEM_PROMPT.replace("{{CWD}}", getCurrentWorkingDirectory());
+  }
+
+  private getTools(): Anthropic.Tool[] {
+    return [
+      bashToolDefinition as Anthropic.Tool,
+      finderToolDefinition as Anthropic.Tool,
+    ];
+  }
+
+  async chat(userMessage: string): Promise<string> {
+    this.messages.push({
+      role: "user",
+      content: userMessage,
+    });
+
+    let response = await this.client.messages.create({
+      model: this.model,
+      max_tokens: this.maxTokens,
+      system: this.getSystemPrompt(),
+      tools: this.getTools(),
+      messages: this.messages,
+    });
+
+    // Process tool calls in a loop until we get a final response
+    while (response.stop_reason === "tool_use") {
+      const assistantContent = response.content;
+      this.messages.push({
+        role: "assistant",
+        content: assistantContent,
+      });
+
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+      for (const block of assistantContent) {
+        if (block.type === "tool_use") {
+          const result = await this.executeTool(block.name, block.input as any);
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: typeof result === "string" ? result : JSON.stringify(result, null, 2),
+          });
+        }
+      }
+
+      this.messages.push({
+        role: "user",
+        content: toolResults,
+      });
+
+      response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: this.maxTokens,
+        system: this.getSystemPrompt(),
+        tools: this.getTools(),
+        messages: this.messages,
+      });
+    }
+
+    // Extract text response
+    const textContent = response.content.find((block) => block.type === "text");
+    const responseText = textContent?.type === "text" ? textContent.text : "";
+
+    this.messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    return responseText;
+  }
+
+  private async executeTool(name: string, input: any): Promise<any> {
+    switch (name) {
+      case "bash": {
+        const result = await executeBash(input as BashInput);
+
+        // Sync Finder if cd was used and sync is enabled
+        if (
+          this.syncFinderOnCd &&
+          (input as BashInput).command.trim().startsWith("cd ") &&
+          result.exitCode === 0
+        ) {
+          await syncFinderToPath(result.cwd);
+        }
+
+        return result;
+      }
+
+      case "finder": {
+        const { action, path } = input;
+
+        switch (action) {
+          case "navigate":
+            return await openInFinder({ path });
+          case "reveal":
+            return await revealInFinder(path);
+          case "get_current":
+            const currentPath = await getCurrentFinderPath();
+            return { path: currentPath };
+          default:
+            return { error: `Unknown finder action: ${action}` };
+        }
+      }
+
+      default:
+        return { error: `Unknown tool: ${name}` };
+    }
+  }
+
+  getCwd(): string {
+    return getCurrentWorkingDirectory();
+  }
+
+  getHistory(): Message[] {
+    return this.messages
+      .filter((m) => typeof m.content === "string")
+      .map((m) => ({
+        role: m.role,
+        content: m.content as string,
+      }));
+  }
+
+  clearHistory(): void {
+    this.messages = [];
+  }
+}
+
+export function createAgent(config?: AgentConfig): MDAgent {
+  return new MDAgent(config);
+}

@@ -1,0 +1,225 @@
+# MMS Project - Claude Code Instructions
+
+> **Project:** MMS (Metro Mileage Management System)
+> **Methodology:** BMAD Method V6
+> **Language Policy:** All AI instructions in English; user communication in Portuguese (pt-BR)
+
+---
+
+## Quick Commands
+
+| Command | Description |
+|---------|-------------|
+| `continue` | Resume pending tasks from db.json |
+| `status` | Show current progress via jq query |
+
+---
+
+## Task Management via db.json
+
+### Memory-Efficient Reading with `jq`
+
+**CRITICAL:** Never read db.json directly with the Read tool. Always use `jq` for selective queries to preserve context/memory.
+
+```bash
+# List all TODO tasks (compact)
+jq '.value[] | select(.status == "TODO") | {id, phase, value}' db.json
+
+# Get next pending task
+jq '.value | map(select(.status == "TODO")) | first' db.json
+
+# Count tasks by status
+jq '[.value[] | .status] | group_by(.) | map({status: .[0], count: length})' db.json
+
+# List tasks by phase
+jq '.value | group_by(.phase) | map({phase: .[0].phase, tasks: map(.id)})' db.json
+```
+
+### Updating Task Status
+
+```bash
+# Mark task as DONE
+jq '(.value[] | select(.id == "TASK_ID")).status = "DONE"' db.json > tmp.json && mv tmp.json db.json
+
+# Add new task
+jq '.value += [{"id": "new-task", "kind": "task", "phase": 1, "status": "TODO", "value": "Description", "acceptance": "Criteria"}]' db.json > tmp.json && mv tmp.json db.json
+```
+
+---
+
+## Workflow: "continue"
+
+When user says `continue`, execute this workflow:
+
+### Step 1: Query Next Task
+```bash
+jq '.value | map(select(.status == "TODO")) | first' db.json
+```
+
+### Step 2: Spawn Executor Subagent
+Use Task tool with `subagent_type: "general-purpose"`:
+- Provide task details from jq output
+- Scope: Execute ONLY that single task
+- Request: Report files modified + success/failure
+
+### Step 3: Spawn Monitor Subagent (parallel)
+Use Task tool with `subagent_type: "general-purpose"`:
+- Validate executor's work
+- Check: Files exist, content correct, no regressions
+- Report: Pass/Fail with details
+
+### Step 4: On Success
+1. Update db.json status to "DONE"
+2. Git commit with appropriate message
+3. Query next TODO task
+4. Repeat until no TODO tasks remain
+
+### Step 5: On Failure
+1. Keep status as "TODO"
+2. Log error in task comments
+3. Ask user for guidance
+
+---
+
+## Subagent Architecture
+
+### Executor Agent
+```
+Type: general-purpose
+Scope: Execute single task from db.json
+Input: Task ID, value, acceptance criteria
+Output:
+  - success: true/false
+  - files_modified: [list]
+  - summary: string
+```
+
+### Monitor Agent
+```
+Type: general-purpose
+Scope: Validate executor's work
+Input: Task ID, acceptance criteria, files_modified
+Checks:
+  - Files exist at expected paths
+  - Content matches requirements
+  - No syntax errors introduced
+  - No regressions in existing files
+Output:
+  - validated: true/false
+  - issues: [list] (if any)
+```
+
+### Context Preservation Rules
+- **Main chat:** Orchestration ONLY (query tasks, spawn agents, update status, commit)
+- **Subagents:** ALL heavy lifting (file reads, writes, validation)
+- **db.json:** Single source of truth for task state
+
+---
+
+## Git Commit Discipline
+
+### Rule: Commit After Every Task Completion
+
+After EACH successful task:
+```bash
+git add -A && git commit -m "<type>(phase-<N>): <task-description>"
+```
+
+### Commit Message Format
+
+| Prefix | Use Case |
+|--------|----------|
+| `feat(phase-N):` | New functionality |
+| `fix(phase-N):` | Bug fixes |
+| `docs(phase-N):` | Documentation changes |
+| `refactor(phase-N):` | Code restructuring |
+| `chore(phase-N):` | Maintenance tasks |
+| `test(phase-N):` | Test additions/changes |
+
+### Examples
+```bash
+git commit -m "feat(phase-0): create Otto OR-specialist agent"
+git commit -m "docs(phase-1): add product brief artifact"
+git commit -m "chore(phase-0): restructure knowledge folders"
+```
+
+---
+
+## BMAD Integration
+
+### Phase Tracking
+- **Primary source:** `_bmad/bmm-workflow-status.yaml`
+- **Task-level source:** `db.json`
+
+### Agent Activation
+When executing tasks, consider which BMAD agent owns the work:
+- **Phase 0 (Setup):** Architect (Sofia)
+- **Phase 1 (Analysis):** Analyst (Alex)
+- **Phase 2 (Planning):** PM (John)
+- **Phase 3 (Solutioning):** Architect + UX Designer (Sofia + Uma)
+- **Phase 4 (Implementation):** Dev + SM (Dev + Marcus)
+
+### Domain Validation
+For any railway-specific content, validate with Maria (railway-domain-expert.agent.md):
+- Terminology accuracy
+- Operational constraints
+- Realistic values
+
+---
+
+## Project Structure Reference
+
+```
+MFC/
+├── CLAUDE.md              # This file - AI instructions
+├── db.json                # Task tracking (query with jq)
+├── _bmad/                 # BMAD framework
+│   ├── bmm/agents/        # Standard agents (8)
+│   ├── custom/agents/     # MMS-specific agents (4)
+│   ├── project-context.md # Project configuration
+│   └── bmm-workflow-status.yaml
+├── bmad-artifacts/        # Phase deliverables
+│   ├── phase-1-analysis/
+│   ├── phase-2-planning/
+│   ├── phase-3-solutioning/
+│   └── phase-4-implementation/
+├── bmad-knowledge/        # Domain knowledge
+│   ├── business/
+│   ├── domain/
+│   └── technical/
+├── docs/                  # Project documentation
+└── src/                   # Source code
+    ├── backend/
+    ├── frontend/
+    └── solver/
+```
+
+---
+
+## Error Handling
+
+### If jq command fails
+1. Check db.json syntax: `jq '.' db.json`
+2. If invalid JSON, restore from git: `git checkout db.json`
+
+### If subagent fails
+1. Do NOT retry automatically
+2. Report failure to user with details
+3. Wait for user guidance
+
+### If git commit fails
+1. Check for uncommitted changes: `git status`
+2. Check for conflicts: `git diff`
+3. Report to user
+
+---
+
+## Constraints & Rules
+
+1. **Never read db.json directly** - Always use jq
+2. **Never skip commits** - Every task completion = one commit
+3. **Never batch tasks** - One task at a time
+4. **Never modify without subagent** - Main chat is orchestrator only
+5. **Never assume task done** - Verify via monitor subagent
+6. **Always use English** - For all code, docs, and AI instructions
+7. **Always validate domain content** - Railway terminology must be accurate

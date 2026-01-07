@@ -1,0 +1,300 @@
+#!/usr/bin/env bun
+/**
+ * MMS Harness Runner
+ *
+ * Automated harness execution with PTY support.
+ * - Spawns Claude sessions with proper TTY
+ * - Executes features sequentially
+ * - Sends macOS notifications on events
+ */
+
+import { spawn } from '@zenyr/bun-pty';
+import {
+  harnesses,
+  getHarness,
+  getPendingCount,
+  getNextFeature,
+  type HarnessConfig,
+} from './harness-config';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+
+const colors = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+};
+
+function print(msg: string) {
+  console.log(msg);
+}
+
+function printHeader(title: string) {
+  print(`\n${colors.bold}${colors.blue}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${colors.reset}`);
+  print(`${colors.bold}${colors.blue}  ${title}${colors.reset}`);
+  print(`${colors.bold}${colors.blue}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${colors.reset}\n`);
+}
+
+function printSuccess(msg: string) {
+  print(`${colors.green}✓ ${msg}${colors.reset}`);
+}
+
+function printError(msg: string) {
+  print(`${colors.red}✗ ${msg}${colors.reset}`);
+}
+
+function printInfo(msg: string) {
+  print(`${colors.blue}ℹ ${msg}${colors.reset}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MACOS NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function notify(title: string, message: string, sound: string = 'Ping') {
+  try {
+    await Bun.spawn([
+      'osascript',
+      '-e',
+      `display notification "${message}" with title "${title}" sound name "${sound}"`,
+    ]).exited;
+  } catch (e) {
+    // Ignore notification errors
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MENU
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function showMenu(): Promise<HarnessConfig | null> {
+  printHeader('🔧 MMS Harness Runner');
+
+  print('Selecione o harness:\n');
+
+  // Get pending counts for all harnesses
+  const counts = await Promise.all(
+    harnesses.map(async (h) => ({
+      harness: h,
+      pending: await getPendingCount(h),
+    }))
+  );
+
+  // Display options
+  counts.forEach(({ harness, pending }, index) => {
+    const pendingText =
+      pending > 0 ? `${colors.yellow}${pending} pendentes${colors.reset}` : `${colors.green}✓ completo${colors.reset}`;
+    print(`  ${colors.cyan}${index + 1}.${colors.reset} ${harness.icon} ${harness.name} - ${pendingText}`);
+  });
+
+  print(`\n  ${colors.dim}0. Sair${colors.reset}`);
+  print('');
+
+  // Read user input
+  process.stdout.write(`${colors.bold}> ${colors.reset}`);
+
+  const reader = Bun.stdin.stream().getReader();
+  const { value } = await reader.read();
+  reader.releaseLock();
+
+  if (!value) return null;
+
+  const input = new TextDecoder().decode(value).trim();
+  const choice = parseInt(input, 10);
+
+  if (choice === 0 || isNaN(choice)) {
+    return null;
+  }
+
+  if (choice < 1 || choice > harnesses.length) {
+    printError('Opção inválida');
+    return null;
+  }
+
+  return harnesses[choice - 1];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FEATURE EXECUTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function executeFeature(
+  harness: HarnessConfig,
+  featureId: string,
+  featureDesc: string,
+  current: number,
+  total: number
+): Promise<boolean> {
+  printHeader(`🎯 Tarefa ${current}/${total}: ${featureId}`);
+  print(`${colors.dim}${featureDesc}${colors.reset}\n`);
+
+  return new Promise((resolve) => {
+    // Spawn Claude with PTY
+    const pty = spawn('claude', ['--append-system-prompt', harness.isolationPrompt], {
+      cwd: harness.cwd,
+      env: process.env as Record<string, string>,
+    });
+
+    let idleTimeout: ReturnType<typeof setTimeout> | null = null;
+    let hasNotifiedIdle = false;
+    let outputBuffer = '';
+
+    // Reset idle timer
+    const resetIdleTimer = () => {
+      if (idleTimeout) clearTimeout(idleTimeout);
+      hasNotifiedIdle = false;
+
+      idleTimeout = setTimeout(async () => {
+        if (!hasNotifiedIdle) {
+          hasNotifiedIdle = true;
+          await notify('🤖 Harness', `Aguardando input - ${featureId}`, 'Purr');
+        }
+      }, 30000); // 30 seconds of inactivity
+    };
+
+    // Handle PTY data
+    pty.onData((data: string) => {
+      process.stdout.write(data);
+      outputBuffer += data;
+      resetIdleTimer();
+
+      // Detect patterns
+      if (outputBuffer.includes('Do you want to')) {
+        // Claude is asking a question
+        notify('❓ Harness', `Claude perguntou algo - ${featureId}`, 'Submarine');
+      }
+    });
+
+    // Pass stdin to PTY
+    const stdinHandler = (chunk: Buffer) => {
+      pty.write(chunk.toString());
+      resetIdleTimer();
+    };
+
+    process.stdin.on('data', stdinHandler);
+    process.stdin.setRawMode?.(true);
+
+    // Handle PTY exit
+    pty.onExit(({ exitCode }) => {
+      if (idleTimeout) clearTimeout(idleTimeout);
+      process.stdin.removeListener('data', stdinHandler);
+      process.stdin.setRawMode?.(false);
+
+      print(`\n${colors.dim}━━━ Sessão encerrada (código: ${exitCode}) ━━━${colors.reset}\n`);
+
+      // Check if feature was completed
+      resolve(exitCode === 0);
+    });
+
+    resetIdleTimer();
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runHarness(harness: HarnessConfig) {
+  printHeader(`🚀 Iniciando: ${harness.icon} ${harness.name}`);
+
+  let completedCount = 0;
+  let totalPending = await getPendingCount(harness);
+
+  if (totalPending === 0) {
+    printSuccess('Todas as tarefas já foram concluídas!');
+    await notify('✅ Harness', `${harness.name}: Nenhuma tarefa pendente`, 'Glass');
+    return;
+  }
+
+  printInfo(`${totalPending} tarefas pendentes\n`);
+
+  while (true) {
+    const nextFeature = await getNextFeature(harness);
+
+    if (!nextFeature) {
+      break;
+    }
+
+    const currentNumber = completedCount + 1;
+    const success = await executeFeature(
+      harness,
+      nextFeature.id,
+      nextFeature.description,
+      currentNumber,
+      totalPending
+    );
+
+    if (success) {
+      completedCount++;
+      printSuccess(`Tarefa ${nextFeature.id} concluída`);
+    } else {
+      printError(`Tarefa ${nextFeature.id} pode ter falhado`);
+    }
+
+    // Check if there are more features
+    const remaining = await getPendingCount(harness);
+    if (remaining === 0) {
+      break;
+    }
+
+    // Small delay before next task
+    await Bun.sleep(1000);
+  }
+
+  // Final notification
+  printHeader('📊 Resumo da Sessão');
+  printSuccess(`${completedCount} tarefas executadas`);
+
+  const finalPending = await getPendingCount(harness);
+  if (finalPending === 0) {
+    printSuccess('Todas as tarefas foram concluídas! 🎉');
+    await notify('🎉 Harness Completo', `${harness.name}: Todas as tarefas concluídas!`, 'Glass');
+  } else {
+    printInfo(`${finalPending} tarefas ainda pendentes`);
+    await notify('⏸️ Harness Pausado', `${harness.name}: ${finalPending} tarefas restantes`, 'Basso');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY POINT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  // Check for command line argument
+  const args = process.argv.slice(2);
+
+  let harness: HarnessConfig | null = null;
+
+  if (args.length > 0) {
+    // Direct harness selection via argument
+    harness = getHarness(args[0]) ?? null;
+    if (!harness) {
+      printError(`Harness não encontrado: ${args[0]}`);
+      print(`\nHarnesses disponíveis: ${harnesses.map((h) => h.id).join(', ')}`);
+      process.exit(1);
+    }
+  } else {
+    // Interactive menu
+    harness = await showMenu();
+  }
+
+  if (!harness) {
+    print('\nSaindo...');
+    process.exit(0);
+  }
+
+  await runHarness(harness);
+}
+
+main().catch((err) => {
+  printError(`Erro: ${err.message}`);
+  process.exit(1);
+});

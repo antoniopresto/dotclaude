@@ -1,0 +1,726 @@
+/**
+ * FractalCanvas Component
+ *
+ * The complete semantic zoom visualization integrating all 4 LOD layers:
+ * - Strategic (< 0.3x): 12-year heatmap overview
+ * - Tactical (0.3-1.0x): Monthly stacked bars
+ * - Operational (1.0-3.0x): DNA-style task blocks
+ * - Execution (> 3.0x): Detailed task cards
+ *
+ * Features smooth crossfade transitions between LOD levels.
+ */
+
+import React, { useMemo, useState, useCallback, useRef, useEffect } from 'react';
+import { Card, Tag, Intent, Slider, Button, ButtonGroup, Navbar, NavbarGroup, NavbarHeading, NavbarDivider, Alignment } from '@blueprintjs/core';
+import DeckGL from '@deck.gl/react';
+import { OrthographicView } from '@deck.gl/core';
+import { SolidPolygonLayer } from '@deck.gl/layers';
+import type { PickingInfo } from '@deck.gl/core';
+import type { Task, Train, AggregatedCell } from '../data/mock-generator';
+import { generateMockData, getTasksInRange } from '../data/mock-generator';
+import { MAINTENANCE_TYPES, MAINTENANCE_TYPE_MAP, TIME_RANGE, COLORS } from '../data/mock-config';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+export interface FractalCanvasProps {
+  /** Width of the viewport */
+  width: number;
+  /** Height of the viewport */
+  height: number;
+  /** Initial zoom level */
+  initialZoom?: number;
+}
+
+type LODLevel = 'strategic' | 'tactical' | 'operational' | 'execution';
+
+interface ViewState {
+  target: [number, number, number];
+  zoom: number;
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const LOD_THRESHOLDS = {
+  strategic: { max: 0.3 },
+  tactical: { min: 0.3, max: 1.0 },
+  operational: { min: 1.0, max: 3.0 },
+  execution: { min: 3.0 },
+};
+
+const TRANSITION_RANGE = 0.15; // 15% overlap for crossfade
+
+// Strategic layer constants
+const STRATEGIC_CELL_WIDTH = 30; // pixels per quarter
+const STRATEGIC_CELL_HEIGHT = 8; // pixels per train
+
+// Tactical layer constants
+const TACTICAL_CELL_WIDTH = 20; // pixels per month
+const TACTICAL_CELL_HEIGHT = 16; // pixels per train
+
+// Operational layer constants
+const OPERATIONAL_PX_PER_DAY = 8;
+const OPERATIONAL_PX_PER_TRAIN = 28;
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+function getLODLevel(zoom: number): LODLevel {
+  if (zoom < LOD_THRESHOLDS.strategic.max) return 'strategic';
+  if (zoom < LOD_THRESHOLDS.tactical.max) return 'tactical';
+  if (zoom < LOD_THRESHOLDS.operational.max) return 'operational';
+  return 'execution';
+}
+
+function getLODOpacity(zoom: number, level: LODLevel): number {
+  const thresholds = LOD_THRESHOLDS[level];
+
+  if (level === 'strategic') {
+    if (zoom <= thresholds.max - TRANSITION_RANGE) return 1;
+    if (zoom >= thresholds.max) return 0;
+    return 1 - (zoom - (thresholds.max - TRANSITION_RANGE)) / TRANSITION_RANGE;
+  }
+
+  if (level === 'tactical') {
+    const fadeIn = zoom < thresholds.min! + TRANSITION_RANGE
+      ? (zoom - thresholds.min!) / TRANSITION_RANGE
+      : 1;
+    const fadeOut = zoom > thresholds.max - TRANSITION_RANGE
+      ? 1 - (zoom - (thresholds.max - TRANSITION_RANGE)) / TRANSITION_RANGE
+      : 1;
+    return Math.max(0, Math.min(1, Math.min(fadeIn, fadeOut)));
+  }
+
+  if (level === 'operational') {
+    const fadeIn = zoom < thresholds.min! + TRANSITION_RANGE
+      ? (zoom - thresholds.min!) / TRANSITION_RANGE
+      : 1;
+    const fadeOut = zoom > thresholds.max - TRANSITION_RANGE
+      ? 1 - (zoom - (thresholds.max - TRANSITION_RANGE)) / TRANSITION_RANGE
+      : 1;
+    return Math.max(0, Math.min(1, Math.min(fadeIn, fadeOut)));
+  }
+
+  if (level === 'execution') {
+    if (zoom >= thresholds.min! + TRANSITION_RANGE) return 1;
+    if (zoom <= thresholds.min!) return 0;
+    return (zoom - thresholds.min!) / TRANSITION_RANGE;
+  }
+
+  return 0;
+}
+
+function daysBetween(start: Date, end: Date): number {
+  return Math.floor((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function hexToRgba(hex: string, alpha: number = 255): [number, number, number, number] {
+  const result = /^#?([a-f\\d]{2})([a-f\\d]{2})([a-f\\d]{2})$/i.exec(hex);
+  if (result) {
+    return [
+      parseInt(result[1], 16),
+      parseInt(result[2], 16),
+      parseInt(result[3], 16),
+      alpha,
+    ];
+  }
+  return [128, 128, 128, alpha];
+}
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+export const FractalCanvas: React.FC<FractalCanvasProps> = ({
+  width,
+  height,
+  initialZoom = 0.5,
+}) => {
+  // Generate mock data
+  const mockData = useMemo(() => generateMockData(), []);
+
+  // State
+  const [zoom, setZoom] = useState(initialZoom);
+  const [cameraX, setCameraX] = useState(0);
+  const [cameraY, setCameraY] = useState(0);
+  const [hoveredItem, setHoveredItem] = useState<Task | AggregatedCell | null>(null);
+
+  // Current LOD level
+  const currentLOD = getLODLevel(zoom);
+
+  // Calculate opacities for each layer
+  const opacities = useMemo(() => ({
+    strategic: getLODOpacity(zoom, 'strategic'),
+    tactical: getLODOpacity(zoom, 'tactical'),
+    operational: getLODOpacity(zoom, 'operational'),
+    execution: getLODOpacity(zoom, 'execution'),
+  }), [zoom]);
+
+  // Calculate world dimensions based on current LOD
+  const worldDimensions = useMemo(() => {
+    const totalDays = TIME_RANGE.years * 365;
+    const trainCount = mockData.trains.length;
+
+    return {
+      strategic: {
+        width: (TIME_RANGE.years * 4) * STRATEGIC_CELL_WIDTH,
+        height: trainCount * STRATEGIC_CELL_HEIGHT,
+      },
+      tactical: {
+        width: (TIME_RANGE.years * 12) * TACTICAL_CELL_WIDTH,
+        height: trainCount * TACTICAL_CELL_HEIGHT,
+      },
+      operational: {
+        width: totalDays * OPERATIONAL_PX_PER_DAY,
+        height: trainCount * OPERATIONAL_PX_PER_TRAIN,
+      },
+    };
+  }, [mockData.trains.length]);
+
+  // Create strategic layer (heatmap)
+  const strategicLayers = useMemo(() => {
+    if (opacities.strategic <= 0) return [];
+
+    return [
+      new SolidPolygonLayer<AggregatedCell>({
+        id: 'strategic-heatmap',
+        data: mockData.aggregatedByQuarter,
+        getPolygon: (d) => {
+          const x = d.periodIndex * STRATEGIC_CELL_WIDTH;
+          const y = d.trainIndex * STRATEGIC_CELL_HEIGHT;
+          return [
+            [x, y],
+            [x + STRATEGIC_CELL_WIDTH - 1, y],
+            [x + STRATEGIC_CELL_WIDTH - 1, y + STRATEGIC_CELL_HEIGHT - 1],
+            [x, y + STRATEGIC_CELL_HEIGHT - 1],
+          ];
+        },
+        getFillColor: (d) => {
+          const intensity = Math.min(1, d.utilizationPercent / 100);
+          // Yellow → Orange → Red gradient
+          if (intensity < 0.5) {
+            const t = intensity * 2;
+            return [255, Math.round(243 - t * 50), Math.round(196 - t * 100), 255 * opacities.strategic];
+          } else {
+            const t = (intensity - 0.5) * 2;
+            return [255, Math.round(193 - t * 100), Math.round(96 - t * 96), 255 * opacities.strategic];
+          }
+        },
+        pickable: true,
+        opacity: opacities.strategic,
+        updateTriggers: {
+          getFillColor: [opacities.strategic],
+        },
+      }),
+    ];
+  }, [mockData.aggregatedByQuarter, opacities.strategic]);
+
+  // Create tactical layer (monthly bars)
+  const tacticalLayers = useMemo(() => {
+    if (opacities.tactical <= 0) return [];
+
+    return [
+      new SolidPolygonLayer<AggregatedCell>({
+        id: 'tactical-bars',
+        data: mockData.aggregatedByMonth,
+        getPolygon: (d) => {
+          const x = d.periodIndex * TACTICAL_CELL_WIDTH;
+          const y = d.trainIndex * TACTICAL_CELL_HEIGHT;
+          const barHeight = (d.utilizationPercent / 100) * (TACTICAL_CELL_HEIGHT - 2);
+          return [
+            [x + 1, y + TACTICAL_CELL_HEIGHT - 1 - barHeight],
+            [x + TACTICAL_CELL_WIDTH - 2, y + TACTICAL_CELL_HEIGHT - 1 - barHeight],
+            [x + TACTICAL_CELL_WIDTH - 2, y + TACTICAL_CELL_HEIGHT - 1],
+            [x + 1, y + TACTICAL_CELL_HEIGHT - 1],
+          ];
+        },
+        getFillColor: (d) => {
+          if (d.hasConflict) return [239, 68, 68, 255 * opacities.tactical];
+          const intensity = Math.min(1, d.utilizationPercent / 100);
+          if (intensity > 0.8) return [239, 68, 68, 255 * opacities.tactical];
+          if (intensity > 0.6) return [251, 191, 36, 255 * opacities.tactical];
+          return [34, 197, 94, 255 * opacities.tactical];
+        },
+        pickable: true,
+        opacity: opacities.tactical,
+        updateTriggers: {
+          getFillColor: [opacities.tactical],
+        },
+      }),
+    ];
+  }, [mockData.aggregatedByMonth, opacities.tactical]);
+
+  // Create operational layer (task blocks)
+  const operationalLayers = useMemo(() => {
+    if (opacities.operational <= 0) return [];
+
+    interface TaskPolygon {
+      polygon: [number, number][];
+      task: Task;
+      color: [number, number, number, number];
+    }
+
+    const taskPolygons: TaskPolygon[] = mockData.tasks.map((task) => {
+      const startDay = daysBetween(TIME_RANGE.start, task.startDate);
+      const duration = Math.max(1, daysBetween(task.startDate, task.endDate));
+
+      const x = startDay * OPERATIONAL_PX_PER_DAY;
+      const y = task.trainIndex * OPERATIONAL_PX_PER_TRAIN + 4;
+      const w = duration * OPERATIONAL_PX_PER_DAY - 1;
+      const h = 20;
+
+      const mt = MAINTENANCE_TYPE_MAP.get(task.type);
+      const baseColor = mt?.color ?? COLORS.task.default;
+
+      return {
+        polygon: [
+          [x, y],
+          [x + w, y],
+          [x + w, y + h],
+          [x, y + h],
+        ],
+        task,
+        color: hexToRgba(baseColor, 255 * opacities.operational),
+      };
+    });
+
+    return [
+      // Background rows
+      new SolidPolygonLayer<{ polygon: [number, number][]; index: number }>({
+        id: 'operational-grid',
+        data: mockData.trains.map((_, i) => ({
+          polygon: [
+            [0, i * OPERATIONAL_PX_PER_TRAIN],
+            [worldDimensions.operational.width, i * OPERATIONAL_PX_PER_TRAIN],
+            [worldDimensions.operational.width, (i + 1) * OPERATIONAL_PX_PER_TRAIN - 1],
+            [0, (i + 1) * OPERATIONAL_PX_PER_TRAIN - 1],
+          ],
+          index: i,
+        })),
+        getPolygon: (d) => d.polygon,
+        getFillColor: (d) => d.index % 2 === 0
+          ? [250, 250, 250, 255 * opacities.operational]
+          : [245, 245, 245, 255 * opacities.operational],
+        pickable: false,
+        opacity: opacities.operational * 0.8,
+      }),
+      // Task bars
+      new SolidPolygonLayer<TaskPolygon>({
+        id: 'operational-tasks',
+        data: taskPolygons,
+        getPolygon: (d) => d.polygon,
+        getFillColor: (d) => {
+          if (d.task.hasConflict) return [239, 68, 68, 255 * opacities.operational];
+          return d.color;
+        },
+        pickable: true,
+        opacity: opacities.operational,
+        updateTriggers: {
+          getFillColor: [opacities.operational],
+        },
+      }),
+    ];
+  }, [mockData.tasks, mockData.trains.length, worldDimensions.operational.width, opacities.operational]);
+
+  // All deck.gl layers
+  const layers = useMemo(() => [
+    ...strategicLayers,
+    ...tacticalLayers,
+    ...operationalLayers,
+  ], [strategicLayers, tacticalLayers, operationalLayers]);
+
+  // View state
+  const viewState: ViewState = useMemo(() => {
+    // Scale camera position based on current LOD world dimensions
+    let targetX = cameraX;
+    let targetY = cameraY;
+
+    if (currentLOD === 'strategic') {
+      targetX = cameraX * STRATEGIC_CELL_WIDTH / OPERATIONAL_PX_PER_DAY * 90; // ~90 days per quarter
+      targetY = cameraY * STRATEGIC_CELL_HEIGHT;
+    } else if (currentLOD === 'tactical') {
+      targetX = cameraX * TACTICAL_CELL_WIDTH / OPERATIONAL_PX_PER_DAY * 30; // ~30 days per month
+      targetY = cameraY * TACTICAL_CELL_HEIGHT;
+    } else {
+      targetX = cameraX * OPERATIONAL_PX_PER_DAY;
+      targetY = cameraY * OPERATIONAL_PX_PER_TRAIN;
+    }
+
+    return {
+      target: [targetX + width / 2, targetY + height / 2, 0],
+      zoom: Math.log2(zoom),
+    };
+  }, [cameraX, cameraY, zoom, width, height, currentLOD]);
+
+  // Handle zoom change
+  const handleZoomChange = useCallback((delta: number) => {
+    setZoom((z) => Math.max(0.1, Math.min(5, z + delta)));
+  }, []);
+
+  // Handle pan
+  const handlePan = useCallback((dx: number, dy: number) => {
+    setCameraX((x) => x + dx);
+    setCameraY((y) => Math.max(0, Math.min(mockData.trains.length - 1, y + dy)));
+  }, [mockData.trains.length]);
+
+  // View
+  const views = new OrthographicView({
+    id: 'fractal-view',
+    flipY: false,
+    controller: true,
+  });
+
+  // Get visible trains based on cameraY
+  const visibleTrains = useMemo(() => {
+    const startIndex = Math.max(0, Math.floor(cameraY));
+    const visibleCount = Math.ceil(height / 30) + 2;
+    return mockData.trains.slice(startIndex, startIndex + visibleCount);
+  }, [cameraY, height, mockData.trains]);
+
+  return (
+    <div style={{ width, height, position: 'relative', background: '#f4f4f5' }}>
+      {/* Navbar */}
+      <Navbar style={{ height: 40 }}>
+        <NavbarGroup align={Alignment.LEFT}>
+          <NavbarHeading style={{ fontSize: 14 }}>MMS Fractal Canvas</NavbarHeading>
+          <NavbarDivider />
+          <Tag
+            intent={
+              currentLOD === 'strategic' ? Intent.PRIMARY :
+              currentLOD === 'tactical' ? Intent.WARNING :
+              currentLOD === 'operational' ? Intent.SUCCESS :
+              Intent.DANGER
+            }
+            large
+          >
+            {currentLOD.toUpperCase()}
+          </Tag>
+        </NavbarGroup>
+        <NavbarGroup align={Alignment.RIGHT}>
+          <span style={{ fontSize: 12, marginRight: 8 }}>Zoom: {zoom.toFixed(2)}x</span>
+          <ButtonGroup>
+            <Button icon="minus" onClick={() => handleZoomChange(-0.1)} />
+            <Button icon="plus" onClick={() => handleZoomChange(0.1)} />
+            <Button icon="home" onClick={() => setZoom(initialZoom)} />
+          </ButtonGroup>
+        </NavbarGroup>
+      </Navbar>
+
+      {/* Main content area */}
+      <div style={{ display: 'flex', height: height - 40 }}>
+        {/* Sidebar - Train IDs */}
+        <Card
+          style={{
+            width: 100,
+            height: '100%',
+            borderRadius: 0,
+            padding: 0,
+            overflow: 'hidden',
+          }}
+        >
+          <div style={{ padding: 8, borderBottom: '1px solid #e2e8f0', fontWeight: 600, fontSize: 11 }}>
+            Trains
+          </div>
+          <div style={{ overflowY: 'auto', height: 'calc(100% - 32px)' }}>
+            {visibleTrains.map((train) => (
+              <div
+                key={train.id}
+                style={{
+                  padding: '6px 8px',
+                  borderBottom: '1px solid #f1f5f9',
+                  fontSize: 10,
+                }}
+              >
+                <div style={{ fontWeight: 500 }}>{train.name}</div>
+                <Tag
+                  minimal
+                  intent={train.fleetId === 'kinki' ? Intent.SUCCESS : Intent.PRIMARY}
+                  style={{ fontSize: 9 }}
+                >
+                  {train.fleetId === 'kinki' ? 'KNK' : 'ALT'}
+                </Tag>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        {/* Canvas area */}
+        <div style={{ flex: 1, position: 'relative' }}>
+          {/* Execution layer (HTML overlay) - only show at execution zoom */}
+          {opacities.execution > 0 && (
+            <ExecutionOverlay
+              tasks={mockData.tasks}
+              trains={mockData.trains}
+              cameraX={cameraX}
+              cameraY={cameraY}
+              zoom={zoom}
+              width={width - 100}
+              height={height - 40}
+              opacity={opacities.execution}
+            />
+          )}
+
+          {/* deck.gl layers for Strategic, Tactical, Operational */}
+          {(opacities.strategic > 0 || opacities.tactical > 0 || opacities.operational > 0) && (
+            <DeckGL
+              width={width - 100}
+              height={height - 40}
+              views={views}
+              viewState={viewState}
+              layers={layers}
+              getCursor={() => 'grab'}
+              style={{ opacity: Math.max(opacities.strategic, opacities.tactical, opacities.operational) }}
+            />
+          )}
+
+          {/* LOD opacity indicators */}
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 16,
+              right: 16,
+              background: 'white',
+              padding: 12,
+              borderRadius: 8,
+              boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+              fontSize: 11,
+            }}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Layer Visibility</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div
+                  style={{
+                    width: 40,
+                    height: 6,
+                    background: `linear-gradient(to right, #3b82f6 ${opacities.strategic * 100}%, #e5e7eb ${opacities.strategic * 100}%)`,
+                    borderRadius: 3,
+                  }}
+                />
+                <span>Strategic ({Math.round(opacities.strategic * 100)}%)</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div
+                  style={{
+                    width: 40,
+                    height: 6,
+                    background: `linear-gradient(to right, #f59e0b ${opacities.tactical * 100}%, #e5e7eb ${opacities.tactical * 100}%)`,
+                    borderRadius: 3,
+                  }}
+                />
+                <span>Tactical ({Math.round(opacities.tactical * 100)}%)</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div
+                  style={{
+                    width: 40,
+                    height: 6,
+                    background: `linear-gradient(to right, #22c55e ${opacities.operational * 100}%, #e5e7eb ${opacities.operational * 100}%)`,
+                    borderRadius: 3,
+                  }}
+                />
+                <span>Operational ({Math.round(opacities.operational * 100)}%)</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div
+                  style={{
+                    width: 40,
+                    height: 6,
+                    background: `linear-gradient(to right, #ef4444 ${opacities.execution * 100}%, #e5e7eb ${opacities.execution * 100}%)`,
+                    borderRadius: 3,
+                  }}
+                />
+                <span>Execution ({Math.round(opacities.execution * 100)}%)</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Zoom slider */}
+          <Card
+            style={{
+              position: 'absolute',
+              bottom: 16,
+              left: 16,
+              padding: 12,
+              width: 200,
+            }}
+          >
+            <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>
+              Zoom Level
+            </div>
+            <Slider
+              min={0.1}
+              max={5}
+              stepSize={0.05}
+              value={zoom}
+              onChange={setZoom}
+              labelRenderer={(val) => `${val.toFixed(1)}x`}
+              labelStepSize={1}
+            />
+            <div style={{ fontSize: 10, color: '#666', marginTop: 8 }}>
+              <div>Strategic: &lt; 0.3x</div>
+              <div>Tactical: 0.3 - 1.0x</div>
+              <div>Operational: 1.0 - 3.0x</div>
+              <div>Execution: &gt; 3.0x</div>
+            </div>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
+// EXECUTION OVERLAY (HTML-based for detailed view)
+// =============================================================================
+
+interface ExecutionOverlayProps {
+  tasks: Task[];
+  trains: Train[];
+  cameraX: number;
+  cameraY: number;
+  zoom: number;
+  width: number;
+  height: number;
+  opacity: number;
+}
+
+const ExecutionOverlay: React.FC<ExecutionOverlayProps> = ({
+  tasks,
+  trains,
+  cameraX,
+  cameraY,
+  zoom,
+  width,
+  height,
+  opacity,
+}) => {
+  const ROW_HEIGHT = 80;
+  const EXEC_PX_PER_DAY = 80;
+  const HEADER_HEIGHT = 50;
+
+  // Filter tasks for visible range
+  const visibleTasks = useMemo(() => {
+    const startTrain = Math.max(0, Math.floor(cameraY));
+    const endTrain = Math.min(trains.length - 1, Math.ceil(cameraY + height / ROW_HEIGHT));
+
+    return tasks.filter((task) => {
+      return task.trainIndex >= startTrain && task.trainIndex <= endTrain;
+    }).slice(0, 50); // Limit for performance
+  }, [tasks, trains.length, cameraY, height]);
+
+  // Calculate earliest task day
+  const earliestTaskDay = useMemo(() => {
+    if (visibleTasks.length === 0) return 0;
+    const days = visibleTasks.map(t => daysBetween(TIME_RANGE.start, t.startDate));
+    return Math.min(...days);
+  }, [visibleTasks]);
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        width,
+        height,
+        overflow: 'hidden',
+        background: '#f8fafc',
+        opacity,
+        pointerEvents: opacity > 0.5 ? 'auto' : 'none',
+      }}
+    >
+      {/* Header */}
+      <div
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          height: HEADER_HEIGHT,
+          background: 'white',
+          borderBottom: '1px solid #e2e8f0',
+          display: 'flex',
+          alignItems: 'center',
+          paddingLeft: 16,
+          fontWeight: 600,
+          fontSize: 12,
+        }}
+      >
+        Execution View - {visibleTasks.length} tasks visible
+      </div>
+
+      {/* Task cards */}
+      <div
+        style={{
+          position: 'absolute',
+          top: HEADER_HEIGHT,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          overflow: 'auto',
+        }}
+      >
+        {visibleTasks.map((task) => {
+          const startDay = daysBetween(TIME_RANGE.start, task.startDate);
+          const duration = Math.max(1, daysBetween(task.startDate, task.endDate));
+          const dayOffset = startDay - earliestTaskDay;
+
+          const x = 16 + dayOffset * EXEC_PX_PER_DAY;
+          const y = (task.trainIndex - Math.floor(cameraY)) * ROW_HEIGHT + 10;
+          const w = Math.max(duration * EXEC_PX_PER_DAY - 10, 150);
+
+          const mt = MAINTENANCE_TYPE_MAP.get(task.type);
+
+          return (
+            <Card
+              key={task.id}
+              interactive
+              elevation={1}
+              style={{
+                position: 'absolute',
+                left: x,
+                top: y,
+                width: w,
+                height: 60,
+                padding: 8,
+                borderLeft: `4px solid ${mt?.color ?? '#94a3b8'}`,
+                overflow: 'hidden',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: '#1e293b' }}>
+                  {task.name}
+                </div>
+                <Tag
+                  minimal
+                  intent={
+                    task.status === 'completed' ? Intent.SUCCESS :
+                    task.status === 'in-progress' ? Intent.PRIMARY :
+                    task.status === 'overdue' ? Intent.DANGER :
+                    Intent.NONE
+                  }
+                  style={{ fontSize: 8 }}
+                >
+                  {task.status}
+                </Tag>
+              </div>
+              <div style={{ fontSize: 9, color: '#64748b' }}>
+                {task.durationHours}h • {task.manHours}mh
+              </div>
+              {task.hasConflict && (
+                <Tag intent={Intent.DANGER} style={{ position: 'absolute', top: 4, right: 4, fontSize: 8 }}>!</Tag>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+export default FractalCanvas;

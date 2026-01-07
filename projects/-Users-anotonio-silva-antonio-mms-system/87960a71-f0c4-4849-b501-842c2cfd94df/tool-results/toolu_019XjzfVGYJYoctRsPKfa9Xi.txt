@@ -1,0 +1,399 @@
+     1→import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+     2→import {
+     3→  Navbar,
+     4→  NavbarGroup,
+     5→  NavbarHeading,
+     6→  NavbarDivider,
+     7→  Button,
+     8→  ButtonGroup,
+     9→  Tag,
+    10→  Card,
+    11→  Intent,
+    12→  Alignment,
+    13→  OverlayToaster,
+    14→  Position,
+    15→} from '@blueprintjs/core';
+    16→import type { Toaster } from '@blueprintjs/core';
+    17→import { InfiniteCanvas } from './canvas/InfiniteCanvas';
+    18→import type { ViewportInfo, NavigationTarget } from './canvas/InfiniteCanvas';
+    19→import { TimelineHeader } from './components/TimelineHeader';
+    20→import { TaskTooltip } from './components/TaskTooltip';
+    21→import { TaskDetailsPanel } from './components/TaskDetailsPanel';
+    22→import { Minimap } from './components/Minimap';
+    23→import { usePerfMonitorToggle } from './components/PerfMonitor';
+    24→import type { PerfEvent } from './components/PerfMonitor';
+    25→import { PerformancePanel } from './components/StatsMonitor';
+    26→import { useCanvasSelector } from './state';
+    27→import { DEFAULT_VIEW_CONFIG } from './data/types';
+    28→import { getRenderData } from './data/generator';
+    29→
+    30→type LOD = 'MACRO' | 'MESO' | 'MICRO';
+    31→
+    32→// Number of trains to display in sidebar
+    33→const TRAIN_COUNT = 50;
+    34→const TOTAL_DAYS = 365 * 10; // 10 years
+    35→const { pxPerTrain, pxPerDay } = DEFAULT_VIEW_CONFIG;
+    36→
+    37→// Sidebar width constant - used for TimelineHeader offset
+    38→const SIDEBAR_WIDTH = 130;
+    39→
+    40→function App() {
+    41→  const [zoom, setZoom] = useState(1.0);
+    42→  // Dynamic min zoom calculated by InfiniteCanvas based on world bounds
+    43→  const [minZoom, setMinZoom] = useState(0.1);
+    44→  // viewportTopY: the Y coordinate of the TOP of the viewport in world space
+    45→  // 0 = top of TRAIN-001, -24 = top of TRAIN-002, etc.
+    46→  const [viewportTopY, setViewportTopY] = useState(0);
+    47→  // Viewport X bounds for timeline header
+    48→  const [viewportLeftX, setViewportLeftX] = useState(0);
+    49→  const [viewportRightX, setViewportRightX] = useState(1000);
+    50→
+    51→  // Animated zoom target (for smooth button zoom)
+    52→  const [animatedZoomTarget, setAnimatedZoomTarget] = useState<number | null>(null);
+    53→
+    54→  // Navigation target for sidebar/timeline clicks (F124)
+    55→  const [navigationTarget, setNavigationTarget] = useState<NavigationTarget | null>(null);
+    56→
+    57→  // Performance monitor toggle (PERF-001)
+    58→  const { visible: perfVisible, toggle: togglePerf } = usePerfMonitorToggle(
+    59→    process.env.NODE_ENV === 'development'
+    60→  );
+    61→
+    62→  // Performance event tracking for logging context
+    63→  const [isPanning, setIsPanning] = useState(false);
+    64→  const [isZooming, setIsZooming] = useState(false);
+    65→  const prevLod = useRef<LOD>('MESO');
+    66→
+    67→  // Mouse position for tooltip (F020)
+    68→  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+    69→
+    70→  // BUG-004: Removed minimapVisible state - minimap is now always visible (Google Maps style)
+    71→
+    72→  // Get hovered task ID from canvas state (F020)
+    73→  const hoveredTaskId = useCanvasSelector((s) => s.interaction.hoveredTaskId);
+    74→
+    75→  // Get camera position from canvas state for minimap (F025)
+    76→  const canvasCameraX = useCanvasSelector((s) => s.viewport.camera.x);
+    77→  const canvasCameraY = useCanvasSelector((s) => s.viewport.camera.y);
+    78→  const canvasSizeFromStore = useCanvasSelector((s) => s.viewport.canvasSize);
+    79→
+    80→  // Get render data for minimap (F025)
+    81→  const { tasks } = useMemo(() => getRenderData(), []);
+    82→
+    83→  // Instructions toaster ref
+    84→  const toasterRef = useRef<Toaster | null>(null);
+    85→
+    86→  // Show instructions on first load
+    87→  useEffect(() => {
+    88→    let isMounted = true;
+    89→
+    90→    // Create toaster instance (async in BlueprintJS 6)
+    91→    OverlayToaster.createAsync({
+    92→      position: Position.TOP,
+    93→      className: 'instructions-toaster',
+    94→    }).then((toaster) => {
+    95→      if (!isMounted) return;
+    96→      toasterRef.current = toaster;
+    97→
+    98→      // Show instruction toast with 5 second auto-dismiss
+    99→      toaster.show({
+   100→        message: '🖱️ Scroll to zoom  •  Drag to pan  •  Double-click to zoom in',
+   101→        intent: Intent.PRIMARY,
+   102→        timeout: 5000,
+   103→        icon: 'info-sign',
+   104→      });
+   105→    });
+   106→
+   107→    // Cleanup: clear toaster on unmount
+   108→    return () => {
+   109→      isMounted = false;
+   110→      toasterRef.current?.clear();
+   111→    };
+   112→  }, []);
+   113→
+   114→  // Compute LOD from zoom level
+   115→  const getLOD = (z: number): LOD => {
+   116→    if (z < 0.5) return 'MACRO';
+   117→    if (z > 2.0) return 'MICRO';
+   118→    return 'MESO';
+   119→  };
+   120→
+   121→  const lod = getLOD(zoom);
+   122→
+   123→  const getLODIntent = (l: LOD): Intent => {
+   124→    switch (l) {
+   125→      case 'MACRO': return Intent.WARNING;
+   126→      case 'MESO': return Intent.PRIMARY;
+   127→      case 'MICRO': return Intent.SUCCESS;
+   128→    }
+   129→  };
+   130→
+   131→  // Button handlers use animated zoom for smooth transitions
+   132→  const handleZoomIn = () => setAnimatedZoomTarget(Math.min(zoom * 1.5, 5.0));
+   133→  const handleZoomOut = () => setAnimatedZoomTarget(Math.max(zoom / 1.5, minZoom));
+   134→  const handleMinZoomChange = useCallback((newMinZoom: number) => {
+   135→    setMinZoom(newMinZoom);
+   136→  }, []);
+   137→  const handleReset = () => {
+   138→    setAnimatedZoomTarget(1.0);
+   139→    setViewportTopY(0);
+   140→  };
+   141→  const handleAnimatedZoomComplete = useCallback(() => {
+   142→    setAnimatedZoomTarget(null);
+   143→  }, []);
+   144→
+   145→  // F124: Navigation handlers for sidebar and timeline clicks
+   146→  const handleNavigateToTrain = useCallback((trainIndex: number) => {
+   147→    setNavigationTarget({ trainIndex });
+   148→  }, []);
+   149→
+   150→  const handleNavigateToDate = useCallback((dayOffset: number) => {
+   151→    setNavigationTarget({ dayOffset });
+   152→  }, []);
+   153→
+   154→  const handleNavigationComplete = useCallback(() => {
+   155→    setNavigationTarget(null);
+   156→  }, []);
+   157→
+   158→  // F025: Minimap navigation - navigate to world coordinates
+   159→  const handleMinimapNavigate = useCallback((worldX: number, worldY: number) => {
+   160→    // Convert world coordinates to day offset and train index
+   161→    const dayOffset = worldX / pxPerDay;
+   162→    const trainIndex = -worldY / pxPerTrain; // Y is negative in world
+   163→
+   164→    // Navigate to the position
+   165→    setNavigationTarget({
+   166→      dayOffset: Math.max(0, dayOffset),
+   167→      trainIndex: Math.max(0, Math.min(TRAIN_COUNT - 1, Math.round(trainIndex))),
+   168→    });
+   169→  }, []);
+   170→
+   171→  // BUG-004: Removed handleMinimapToggle - minimap is now always visible (Google Maps style)
+   172→
+   173→  const handleZoomChange = useCallback((newZoom: number) => {
+   174→    setZoom(newZoom);
+   175→    // Track zooming state for perf logging
+   176→    setIsZooming(true);
+   177→    // Reset zooming after brief delay
+   178→    const timeout = setTimeout(() => setIsZooming(false), 100);
+   179→    return () => clearTimeout(timeout);
+   180→  }, []);
+   181→
+   182→  const handleViewportChange = useCallback((viewport: ViewportInfo) => {
+   183→    setViewportTopY(viewport.topY);
+   184→    setViewportLeftX(viewport.leftX);
+   185→    setViewportRightX(viewport.rightX);
+   186→    // Track panning state for perf logging
+   187→    setIsPanning(true);
+   188→    // Reset panning after brief delay
+   189→    const timeout = setTimeout(() => setIsPanning(false), 100);
+   190→    return () => clearTimeout(timeout);
+   191→  }, []);
+   192→
+   193→  // Determine current performance event for logging
+   194→  const getCurrentPerfEvent = useCallback((): PerfEvent => {
+   195→    const currentLod = getLOD(zoom);
+   196→    if (prevLod.current !== currentLod) {
+   197→      prevLod.current = currentLod;
+   198→      return 'lod_transition';
+   199→    }
+   200→    if (animatedZoomTarget != null || navigationTarget != null) {
+   201→      return 'animating';
+   202→    }
+   203→    if (isZooming) return 'zooming';
+   204→    if (isPanning) return 'panning';
+   205→    return 'idle';
+   206→  }, [zoom, animatedZoomTarget, navigationTarget, isZooming, isPanning]);
+   207→
+   208→  const perfEvent = getCurrentPerfEvent();
+   209→
+   210→  // Calculate sidebar offset to align with canvas
+   211→  // viewportTopY = 0 means TRAIN-001 is at the top
+   212→  // viewportTopY = -24 means TRAIN-002 is at the top
+   213→  // Sidebar offset = -viewportTopY (positive value scrolls down)
+   214→  const rowHeight = pxPerTrain * zoom;
+   215→  const sidebarOffset = viewportTopY * zoom;
+   216→
+   217→  return (
+   218→    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+   219→      {/* Navbar with app title and zoom controls */}
+   220→      <Navbar fixedToTop={false}>
+   221→        <NavbarGroup align={Alignment.LEFT}>
+   222→          <NavbarHeading>
+   223→            <strong>MMS</strong> Canvas
+   224→          </NavbarHeading>
+   225→          <NavbarDivider />
+   226→          <span style={{ fontFamily: 'monospace', fontSize: 13 }}>
+   227→            Zoom: {zoom.toFixed(2)}x
+   228→          </span>
+   229→          <NavbarDivider />
+   230→          <Tag intent={getLODIntent(lod)} minimal large>
+   231→            {lod}
+   232→          </Tag>
+   233→        </NavbarGroup>
+   234→        <NavbarGroup align={Alignment.RIGHT}>
+   235→          <ButtonGroup minimal>
+   236→            <Button icon="minus" onClick={handleZoomOut} title="Zoom Out" />
+   237→            <Button icon="plus" onClick={handleZoomIn} title="Zoom In" />
+   238→          </ButtonGroup>
+   239→          <NavbarDivider />
+   240→          <Button icon="reset" minimal onClick={handleReset}>
+   241→            Reset View
+   242→          </Button>
+   243→          <NavbarDivider />
+   244→          <Button
+   245→            icon="dashboard"
+   246→            minimal
+   247→            active={perfVisible}
+   248→            onClick={togglePerf}
+   249→            title="Toggle Performance Monitor (P)"
+   250→          >
+   251→            Perf
+   252→          </Button>
+   253→        </NavbarGroup>
+   254→      </Navbar>
+   255→
+   256→      {/* Timeline header - positioned above canvas, offset by sidebar width */}
+   257→      <TimelineHeader
+   258→        viewportLeftX={viewportLeftX}
+   259→        viewportRightX={viewportRightX}
+   260→        zoom={zoom}
+   261→        sidebarWidth={SIDEBAR_WIDTH}
+   262→        onDateClick={handleNavigateToDate}
+   263→      />
+   264→
+   265→      {/* Main content area with sidebar and canvas */}
+   266→      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
+   267→        {/* Train sidebar using BlueprintJS Card */}
+   268→        <Card
+   269→          elevation={1}
+   270→          style={{
+   271→            width: SIDEBAR_WIDTH,
+   272→            borderRadius: 0,
+   273→            padding: 0,
+   274→            flexShrink: 0,
+   275→            display: 'flex',
+   276→            flexDirection: 'column',
+   277→            overflow: 'hidden',
+   278→          }}
+   279→        >
+   280→          {/* Sidebar header */}
+   281→          <div
+   282→            style={{
+   283→              padding: '10px 12px',
+   284→              borderBottom: '1px solid #e1e8ed',
+   285→              backgroundColor: '#f5f8fa',
+   286→              fontWeight: 600,
+   287→              fontSize: 13,
+   288→            }}
+   289→          >
+   290→            Trains
+   291→          </div>
+   292→
+   293→          {/* Scrollable train list - synced with canvas panY (BUG-002 fix: overflow auto) */}
+   294→          <div
+   295→            style={{
+   296→              flex: 1,
+   297→              overflow: 'auto',
+   298→              position: 'relative',
+   299→            }}
+   300→          >
+   301→            <div
+   302→              style={{
+   303→                position: 'absolute',
+   304→                top: sidebarOffset,
+   305→                left: 0,
+   306→                right: 0,
+   307→              }}
+   308→            >
+   309→              {Array.from({ length: TRAIN_COUNT }, (_, i) => (
+   310→                <div
+   311→                  key={i}
+   312→                  onClick={() => handleNavigateToTrain(i)}
+   313→                  style={{
+   314→                    height: rowHeight,
+   315→                    padding: '0 12px',
+   316→                    fontSize: 12,
+   317→                    fontFamily: 'monospace',
+   318→                    display: 'flex',
+   319→                    alignItems: 'center',
+   320→                    borderBottom: '1px solid #f0f0f0',
+   321→                    backgroundColor: i % 2 === 0 ? '#ffffff' : '#fafafa',
+   322→                    cursor: 'pointer',
+   323→                    transition: 'background-color 0.15s ease',
+   324→                  }}
+   325→                  onMouseEnter={(e) => {
+   326→                    e.currentTarget.style.backgroundColor = '#e1e8ed';
+   327→                  }}
+   328→                  onMouseLeave={(e) => {
+   329→                    e.currentTarget.style.backgroundColor = i % 2 === 0 ? '#ffffff' : '#fafafa';
+   330→                  }}
+   331→                  title={`Click to navigate to TRAIN-${String(i + 1).padStart(3, '0')}`}
+   332→                >
+   333→                  TRAIN-{String(i + 1).padStart(3, '0')}
+   334→                </div>
+   335→              ))}
+   336→            </div>
+   337→          </div>
+   338→        </Card>
+   339→
+   340→        {/* R3F Canvas area */}
+   341→        <div
+   342→          style={{ flex: 1, position: 'relative', minWidth: 0 }}
+   343→          onMouseMove={(e) => setMousePos({ x: e.clientX, y: e.clientY })}
+   344→        >
+   345→          <InfiniteCanvas
+   346→            zoom={zoom}
+   347→            lod={lod}
+   348→            onZoomChange={handleZoomChange}
+   349→            onViewportChange={handleViewportChange}
+   350→            onMinZoomChange={handleMinZoomChange}
+   351→            animatedZoomTarget={animatedZoomTarget}
+   352→            onAnimatedZoomComplete={handleAnimatedZoomComplete}
+   353→            navigationTarget={navigationTarget}
+   354→            onNavigationComplete={handleNavigationComplete}
+   355→            perfVisible={perfVisible}
+   356→            perfEvent={perfEvent}
+   357→          />
+   358→
+   359→          {/* Minimap (F025, BUG-004) - bird's eye navigation - always visible (Google Maps style) */}
+   360→          <Minimap
+   361→            trainCount={TRAIN_COUNT}
+   362→            totalDays={TOTAL_DAYS}
+   363→            tasks={tasks}
+   364→            cameraX={canvasCameraX}
+   365→            cameraY={canvasCameraY}
+   366→            zoom={zoom}
+   367→            canvasWidth={canvasSizeFromStore.width || 800}
+   368→            canvasHeight={canvasSizeFromStore.height || 600}
+   369→            onNavigate={handleMinimapNavigate}
+   370→          />
+   371→        </div>
+   372→      </div>
+   373→
+   374→      {/* Task tooltip (F020) - shown on hover */}
+   375→      <TaskTooltip
+   376→        taskId={hoveredTaskId}
+   377→        mouseX={mousePos.x}
+   378→        mouseY={mousePos.y}
+   379→      />
+   380→
+   381→      {/* Task details panel (F026) - shown on selection */}
+   382→      <TaskDetailsPanel />
+   383→
+   384→      {/* Performance panel - reliable FPS monitor using stats.js */}
+   385→      {/* BUG-005: Moved to bottom-left to avoid overlapping TimelineHeader */}
+   386→      <PerformancePanel
+   387→        visible={perfVisible}
+   388→        position="bottom-left"
+   389→      />
+   390→    </div>
+   391→  );
+   392→}
+   393→
+   394→export default App;
+   395→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

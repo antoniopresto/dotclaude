@@ -1,0 +1,204 @@
+#!/usr/bin/env node
+
+/**
+ * Script to automatically install the extension in Chrome for testing
+ *
+ * This script:
+ * 1. Builds the extension
+ * 2. Opens Chrome with the extension loaded unpacked
+ * 3. Creates a temporary Chrome profile to avoid conflicts
+ *
+ * Usage: npm run chrome:install
+ */
+
+import { spawn, exec } from 'child_process';
+import { existsSync, mkdirSync, rmSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Configuration
+const PROJECT_ROOT = resolve(__dirname, '..');
+const DIST_DIR = resolve(PROJECT_ROOT, '.output', 'chrome-mv3');
+const CHROME_PROFILE_DIR = resolve(PROJECT_ROOT, 'chrome-profile');
+
+// Chrome paths for different operating systems
+const CHROME_PATHS = {
+  darwin: [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  ],
+  linux: [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/snap/bin/chromium',
+  ],
+  win32: [
+    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.PROGRAMFILES + '\\Google\\Chrome\\Application\\chrome.exe',
+    process.env['PROGRAMFILES(X86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
+  ],
+};
+
+/**
+ * Find Chrome executable path
+ */
+function findChrome() {
+  const platform = process.platform;
+  const paths = CHROME_PATHS[platform] || [];
+
+  for (const chromePath of paths) {
+    if (chromePath && existsSync(chromePath)) {
+      return chromePath;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Execute a command and return a promise
+ */
+function execPromise(command, options = {}) {
+  return new Promise((resolve, reject) => {
+    exec(command, { cwd: PROJECT_ROOT, ...options }, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+/**
+ * Build the extension
+ */
+async function buildExtension() {
+  console.log('Building extension...');
+
+  try {
+    await execPromise('npm run build');
+    console.log('Build completed successfully!');
+  } catch (error) {
+    console.error('Build failed:', error.message);
+    process.exit(1);
+  }
+}
+
+/**
+ * Check if the extension is already built
+ */
+function isBuilt() {
+  return existsSync(DIST_DIR) && existsSync(resolve(DIST_DIR, 'manifest.json'));
+}
+
+/**
+ * Create or clean Chrome profile directory
+ */
+function setupChromeProfile(clean = false) {
+  if (clean && existsSync(CHROME_PROFILE_DIR)) {
+    console.log('Cleaning Chrome profile...');
+    rmSync(CHROME_PROFILE_DIR, { recursive: true, force: true });
+  }
+
+  if (!existsSync(CHROME_PROFILE_DIR)) {
+    console.log('Creating Chrome profile directory...');
+    mkdirSync(CHROME_PROFILE_DIR, { recursive: true });
+  }
+}
+
+/**
+ * Launch Chrome with the extension
+ */
+function launchChrome(chromePath) {
+  console.log('Launching Chrome with extension...');
+  console.log(`Extension path: ${DIST_DIR}`);
+  console.log(`Profile path: ${CHROME_PROFILE_DIR}`);
+
+  const args = [
+    `--user-data-dir=${CHROME_PROFILE_DIR}`,
+    `--load-extension=${DIST_DIR}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--auto-open-devtools-for-tabs',
+    'https://www.example.com',
+  ];
+
+  const chrome = spawn(chromePath, args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+
+  chrome.unref();
+
+  console.log('Chrome launched successfully!');
+  console.log('');
+  console.log('The extension has been loaded in a separate Chrome profile.');
+  console.log('You can find the extension icon in the Chrome toolbar.');
+  console.log('');
+  console.log('Tips:');
+  console.log('  - Navigate to any page with videos to test the extension');
+  console.log('  - Click the extension icon to see detected videos');
+  console.log('  - Use chrome://extensions to see extension details');
+  console.log('');
+  console.log('To reload the extension after changes:');
+  console.log('  1. Run "npm run build" to rebuild');
+  console.log('  2. Go to chrome://extensions');
+  console.log('  3. Click the reload button on the extension');
+}
+
+/**
+ * Main function
+ */
+async function main() {
+  console.log('Video Downloader Extension - Chrome Installer');
+  console.log('==============================================');
+  console.log('');
+
+  // Check for command line arguments
+  const args = process.argv.slice(2);
+  const cleanProfile = args.includes('--clean');
+  const skipBuild = args.includes('--skip-build');
+
+  // Find Chrome
+  const chromePath = findChrome();
+  if (!chromePath) {
+    console.error('Error: Could not find Chrome installation.');
+    console.error('Please install Google Chrome or set the CHROME_PATH environment variable.');
+    process.exit(1);
+  }
+
+  console.log(`Found Chrome at: ${chromePath}`);
+
+  // Build if needed
+  if (!skipBuild || !isBuilt()) {
+    await buildExtension();
+  } else {
+    console.log('Skipping build (using existing dist)');
+  }
+
+  // Verify build output
+  if (!isBuilt()) {
+    console.error('Error: Extension build output not found.');
+    console.error(`Expected directory: ${DIST_DIR}`);
+    process.exit(1);
+  }
+
+  // Setup Chrome profile
+  setupChromeProfile(cleanProfile);
+
+  // Launch Chrome
+  launchChrome(chromePath);
+}
+
+// Run
+main().catch((error) => {
+  console.error('Error:', error.message);
+  process.exit(1);
+});

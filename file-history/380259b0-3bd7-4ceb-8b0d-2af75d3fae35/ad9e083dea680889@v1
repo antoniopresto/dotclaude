@@ -1,0 +1,192 @@
+/**
+ * visx TimeScrubber POC
+ *
+ * Uses @visx/brush with @visx/shape for a React-native time scrubber
+ * with density visualization.
+ *
+ * Pros:
+ * - Excellent TypeScript support (fully written in TS)
+ * - Maximum customization flexibility
+ * - Clean React integration
+ *
+ * Cons:
+ * - SVG-based (requires downsampling for 60K+ points)
+ * - More code to write compared to Recharts
+ */
+
+import React, { useMemo, useRef, useCallback } from 'react';
+import { Brush } from '@visx/brush';
+import { AreaClosed, LinePath } from '@visx/shape';
+import { scaleTime, scaleLinear } from '@visx/scale';
+import { Group } from '@visx/group';
+import { AxisBottom } from '@visx/axis';
+import { curveMonotoneX } from '@visx/curve';
+import { LinearGradient } from '@visx/gradient';
+import type { BaseBrushState, UpdateBrush } from '@visx/brush/lib/types';
+import type { TimeSeriesPoint } from './mockData';
+
+interface VisxTimeScrubberProps {
+  /** Time series data for density visualization */
+  data: TimeSeriesPoint[];
+  /** Width of the component */
+  width: number;
+  /** Height of the component */
+  height: number;
+  /** Callback when brush selection changes */
+  onBrushChange?: (domain: [Date, Date] | null) => void;
+  /** Initial brush selection */
+  initialSelection?: [Date, Date];
+  /** Margin around the chart */
+  margin?: { top: number; right: number; bottom: number; left: number };
+  /** Area fill color */
+  fillColor?: string;
+  /** Stroke color */
+  strokeColor?: string;
+  /** Brush handle color */
+  brushColor?: string;
+}
+
+const defaultMargin = { top: 10, right: 10, bottom: 30, left: 10 };
+
+export const VisxTimeScrubber: React.FC<VisxTimeScrubberProps> = ({
+  data,
+  width,
+  height,
+  onBrushChange,
+  initialSelection,
+  margin = defaultMargin,
+  fillColor = '#6366f1',
+  strokeColor = '#4f46e5',
+  brushColor = 'rgba(99, 102, 241, 0.3)',
+}) => {
+  const brushRef = useRef<BaseBrushState | null>(null);
+
+  // Calculate inner dimensions
+  const innerWidth = width - margin.left - margin.right;
+  const innerHeight = height - margin.top - margin.bottom;
+
+  // Create scales
+  const xScale = useMemo(() => {
+    const dates = data.map((d) => d.date);
+    return scaleTime<number>({
+      domain: [Math.min(...dates.map((d) => d.getTime())), Math.max(...dates.map((d) => d.getTime()))],
+      range: [0, innerWidth],
+    });
+  }, [data, innerWidth]);
+
+  const yScale = useMemo(() => {
+    const values = data.map((d) => d.value);
+    return scaleLinear<number>({
+      domain: [0, Math.max(...values) * 1.1],
+      range: [innerHeight, 0],
+      nice: true,
+    });
+  }, [data, innerHeight]);
+
+  // Brush change handler
+  const handleBrushChange = useCallback(
+    (domain: { x0: number; x1: number; y0: number; y1: number } | null) => {
+      if (!domain || !onBrushChange) return;
+
+      const x0Date = xScale.invert(domain.x0);
+      const x1Date = xScale.invert(domain.x1);
+
+      onBrushChange([x0Date, x1Date]);
+    },
+    [xScale, onBrushChange]
+  );
+
+  // Accessors
+  const getX = (d: TimeSeriesPoint) => d.date;
+  const getY = (d: TimeSeriesPoint) => d.value;
+
+  // Initial brush position
+  const initialBrushPosition = useMemo(() => {
+    if (!initialSelection) return undefined;
+    return {
+      start: { x: xScale(initialSelection[0]) },
+      end: { x: xScale(initialSelection[1]) },
+    };
+  }, [initialSelection, xScale]);
+
+  if (width < 100 || height < 50) {
+    return <div>Container too small</div>;
+  }
+
+  return (
+    <svg width={width} height={height}>
+      <LinearGradient
+        id="visx-area-gradient"
+        from={fillColor}
+        to={fillColor}
+        fromOpacity={0.4}
+        toOpacity={0.1}
+      />
+      <Group left={margin.left} top={margin.top}>
+        {/* Area chart for density visualization */}
+        <AreaClosed<TimeSeriesPoint>
+          data={data}
+          x={(d) => xScale(getX(d)) ?? 0}
+          y={(d) => yScale(getY(d)) ?? 0}
+          yScale={yScale}
+          curve={curveMonotoneX}
+          fill="url(#visx-area-gradient)"
+        />
+
+        {/* Line on top of area */}
+        <LinePath<TimeSeriesPoint>
+          data={data}
+          x={(d) => xScale(getX(d)) ?? 0}
+          y={(d) => yScale(getY(d)) ?? 0}
+          curve={curveMonotoneX}
+          stroke={strokeColor}
+          strokeWidth={1.5}
+        />
+
+        {/* Brush component */}
+        <Brush
+          xScale={xScale}
+          yScale={yScale}
+          width={innerWidth}
+          height={innerHeight}
+          margin={{ top: 0, bottom: 0, left: 0, right: 0 }}
+          handleSize={8}
+          innerRef={(ref) => {
+            brushRef.current = ref as BaseBrushState | null;
+          }}
+          resizeTriggerAreas={['left', 'right']}
+          brushDirection="horizontal"
+          initialBrushPosition={initialBrushPosition}
+          onChange={handleBrushChange}
+          onClick={() => {
+            if (onBrushChange) onBrushChange(null);
+          }}
+          selectedBoxStyle={{
+            fill: brushColor,
+            stroke: strokeColor,
+            strokeWidth: 1,
+          }}
+          useWindowMoveEvents
+        />
+
+        {/* X Axis */}
+        <AxisBottom
+          top={innerHeight}
+          scale={xScale}
+          numTicks={width > 400 ? 6 : 3}
+          tickFormat={(value) => {
+            const date = value as Date;
+            return date.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+          }}
+          tickLabelProps={() => ({
+            fontSize: 10,
+            textAnchor: 'middle',
+            fill: '#666',
+          })}
+        />
+      </Group>
+    </svg>
+  );
+};
+
+export default VisxTimeScrubber;

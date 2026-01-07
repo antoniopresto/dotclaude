@@ -1,0 +1,224 @@
+import { FastifyInstance } from 'fastify';
+import { db } from '../db';
+import { maintenanceSchedules, trains, depots, fleets } from '../db/schema';
+import { eq, gte, lte, and, sql, count } from 'drizzle-orm';
+
+export async function maintenanceRoutes(fastify: FastifyInstance) {
+  /**
+   * GET /api/maintenance/gantt
+   * Returns maintenance schedule data for Gantt chart
+   */
+  fastify.get('/gantt', async (request, reply) => {
+    try {
+      // Get date range (4 weeks from today)
+      const startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(startDate);
+      endDate.setDate(endDate.getDate() + 28);
+
+      // Get all trains with their schedules
+      const trainsData = await db
+        .select({
+          id: trains.id,
+          trainId: trains.trainId,
+          fleetName: fleets.name,
+          depotCode: depots.code,
+        })
+        .from(trains)
+        .leftJoin(fleets, eq(trains.fleetId, fleets.id))
+        .leftJoin(depots, eq(trains.baseDepotId, depots.id))
+        .limit(50); // Limit for performance
+
+      // Get maintenance schedules in range
+      const schedules = await db
+        .select({
+          id: maintenanceSchedules.id,
+          trainId: maintenanceSchedules.trainId,
+          type: maintenanceSchedules.type,
+          scheduledDate: maintenanceSchedules.scheduledDate,
+          depotId: maintenanceSchedules.depotId,
+          depotName: depots.name,
+          kmAtMaintenance: maintenanceSchedules.kmAtMaintenance,
+        })
+        .from(maintenanceSchedules)
+        .leftJoin(depots, eq(maintenanceSchedules.depotId, depots.id))
+        .where(
+          and(
+            gte(maintenanceSchedules.scheduledDate, startDate.toISOString().split('T')[0]),
+            lte(maintenanceSchedules.scheduledDate, endDate.toISOString().split('T')[0])
+          )
+        );
+
+      // Get train codes for schedules
+      const trainCodes = await db
+        .select({ id: trains.id, trainId: trains.trainId })
+        .from(trains);
+      const trainCodeMap = new Map(trainCodes.map(t => [t.id, t.trainId]));
+
+      // Build train rows with events
+      const trainRows = trainsData.map(train => ({
+        id: train.id,
+        trainId: train.trainId,
+        fleetName: train.fleetName || 'Unknown',
+        depotCode: train.depotCode || 'UNK',
+        events: schedules
+          .filter(s => s.trainId === train.id)
+          .map(s => ({
+            id: s.id,
+            trainId: train.id,
+            trainCode: train.trainId,
+            type: s.type as 'PM1' | 'PM2' | 'HM' | 'OVH',
+            startDate: s.scheduledDate,
+            endDate: s.scheduledDate,
+            depotId: s.depotId,
+            depotName: s.depotName || 'Unknown',
+            kmAtMaintenance: s.kmAtMaintenance || 0,
+          })),
+      }));
+
+      return reply.send({
+        trains: trainRows,
+        startDate: startDate.toISOString().split('T')[0],
+        endDate: endDate.toISOString().split('T')[0],
+      });
+    } catch (error) {
+      console.error('Failed to fetch gantt data:', error);
+      return reply.status(500).send({ error: 'Failed to fetch gantt data' });
+    }
+  });
+
+  /**
+   * GET /api/maintenance/depot-capacity
+   * Returns weekly depot capacity utilization
+   */
+  fastify.get('/depot-capacity', async (request, reply) => {
+    try {
+      // Get all depots
+      const depotsData = await db
+        .select({
+          id: depots.id,
+          name: depots.name,
+          code: depots.code,
+          capacityManhours: depots.capacityManhours,
+        })
+        .from(depots);
+
+      // Generate 4 weeks of data
+      const weeks: { week: string; start: string; end: string }[] = [];
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      for (let w = 0; w < 4; w++) {
+        const weekStart = new Date(today);
+        weekStart.setDate(today.getDate() + w * 7);
+        const weekEnd = new Date(weekStart);
+        weekEnd.setDate(weekStart.getDate() + 6);
+
+        weeks.push({
+          week: `Week ${w + 1}`,
+          start: weekStart.toISOString().split('T')[0],
+          end: weekEnd.toISOString().split('T')[0],
+        });
+      }
+
+      // Get maintenance counts per depot per week
+      const capacityData: Array<{
+        depotId: string;
+        depotName: string;
+        depotCode: string;
+        week: string;
+        weekStart: string;
+        weekEnd: string;
+        scheduled: number;
+        capacity: number;
+        utilization: number;
+        trains: string[];
+      }> = [];
+
+      for (const depot of depotsData) {
+        for (const week of weeks) {
+          // Get schedules for this depot in this week
+          const weekSchedules = await db
+            .select({
+              id: maintenanceSchedules.id,
+              trainId: maintenanceSchedules.trainId,
+            })
+            .from(maintenanceSchedules)
+            .where(
+              and(
+                eq(maintenanceSchedules.depotId, depot.id),
+                gte(maintenanceSchedules.scheduledDate, week.start),
+                lte(maintenanceSchedules.scheduledDate, week.end)
+              )
+            );
+
+          // Get train codes
+          const trainIds = weekSchedules.map(s => s.trainId);
+          let trainCodes: string[] = [];
+          if (trainIds.length > 0) {
+            const trainData = await db
+              .select({ id: trains.id, trainId: trains.trainId })
+              .from(trains)
+              .where(sql`${trains.id} IN ${trainIds}`);
+            trainCodes = trainData.map(t => t.trainId);
+          }
+
+          // Capacity is simplified as max schedules per week (e.g., 5 per depot)
+          const capacity = Math.ceil((depot.capacityManhours || 100) / 20);
+          const utilization = capacity > 0 ? (weekSchedules.length / capacity) * 100 : 0;
+
+          capacityData.push({
+            depotId: depot.id,
+            depotName: depot.name,
+            depotCode: depot.code,
+            week: week.week,
+            weekStart: week.start,
+            weekEnd: week.end,
+            scheduled: weekSchedules.length,
+            capacity,
+            utilization: Math.round(utilization * 10) / 10,
+            trains: trainCodes,
+          });
+        }
+      }
+
+      return reply.send({
+        depots: depotsData.map(d => ({
+          id: d.id,
+          name: d.name,
+          code: d.code,
+          maxCapacity: Math.ceil((d.capacityManhours || 100) / 20),
+        })),
+        weeks,
+        data: capacityData,
+      });
+    } catch (error) {
+      console.error('Failed to fetch depot capacity:', error);
+      return reply.status(500).send({ error: 'Failed to fetch depot capacity' });
+    }
+  });
+
+  /**
+   * PUT /api/maintenance/schedule/:id
+   * Update a maintenance schedule (for drag-drop)
+   */
+  fastify.put<{ Params: { id: string }; Body: { startDate: string } }>(
+    '/schedule/:id',
+    async (request, reply) => {
+      try {
+        const { id } = request.params;
+        const { startDate } = request.body;
+
+        await db
+          .update(maintenanceSchedules)
+          .set({ scheduledDate: startDate })
+          .where(eq(maintenanceSchedules.id, id));
+
+        return reply.send({ success: true, id, startDate });
+      } catch (error) {
+        console.error('Failed to update schedule:', error);
+        return reply.status(500).send({ error: 'Failed to update schedule' });
+      }
+    }
+  );
+}

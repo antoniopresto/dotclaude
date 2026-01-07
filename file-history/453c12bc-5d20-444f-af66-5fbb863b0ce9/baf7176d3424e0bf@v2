@@ -1,0 +1,768 @@
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { apiFetch, servicesApi, trainsApi, type Service, type Train } from '@/lib/api';
+
+interface Scenario {
+  id: string;
+  name: string;
+  baseDate: string;
+  changeCount: number;
+  createdAt: string;
+}
+
+interface ComparisonMetric {
+  metric: string;
+  current: number;
+  projected: number;
+  change: number;
+  improved: boolean;
+}
+
+interface SimulationResult {
+  scenarioId: string;
+  projectedVariance: number;
+  projectedDeadRunning: number;
+  comparison: ComparisonMetric[];
+}
+
+interface AllocationChange {
+  serviceId: string;
+  serviceCode: string;
+  origin: string;
+  destination: string;
+  originalTrainId: string | null;
+  newTrainId: string;
+}
+
+/**
+ * Simulation Panel Component
+ *
+ * Enables what-if scenario creation and comparison.
+ */
+export function SimulationPanel() {
+  const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
+  const [simulationResult, setSimulationResult] = useState<SimulationResult | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [newScenarioName, setNewScenarioName] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  // Allocation Editor state
+  const [pendingServices, setPendingServices] = useState<Service[]>([]);
+  const [availableTrains, setAvailableTrains] = useState<Train[]>([]);
+  const [allocationChanges, setAllocationChanges] = useState<AllocationChange[]>([]);
+  const [loadingServices, setLoadingServices] = useState(false);
+
+  // Multi-scenario comparison state (Issue #7 fix)
+  const [selectedForComparison, setSelectedForComparison] = useState<Set<string>>(new Set());
+  const [comparisonResults, setComparisonResults] = useState<Map<string, SimulationResult>>(new Map());
+  const [comparing, setComparing] = useState(false);
+
+  // Apply to Live state
+  const [showApplyConfirm, setShowApplyConfirm] = useState(false);
+  const [applying, setApplying] = useState(false);
+
+  // Fetch services and trains when a scenario is selected
+  useEffect(() => {
+    if (selectedScenario) {
+      loadServicesAndTrains();
+    }
+  }, [selectedScenario]);
+
+  const loadServicesAndTrains = async () => {
+    setLoadingServices(true);
+    setError(null);
+
+    const [servicesResult, trainsResult] = await Promise.all([
+      servicesApi.getPending(),
+      trainsApi.getAll({ status: 'fit' }),
+    ]);
+
+    if (servicesResult.error) {
+      setError(servicesResult.error);
+    } else if (servicesResult.data) {
+      setPendingServices(servicesResult.data.services);
+    }
+
+    if (trainsResult.error) {
+      setError(trainsResult.error);
+    } else if (trainsResult.data) {
+      setAvailableTrains(trainsResult.data.trains);
+    }
+
+    setLoadingServices(false);
+  };
+
+  const handleTrainChange = (service: Service, newTrainId: string) => {
+    setAllocationChanges((prev) => {
+      // Remove existing change for this service if any
+      const filtered = prev.filter((c) => c.serviceId !== service.id);
+
+      if (!newTrainId) {
+        // If no train selected, just remove the change
+        return filtered;
+      }
+
+      // Add new change
+      return [
+        ...filtered,
+        {
+          serviceId: service.id,
+          serviceCode: service.serviceCode,
+          origin: service.origin,
+          destination: service.destination,
+          originalTrainId: null, // No current allocation for pending services
+          newTrainId,
+        },
+      ];
+    });
+
+    // Update scenario change count
+    if (selectedScenario) {
+      setScenarios((prev) =>
+        prev.map((s) =>
+          s.id === selectedScenario.id
+            ? { ...s, changeCount: allocationChanges.length + 1 }
+            : s
+        )
+      );
+    }
+  };
+
+  const getSelectedTrainForService = (serviceId: string): string => {
+    const change = allocationChanges.find((c) => c.serviceId === serviceId);
+    return change?.newTrainId || '';
+  };
+
+  const removeAllocationChange = (serviceId: string) => {
+    setAllocationChanges((prev) => prev.filter((c) => c.serviceId !== serviceId));
+  };
+
+  // Toggle scenario selection for comparison
+  const toggleComparisonSelection = (scenarioId: string) => {
+    setSelectedForComparison((prev) => {
+      const next = new Set(prev);
+      if (next.has(scenarioId)) {
+        next.delete(scenarioId);
+      } else if (next.size < 3) {
+        // Max 3 scenarios for comparison
+        next.add(scenarioId);
+      }
+      return next;
+    });
+  };
+
+  // Run comparison for selected scenarios
+  const handleCompareScenarios = async () => {
+    if (selectedForComparison.size < 2) {
+      setError('Select at least 2 scenarios to compare');
+      return;
+    }
+
+    setComparing(true);
+    setError(null);
+    const results = new Map<string, SimulationResult>();
+
+    for (const scenarioId of Array.from(selectedForComparison)) {
+      const scenario = scenarios.find((s) => s.id === scenarioId);
+      if (!scenario || scenario.changeCount === 0) continue;
+
+      const { data, error: compError } = await apiFetch<SimulationResult>(
+        `/api/simulation/${scenarioId}/run`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            changes: [], // Use stored changes from scenario
+          }),
+        }
+      );
+
+      if (data) {
+        results.set(scenarioId, data);
+      }
+    }
+
+    setComparisonResults(results);
+    setComparing(false);
+  };
+
+  // Apply scenario changes to live allocations
+  const handleApplyToLive = async () => {
+    if (!selectedScenario || allocationChanges.length === 0) return;
+
+    setApplying(true);
+    setError(null);
+
+    const { data, error: applyError } = await apiFetch<{ applied: number }>(
+      `/api/simulation/${selectedScenario.id}/apply`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          changes: allocationChanges.map((change) => ({
+            serviceId: change.serviceId,
+            trainId: change.newTrainId,
+          })),
+        }),
+      }
+    );
+
+    if (applyError) {
+      setError(applyError);
+    } else if (data) {
+      // Clear the scenario after applying
+      setAllocationChanges([]);
+      setSimulationResult(null);
+      setShowApplyConfirm(false);
+
+      // Remove the applied scenario from list
+      setScenarios((prev) => prev.filter((s) => s.id !== selectedScenario.id));
+      setSelectedScenario(null);
+    }
+
+    setApplying(false);
+  };
+
+  const handleCreateScenario = async () => {
+    if (!newScenarioName.trim()) return;
+
+    setCreating(true);
+    setError(null);
+
+    const { data, error } = await apiFetch<{ scenarioId: string } & Scenario>(
+      '/api/simulation/create',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name: newScenarioName,
+          baseDate: new Date().toISOString().split('T')[0],
+        }),
+      }
+    );
+
+    if (error) {
+      setError(error);
+    } else if (data) {
+      const newScenario: Scenario = {
+        id: data.scenarioId,
+        name: newScenarioName,
+        baseDate: new Date().toISOString().split('T')[0],
+        changeCount: 0,
+        createdAt: new Date().toISOString(),
+      };
+      setScenarios((prev) => [...prev, newScenario]);
+      setSelectedScenario(newScenario);
+      setNewScenarioName('');
+    }
+
+    setCreating(false);
+  };
+
+  const handleRunSimulation = async () => {
+    if (!selectedScenario) return;
+
+    if (allocationChanges.length === 0) {
+      setError('Please assign at least one train to a service before running simulation');
+      return;
+    }
+
+    setRunning(true);
+    setError(null);
+
+    // Run simulation with actual user-defined changes
+    const { data, error: simError } = await apiFetch<SimulationResult>(
+      `/api/simulation/${selectedScenario.id}/run`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          changes: allocationChanges.map((change) => ({
+            serviceId: change.serviceId,
+            originalTrainId: change.originalTrainId,
+            newTrainId: change.newTrainId,
+          })),
+        }),
+      }
+    );
+
+    if (simError) {
+      setError(simError);
+    } else if (data) {
+      setSimulationResult(data);
+    }
+
+    setRunning(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Create New Scenario */}
+      <div className="bg-white shadow rounded-lg p-6">
+        <h2 className="text-lg font-semibold text-gray-900 mb-4">
+          What-If Simulation
+        </h2>
+        <p className="text-sm text-gray-600 mb-4">
+          Create scenarios to test different allocation strategies and see projected impact on km variance.
+        </p>
+
+        <div className="flex gap-4">
+          <input
+            type="text"
+            value={newScenarioName}
+            onChange={(e) => setNewScenarioName(e.target.value)}
+            placeholder="Scenario name (e.g., Q1 Rebalancing)"
+            className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+          />
+          <button
+            onClick={handleCreateScenario}
+            disabled={creating || !newScenarioName.trim()}
+            className="px-6 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {creating ? 'Creating...' : 'Create Scenario'}
+          </button>
+        </div>
+
+        {error && (
+          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded text-red-800 text-sm">
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* Scenarios List with Multi-Select for Comparison (Issue #7 Fix) */}
+      {scenarios.length > 0 && (
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
+            <div>
+              <h3 className="font-semibold text-gray-900">Your Scenarios</h3>
+              <p className="text-xs text-gray-500">Select up to 3 scenarios to compare</p>
+            </div>
+            {selectedForComparison.size >= 2 && (
+              <button
+                onClick={handleCompareScenarios}
+                disabled={comparing}
+                className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 text-sm transition-colors"
+              >
+                {comparing ? 'Comparing...' : `Compare ${selectedForComparison.size} Scenarios`}
+              </button>
+            )}
+          </div>
+          <div className="divide-y divide-gray-100">
+            {scenarios.map((scenario) => (
+              <div
+                key={scenario.id}
+                className={`p-4 transition-colors ${
+                  selectedScenario?.id === scenario.id
+                    ? 'bg-primary-50 border-l-4 border-primary-500'
+                    : selectedForComparison.has(scenario.id)
+                    ? 'bg-purple-50'
+                    : 'hover:bg-gray-50'
+                }`}
+              >
+                <div className="flex items-center gap-4">
+                  {/* Checkbox for comparison */}
+                  <input
+                    type="checkbox"
+                    checked={selectedForComparison.has(scenario.id)}
+                    onChange={() => toggleComparisonSelection(scenario.id)}
+                    className="w-4 h-4 text-purple-600 rounded focus:ring-purple-500"
+                    title="Select for comparison"
+                  />
+
+                  {/* Scenario info - clickable for editing */}
+                  <div
+                    className="flex-1 cursor-pointer"
+                    onClick={() => setSelectedScenario(scenario)}
+                  >
+                    <div className="font-medium text-gray-900">{scenario.name}</div>
+                    <div className="text-sm text-gray-500">
+                      Base: {scenario.baseDate} • Changes: {scenario.changeCount}
+                    </div>
+                  </div>
+
+                  {/* Actions */}
+                  {selectedScenario?.id === scenario.id && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRunSimulation();
+                      }}
+                      disabled={running}
+                      className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 text-sm transition-colors"
+                    >
+                      {running ? 'Running...' : 'Run Simulation'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Allocation Editor - Issue #6 Fix */}
+      {selectedScenario && (
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-gray-200 bg-blue-50">
+            <h3 className="font-semibold text-blue-800">
+              Allocation Editor: {selectedScenario.name}
+            </h3>
+            <p className="text-sm text-blue-600">
+              Assign trains to pending services. Changes: {allocationChanges.length}
+            </p>
+          </div>
+
+          {loadingServices ? (
+            <div className="p-8 text-center text-gray-500">
+              Loading services and trains...
+            </div>
+          ) : pendingServices.length === 0 ? (
+            <div className="p-8 text-center text-gray-500">
+              No pending services found for today.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                      Service
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                      Route
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                      Distance
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                      Assign Train
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {pendingServices.slice(0, 10).map((service) => (
+                    <tr
+                      key={service.id}
+                      className={
+                        getSelectedTrainForService(service.id)
+                          ? 'bg-green-50'
+                          : 'hover:bg-gray-50'
+                      }
+                    >
+                      <td className="px-4 py-3">
+                        <div className="font-medium text-gray-900">
+                          {service.serviceCode}
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          {service.departureTime?.slice(0, 5) || '--:--'}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-600">
+                        {service.origin} → {service.destination}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-600">
+                        {service.distanceKm} km
+                      </td>
+                      <td className="px-4 py-3">
+                        <select
+                          value={getSelectedTrainForService(service.id)}
+                          onChange={(e) =>
+                            handleTrainChange(service, e.target.value)
+                          }
+                          className="w-full px-3 py-1.5 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                        >
+                          <option value="">-- Select Train --</option>
+                          {availableTrains.map((train) => (
+                            <option key={train.id} value={train.id}>
+                              {train.trainId} ({train.currentKm.toLocaleString()} km,{' '}
+                              {train.deltaPercent > 0 ? '+' : ''}
+                              {train.deltaPercent.toFixed(1)}%)
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Summary of Changes */}
+          {allocationChanges.length > 0 && (
+            <div className="p-4 bg-gray-50 border-t">
+              <h4 className="font-medium text-gray-900 mb-2">
+                Pending Changes ({allocationChanges.length})
+              </h4>
+              <div className="flex flex-wrap gap-2">
+                {allocationChanges.map((change) => {
+                  const train = availableTrains.find(
+                    (t) => t.id === change.newTrainId
+                  );
+                  return (
+                    <span
+                      key={change.serviceId}
+                      className="inline-flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-800 rounded text-xs"
+                    >
+                      {change.serviceCode} → {train?.trainId || change.newTrainId}
+                      <button
+                        onClick={() => removeAllocationChange(change.serviceId)}
+                        className="ml-1 hover:text-blue-600"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Simulation Results */}
+      {simulationResult && (
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-gray-200 bg-green-50">
+            <h3 className="font-semibold text-green-800">Simulation Results</h3>
+            <p className="text-sm text-green-600">
+              Projected impact of {selectedScenario?.name}
+            </p>
+          </div>
+
+          {/* Comparison Table */}
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                    Metric
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">
+                    Current
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">
+                    Projected
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">
+                    Change
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {simulationResult.comparison.map((metric) => (
+                  <tr key={metric.metric}>
+                    <td className="px-4 py-3 text-sm font-medium text-gray-900">
+                      {metric.metric}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-500">
+                      {metric.current}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900 font-medium">
+                      {metric.projected}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-right">
+                      <span
+                        className={`font-medium ${
+                          metric.improved ? 'text-green-600' : 'text-red-600'
+                        }`}
+                      >
+                        {metric.change > 0 ? '+' : ''}{metric.change}
+                        {metric.improved && ' ✓'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Summary */}
+          <div className="p-4 bg-gray-50 border-t">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-sm text-gray-600 mr-4">
+                  Projected Variance: <strong>{simulationResult.projectedVariance}%</strong>
+                </span>
+                <span className="text-sm text-gray-600">
+                  Dead Running: <strong>{simulationResult.projectedDeadRunning} km</strong>
+                </span>
+              </div>
+              <button
+                onClick={() => setShowApplyConfirm(true)}
+                disabled={allocationChanges.length === 0}
+                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 text-sm transition-colors"
+              >
+                Apply to Live
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Apply to Live Confirmation Modal */}
+      {showApplyConfirm && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-md w-full mx-4">
+            <div className="p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                Confirm Apply to Live
+              </h3>
+              <p className="text-gray-600 mb-4">
+                This will create {allocationChanges.length} new allocation(s) in the live system.
+                This action cannot be undone.
+              </p>
+
+              <div className="bg-yellow-50 border border-yellow-200 rounded p-3 mb-4">
+                <p className="text-sm text-yellow-800">
+                  <strong>Changes to apply:</strong>
+                </p>
+                <ul className="text-sm text-yellow-700 mt-1">
+                  {allocationChanges.slice(0, 5).map((change) => (
+                    <li key={change.serviceId}>
+                      • {change.serviceCode}: Assign train {change.newTrainId.slice(0, 8)}...
+                    </li>
+                  ))}
+                  {allocationChanges.length > 5 && (
+                    <li>... and {allocationChanges.length - 5} more</li>
+                  )}
+                </ul>
+              </div>
+
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => setShowApplyConfirm(false)}
+                  className="px-4 py-2 text-gray-600 hover:text-gray-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleApplyToLive}
+                  disabled={applying}
+                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {applying ? 'Applying...' : 'Confirm Apply'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Multi-Scenario Comparison Results (Issue #7 Fix) */}
+      {comparisonResults.size >= 2 && (
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-gray-200 bg-purple-50">
+            <h3 className="font-semibold text-purple-800">
+              Scenario Comparison ({comparisonResults.size} scenarios)
+            </h3>
+            <p className="text-sm text-purple-600">
+              Side-by-side comparison of selected scenarios
+            </p>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                    Metric
+                  </th>
+                  {Array.from(comparisonResults.keys()).map((scenarioId) => {
+                    const scenario = scenarios.find((s) => s.id === scenarioId);
+                    return (
+                      <th
+                        key={scenarioId}
+                        className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase"
+                      >
+                        {scenario?.name || 'Scenario'}
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {/* Variance comparison */}
+                <tr>
+                  <td className="px-4 py-3 text-sm font-medium text-gray-900">
+                    Projected Variance
+                  </td>
+                  {Array.from(comparisonResults.entries()).map(([id, result]) => {
+                    const allValues = Array.from(comparisonResults.values()).map(
+                      (r) => r.projectedVariance
+                    );
+                    const isBest = result.projectedVariance === Math.min(...allValues);
+                    return (
+                      <td
+                        key={id}
+                        className={`px-4 py-3 text-sm text-center ${
+                          isBest
+                            ? 'bg-green-100 text-green-800 font-bold'
+                            : 'text-gray-600'
+                        }`}
+                      >
+                        {result.projectedVariance}%
+                        {isBest && ' ✓'}
+                      </td>
+                    );
+                  })}
+                </tr>
+                {/* Dead Running comparison */}
+                <tr>
+                  <td className="px-4 py-3 text-sm font-medium text-gray-900">
+                    Dead Running
+                  </td>
+                  {Array.from(comparisonResults.entries()).map(([id, result]) => {
+                    const allValues = Array.from(comparisonResults.values()).map(
+                      (r) => r.projectedDeadRunning
+                    );
+                    const isBest = result.projectedDeadRunning === Math.min(...allValues);
+                    return (
+                      <td
+                        key={id}
+                        className={`px-4 py-3 text-sm text-center ${
+                          isBest
+                            ? 'bg-green-100 text-green-800 font-bold'
+                            : 'text-gray-600'
+                        }`}
+                      >
+                        {result.projectedDeadRunning} km
+                        {isBest && ' ✓'}
+                      </td>
+                    );
+                  })}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          {/* Actions */}
+          <div className="p-4 bg-gray-50 border-t flex justify-end gap-4">
+            <button
+              onClick={() => {
+                setComparisonResults(new Map());
+                setSelectedForComparison(new Set());
+              }}
+              className="px-4 py-2 text-gray-600 hover:text-gray-800"
+            >
+              Clear Comparison
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Empty State */}
+      {scenarios.length === 0 && (
+        <div className="bg-gray-100 border border-gray-200 rounded-lg p-8 text-center">
+          <div className="text-4xl mb-4">🔬</div>
+          <h3 className="text-lg font-medium text-gray-900 mb-2">
+            No Scenarios Yet
+          </h3>
+          <p className="text-gray-600">
+            Create a scenario above to start testing allocation strategies
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}

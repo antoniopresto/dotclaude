@@ -1,0 +1,327 @@
+# Technical Architecture Document
+## Theia Preview
+
+**Version:** 1.0.0
+**Last Updated:** 2025-12-23
+
+---
+
+## System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         macOS Finder                             │
+│                    (Space key triggers Quick Look)               │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Quick Look Framework                          │
+│                  (Discovers & loads extension)                   │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  TheiaPreviewExtension.appex                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
+│  │   Preview   │  │   Syntax    │  │    Theme Engine         │  │
+│  │  Provider   │──│   Engine    │──│  (JSON → NSColor)       │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
+│         │                │                     │                 │
+│         ▼                ▼                     ▼                 │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                    Text View / Editor                        ││
+│  │              (NSTextView + Syntax Attributes)                ││
+│  └─────────────────────────────────────────────────────────────┘│
+│         │                                                        │
+│         ▼                                                        │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                   LSP Client (Optional)                      ││
+│  │           Swift LSP │ TypeScript LSP │ ...                   ││
+│  └─────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    TheiaPreview.app (Host)                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
+│  │  Settings   │  │   Theme     │  │   Extension             │  │
+│  │     UI      │  │  Manager    │  │   Registration          │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Component Architecture
+
+### 1. Quick Look Extension (`TheiaPreviewExtension.appex`)
+
+The core extension that implements `QLPreviewingController`.
+
+```swift
+// Entry point
+class PreviewViewController: NSViewController, QLPreviewingController {
+    func preparePreviewOfFile(at url: URL) async throws {
+        let content = try String(contentsOf: url)
+        let language = LanguageDetector.detect(url: url)
+        let theme = ThemeManager.shared.currentTheme
+        let highlighted = try await SyntaxEngine.highlight(content, language: language, theme: theme)
+        textView.attributedString = highlighted
+    }
+}
+```
+
+**Responsibilities:**
+- Receive file URL from Quick Look
+- Detect language/file type
+- Apply syntax highlighting
+- Render preview
+- Handle inline editing (if enabled)
+
+### 2. Syntax Engine (`TheiaSyntax`)
+
+Tree-sitter based syntax highlighting engine.
+
+```swift
+public struct SyntaxEngine {
+    private let parsers: [Language: TreeSitterParser]
+
+    public func highlight(_ content: String, language: Language, theme: Theme) async throws -> NSAttributedString {
+        let parser = parsers[language] ?? parsers[.plainText]
+        let tree = parser.parse(content)
+        let tokens = TokenExtractor.extract(from: tree)
+        return AttributedStringBuilder.build(content: content, tokens: tokens, theme: theme)
+    }
+}
+```
+
+**Supported Language Detection:**
+- File extension mapping
+- Shebang detection (`#!/bin/bash`)
+- Content-based heuristics
+
+### 3. Theme Engine (`TheiaThemes`)
+
+JSON-based theme loading and color management.
+
+```swift
+public struct Theme: Codable {
+    let name: String
+    let type: ThemeType // dark | light | high-contrast
+    let colors: EditorColors
+    let tokenColors: [TokenColorRule]
+    let semanticTokenColors: [String: TokenStyle]?
+}
+
+public class ThemeManager {
+    static let shared = ThemeManager()
+
+    var currentTheme: Theme
+    var availableThemes: [Theme]
+
+    func loadTheme(from url: URL) throws -> Theme
+    func switchTheme(to id: String)
+    func observeSystemAppearance() // Auto light/dark switching
+}
+```
+
+### 4. LSP Integration (`TheiaLSP`)
+
+Optional Language Server Protocol client for semantic highlighting.
+
+```swift
+public class LSPClient {
+    let serverPath: URL
+    let language: Language
+
+    func start() async throws
+    func requestSemanticTokens(for document: URL) async throws -> [SemanticToken]
+    func shutdown()
+}
+
+// Swift LSP via SourceKit-LSP
+public class SwiftLSPClient: LSPClient {
+    init() {
+        super.init(
+            serverPath: URL(fileURLWithPath: "/usr/bin/sourcekit-lsp"),
+            language: .swift
+        )
+    }
+}
+```
+
+### 5. Editor Component (`TheiaEditor`)
+
+Optional inline editing with NSTextView.
+
+```swift
+public class TheiaTextView: NSTextView {
+    var isEditingEnabled: Bool
+    var syntaxEngine: SyntaxEngine
+    var theme: Theme
+
+    // Real-time syntax highlighting during editing
+    override func didChangeText() {
+        Task {
+            await rehighlight()
+        }
+    }
+
+    // Undo/redo support
+    // Line numbers
+    // Current line highlighting
+}
+```
+
+### 6. Settings App (`TheiaPreview.app`)
+
+Host application with configuration UI.
+
+```swift
+struct SettingsView: View {
+    @AppStorage("selectedTheme") var selectedTheme: String
+    @AppStorage("fontFamily") var fontFamily: String
+    @AppStorage("fontSize") var fontSize: Int
+    @AppStorage("editingEnabled") var editingEnabled: Bool
+
+    var body: some View {
+        Form {
+            Section("Appearance") {
+                ThemePicker(selection: $selectedTheme)
+                FontPicker(selection: $fontFamily)
+                Stepper("Font Size: \(fontSize)", value: $fontSize, in: 8...32)
+            }
+            Section("Editing") {
+                Toggle("Enable Inline Editing", isOn: $editingEnabled)
+            }
+        }
+    }
+}
+```
+
+## Data Flow
+
+### Preview Request
+```
+1. User presses Space on file.swift
+2. Quick Look finds TheiaPreviewExtension (via UTI declaration)
+3. Extension receives URL
+4. Language detection: .swift → Swift
+5. Theme loaded from UserDefaults
+6. Tree-sitter parses Swift code
+7. (Optional) Swift LSP provides semantic tokens
+8. Tokens + Theme → NSAttributedString
+9. NSTextView displays result
+```
+
+### Theme Loading
+```
+1. App startup
+2. Load built-in themes from bundle
+3. Load custom themes from ~/Library/Application Support/TheiaPreview/Themes/
+4. Merge and dedupe
+5. Apply selected theme (from UserDefaults)
+6. Subscribe to system appearance changes
+```
+
+### Inline Editing
+```
+1. User clicks in preview (if editing enabled)
+2. NSTextView becomes first responder
+3. User types
+4. didChangeText triggers incremental re-highlight
+5. User presses Cmd+S or closes preview
+6. File saved to original URL
+```
+
+## File System Layout
+
+```
+~/Library/Application Support/TheiaPreview/
+├── Themes/                    # Custom user themes
+│   └── my-custom-theme.json
+├── settings.plist             # App configuration
+└── cache/
+    ├── parsers/               # Cached Tree-sitter parsers
+    └── themes/                # Parsed theme cache
+```
+
+## Performance Considerations
+
+### Large File Handling
+- **Virtual scrolling:** Only render visible lines
+- **Lazy parsing:** Parse visible range + buffer
+- **Background threads:** Syntax parsing off main thread
+- **Incremental updates:** Re-parse only changed regions
+
+### Memory Management
+- **File size limit:** 10MB (configurable)
+- **Parser pooling:** Reuse Tree-sitter parsers
+- **Theme caching:** Parse JSON once, cache NSColor objects
+
+### Benchmarks (Targets)
+| Operation | Target |
+|-----------|--------|
+| Preview load (< 100KB) | < 100ms |
+| Preview load (1MB) | < 500ms |
+| Edit keystroke response | < 16ms (60fps) |
+| Theme switch | < 50ms |
+
+## Security Model
+
+### Sandbox Entitlements
+```xml
+<key>com.apple.security.app-sandbox</key>
+<true/>
+<key>com.apple.security.files.user-selected.read-write</key>
+<true/>
+<key>com.apple.security.files.bookmarks.app-scope</key>
+<true/>
+```
+
+### No Network Access
+- All functionality offline
+- No telemetry or analytics
+- Themes loaded from local filesystem only
+
+## Testing Strategy
+
+### Unit Tests
+- Syntax engine token extraction
+- Theme JSON parsing
+- Language detection
+- LSP message handling
+
+### Integration Tests
+- Quick Look extension loading
+- End-to-end preview rendering
+- Settings persistence
+
+### Performance Tests
+- Large file benchmarks
+- Memory leak detection
+- Startup time measurement
+
+## Dependencies
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| SwiftTreeSitter | 0.8+ | Syntax parsing |
+| swift-markdown | 0.3+ | Markdown rendering |
+| swift-syntax | 509+ | Swift-specific parsing |
+| SourceKit-LSP | System | Swift LSP |
+
+## Future Considerations
+
+### Plugin Architecture (v2.0)
+- Custom language definitions
+- User-installable syntax grammars
+- Theme marketplace
+
+### Platform Expansion
+- iPadOS Quick Look (when API available)
+- visionOS support
+
+### Advanced Features
+- Git blame overlay
+- Symbol navigation
+- Code folding

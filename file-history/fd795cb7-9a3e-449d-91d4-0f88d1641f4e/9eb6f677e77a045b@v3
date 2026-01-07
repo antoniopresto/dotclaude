@@ -1,0 +1,190 @@
+# F013: Storage Architecture - Plano Final
+
+## Decisao: Database-First (SEM arquivos texto)
+
+### Requisitos Confirmados
+- **NAO usar**: JSON, JSONL, TXT para dados de sessao
+- **USAR**: Database real (SQLite, GraphLite, ou similar)
+- **Graph-capable**: Conexao criativa de conceitos (pode ser DB separado)
+- **CLI**: Binario/script para query, view features (FUTURO - outra task)
+- **Sem watch**: DB e SSOT (Single Source of Truth)
+
+### Estrutura Proposta
+```
+.harness/
+├── features.json     # MANTER (pequeno, estruturado, já funciona)
+└── data/
+    ├── harness.db    # SQLite: sessoes, eventos, metadata
+    └── graph.db      # GraphLite: conexoes entre conceitos (opcional)
+```
+
+### Por que SQLite + GraphLite?
+
+| Criterio | SQLite | GraphLite | LanceDB |
+|----------|--------|-----------|---------|
+| Maturidade | Excelente | Novo (Dez 2025) | Boa |
+| Queries | SQL | ISO GQL | Vector/SQL |
+| Graph nativo | Nao | **Sim** | Nao |
+| Tamanho | Pequeno | Pequeno | Grande |
+| Rust crate | rusqlite | graphlite | lancedb |
+| Git conflicts | Raros | ? | Raros |
+
+---
+
+## Arquivos a Criar
+
+| Arquivo | Proposito |
+|---------|-----------|
+| `src-tauri/src/harness/mod.rs` | Modulo principal |
+| `src-tauri/src/harness/types.rs` | Structs e enums |
+| `src-tauri/src/harness/db.rs` | SQLite operations |
+| `src-tauri/src/harness/graph.rs` | GraphLite (conexoes) |
+| `src-tauri/src/harness/migrate.rs` | Migrar progress.txt -> DB |
+| `src-tauri/src/harness/commands.rs` | Tauri commands |
+| `src/types/harness.ts` | TypeScript types |
+| `src/lib/harness.ts` | Frontend API client |
+
+## Arquivos a Modificar
+
+| Arquivo | Mudanca |
+|---------|---------|
+| `src-tauri/src/lib.rs` | Adicionar mod harness |
+| `src-tauri/Cargo.toml` | Deps: rusqlite, graphlite, chrono |
+| `src/lib/rpc.ts` | Wrappers para harness_* |
+| `src/state/store.ts` | Slice para sessions |
+
+---
+
+## Schema do Banco (SQLite)
+
+```sql
+-- Sessoes de trabalho
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,           -- UUID v7
+    started_at TEXT NOT NULL,      -- ISO 8601
+    ended_at TEXT,
+    title TEXT NOT NULL,
+    model TEXT,                    -- claude-opus-4-5-20251101
+    commit_sha TEXT
+);
+
+-- Secoes dentro de sessao
+CREATE TABLE sections (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    section_type TEXT NOT NULL,    -- what_was_done, key_learnings, etc.
+    content TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+
+-- Items (bullets) extraidos
+CREATE TABLE items (
+    id TEXT PRIMARY KEY,
+    section_id TEXT NOT NULL REFERENCES sections(id),
+    content TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+
+-- Features trabalhadas por sessao
+CREATE TABLE session_features (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    feature_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, feature_id)
+);
+
+-- Tags customizadas
+CREATE TABLE session_tags (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    tag TEXT NOT NULL,
+    PRIMARY KEY (session_id, tag)
+);
+
+-- Indices para queries comuns
+CREATE INDEX idx_sessions_date ON sessions(started_at);
+CREATE INDEX idx_sections_session ON sections(session_id);
+CREATE INDEX idx_items_section ON items(section_id);
+```
+
+---
+
+## Comandos Tauri
+
+```rust
+// Deteccao e info
+harness_detect(project_path) -> HarnessInfo
+harness_stats(project_path) -> HarnessStats
+
+// Leitura (paginado, eficiente)
+harness_list_sessions(project_path, limit?, offset?) -> Vec<SessionSummary>
+harness_get_session(project_path, session_id) -> Session
+harness_get_features(project_path) -> Vec<Feature>
+
+// Busca (SQL FTS ou LIKE)
+harness_search(project_path, query, limit?) -> Vec<SearchResult>
+
+// Graph queries (GraphLite)
+harness_related_concepts(project_path, concept) -> Vec<Concept>
+harness_feature_history(project_path, feature_id) -> Vec<Session>
+
+// Migracao (one-time)
+harness_migrate(project_path, dry_run) -> MigrationResult
+```
+
+---
+
+## Dependencias Rust
+
+```toml
+# SQLite (embarcado, bundled)
+rusqlite = { version = "0.33", features = ["bundled"] }
+
+# Graph DB (verificar disponibilidade)
+graphlite = "0.1"  # ou graphlite-rust-sdk
+
+# Utilitarios
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+regex = "1"  # Para migracao de progress.txt
+```
+
+---
+
+## Ordem de Implementacao
+
+1. **Schema SQLite** (~1h) - Criar tabelas, tipos Rust
+2. **DB Operations** (~2h) - CRUD para sessions, sections, items
+3. **Tauri Commands** (~2h) - detect, list, get, search
+4. **Migracao** (~2h) - Parser progress.txt -> SQLite
+5. **Frontend** (~2h) - Types TS, RPC, state
+6. **GraphLite** (fase 2) - Conexoes entre conceitos
+
+**Total estimado: ~9h (fase 1) + GraphLite depois**
+
+---
+
+## Estrategia de Migracao
+
+1. Detectar se projeto tem progress.txt
+2. Parse com regex tolerante
+3. Inserir sessoes no SQLite
+4. OPCIONAL: Manter progress.txt como backup (gitignore)
+5. Proximas sessoes vao direto pro DB
+
+---
+
+## Riscos Mitigados
+
+| Risco | Mitigacao |
+|-------|-----------|
+| progress.txt malformado | Parser tolerante, skip linhas invalidas |
+| SQLite corrompido | WAL mode, backups automaticos |
+| GraphLite indisponivel | Fase 2, fallback para SQL joins |
+| Git conflicts no .db | Arquivo pequeno, conflitos raros |
+
+---
+
+## Tasks Relacionadas (FUTURO)
+
+- **CLI de query**: Binario para `hq query "feature X"` (nova task)
+- **GraphLite integration**: Conexao de conceitos (F013 fase 2)
+- **Semantic search**: LanceDB embeddings (opcional)

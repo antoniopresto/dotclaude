@@ -1,0 +1,510 @@
+#!/bin/bash
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MMS Harness Manager
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# A unified interface for managing the MMS harness workflow.
+#
+# Usage: ./harness-manager.sh [command] [options]
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+set -e
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FEATURES_FILE="$SCRIPT_DIR/features.json"
+PROGRESS_FILE="$SCRIPT_DIR/claude-progress.txt"
+ORCHESTRATOR_DIR="$SCRIPT_DIR/packages/harness-orchestrator"
+ORCHESTRATOR_CLI="$ORCHESTRATOR_DIR/dist/cli/index.js"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+print_header() {
+    echo -e "\n${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  $1${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+}
+
+print_section() {
+    echo -e "\n${CYAN}▸ $1${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠ $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}✗ $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ $1${NC}"
+}
+
+print_dim() {
+    echo -e "${DIM}  $1${NC}"
+}
+
+# Check if orchestrator is built
+check_orchestrator() {
+    if [[ ! -f "$ORCHESTRATOR_CLI" ]]; then
+        print_warning "Harness orchestrator not built"
+        print_dim "Building now..."
+        cd "$ORCHESTRATOR_DIR" && bun run build
+        cd "$SCRIPT_DIR"
+        print_success "Orchestrator built"
+    fi
+}
+
+# Count features by status
+count_features() {
+    local total=$(jq '.features | length' "$FEATURES_FILE" 2>/dev/null || echo "0")
+    local completed=$(jq '[.features[] | select(.passes == true)] | length' "$FEATURES_FILE" 2>/dev/null || echo "0")
+    local pending=$((total - completed))
+    echo "$total $completed $pending"
+}
+
+# Get next ready feature
+get_next_feature() {
+    jq -r '
+        .features
+        | map(select(.passes == false))
+        | map(select(
+            .blockedBy == null or
+            .blockedBy == "" or
+            (
+                if type == "array" then
+                    all(. as $dep | $ARGS.positional | index($dep))
+                else
+                    . as $dep | $ARGS.positional | index($dep)
+                end
+            )
+        ))
+        | .[0]
+        | "\(.id)|\(.description // "No description")"
+    ' --args $(jq -r '.features[] | select(.passes == true) | .id' "$FEATURES_FILE") "$FEATURES_FILE" 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    print_header "🚀 MMS Harness Manager"
+
+    echo -e "${BOLD}USAGE:${NC}"
+    echo "    ./harness-manager.sh [command] [options]"
+    echo ""
+
+    echo -e "${BOLD}COMMANDS:${NC}"
+    echo -e "    ${CYAN}status${NC}        Show current harness status and progress"
+    echo -e "    ${CYAN}next${NC}          Show next feature to work on"
+    echo -e "    ${CYAN}analyze${NC}       Analyze dependencies and critical path"
+    echo -e "    ${CYAN}dashboard${NC}     Show interactive dashboard"
+    echo -e "    ${CYAN}doctor${NC}        Validate harness health"
+    echo -e "    ${CYAN}session${NC}       Start a new session in progress file"
+    echo -e "    ${CYAN}log${NC} <msg>     Add quick note to progress file"
+    echo -e "    ${CYAN}commit${NC} <id>   Prepare commit for feature"
+    echo -e "    ${CYAN}verify${NC}        Verify completed features"
+    echo -e "    ${CYAN}branches${NC}      List feature branches"
+    echo -e "    ${CYAN}claude${NC}        Start Claude Code with harness context"
+    echo -e "    ${CYAN}orchestrate${NC}   Run parallel orchestration (advanced)"
+    echo -e "    ${CYAN}build${NC}         Build the orchestrator package"
+    echo -e "    ${CYAN}help${NC}          Show this help message"
+    echo ""
+
+    echo -e "${BOLD}QUICK START:${NC}"
+    echo "    1. ./harness-manager.sh status    # Check current state"
+    echo "    2. ./harness-manager.sh next      # See next feature"
+    echo "    3. ./harness-manager.sh claude    # Start Claude Code"
+    echo ""
+
+    echo -e "${BOLD}EXAMPLES:${NC}"
+    echo "    ./harness-manager.sh status"
+    echo "    ./harness-manager.sh next"
+    echo "    ./harness-manager.sh log \"Fixed F123 visual bug\""
+    echo "    ./harness-manager.sh commit F123"
+    echo "    ./harness-manager.sh claude --model opus"
+    echo ""
+}
+
+cmd_status() {
+    print_header "📊 Harness Status"
+
+    if [[ ! -f "$FEATURES_FILE" ]]; then
+        print_error "features.json not found"
+        exit 1
+    fi
+
+    # Basic stats
+    read total completed pending <<< $(count_features)
+    local percent=$((completed * 100 / total))
+
+    # Progress bar
+    local filled=$((percent / 5))
+    local empty=$((20 - filled))
+    local bar=$(printf '█%.0s' $(seq 1 $filled 2>/dev/null || echo ""))
+    bar+=$(printf '░%.0s' $(seq 1 $empty 2>/dev/null || echo ""))
+
+    echo -e "${BOLD}Project:${NC} $(jq -r '.project // "MMS"' "$FEATURES_FILE")"
+    echo -e "${BOLD}Version:${NC} $(jq -r '.version // "0.0.0"' "$FEATURES_FILE")"
+    echo -e "${BOLD}Updated:${NC} $(jq -r '.lastUpdated // "unknown"' "$FEATURES_FILE")"
+    echo ""
+    echo -e "${BOLD}Progress:${NC} [$bar] $percent%"
+    echo -e "  ${GREEN}$completed${NC} completed / ${YELLOW}$pending${NC} pending / $total total"
+
+    # Recent sessions from progress file
+    if [[ -f "$PROGRESS_FILE" ]]; then
+        print_section "Recent Sessions"
+        grep -E "^## Session" "$PROGRESS_FILE" | tail -3 | while read line; do
+            echo -e "  ${DIM}$line${NC}"
+        done
+    fi
+
+    # Ready features
+    print_section "Ready to Work On"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" analyze "$FEATURES_FILE" 2>/dev/null | grep -A10 "Ready to run" | tail -n +2 | head -5 || echo "  (none)"
+
+    echo ""
+}
+
+cmd_next() {
+    print_header "🎯 Next Feature"
+
+    if [[ ! -f "$FEATURES_FILE" ]]; then
+        print_error "features.json not found"
+        exit 1
+    fi
+
+    check_orchestrator
+
+    # Use orchestrator to get next feature with priority
+    local next_info=$(node "$ORCHESTRATOR_CLI" analyze "$FEATURES_FILE" 2>/dev/null | grep -A20 "Ready to run" | grep -E "^\s+[A-Z]" | head -1)
+
+    if [[ -z "$next_info" ]]; then
+        read total completed pending <<< $(count_features)
+        if [[ "$pending" -eq 0 ]]; then
+            print_success "All features are complete! 🎉"
+        else
+            print_warning "No features ready - all are blocked"
+            echo ""
+            echo "Blocked features:"
+            jq -r '.features[] | select(.passes == false) | "  \(.id): blocked by \(.blockedBy // "nothing")"' "$FEATURES_FILE"
+        fi
+        exit 0
+    fi
+
+    # Extract feature ID from the output
+    local feature_id=$(echo "$next_info" | grep -oE '[A-Z][0-9]{3}' | head -1)
+
+    if [[ -n "$feature_id" ]]; then
+        local feature=$(jq -r ".features[] | select(.id == \"$feature_id\")" "$FEATURES_FILE")
+
+        echo -e "${BOLD}Feature:${NC} ${CYAN}$feature_id${NC}"
+        echo -e "${BOLD}Description:${NC} $(echo "$feature" | jq -r '.description')"
+        echo -e "${BOLD}Category:${NC} $(echo "$feature" | jq -r '.category // "general"')"
+        echo -e "${BOLD}Priority:${NC} $(echo "$feature" | jq -r '.priority // "normal"')"
+
+        local blocked_by=$(echo "$feature" | jq -r '.blockedBy // empty')
+        if [[ -n "$blocked_by" && "$blocked_by" != "null" ]]; then
+            echo -e "${BOLD}Blocked By:${NC} $blocked_by"
+        fi
+
+        # Show steps if available
+        local steps=$(echo "$feature" | jq -r '.steps // empty')
+        if [[ -n "$steps" && "$steps" != "null" && "$steps" != "[]" ]]; then
+            echo ""
+            echo -e "${BOLD}Steps:${NC}"
+            echo "$feature" | jq -r '.steps[]' | nl -w2 -s'. '
+        fi
+
+        local notes=$(echo "$feature" | jq -r '.notes // empty')
+        if [[ -n "$notes" && "$notes" != "null" ]]; then
+            echo ""
+            echo -e "${BOLD}Notes:${NC} $notes"
+        fi
+
+        echo ""
+        echo -e "${DIM}Run: ./harness-manager.sh claude${NC}"
+    else
+        print_warning "Could not determine next feature"
+    fi
+}
+
+cmd_analyze() {
+    print_header "🔍 Dependency Analysis"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" analyze "$FEATURES_FILE"
+}
+
+cmd_dashboard() {
+    print_header "📈 Dashboard"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" dashboard "$FEATURES_FILE"
+}
+
+cmd_doctor() {
+    print_header "🩺 Harness Doctor"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" doctor "$SCRIPT_DIR" "${@}"
+}
+
+cmd_session() {
+    local title="${1:-New Session}"
+    print_header "📝 New Session"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" session "$SCRIPT_DIR" -t "$title"
+}
+
+cmd_log() {
+    if [[ -z "$1" ]]; then
+        print_error "Usage: ./harness-manager.sh log <message>"
+        exit 1
+    fi
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" log "$1" -p "$SCRIPT_DIR"
+}
+
+cmd_commit() {
+    local feature_id="$1"
+    if [[ -z "$feature_id" ]]; then
+        print_error "Usage: ./harness-manager.sh commit <feature-id>"
+        echo "Example: ./harness-manager.sh commit F123"
+        exit 1
+    fi
+    print_header "🔐 Commit Workflow"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" commit "$SCRIPT_DIR" -f "$feature_id" "${@:2}"
+}
+
+cmd_verify() {
+    print_header "✅ Verification"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" verify "$FEATURES_FILE" "${@}"
+}
+
+cmd_branches() {
+    print_header "🌿 Feature Branches"
+    check_orchestrator
+    node "$ORCHESTRATOR_CLI" branches "$FEATURES_FILE" "${@}"
+}
+
+cmd_orchestrate() {
+    print_header "🤖 Parallel Orchestration"
+    check_orchestrator
+
+    print_warning "This will spawn multiple Claude agents in parallel"
+    echo ""
+    echo "Options:"
+    echo "  --dry-run        Show plan without executing"
+    echo "  --max-agents N   Limit concurrent agents (default: 3)"
+    echo "  --model MODEL    Model to use: haiku, sonnet, opus"
+    echo "  --dashboard      Show live dashboard"
+    echo ""
+
+    node "$ORCHESTRATOR_CLI" orchestrate "$FEATURES_FILE" "${@}"
+}
+
+cmd_build() {
+    print_header "🔨 Building Orchestrator"
+    cd "$ORCHESTRATOR_DIR"
+
+    print_section "Installing dependencies"
+    bun install
+
+    print_section "Building TypeScript"
+    bun run build
+
+    print_success "Build complete"
+    cd "$SCRIPT_DIR"
+}
+
+cmd_claude() {
+    print_header "🤖 Starting Claude Code"
+
+    # Parse arguments
+    local model="sonnet"
+    local debug=""
+    local verbose=""
+    local skip_permissions=""
+    local append_prompt=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --model)
+                model="$2"
+                shift 2
+                ;;
+            --opus)
+                model="opus"
+                shift
+                ;;
+            --haiku)
+                model="haiku"
+                shift
+                ;;
+            --debug)
+                debug="--debug"
+                shift
+                ;;
+            --verbose)
+                verbose="--verbose"
+                shift
+                ;;
+            --skip-permissions)
+                skip_permissions="--dangerously-skip-permissions"
+                shift
+                ;;
+            --append-prompt)
+                append_prompt="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Get next feature for context
+    local next_feature=$(jq -r '
+        .features
+        | map(select(.passes == false))
+        | .[0]
+        | "\(.id): \(.description // "pending feature")"
+    ' "$FEATURES_FILE" 2>/dev/null || echo "")
+
+    read total completed pending <<< $(count_features)
+
+    # Build system prompt
+    local system_prompt="Continue the harness workflow.
+Current progress: $completed/$total features complete.
+Next feature to work on: $next_feature
+
+PROTOCOL:
+1. Read claude-progress.txt for context
+2. Read features.json for next feature (passes: false)
+3. Implement ONE feature at a time
+4. Test with Playwright MCP (visual verification)
+5. Update features.json (passes: true)
+6. Update claude-progress.txt
+7. Commit changes"
+
+    if [[ -n "$append_prompt" ]]; then
+        system_prompt="$system_prompt
+
+$append_prompt"
+    fi
+
+    echo -e "${BOLD}Model:${NC} $model"
+    echo -e "${BOLD}Features:${NC} $completed/$total complete"
+    echo -e "${BOLD}Next:${NC} $next_feature"
+    echo ""
+
+    print_info "Starting Claude Code..."
+    echo ""
+
+    # Build command
+    local cmd="claude"
+    [[ -n "$debug" ]] && cmd="$cmd $debug"
+    [[ -n "$verbose" ]] && cmd="$cmd $verbose"
+    [[ -n "$skip_permissions" ]] && cmd="$cmd $skip_permissions"
+    cmd="$cmd --append-system-prompt=\"$system_prompt\""
+
+    # Execute
+    eval "$cmd"
+}
+
+cmd_quick_status() {
+    # One-liner status for shell prompt integration
+    if [[ ! -f "$FEATURES_FILE" ]]; then
+        echo "⚠ no harness"
+        exit 0
+    fi
+
+    read total completed pending <<< $(count_features)
+    local percent=$((completed * 100 / total))
+    echo "📊 $completed/$total ($percent%)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        status|s)
+            cmd_status
+            ;;
+        next|n)
+            cmd_next
+            ;;
+        analyze|a)
+            cmd_analyze
+            ;;
+        dashboard|d)
+            cmd_dashboard
+            ;;
+        doctor)
+            cmd_doctor "$@"
+            ;;
+        session)
+            cmd_session "$@"
+            ;;
+        log|l)
+            cmd_log "$@"
+            ;;
+        commit|c)
+            cmd_commit "$@"
+            ;;
+        verify|v)
+            cmd_verify "$@"
+            ;;
+        branches|b)
+            cmd_branches "$@"
+            ;;
+        orchestrate|o)
+            cmd_orchestrate "$@"
+            ;;
+        build)
+            cmd_build
+            ;;
+        claude|cl)
+            cmd_claude "$@"
+            ;;
+        quick)
+            cmd_quick_status
+            ;;
+        help|h|--help|-h)
+            cmd_help
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            echo "Run './harness-manager.sh help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

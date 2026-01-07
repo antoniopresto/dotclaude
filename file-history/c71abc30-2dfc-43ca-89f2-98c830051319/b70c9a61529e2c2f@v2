@@ -1,0 +1,230 @@
+"""SENIOR_ENGINEER Agent - Implements the feature.
+
+Consolidates: ARCHITECT + TECH_LEAD + ENGINEER
+
+Responsibilities:
+- Design technical approach
+- Make stack decisions
+- Implement production-grade code
+- Write tests
+- Ensure code quality
+"""
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+
+import sys
+sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
+from src.graph.state import PharosState
+from src.tools.code_tools import (
+    read_file,
+    write_file,
+    list_files,
+    run_command,
+    run_typecheck,
+    run_lint,
+    run_tests,
+)
+from .base import get_llm, add_to_history, format_state_for_prompt
+
+
+SENIOR_ENGINEER_SYSTEM_PROMPT = """You are the PHAROS SENIOR_ENGINEER agent.
+
+You consolidate the roles of ARCHITECT, TECH_LEAD, and ENGINEER.
+Your job is to define HOW the feature will be built and then implement it.
+
+## Your Responsibilities
+
+### As ARCHITECT:
+- Design the technical approach
+- Identify files to create/modify
+- Ensure proper separation of concerns
+- Maintain architectural constraints
+
+### As TECH_LEAD:
+- Make technology decisions
+- Ensure code follows project standards
+- Review approach for scalability and maintainability
+
+### As ENGINEER:
+- Write production-grade TypeScript code
+- Write comprehensive tests
+- Ensure all type checks pass
+- Ensure lint rules are followed
+
+## Project Constraints (Non-Negotiable)
+
+| Feature | Allowed | Forbidden |
+|---------|---------|-----------|
+| Scrolling | Virtual Scroller (Math-based) | Native DOM / Ghost Divs |
+| Data | TypedArrays, SoA, Maps | Array of Objects (large data) |
+| State | Zustand (transient + global) | Redux, Context (high-freq) |
+| Rendering | PixiJS (WebGL), Shaders | DOM (>100 items), SVG |
+| Animation | requestAnimationFrame | setInterval, setTimeout |
+
+## Code Standards
+
+- **No `any` types** - Use `unknown` or generics
+- **JSDoc on exports** - Explain WHY, not just WHAT
+- **No console.log** in production code
+- **Comprehensive tests** - Unit tests for logic
+
+## Tools Available
+
+You have access to:
+- `read_file(path)` - Read file contents
+- `write_file(path, content)` - Write file
+- `list_files(dir, pattern)` - List files
+- `run_command(cmd)` - Run shell command
+- `run_typecheck()` - Run TypeScript check
+- `run_lint()` - Run ESLint
+- `run_tests()` - Run Vitest
+
+## Output Format
+
+After implementing, respond with JSON:
+
+```json
+{
+    "implementation": {
+        "approach": "Description of technical approach",
+        "files_to_modify": ["path1", "path2"],
+        "files_to_create": ["path3"],
+        "files_changed": ["path1", "path2", "path3"],
+        "commits": [],
+        "test_results": {
+            "passed": true,
+            "summary": "All tests passed"
+        }
+    },
+    "code_complete": true,
+    "engineer_notes": "Any notes for THE_AUDITOR"
+}
+```
+
+## Important
+
+1. Read the PRODUCT_DESIGN spec carefully - implement EXACTLY what was specified
+2. Run typecheck and lint BEFORE marking complete
+3. If tests fail, fix them - don't mark complete with failing tests
+4. THE_AUDITOR will verify against the spec - be accurate
+"""
+
+
+def run_senior_engineer(state: PharosState) -> PharosState:
+    """Run the SENIOR_ENGINEER agent.
+
+    Implements the feature based on specifications.
+    """
+    from langchain.agents import AgentExecutor, create_tool_calling_agent
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+    llm = get_llm()
+
+    # Available tools
+    tools = [
+        read_file,
+        write_file,
+        list_files,
+        run_command,
+        run_typecheck,
+        run_lint,
+        run_tests,
+    ]
+
+    # Build context
+    state_summary = format_state_for_prompt(state)
+
+    # Check if this is a retry (has rejection reasons)
+    retry_context = ""
+    if state.get("rejection_reasons"):
+        retry_context = f"""
+## IMPORTANT: This is a RETRY
+
+Previous attempt was rejected. Issues to fix:
+{chr(10).join('- ' + r for r in state['rejection_reasons'])}
+
+Address ALL of these issues in this iteration.
+"""
+
+    # Create prompt
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SENIOR_ENGINEER_SYSTEM_PROMPT),
+        ("human", f"""Implement this feature:
+
+{state_summary}
+{retry_context}
+
+Steps:
+1. Read the visual and technical specifications carefully
+2. Design your approach
+3. List files that need changes
+4. Implement the changes
+5. Run typecheck and lint
+6. Run tests
+7. Report results
+
+Use the tools to read/write files and run commands.
+When done, provide your final JSON summary."""),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+
+    # Create agent
+    agent = create_tool_calling_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        max_iterations=20,  # Allow multiple tool calls
+        handle_parsing_errors=True,
+    )
+
+    # Run agent
+    try:
+        result = agent_executor.invoke({})
+        output = result.get("output", "")
+
+        # Parse result
+        try:
+            import json
+            json_start = output.find("{")
+            json_end = output.rfind("}") + 1
+            if json_start >= 0 and json_end > json_start:
+                result_json = json.loads(output[json_start:json_end])
+
+                if "implementation" in result_json:
+                    state["implementation"] = result_json["implementation"]
+
+                state["code_complete"] = result_json.get("code_complete", False)
+                state["engineer_notes"] = result_json.get("engineer_notes")
+            else:
+                state["code_complete"] = False
+                state["engineer_notes"] = output
+
+        except json.JSONDecodeError:
+            state["code_complete"] = False
+            state["engineer_notes"] = output
+
+    except Exception as e:
+        state["code_complete"] = False
+        state["error"] = str(e)
+        state["engineer_notes"] = f"Error during implementation: {str(e)}"
+
+    # Update status
+    if state.get("code_complete"):
+        state["status"] = "review_pending"
+    else:
+        state["status"] = "in_progress"
+
+    state["current_agent"] = "senior_engineer"
+
+    # Clear rejection reasons if retry was successful
+    if state.get("code_complete") and state.get("rejection_reasons"):
+        state["rejection_reasons"] = []
+
+    add_to_history(state, "senior_engineer", "implementation", {
+        "code_complete": state.get("code_complete"),
+        "files_changed": state.get("implementation", {}).get("files_changed", []),
+    })
+
+    return state

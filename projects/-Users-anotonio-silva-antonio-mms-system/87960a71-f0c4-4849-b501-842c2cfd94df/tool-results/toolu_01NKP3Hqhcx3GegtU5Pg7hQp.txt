@@ -1,0 +1,210 @@
+     1→/**
+     2→ * MacroLayer - Strategic heatmap visualization
+     3→ *
+     4→ * Renders a heatmap showing task density across trains and time.
+     5→ * Visible at zoom levels < 0.5x (MACRO LOD level).
+     6→ *
+     7→ * Features:
+     8→ * - Aggregates tasks by month/train into cells
+     9→ * - Color gradient: yellow (low) → orange (medium) → red (high density)
+    10→ * - InstancedMesh for optimal performance
+    11→ * - Shows 10-20 year strategic overview
+    12→ *
+    13→ * D3-MIGRATE-001: Uses d3-scale-chromatic for heatmap color interpolation
+    14→ */
+    15→
+    16→import { useMemo, useRef, useEffect } from 'react';
+    17→import { InstancedMesh, Object3D, Color } from 'three';
+    18→import { interpolateYlOrRd } from 'd3-scale-chromatic';
+    19→import type { TaskRender } from '../../data/types';
+    20→import { DEFAULT_VIEW_CONFIG } from '../../data/types';
+    21→
+    22→interface MacroLayerProps {
+    23→  tasks: TaskRender[];
+    24→  trainCount: number;
+    25→  totalYears?: number;
+    26→  /** Opacity for LOD transitions (0-1). Default: 1 */
+    27→  opacity?: number;
+    28→}
+    29→
+    30→const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+    31→
+    32→// Heatmap cell size
+    33→const DAYS_PER_CELL = 30; // ~1 month per cell
+    34→const CELL_WIDTH = DAYS_PER_CELL * pxPerDay; // 300px
+    35→const CELL_HEIGHT = pxPerTrain; // 24px per train row
+    36→const CELL_GAP = 1; // Small gap between cells
+    37→
+    38→// Empty cell background color
+    39→const EMPTY_CELL_COLOR = '#f8fafc'; // slate-50
+    40→
+    41→/**
+    42→ * Interpolate between colors based on density (0-1)
+    43→ * D3-MIGRATE-001: Uses d3-scale-chromatic interpolateYlOrRd for heatmap colors
+    44→ *
+    45→ * The YlOrRd (Yellow-Orange-Red) scale is a standard sequential color scheme
+    46→ * designed for heatmaps, providing perceptually uniform color progression.
+    47→ */
+    48→function getHeatmapColor(density: number): Color {
+    49→  // No tasks = light background
+    50→  if (density === 0) {
+    51→    return new Color(EMPTY_CELL_COLOR);
+    52→  }
+    53→
+    54→  // Normalize density (0-1 range, with max around 8 tasks)
+    55→  const normalizedDensity = Math.min(density / 8, 1);
+    56→
+    57→  // Use d3 YlOrRd scale (0 = yellow, 1 = red)
+    58→  // Start at 0.1 to avoid very light yellow for low values
+    59→  const t = 0.1 + normalizedDensity * 0.9;
+    60→  const colorString = interpolateYlOrRd(t);
+    61→
+    62→  return new Color(colorString);
+    63→}
+    64→
+    65→/**
+    66→ * Calculate task density per cell
+    67→ * Returns a 2D array: [trainIndex][monthIndex] = task count
+    68→ */
+    69→function calculateDensityGrid(
+    70→  tasks: TaskRender[],
+    71→  trainCount: number,
+    72→  totalMonths: number
+    73→): number[][] {
+    74→  // Initialize grid with zeros
+    75→  const grid: number[][] = Array.from({ length: trainCount }, () =>
+    76→    Array(totalMonths).fill(0)
+    77→  );
+    78→
+    79→  // Count tasks in each cell
+    80→  for (const task of tasks) {
+    81→    // Calculate which month(s) this task spans
+    82→    const startMonth = Math.floor(task.startDay / DAYS_PER_CELL);
+    83→    const endMonth = Math.floor((task.startDay + task.duration) / DAYS_PER_CELL);
+    84→
+    85→    // Increment count for all months the task spans
+    86→    for (let month = startMonth; month <= endMonth && month < totalMonths; month++) {
+    87→      if (month >= 0 && task.trainIndex >= 0 && task.trainIndex < trainCount) {
+    88→        grid[task.trainIndex][month]++;
+    89→      }
+    90→    }
+    91→  }
+    92→
+    93→  return grid;
+    94→}
+    95→
+    96→/**
+    97→ * MacroLayer Component
+    98→ *
+    99→ * Renders the strategic heatmap visualization for the MACRO LOD level.
+   100→ */
+   101→export function MacroLayer({ tasks, trainCount, totalYears = 10, opacity = 1 }: MacroLayerProps) {
+   102→  const meshRef = useRef<InstancedMesh>(null);
+   103→  const tempObject = useMemo(() => new Object3D(), []);
+   104→
+   105→  // Calculate grid dimensions
+   106→  const totalMonths = totalYears * 12;
+   107→  const totalCells = trainCount * totalMonths;
+   108→
+   109→  // Calculate density grid
+   110→  const densityGrid = useMemo(
+   111→    () => calculateDensityGrid(tasks, trainCount, totalMonths),
+   112→    [tasks, trainCount, totalMonths]
+   113→  );
+   114→
+   115→  // Update instance matrices and colors
+   116→  useEffect(() => {
+   117→    if (!meshRef.current) return;
+   118→
+   119→    const mesh = meshRef.current;
+   120→
+   121→    let instanceIndex = 0;
+   122→
+   123→    for (let trainIndex = 0; trainIndex < trainCount; trainIndex++) {
+   124→      for (let monthIndex = 0; monthIndex < totalMonths; monthIndex++) {
+   125→        // Calculate position
+   126→        const x = monthIndex * CELL_WIDTH + CELL_WIDTH / 2;
+   127→        const y = -trainIndex * CELL_HEIGHT - CELL_HEIGHT / 2;
+   128→        const z = 0;
+   129→
+   130→        // Set transform
+   131→        tempObject.position.set(x, y, z);
+   132→        tempObject.scale.set(CELL_WIDTH - CELL_GAP, CELL_HEIGHT - CELL_GAP, 1);
+   133→        tempObject.updateMatrix();
+   134→        mesh.setMatrixAt(instanceIndex, tempObject.matrix);
+   135→
+   136→        // Set color based on density
+   137→        const density = densityGrid[trainIndex]?.[monthIndex] ?? 0;
+   138→        const color = getHeatmapColor(density);
+   139→        mesh.setColorAt(instanceIndex, color);
+   140→
+   141→        instanceIndex++;
+   142→      }
+   143→    }
+   144→
+   145→    // Mark buffers for update
+   146→    mesh.instanceMatrix.needsUpdate = true;
+   147→    if (mesh.instanceColor) {
+   148→      mesh.instanceColor.needsUpdate = true;
+   149→    }
+   150→  }, [densityGrid, trainCount, totalMonths, tempObject]);
+   151→
+   152→  if (totalCells === 0) {
+   153→    return null;
+   154→  }
+   155→
+   156→  return (
+   157→    <group>
+   158→      {/* Heatmap cells */}
+   159→      <instancedMesh
+   160→        ref={meshRef}
+   161→        args={[undefined, undefined, totalCells]}
+   162→      >
+   163→        <planeGeometry args={[1, 1]} />
+   164→        <meshBasicMaterial
+   165→          toneMapped={false}
+   166→          transparent={opacity < 1}
+   167→          opacity={opacity}
+   168→        />
+   169→      </instancedMesh>
+   170→
+   171→      {/* Year markers (vertical lines) */}
+   172→      <YearMarkers totalYears={totalYears} trainCount={trainCount} opacity={opacity} />
+   173→    </group>
+   174→  );
+   175→}
+   176→
+   177→/**
+   178→ * Renders vertical lines for year boundaries
+   179→ */
+   180→function YearMarkers({
+   181→  totalYears,
+   182→  trainCount,
+   183→  opacity = 1,
+   184→}: {
+   185→  totalYears: number;
+   186→  trainCount: number;
+   187→  opacity?: number;
+   188→}) {
+   189→  const totalHeight = trainCount * CELL_HEIGHT;
+   190→  const markerColor = '#94a3b8'; // slate-400
+   191→
+   192→  return (
+   193→    <group>
+   194→      {Array.from({ length: totalYears + 1 }, (_, year) => {
+   195→        const x = year * 12 * CELL_WIDTH;
+   196→        return (
+   197→          <mesh key={`year-${year}`} position={[x, -totalHeight / 2, 0.05]}>
+   198→            <planeGeometry args={[2, totalHeight]} />
+   199→            <meshBasicMaterial color={markerColor} transparent opacity={0.3 * opacity} />
+   200→          </mesh>
+   201→        );
+   202→      })}
+   203→    </group>
+   204→  );
+   205→}
+   206→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

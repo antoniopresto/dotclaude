@@ -1,0 +1,343 @@
+#!/bin/bash
+
+# ============================================================================
+# CASCADE RULES - Hierarchical Rule Enforcement for Claude Code Hooks
+# ============================================================================
+#
+# Author: @antoniopresto
+# License: MIT
+# Version: 1.0.0
+#
+# ============================================================================
+# WHAT IS THIS?
+# ============================================================================
+#
+# A Claude Code hook that enforces rules defined in `__*.md` files throughout
+# your project hierarchy. Rules cascade from parent to child directories,
+# similar to how `.gitignore` works.
+#
+# This enables:
+# - Directory-specific rules that LLMs must follow
+# - Automatic rule inheritance (child dirs inherit parent rules)
+# - Hard blocking of forbidden actions (exit 2)
+# - Context injection (rules shown to LLM before action)
+#
+# ============================================================================
+# THE IDEA: CASCADING RULES FOR LLM AGENTS
+# ============================================================================
+#
+# Problem: LLMs lose context over long sessions. Rules defined in conversation
+# are forgotten. How do you enforce persistent rules across sessions?
+#
+# Solution: Store rules in `__*.md` files in your project directories.
+# A hook reads these files before every file operation and:
+#   1. Injects rules into LLM context (proactive)
+#   2. Blocks forbidden actions with exit 2 (reactive)
+#
+# The `__` prefix is inspired by Python's `__init__.py` - it signals
+# "this is a meta/rules file" rather than regular content.
+#
+# ============================================================================
+# HOW IT WORKS
+# ============================================================================
+#
+#   project/
+#   ├── __rules.md              ← Root rules (apply to ALL subdirs)
+#   ├── src/
+#   │   ├── __rules.md          ← src-specific rules (inherit root)
+#   │   └── components/
+#   │       └── __rules.md      ← components rules (inherit src + root)
+#   └── docs/
+#       └── __rules.md          ← docs rules (inherit root only)
+#
+# When operating on `src/components/Button.tsx`:
+#   1. Hook collects: components/__rules.md + src/__rules.md + __rules.md
+#   2. Rules are shown to LLM (context injection)
+#   3. If action violates a rule → exit 2 (blocked)
+#   4. If allowed → exit 0 (proceed)
+#
+# ============================================================================
+# INSTALLATION
+# ============================================================================
+#
+# 1. Create the hook file:
+#    mkdir -p .claude/hooks
+#    cp cascade-rules.sh .claude/hooks/
+#    chmod +x .claude/hooks/cascade-rules.sh
+#
+# 2. Configure in .claude/settings.json:
+#    {
+#      "hooks": {
+#        "PreToolUse": [
+#          {
+#            "matcher": "Write",
+#            "hooks": [{
+#              "type": "command",
+#              "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cascade-rules.sh"
+#            }]
+#          },
+#          {
+#            "matcher": "Edit",
+#            "hooks": [{
+#              "type": "command",
+#              "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cascade-rules.sh"
+#            }]
+#          }
+#        ]
+#      }
+#    }
+#
+# 3. Create your first rules file:
+#    echo "# __rules.md
+#    > Rules that LLMs MUST follow in this directory.
+#
+#    ## RULES
+#    ### RULE-001
+#    > Never create files with extension \`.forbidden\`
+#    " > __rules.md
+#
+# ============================================================================
+# EXAMPLE __rules.md FILE
+# ============================================================================
+#
+#   # __rules.md
+#
+#   > **Cascade Framework**: Rules in this file MUST be followed by all LLMs
+#   > operating in this directory or subdirectories.
+#
+#   ---
+#
+#   ## RULES
+#
+#   ### RULE-001
+#   **Type**: Blocking rule
+#   **Content**:
+#   > Never create files with extension `.forbidden`
+#
+#   **Enforcement**: Hook checks file extension and blocks with exit 2.
+#
+#   ### RULE-002
+#   **Type**: Context rule
+#   **Content**:
+#   > All TypeScript files must use strict mode
+#
+#   **Enforcement**: Shown to LLM before action (soft enforcement).
+#
+#   ---
+#
+# ============================================================================
+# RULE TYPES
+# ============================================================================
+#
+# 1. BLOCKING RULES (Hard Enforcement)
+#    - Implemented as bash checks in this script
+#    - Violations cause exit 2 → action blocked
+#    - Example: file extension restrictions, path blacklists
+#
+# 2. CONTEXT RULES (Soft Enforcement)
+#    - Written in __rules.md, shown to LLM
+#    - LLM is expected to follow (but not forced)
+#    - Example: code style, naming conventions
+#
+# 3. HYBRID RULES
+#    - Context rule + post-action validation
+#    - Requires PostToolUse hook for validation
+#    - Example: "all files must have header comment"
+#
+# ============================================================================
+# ADDING CUSTOM BLOCKING RULES
+# ============================================================================
+#
+# To add a new blocking rule, create a function and call it in ENFORCEMENT:
+#
+#   # Function to check your custom rule
+#   check_my_custom_rule() {
+#       local path="$1"
+#       if [[ "$path" == *"forbidden_pattern"* ]]; then
+#           echo "❌ RULE VIOLATION: MY-RULE-001" >&2
+#           echo "   Description of violation" >&2
+#           echo "   Action BLOCKED" >&2
+#           exit 2
+#       fi
+#   }
+#
+#   # In ENFORCEMENT section:
+#   check_my_custom_rule "$TARGET_PATH"
+#
+# ============================================================================
+# DEBUGGING
+# ============================================================================
+#
+# Debug log is written to: /tmp/cascade-rules-debug.log
+#
+# View recent activity:
+#   tail -50 /tmp/cascade-rules-debug.log
+#
+# Log format:
+#   === CASCADE RULES <timestamp> ===
+#   TARGET_PATH: /path/to/file
+#   ALLOWED: /path/to/file
+#   (or)
+#   BLOCKED: reason
+#
+# ============================================================================
+# ENVIRONMENT VARIABLES
+# ============================================================================
+#
+# CLAUDE_PROJECT_DIR - Project root directory (set by Claude Code)
+#
+# The hook receives JSON on stdin with structure:
+#   {
+#     "tool_name": "Write",
+#     "tool_input": {
+#       "file_path": "/absolute/path/to/file",
+#       "content": "..."
+#     }
+#   }
+#
+# ============================================================================
+# EXIT CODES
+# ============================================================================
+#
+# 0 - Action allowed (proceed)
+# 2 - Action blocked (rule violation)
+#
+# ============================================================================
+# RELATED CONCEPTS
+# ============================================================================
+#
+# This hook is inspired by:
+# - Zettelkasten: Atomic, interconnected notes
+# - CSS Cascade: Rules inherit and override
+# - .gitignore: Directory-scoped configuration
+# - CLAUDE.md: Project-level AI instructions
+#
+# The broader vision is "Research-as-Tests" - defining verifiable assertions
+# that AI must satisfy, combining:
+# - Intent-based specs (describe WHAT, not HOW)
+# - Self-healing assertions (fallback matching)
+# - Cascade inheritance (rules flow down)
+#
+# ============================================================================
+# LICENSE
+# ============================================================================
+#
+# MIT License - Use freely, attribution appreciated.
+#
+# ============================================================================
+# START OF SCRIPT
+# ============================================================================
+
+set -euo pipefail
+
+# Project root (set by Claude Code, fallback to pwd)
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+
+# Debug log location
+DEBUG_LOG="/tmp/cascade-rules-debug.log"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+log_debug() {
+    echo "$1" >> "$DEBUG_LOG"
+}
+
+# Read JSON from stdin and extract file_path
+read_target_path() {
+    local stdin_json
+    stdin_json=$(cat)
+    echo "$stdin_json" | jq -r '.tool_input.file_path // empty' 2>/dev/null
+}
+
+# Collect all __*.md rules from target path up to project root
+collect_rules() {
+    local target_dir="$1"
+    local rules=""
+
+    # Normalize path - if it's a file, get its directory
+    if [[ -f "$target_dir" ]]; then
+        target_dir=$(dirname "$target_dir")
+    fi
+
+    # Walk up the directory tree until we exit PROJECT_ROOT
+    local current_dir="$target_dir"
+    while [[ "$current_dir" == "$PROJECT_ROOT"* ]] && [[ "$current_dir" != "/" ]]; do
+        # Find __*.md files in current directory
+        for rule_file in "$current_dir"/__*.md; do
+            if [[ -f "$rule_file" ]]; then
+                rules="$rules\n--- Rules from: $rule_file ---\n$(cat "$rule_file")\n"
+            fi
+        done
+
+        # Move up one level
+        current_dir=$(dirname "$current_dir")
+    done
+
+    echo -e "$rules"
+}
+
+# ============================================================================
+# BLOCKING RULE CHECKS
+# ============================================================================
+
+# RULE-TEST-001: No .forbidden files (example rule)
+check_forbidden_extension() {
+    local path="$1"
+    if [[ "$path" == *.forbidden ]]; then
+        echo "❌ RULE VIOLATION: RULE-TEST-001" >&2
+        echo "   Attempted to create .forbidden file: $path" >&2
+        echo "   Action BLOCKED" >&2
+        log_debug "BLOCKED: .forbidden file"
+        exit 2
+    fi
+}
+
+# Add more blocking rules here...
+# check_another_rule() { ... }
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+main() {
+    # Log start
+    log_debug "=== CASCADE RULES $(date) ==="
+
+    # Get target path from stdin JSON
+    local target_path
+    target_path=$(read_target_path)
+    log_debug "TARGET_PATH: ${target_path:-EMPTY}"
+
+    # If no target path, allow action (non-file operation)
+    if [[ -z "$target_path" ]]; then
+        exit 0
+    fi
+
+    # === ENFORCEMENT: BLOCKING RULES ===
+
+    check_forbidden_extension "$target_path"
+    # Add more rule checks here...
+
+    # === CONTEXT INJECTION ===
+
+    local rules
+    rules=$(collect_rules "$target_path")
+
+    if [[ -n "$rules" ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🔒 CASCADE RULES ACTIVE for: $target_path"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo -e "$rules"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    log_debug "ALLOWED: $target_path"
+
+    # Allow action to proceed
+    exit 0
+}
+
+# Run main
+main

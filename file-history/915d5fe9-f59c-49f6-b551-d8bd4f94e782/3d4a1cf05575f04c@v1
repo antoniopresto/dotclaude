@@ -1,0 +1,99 @@
+import React from 'react';
+
+import { defineFunctionName } from '../helpers/function';
+import { getProperty } from '../helpers/object-utils';
+import { capitalize } from '../helpers/string-utils';
+
+import type { SliceContext, StringTypes, UnknownAction } from './models';
+import type { Slices } from './slice';
+import type { Store } from './store';
+
+export function Hooks(params: {
+  machineID: string;
+  store: Store.Instance;
+  getContext(): SliceContext;
+  mappedSlices: Slices.SlicesMap;
+}) {
+  const { machineID, store, getContext, mappedSlices } = params;
+
+  function useSelector<T>(selector: (state: any) => T): T {
+    return React.useSyncExternalStore(store.subscribe, () => {
+      const fullState = store.getState();
+      return selector(fullState);
+    });
+  }
+
+  // transforming action creators into action dispatchers
+  const runtimeActions = {} as {
+    [K: StringTypes.SliceKey]: {
+      [K: StringTypes.SliceReducerName]: (payload: unknown) => UnknownAction;
+    };
+  };
+
+  mappedSlices.info.forEach(({ sliceKey }) => {
+    const actions = mappedSlices.actionCreatorListBySliceKey[sliceKey];
+    actions.forEach(actionCreator => {
+      function dispatch(payload: unknown) {
+        const context = getContext();
+        const actionObject = actionCreator(payload, context);
+        return store.dispatch(actionObject);
+      }
+
+      defineFunctionName(
+        dispatch,
+        `${machineID}Runtime${capitalize(actionCreator.sliceReducerName)}`,
+      );
+      runtimeActions[sliceKey] = runtimeActions[sliceKey] || {};
+      runtimeActions[sliceKey][actionCreator.sliceReducerName] = dispatch;
+    });
+  });
+
+  /**
+   * Custom React hook to interact with a specific slice of the state machine.
+   * @param path The key of the slice or selector to access.
+   * @returns The slice's state and associated actions
+   */
+  function useMachine(path: string) {
+    const isSliceKey = Boolean(
+      mappedSlices.reducerBySliceKey[path as StringTypes.SliceKey],
+    );
+
+    const [initialState] = React.useState(() => {
+      const selection = Object.create(null);
+      const actions = isSliceKey
+        ? { ...runtimeActions[path as StringTypes.SliceKey] }
+        : undefined;
+      return Object.assign(
+        [
+          selection,
+          actions,
+        ],
+        actions,
+        selection,
+      );
+    });
+
+    const ref = React.useRef(initialState);
+
+    return useSelector(state => {
+      const selection = getProperty(state, path, true);
+      const [current, actions] = ref.current;
+      if (selection !== current) {
+        ref.current = Object.assign(
+          [
+            selection,
+            actions,
+          ],
+          actions,
+          selection,
+        );
+      }
+      return isSliceKey ? ref.current : ref.current[0];
+    });
+  }
+
+  return {
+    useSelector,
+    useMachine,
+  };
+}

@@ -1,0 +1,220 @@
+     1→/**
+     2→ * EntityStore Types - STATE-ARCH-001 Phase 1
+     3→ *
+     4→ * Type definitions for the high-performance TypedArray-based entity store.
+     5→ * Uses Structure of Arrays (SoA) pattern for cache-friendly data access.
+     6→ *
+     7→ * Key principles:
+     8→ * - TypedArrays for numeric data (cache-friendly, no GC pressure)
+     9→ * - String IDs stored separately in Map<index, string>
+    10→ * - Direct mutation (no Proxy, no reactive wrappers)
+    11→ * - Zero allocations in hot path
+    12→ */
+    13→
+    14→/**
+    15→ * Task type enum values for TypedArray storage
+    16→ * Stored as Uint8 (0-2)
+    17→ */
+    18→export const TASK_TYPE = {
+    19→  MAINTENANCE: 0,
+    20→  OVERHAUL: 1,
+    21→  INSPECTION: 2,
+    22→} as const;
+    23→
+    24→export type TaskTypeValue = (typeof TASK_TYPE)[keyof typeof TASK_TYPE];
+    25→
+    26→/**
+    27→ * Task color enum values for TypedArray storage
+    28→ * Stored as Uint8 (0-2)
+    29→ */
+    30→export const TASK_COLOR = {
+    31→  BLUE: 0,
+    32→  ORANGE: 1,
+    33→  GRAY: 2,
+    34→} as const;
+    35→
+    36→export type TaskColorValue = (typeof TASK_COLOR)[keyof typeof TASK_COLOR];
+    37→
+    38→/**
+    39→ * Map from string TaskType to numeric value
+    40→ */
+    41→export const TASK_TYPE_TO_VALUE: Record<string, TaskTypeValue> = {
+    42→  maintenance: TASK_TYPE.MAINTENANCE,
+    43→  overhaul: TASK_TYPE.OVERHAUL,
+    44→  inspection: TASK_TYPE.INSPECTION,
+    45→};
+    46→
+    47→/**
+    48→ * Map from numeric value to string TaskType
+    49→ */
+    50→export const VALUE_TO_TASK_TYPE: Record<TaskTypeValue, string> = {
+    51→  [TASK_TYPE.MAINTENANCE]: 'maintenance',
+    52→  [TASK_TYPE.OVERHAUL]: 'overhaul',
+    53→  [TASK_TYPE.INSPECTION]: 'inspection',
+    54→};
+    55→
+    56→/**
+    57→ * Map from string TaskColor to numeric value
+    58→ */
+    59→export const TASK_COLOR_TO_VALUE: Record<string, TaskColorValue> = {
+    60→  blue: TASK_COLOR.BLUE,
+    61→  orange: TASK_COLOR.ORANGE,
+    62→  gray: TASK_COLOR.GRAY,
+    63→};
+    64→
+    65→/**
+    66→ * Map from numeric value to string TaskColor
+    67→ */
+    68→export const VALUE_TO_TASK_COLOR: Record<TaskColorValue, string> = {
+    69→  [TASK_COLOR.BLUE]: 'blue',
+    70→  [TASK_COLOR.ORANGE]: 'orange',
+    71→  [TASK_COLOR.GRAY]: 'gray',
+    72→};
+    73→
+    74→/**
+    75→ * TypedArray storage for task entities
+    76→ * Structure of Arrays (SoA) pattern for optimal cache utilization
+    77→ *
+    78→ * Memory layout for N tasks:
+    79→ * - startDay: Float32Array(N) - 4 bytes per task
+    80→ * - duration: Float32Array(N) - 4 bytes per task
+    81→ * - trainIndex: Uint16Array(N) - 2 bytes per task
+    82→ * - type: Uint8Array(N) - 1 byte per task
+    83→ * - color: Uint8Array(N) - 1 byte per task
+    84→ * - hasConflict: Uint8Array(N) - 1 byte per task (0 or 1)
+    85→ * - predecessorIndex: Int32Array(N) - 4 bytes per task (-1 = no predecessor)
+    86→ *
+    87→ * Total: 17 bytes per task = ~1.7MB for 100k tasks
+    88→ * Compare to ~50MB+ for object-based storage with same data
+    89→ */
+    90→export interface TaskArrays {
+    91→  /** Start day offset from dataset start date */
+    92→  startDay: Float32Array;
+    93→  /** Duration in days */
+    94→  duration: Float32Array;
+    95→  /** Train index (Y position) */
+    96→  trainIndex: Uint16Array;
+    97→  /** Task type (0=maintenance, 1=overhaul, 2=inspection) */
+    98→  type: Uint8Array;
+    99→  /** Task color (0=blue, 1=orange, 2=gray) */
+   100→  color: Uint8Array;
+   101→  /** Conflict flag (0=false, 1=true) */
+   102→  hasConflict: Uint8Array;
+   103→  /** Predecessor task index (-1 = no predecessor) */
+   104→  predecessorIndex: Int32Array;
+   105→}
+   106→
+   107→/**
+   108→ * String data stored separately (cannot be in TypedArray)
+   109→ * Uses index as key for O(1) lookup
+   110→ */
+   111→export interface TaskStringData {
+   112→  /** Map from task index to task ID string */
+   113→  ids: Map<number, string>;
+   114→  /** Reverse lookup: task ID string to index */
+   115→  idToIndex: Map<string, number>;
+   116→}
+   117→
+   118→/**
+   119→ * Entity store interface
+   120→ * Provides typed access to SoA data
+   121→ */
+   122→export interface IEntityStore {
+   123→  /** Current number of entities */
+   124→  readonly count: number;
+   125→  /** Maximum capacity */
+   126→  readonly capacity: number;
+   127→  /** TypedArray storage */
+   128→  readonly arrays: TaskArrays;
+   129→  /** String data storage */
+   130→  readonly strings: TaskStringData;
+   131→
+   132→  /**
+   133→   * Load entities from array of task objects
+   134→   * Bulk load is optimized for initial data loading
+   135→   */
+   136→  load(tasks: TaskData[]): void;
+   137→
+   138→  /**
+   139→   * Get task data by index (zero-allocation read)
+   140→   * Returns a cursor that reads directly from arrays
+   141→   */
+   142→  get(index: number): TaskCursor;
+   143→
+   144→  /**
+   145→   * Get task data by ID
+   146→   * Returns null if not found
+   147→   */
+   148→  getById(id: string): TaskCursor | null;
+   149→
+   150→  /**
+   151→   * Clear all entities
+   152→   */
+   153→  clear(): void;
+   154→
+   155→  /**
+   156→   * Get iterator over all valid entities
+   157→   */
+   158→  [Symbol.iterator](): Iterator<TaskCursor>;
+   159→}
+   160→
+   161→/**
+   162→ * Task data input format (from generator or API)
+   163→ */
+   164→export interface TaskData {
+   165→  id: string;
+   166→  trainIndex: number;
+   167→  startDay: number;
+   168→  duration: number;
+   169→  type: 'maintenance' | 'overhaul' | 'inspection';
+   170→  color: 'blue' | 'orange' | 'gray';
+   171→  hasConflict: boolean;
+   172→  predecessorId?: string;
+   173→}
+   174→
+   175→/**
+   176→ * Task cursor - provides ergonomic read access to TypedArray data
+   177→ * This is a lightweight view into the arrays, not a copy
+   178→ *
+   179→ * IMPORTANT: Do not store cursor references - they are invalidated
+   180→ * when the underlying arrays are modified
+   181→ */
+   182→export interface TaskCursor {
+   183→  /** Entity index in the arrays */
+   184→  readonly index: number;
+   185→  /** Task ID string */
+   186→  readonly id: string;
+   187→  /** Start day offset */
+   188→  readonly startDay: number;
+   189→  /** Duration in days */
+   190→  readonly duration: number;
+   191→  /** Train index */
+   192→  readonly trainIndex: number;
+   193→  /** Task type as numeric value */
+   194→  readonly typeValue: TaskTypeValue;
+   195→  /** Task type as string */
+   196→  readonly type: string;
+   197→  /** Task color as numeric value */
+   198→  readonly colorValue: TaskColorValue;
+   199→  /** Task color as string */
+   200→  readonly color: string;
+   201→  /** Whether task has conflict */
+   202→  readonly hasConflict: boolean;
+   203→  /** Predecessor task index (-1 if none) */
+   204→  readonly predecessorIndex: number;
+   205→  /** Predecessor task ID (undefined if none) */
+   206→  readonly predecessorId: string | undefined;
+   207→
+   208→  // Computed properties for rendering
+   209→  /** X position in world coordinates */
+   210→  readonly x: number;
+   211→  /** Y position in world coordinates */
+   212→  readonly y: number;
+   213→  /** Width in world coordinates */
+   214→  readonly width: number;
+   215→}
+   216→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

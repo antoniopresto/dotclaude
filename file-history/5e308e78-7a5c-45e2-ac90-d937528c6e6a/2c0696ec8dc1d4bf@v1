@@ -1,0 +1,243 @@
+'use client';
+
+/**
+ * Schedule Page - Semantic Zoom Canvas
+ *
+ * Multi-year maintenance schedule visualization with 4 LOD levels:
+ * - LOD 0: Strategic (10-12 years) - Heatmap aggregation
+ * - LOD 1: Tactical (1-3 years) - Campaign bars
+ * - LOD 2: Operational (1-6 months) - Work orders
+ * - LOD 3: Execution (1-4 weeks) - Task details
+ */
+
+import React, { useState, useEffect } from 'react';
+import { Card, Elevation, Button, Tag, Intent, Spinner } from '@blueprintjs/core';
+import { ScheduleCanvas, ViewportControls } from '@/components/schedule';
+import { apiFetch } from '@/lib/api';
+import { LODLevel } from '@/stores/viewportStore';
+
+interface MaintenanceEvent {
+  id: string;
+  trainId: string;
+  trainName: string;
+  type: 'PM1' | 'PM2' | 'HM' | 'OVH';
+  startDate: Date;
+  endDate: Date;
+  depot: string;
+}
+
+const MAINTENANCE_TAG_COLORS: Record<string, { bg: string; color: string }> = {
+  PM1: { bg: 'var(--mms-maint-pm1)', color: '#ffffff' },
+  PM2: { bg: 'var(--mms-maint-pm2)', color: '#ffffff' },
+  HM: { bg: 'var(--mms-maint-hm)', color: '#ffffff' },
+  OVH: { bg: 'var(--mms-maint-ovh)', color: '#ffffff' },
+};
+
+export default function SchedulePage() {
+  const [events, setEvents] = useState<MaintenanceEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedEvent, setSelectedEvent] = useState<MaintenanceEvent | null>(null);
+  const [hoveredEvent, setHoveredEvent] = useState<MaintenanceEvent | null>(null);
+  const [currentLOD, setCurrentLOD] = useState<LODLevel>(2);
+  const [scale, setScale] = useState(0.5);
+
+  useEffect(() => {
+    loadMaintenanceEvents();
+  }, []);
+
+  const loadMaintenanceEvents = async () => {
+    setLoading(true);
+    setError(null);
+
+    const { data, error: apiError } = await apiFetch<{ schedules: any[] }>(
+      '/api/maintenance/gantt'
+    );
+
+    if (apiError) {
+      // Generate demo data if API fails
+      setEvents(generateDemoEvents());
+    } else if (data?.schedules) {
+      // Transform API data to MaintenanceEvent format
+      const transformed = data.schedules.map((s: any) => ({
+        id: s.id,
+        trainId: s.trainId,
+        trainName: s.train?.trainId || 'Unknown',
+        type: s.maintenanceType as 'PM1' | 'PM2' | 'HM' | 'OVH',
+        startDate: new Date(s.scheduledDate),
+        endDate: new Date(new Date(s.scheduledDate).getTime() + s.durationDays * 24 * 60 * 60 * 1000),
+        depot: s.depot?.code || 'Unknown',
+      }));
+      setEvents(transformed);
+    }
+
+    setLoading(false);
+  };
+
+  const handleZoomToLOD = (lod: LODLevel) => {
+    const scaleMap: Record<LODLevel, number> = {
+      0: 0.1,  // Strategic
+      1: 0.35, // Tactical
+      2: 0.7,  // Operational
+      3: 2.0,  // Execution
+    };
+    setScale(scaleMap[lod]);
+    setCurrentLOD(lod);
+  };
+
+  const activeEvent = selectedEvent || hoveredEvent;
+
+  return (
+    <div style={{ minHeight: '100vh', backgroundColor: '#f5f8fa' }}>
+      {/* Header */}
+      <Card elevation={Elevation.ONE} style={{ margin: 0, borderRadius: 0, borderBottom: '1px solid #e1e8ed' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
+          <div>
+            <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600, color: '#182026' }}>
+              Maintenance Schedule
+            </h1>
+            <p style={{ margin: '4px 0 0', fontSize: 14, color: '#5c7080' }}>
+              Semantic zoom timeline - Scroll to zoom, drag to pan
+            </p>
+          </div>
+
+          <Button icon="refresh" onClick={loadMaintenanceEvents} intent={Intent.NONE}>
+            Refresh
+          </Button>
+        </div>
+      </Card>
+
+      {/* Main content */}
+      <div style={{ display: 'flex' }}>
+        {/* Canvas area */}
+        <div style={{ flex: 1, padding: 24 }}>
+          {loading ? (
+            <Card elevation={Elevation.ONE} style={{ height: 600, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Spinner size={32} />
+              <p style={{ marginLeft: 16, color: '#5c7080' }}>Loading schedule...</p>
+            </Card>
+          ) : error ? (
+            <Card elevation={Elevation.ONE} style={{ height: 600, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <p style={{ color: '#db3737' }}>{error}</p>
+            </Card>
+          ) : (
+            <ScheduleCanvas
+              events={events}
+              onEventSelect={setSelectedEvent}
+              onEventHover={setHoveredEvent}
+              width={1000}
+              height={600}
+            />
+          )}
+        </div>
+
+        {/* Sidebar */}
+        <div style={{ width: 256, backgroundColor: '#ffffff', borderLeft: '1px solid #e1e8ed', padding: 16 }}>
+          <ViewportControls
+            currentLOD={currentLOD}
+            scale={scale}
+            onZoomIn={() => setScale((s) => Math.min(4, s * 1.2))}
+            onZoomOut={() => setScale((s) => Math.max(0.05, s / 1.2))}
+            onFit={() => {
+              setScale(0.5);
+              setCurrentLOD(2);
+            }}
+            onReset={() => {
+              setScale(0.5);
+              setCurrentLOD(2);
+            }}
+            onJumpToLOD={handleZoomToLOD}
+          />
+        </div>
+      </div>
+
+      {/* Event details panel */}
+      {activeEvent && (
+        <Card
+          elevation={Elevation.THREE}
+          style={{
+            position: 'fixed',
+            bottom: 16,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            padding: 16,
+            minWidth: 300,
+            zIndex: 50,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 500, color: '#182026' }}>
+                {activeEvent.trainName}
+              </div>
+              <div style={{ fontSize: 12, color: '#5c7080', marginTop: 4 }}>
+                {activeEvent.type} at {activeEvent.depot}
+              </div>
+            </div>
+            <Tag
+              style={{
+                backgroundColor: MAINTENANCE_TAG_COLORS[activeEvent.type]?.bg || '#6b7280',
+                color: MAINTENANCE_TAG_COLORS[activeEvent.type]?.color || '#ffffff',
+              }}
+            >
+              {activeEvent.type}
+            </Tag>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 12, color: '#8a9ba8' }}>
+            {activeEvent.startDate.toLocaleDateString()} - {activeEvent.endDate.toLocaleDateString()}
+          </div>
+          {selectedEvent && (
+            <Button
+              small
+              fill
+              onClick={() => setSelectedEvent(null)}
+              style={{ marginTop: 12 }}
+            >
+              Close
+            </Button>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// Generate demo events for visualization
+function generateDemoEvents(): MaintenanceEvent[] {
+  const events: MaintenanceEvent[] = [];
+  const types: ('PM1' | 'PM2' | 'HM' | 'OVH')[] = ['PM1', 'PM2', 'HM', 'OVH'];
+  const depots = ['LIS', 'PRT', 'FAR', 'BRG'];
+  const trainPrefixes = ['EMU', 'DMU', 'LOC'];
+
+  const now = Date.now();
+  const msPerDay = 24 * 60 * 60 * 1000;
+
+  // Generate 50 demo events spread over 2 years
+  for (let i = 0; i < 50; i++) {
+    const type = types[Math.floor(Math.random() * types.length)];
+    const depot = depots[Math.floor(Math.random() * depots.length)];
+    const prefix = trainPrefixes[Math.floor(Math.random() * trainPrefixes.length)];
+
+    const durationDays =
+      type === 'PM1' ? 1 + Math.random() * 2 :
+      type === 'PM2' ? 3 + Math.random() * 5 :
+      type === 'HM' ? 7 + Math.random() * 14 :
+      30 + Math.random() * 60;
+
+    const startOffset = Math.floor(Math.random() * 365 * 2) - 180; // -6 months to +18 months
+    const startDate = new Date(now + startOffset * msPerDay);
+    const endDate = new Date(startDate.getTime() + durationDays * msPerDay);
+
+    events.push({
+      id: `event-${i}`,
+      trainId: `train-${i % 15}`,
+      trainName: `${prefix}-${1000 + (i % 15)}`,
+      type,
+      startDate,
+      endDate,
+      depot,
+    });
+  }
+
+  return events.sort((a, b) => a.startDate.getTime() - b.startDate.getTime());
+}

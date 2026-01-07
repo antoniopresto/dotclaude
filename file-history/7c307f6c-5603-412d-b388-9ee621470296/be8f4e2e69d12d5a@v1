@@ -1,0 +1,234 @@
+# Parallel Harness Execution
+
+This document describes how to use the parallel harness runner to execute multiple features concurrently using git worktrees.
+
+## Overview
+
+The parallel harness runner enables **2.5x faster** feature development by:
+1. Using **git worktrees** to create isolated working directories
+2. Running multiple **Claude sessions** in parallel
+3. Organizing features into **waves** that minimize merge conflicts
+
+## Prerequisites
+
+- Bun runtime installed
+- Git configured properly
+- macOS (for Terminal-based session spawning)
+
+## Quick Start
+
+```bash
+# Show current status
+bun scripts/parallel-runner.ts status
+
+# Execute Wave 1 (3 parallel groups)
+bun scripts/parallel-runner.ts wave 1
+
+# Interactive mode
+bun scripts/parallel-runner.ts
+```
+
+## Wave Structure
+
+Features are organized into 4 waves based on dependency analysis:
+
+### Wave 1: Initial Parallel (3 groups, no dependencies)
+
+| Group | Features | Files Modified | Risk |
+|-------|----------|----------------|------|
+| A | F023 | MicroLayer.tsx | LOW |
+| B | F123, F025 | App.tsx | MEDIUM |
+| C | F016, F017 | InfiniteCanvas.tsx | HIGH |
+
+**Groups B and C are sequential internally** because features within them modify the same files.
+
+### Wave 2: Keyboard + Panel (2 groups, depends on Wave 1)
+
+| Group | Features | Files Modified | Risk |
+|-------|----------|----------------|------|
+| D | F027, F028 | InfiniteCanvas.tsx | HIGH |
+| E | F026 | App.tsx | MEDIUM |
+
+### Wave 3: Keyboard Navigation (1 group, depends on Wave 2)
+
+| Group | Features | Files Modified | Risk |
+|-------|----------|----------------|------|
+| F | F021 | InfiniteCanvas.tsx, layers | HIGH |
+
+### Wave 4: Final Accessibility (1 group, depends on Wave 3)
+
+| Group | Features | Files Modified | Risk |
+|-------|----------|----------------|------|
+| G | F022 | InfiniteCanvas.tsx, MicroLayer.tsx | LOW |
+
+## Workflow
+
+### 1. Start a Wave
+
+```bash
+bun scripts/parallel-runner.ts wave 1
+```
+
+This will:
+1. Check that previous wave dependencies are satisfied
+2. Create git worktrees for each feature: `.trees/<feature-id>/`
+3. Open separate Terminal windows with Claude sessions
+4. Each session is isolated to its feature branch
+
+### 2. Work on Features
+
+Each Claude session receives an **isolation prompt** that:
+- Specifies which feature to implement
+- Restricts file modifications to feature scope
+- Follows the standard harness protocol
+
+### 3. Complete Features
+
+When a feature is complete:
+1. The session marks `passes: true` in features.json
+2. Updates claude-progress.txt
+3. Commits changes to the feature branch
+4. Types `/exit` to close the session
+
+### 4. Merge Features
+
+```bash
+# Merge a completed feature
+bun scripts/parallel-runner.ts merge F023
+```
+
+This will:
+1. Verify the feature is marked complete
+2. Switch to main branch
+3. Merge the feature branch (no-ff)
+4. Remove the worktree
+5. Delete the feature branch
+
+### 5. Continue to Next Wave
+
+Once all features in a wave are merged, run the next wave:
+
+```bash
+bun scripts/parallel-runner.ts wave 2
+```
+
+## Git Worktree Structure
+
+```
+system/
+├── .trees/           # Git worktrees directory (gitignored)
+│   ├── f023/         # Worktree for F023
+│   │   └── ...       # Full project copy on feat/f023 branch
+│   ├── f123/         # Worktree for F123
+│   └── f016/         # Worktree for F016
+├── apps/canvas/      # Main project
+└── features.json     # Shared state file
+```
+
+## Branch Naming Convention
+
+- Feature branches: `feat/f023`, `feat/f016`, etc.
+- Created automatically from `main`
+
+## Conflict Resolution
+
+### Within Groups (Sequential)
+
+Features in the same group that modify the same files run **sequentially**:
+1. Complete first feature
+2. Merge to main
+3. Start second feature (inherits first feature's changes)
+
+### Across Groups (Parallel)
+
+Groups in the same wave that modify **different files** run in parallel:
+- Group A (MicroLayer.tsx) and Group B (App.tsx) don't conflict
+- Merge order doesn't matter
+
+### Merge Conflicts
+
+If merge conflicts occur:
+1. Resolve manually
+2. Run `git merge --continue`
+3. The runner will handle the rest
+
+## Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `bun scripts/parallel-runner.ts` | Interactive menu |
+| `bun scripts/parallel-runner.ts wave <n>` | Execute wave n |
+| `bun scripts/parallel-runner.ts status` | Show current status |
+| `bun scripts/parallel-runner.ts merge <id>` | Merge feature branch |
+| `bun scripts/parallel-runner.ts cleanup` | Remove all worktrees |
+
+## Monitoring Progress
+
+### Status View
+
+```bash
+bun scripts/parallel-runner.ts status
+```
+
+Shows:
+- Active worktrees
+- Feature completion status (✓ complete, ⟳ in-progress, ○ pending)
+- Wave dependencies
+
+### macOS Notifications
+
+The runner sends notifications for:
+- Session started
+- Session waiting for input
+- Feature merged
+- Wave completed
+
+## Speedup Calculation
+
+| Execution Mode | Features | Sessions |
+|----------------|----------|----------|
+| Sequential | 10 features | 10 sessions |
+| Parallel | 10 features | ~4 sessions (2.5x faster) |
+
+The speedup comes from:
+- Wave 1: 3 parallel groups (longest: 2 features)
+- Wave 2: 2 parallel groups (longest: 2 features)
+- Wave 3: 1 group (1 feature)
+- Wave 4: 1 group (1 feature)
+
+Total parallel sessions: 2 + 2 + 1 + 1 = 6 (vs 10 sequential)
+
+## Troubleshooting
+
+### Worktree Already Exists
+
+```bash
+bun scripts/parallel-runner.ts cleanup
+```
+
+### Branch Checked Out in Another Worktree
+
+Git prevents the same branch from being checked out in multiple worktrees. Remove the conflicting worktree first:
+
+```bash
+git worktree remove .trees/f023 --force
+```
+
+### Terminal Windows Not Opening
+
+The runner uses AppleScript to open Terminal windows. Ensure Terminal.app has accessibility permissions in System Preferences.
+
+## Best Practices
+
+1. **Complete features fully** before merging
+2. **Run visual tests** (Playwright MCP) before marking complete
+3. **Update progress files** in each session
+4. **Merge frequently** to avoid large conflict resolution
+5. **One feature at a time** within sequential groups
+
+## Related Files
+
+- `scripts/parallel-runner.ts` - Main runner script
+- `scripts/parallel-config.ts` - Wave/group configuration
+- `features.json` - Feature status and parallel execution metadata
+- `.gitignore` - Contains `.trees/` exclusion

@@ -1,0 +1,200 @@
+     1→/**
+     2→ * MMS - Simulation Routes
+     3→ *
+     4→ * Endpoints for what-if scenario simulation
+     5→ */
+     6→
+     7→import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+     8→import { db, schema } from '../db/client';
+     9→import { eq, sql, avg } from 'drizzle-orm';
+    10→
+    11→// In-memory scenario storage (for demo purposes)
+    12→const scenarios = new Map<string, {
+    13→  id: string;
+    14→  name: string;
+    15→  baseDate: string;
+    16→  changes: AllocationChange[];
+    17→  createdAt: Date;
+    18→}>();
+    19→
+    20→interface CreateScenarioBody {
+    21→  name: string;
+    22→  baseDate: string;
+    23→}
+    24→
+    25→interface AllocationChange {
+    26→  serviceId: string;
+    27→  originalTrainId: string | null;
+    28→  newTrainId: string;
+    29→}
+    30→
+    31→interface RunSimulationBody {
+    32→  changes: AllocationChange[];
+    33→}
+    34→
+    35→export async function simulationRoutes(fastify: FastifyInstance) {
+    36→  // POST /api/simulation/create
+    37→  fastify.post('/create', async (request: FastifyRequest<{ Body: CreateScenarioBody }>, reply: FastifyReply) => {
+    38→    try {
+    39→      const { name, baseDate } = request.body;
+    40→
+    41→      const id = crypto.randomUUID();
+    42→      const scenario = {
+    43→        id,
+    44→        name,
+    45→        baseDate,
+    46→        changes: [],
+    47→        createdAt: new Date(),
+    48→      };
+    49→
+    50→      scenarios.set(id, scenario);
+    51→
+    52→      return { scenarioId: id, ...scenario };
+    53→    } catch (error) {
+    54→      request.log.error(error);
+    55→      reply.status(500).send({ error: 'Failed to create scenario' });
+    56→    }
+    57→  });
+    58→
+    59→  // POST /api/simulation/:id/run
+    60→  fastify.post('/:id/run', async (request: FastifyRequest<{ Params: { id: string }; Body: RunSimulationBody }>, reply: FastifyReply) => {
+    61→    try {
+    62→      const { id } = request.params;
+    63→      const { changes } = request.body;
+    64→
+    65→      const scenario = scenarios.get(id);
+    66→      if (!scenario) {
+    67→        return reply.status(404).send({ error: 'Scenario not found' });
+    68→      }
+    69→
+    70→      // Store changes
+    71→      scenario.changes = changes;
+    72→
+    73→      // Calculate current metrics
+    74→      const currentStats = await db.execute(sql`
+    75→        SELECT
+    76→          AVG(current_km) as avg_km,
+    77→          STDDEV(current_km) as stddev_km
+    78→        FROM trains
+    79→      `);
+    80→
+    81→      const currentAvg = Number((currentStats as any)[0]?.avg_km) || 0;
+    82→      const currentVariance = Number((currentStats as any)[0]?.stddev_km) / currentAvg * 100 || 0;
+    83→
+    84→      // Simulate the impact (simplified simulation)
+    85→      // In reality, this would involve complex projection calculations
+    86→      const trainChanges = new Set(changes.map(c => c.newTrainId));
+    87→
+    88→      // Get affected trains
+    89→      const affectedTrains = await db.query.trains.findMany({
+    90→        where: sql`id = ANY(${Array.from(trainChanges)})`,
+    91→      });
+    92→
+    93→      // Estimate projected variance improvement
+    94→      // Prioritizing under-running trains reduces variance
+    95→      const varianceReduction = Math.min(5, changes.length * 0.5);
+    96→      const projectedVariance = Math.max(5, currentVariance - varianceReduction);
+    97→
+    98→      // Estimate dead running
+    99→      const projectedDeadRunning = changes.length * 15; // ~15km average dead running per change
+   100→
+   101→      const comparison = [
+   102→        {
+   103→          metric: 'Km Variance',
+   104→          current: Math.round(currentVariance * 10) / 10,
+   105→          projected: Math.round(projectedVariance * 10) / 10,
+   106→          change: Math.round((projectedVariance - currentVariance) * 10) / 10,
+   107→          improved: projectedVariance < currentVariance,
+   108→        },
+   109→        {
+   110→          metric: 'Dead Running (km)',
+   111→          current: 0,
+   112→          projected: projectedDeadRunning,
+   113→          change: projectedDeadRunning,
+   114→          improved: false,
+   115→        },
+   116→        {
+   117→          metric: 'Affected Trains',
+   118→          current: 0,
+   119→          projected: changes.length,
+   120→          change: changes.length,
+   121→          improved: true,
+   122→        },
+   123→      ];
+   124→
+   125→      return {
+   126→        scenarioId: id,
+   127→        projectedVariance: Math.round(projectedVariance * 10) / 10,
+   128→        projectedDeadRunning,
+   129→        comparison,
+   130→      };
+   131→    } catch (error) {
+   132→      request.log.error(error);
+   133→      reply.status(500).send({ error: 'Failed to run simulation' });
+   134→    }
+   135→  });
+   136→
+   137→  // GET /api/simulation/:id/compare
+   138→  fastify.get('/:id/compare', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+   139→    try {
+   140→      const { id } = request.params;
+   141→
+   142→      const scenario = scenarios.get(id);
+   143→      if (!scenario) {
+   144→        return reply.status(404).send({ error: 'Scenario not found' });
+   145→      }
+   146→
+   147→      // Get current state metrics
+   148→      const currentStats = await db.execute(sql`
+   149→        SELECT
+   150→          AVG(current_km) as avg_km,
+   151→          STDDEV(current_km) as stddev_km,
+   152→          MIN(current_km) as min_km,
+   153→          MAX(current_km) as max_km
+   154→        FROM trains
+   155→      `);
+   156→
+   157→      const stats = (currentStats as any)[0];
+   158→
+   159→      return {
+   160→        scenario: {
+   161→          id: scenario.id,
+   162→          name: scenario.name,
+   163→          changeCount: scenario.changes.length,
+   164→        },
+   165→        currentState: {
+   166→          averageKm: Math.round(stats.avg_km),
+   167→          variancePercent: Math.round((stats.stddev_km / stats.avg_km) * 100 * 10) / 10,
+   168→          minKm: Math.round(stats.min_km),
+   169→          maxKm: Math.round(stats.max_km),
+   170→        },
+   171→      };
+   172→    } catch (error) {
+   173→      request.log.error(error);
+   174→      reply.status(500).send({ error: 'Failed to compare scenarios' });
+   175→    }
+   176→  });
+   177→
+   178→  // GET /api/simulation/list
+   179→  fastify.get('/list', async (request: FastifyRequest, reply: FastifyReply) => {
+   180→    try {
+   181→      const scenarioList = Array.from(scenarios.values()).map(s => ({
+   182→        id: s.id,
+   183→        name: s.name,
+   184→        baseDate: s.baseDate,
+   185→        changeCount: s.changes.length,
+   186→        createdAt: s.createdAt,
+   187→      }));
+   188→
+   189→      return { scenarios: scenarioList };
+   190→    } catch (error) {
+   191→      request.log.error(error);
+   192→      reply.status(500).send({ error: 'Failed to list scenarios' });
+   193→    }
+   194→  });
+   195→}
+   196→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,333 @@
+/**
+ * Popup main script - handles UI interactions and video detection
+ */
+
+import { type DetectedVideo, formatDuration } from '../../utils/video-detector';
+
+interface DownloadStatus {
+  videoId: string;
+  status: 'downloading' | 'completed' | 'failed' | null;
+}
+
+// DOM Elements
+const loadingEl = document.getElementById('loading')!;
+const videoListEl = document.getElementById('video-list')!;
+const noVideosEl = document.getElementById('no-videos')!;
+const errorEl = document.getElementById('error')!;
+const errorMessageEl = document.getElementById('error-message')!;
+const refreshBtn = document.getElementById('refresh-btn');
+const retryBtn = document.getElementById('retry-btn');
+
+// State
+let detectedVideos: DetectedVideo[] = [];
+let downloadStatuses = new Map<string, 'downloading' | 'completed' | 'failed'>();
+
+/**
+ * Initialize popup
+ */
+async function init(): Promise<void> {
+  refreshBtn?.addEventListener('click', () => scanForVideos());
+  retryBtn?.addEventListener('click', () => scanForVideos());
+
+  await scanForVideos();
+}
+
+/**
+ * Scan current tab for videos
+ */
+async function scanForVideos(): Promise<void> {
+  showLoading();
+
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+
+    if (!tab?.id) {
+      showError('Could not access current tab');
+      return;
+    }
+
+    if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('chrome-extension://')) {
+      showError('Cannot scan browser internal pages');
+      return;
+    }
+
+    const allVideos: DetectedVideo[] = [];
+
+    // Get intercepted videos from background
+    try {
+      const interceptedResponse = await browser.runtime.sendMessage({
+        action: 'getInterceptedVideos',
+        tabId: tab.id,
+      });
+      if (interceptedResponse?.videos) {
+        allVideos.push(...interceptedResponse.videos);
+      }
+    } catch (e) {
+      console.log('[Video Downloader] Could not get intercepted videos:', e);
+    }
+
+    // Get videos from content script
+    try {
+      const contentResponse = await browser.tabs.sendMessage(tab.id, { action: 'detectVideos' });
+      if (contentResponse?.videos) {
+        allVideos.push(...contentResponse.videos);
+      }
+    } catch (e) {
+      console.log('[Video Downloader] Content script not available:', e);
+    }
+
+    // Load download history
+    try {
+      const historyResponse = await browser.runtime.sendMessage({ action: 'getDownloadHistory' });
+      if (historyResponse?.history) {
+        historyResponse.history.forEach((record: { videoId: string; status: 'downloading' | 'completed' | 'failed' }) => {
+          downloadStatuses.set(record.videoId, record.status);
+        });
+      }
+    } catch (e) {
+      console.log('[Video Downloader] Could not get download history:', e);
+    }
+
+    // Deduplicate
+    const seen = new Set<string>();
+    detectedVideos = allVideos.filter((video) => {
+      const normalizedUrl = video.url.split('?')[0];
+      if (seen.has(normalizedUrl)) return false;
+      seen.add(normalizedUrl);
+      return true;
+    });
+
+    if (detectedVideos.length > 0) {
+      renderVideoList();
+    } else {
+      showNoVideos();
+    }
+  } catch (error) {
+    console.error('[Video Downloader] Error scanning for videos:', error);
+    showError('Failed to scan page for videos. Try refreshing the page.');
+  }
+}
+
+/**
+ * Show loading state
+ */
+function showLoading(): void {
+  loadingEl.style.display = 'flex';
+  videoListEl.style.display = 'none';
+  noVideosEl.style.display = 'none';
+  errorEl.style.display = 'none';
+}
+
+/**
+ * Show no videos state
+ */
+function showNoVideos(): void {
+  loadingEl.style.display = 'none';
+  videoListEl.style.display = 'none';
+  noVideosEl.style.display = 'flex';
+  errorEl.style.display = 'none';
+}
+
+/**
+ * Show error state
+ */
+function showError(message: string): void {
+  loadingEl.style.display = 'none';
+  videoListEl.style.display = 'none';
+  noVideosEl.style.display = 'none';
+  errorEl.style.display = 'flex';
+  errorMessageEl.textContent = message;
+}
+
+/**
+ * Render the video list
+ */
+function renderVideoList(): void {
+  loadingEl.style.display = 'none';
+  noVideosEl.style.display = 'none';
+  errorEl.style.display = 'none';
+  videoListEl.style.display = 'flex';
+
+  videoListEl.innerHTML = detectedVideos.map((video) => createVideoItemHTML(video)).join('');
+
+  // Bind download buttons
+  videoListEl.querySelectorAll('.download-btn').forEach((btn) => {
+    btn.addEventListener('click', handleDownloadClick);
+  });
+}
+
+/**
+ * Create HTML for a video item
+ */
+function createVideoItemHTML(video: DetectedVideo): string {
+  const thumbnailHTML = video.thumbnail
+    ? `<img src="${escapeHTML(video.thumbnail)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+    : `<div class="video-thumbnail-placeholder">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="23 7 16 12 23 17 23 7"></polygon>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+      </div>`;
+
+  const durationHTML = video.duration
+    ? `<span>${formatDuration(video.duration)}</span>`
+    : '';
+
+  const qualityHTML = video.quality && video.quality !== 'Unknown'
+    ? `<span>${video.quality}</span>`
+    : '';
+
+  const sourceHTML = video.source
+    ? `<span class="video-source">${getSourceLabel(video.source)}</span>`
+    : '';
+
+  // Check download status
+  const downloadStatus = downloadStatuses.get(video.id);
+  let buttonHTML: string;
+  let statusHTML = '';
+
+  if (downloadStatus === 'completed') {
+    buttonHTML = `<button class="btn btn-success btn-small download-btn" data-video-id="${escapeHTML(video.id)}" disabled>Downloaded</button>`;
+    statusHTML = '<span class="status-badge success">Done</span>';
+  } else if (downloadStatus === 'downloading') {
+    buttonHTML = `<button class="btn btn-secondary btn-small download-btn" data-video-id="${escapeHTML(video.id)}" disabled>Downloading...</button>`;
+    statusHTML = '<span class="status-badge downloading">...</span>';
+  } else {
+    buttonHTML = `<button class="btn btn-primary btn-small download-btn" data-video-id="${escapeHTML(video.id)}">Download</button>`;
+  }
+
+  return `
+    <div class="video-item ${downloadStatus === 'completed' ? 'downloaded' : ''}" data-video-id="${escapeHTML(video.id)}">
+      <div class="video-thumbnail">${thumbnailHTML}</div>
+      <div class="video-info">
+        <div class="video-title" title="${escapeHTML(video.title)}">${escapeHTML(truncateTitle(video.title, 50))}</div>
+        <div class="video-meta">
+          ${durationHTML}
+          ${qualityHTML}
+          <span>${getTypeLabel(video.type)}</span>
+          ${sourceHTML}
+          ${statusHTML}
+        </div>
+        <div class="video-actions">
+          ${buttonHTML}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * Truncate title to max length
+ */
+function truncateTitle(title: string, maxLength: number): string {
+  if (title.length <= maxLength) return title;
+  return title.substring(0, maxLength - 3) + '...';
+}
+
+/**
+ * Get human-readable source label
+ */
+function getSourceLabel(source: string): string {
+  if (source.startsWith('network')) return 'Network';
+  if (source === 'instagram') return 'Instagram';
+  if (source === 'twitter') return 'Twitter';
+  if (source === 'tiktok') return 'TikTok';
+  if (source === 'video-element') return 'DOM';
+  if (source === 'og-meta') return 'Meta';
+  if (source === 'json-ld') return 'Schema';
+  return '';
+}
+
+/**
+ * Handle download button click
+ */
+async function handleDownloadClick(event: Event): Promise<void> {
+  const btn = event.currentTarget as HTMLButtonElement;
+  const videoId = btn.dataset.videoId;
+
+  if (!videoId) return;
+
+  const video = detectedVideos.find((v) => v.id === videoId);
+  if (!video) return;
+
+  // Update UI immediately
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  btn.classList.remove('btn-primary');
+  btn.classList.add('btn-secondary');
+
+  // Update local status
+  downloadStatuses.set(videoId, 'downloading');
+
+  try {
+    const response = await browser.runtime.sendMessage({
+      action: 'download',
+      options: { video },
+    });
+
+    if (response?.success) {
+      btn.textContent = 'Started!';
+
+      // Update status after a short delay to show completion
+      setTimeout(() => {
+        downloadStatuses.set(videoId, 'completed');
+        // Re-render the specific item
+        const videoItem = document.querySelector(`[data-video-id="${videoId}"]`);
+        if (videoItem) {
+          videoItem.classList.add('downloaded');
+          const btnEl = videoItem.querySelector('.download-btn') as HTMLButtonElement;
+          if (btnEl) {
+            btnEl.textContent = 'Downloaded';
+            btnEl.classList.remove('btn-secondary');
+            btnEl.classList.add('btn-success');
+          }
+        }
+      }, 1500);
+    } else {
+      throw new Error(response?.error || 'Download failed');
+    }
+  } catch (error) {
+    console.error('[Video Downloader] Download error:', error);
+    downloadStatuses.set(videoId, 'failed');
+    btn.textContent = 'Failed';
+
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+      btn.classList.remove('btn-secondary');
+      btn.classList.add('btn-primary');
+      downloadStatuses.delete(videoId);
+    }, 2000);
+  }
+}
+
+/**
+ * Get human-readable type label
+ */
+function getTypeLabel(mimeType: string): string {
+  const types: Record<string, string> = {
+    'video/mp4': 'MP4',
+    'video/webm': 'WebM',
+    'video/ogg': 'OGG',
+    'video/quicktime': 'MOV',
+    'video/x-msvideo': 'AVI',
+    'video/x-matroska': 'MKV',
+    'video/mp2t': 'TS',
+    'application/x-mpegURL': 'HLS',
+    'application/dash+xml': 'DASH',
+  };
+
+  return types[mimeType] || 'Video';
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHTML(str: string): string {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// Initialize when DOM is ready
+document.addEventListener('DOMContentLoaded', init);

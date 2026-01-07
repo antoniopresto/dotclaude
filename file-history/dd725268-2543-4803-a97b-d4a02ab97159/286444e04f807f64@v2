@@ -1,0 +1,207 @@
+/**
+ * Claude Agent
+ *
+ * Wrapper for spawning and managing a single Claude CLI process.
+ */
+
+import { spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import type { Feature, ModelType } from '../types.js';
+
+export interface AgentOptions {
+  model: ModelType;
+  maxBudget?: number;
+  timeout?: number;
+  cwd?: string;
+}
+
+export interface AgentResult {
+  success: boolean;
+  output: string;
+  error?: string;
+  duration: number;
+}
+
+export class ClaudeAgent extends EventEmitter {
+  readonly id: string;
+  private process: ChildProcess | null = null;
+  private output: string[] = [];
+  private errorOutput: string[] = [];
+  private startTime: number = 0;
+
+  constructor(
+    id: string,
+    private options: AgentOptions
+  ) {
+    super();
+    this.id = id;
+  }
+
+  /**
+   * Execute a feature task
+   */
+  async executeFeature(feature: Feature): Promise<AgentResult> {
+    const prompt = this.buildPrompt(feature);
+    return this.execute(prompt);
+  }
+
+  /**
+   * Execute a raw prompt
+   */
+  async execute(prompt: string): Promise<AgentResult> {
+    return new Promise((resolve) => {
+      this.startTime = Date.now();
+      this.output = [];
+      this.errorOutput = [];
+
+      const args = this.buildArgs(prompt);
+
+      this.process = spawn('claude', args, {
+        cwd: this.options.cwd || process.cwd(),
+        shell: true,
+        stdio: ['inherit', 'pipe', 'pipe'],
+      });
+
+      const timeout = this.options.timeout || 10 * 60 * 1000; // 10 min default
+      const timeoutId = setTimeout(() => {
+        this.kill('Timeout exceeded');
+      }, timeout);
+
+      this.process.stdout?.on('data', (data: Buffer) => {
+        const text = data.toString();
+        this.output.push(text);
+        this.emit('output', text);
+      });
+
+      this.process.stderr?.on('data', (data: Buffer) => {
+        const text = data.toString();
+        this.errorOutput.push(text);
+        this.emit('error', text);
+      });
+
+      this.process.on('error', (err) => {
+        clearTimeout(timeoutId);
+        resolve({
+          success: false,
+          output: this.output.join(''),
+          error: err.message,
+          duration: Date.now() - this.startTime,
+        });
+      });
+
+      this.process.on('close', (code) => {
+        clearTimeout(timeoutId);
+        resolve({
+          success: code === 0,
+          output: this.output.join(''),
+          error: code !== 0 ? this.errorOutput.join('') : undefined,
+          duration: Date.now() - this.startTime,
+        });
+      });
+    });
+  }
+
+  /**
+   * Build command line arguments for claude CLI
+   *
+   * Key flags for context isolation:
+   * - `-p` (print mode): Non-interactive, exits after completion
+   * - `--no-session-persistence`: Does NOT save to disk, cannot be resumed
+   * - Each execution is a fresh context with no memory of previous tasks
+   */
+  private buildArgs(prompt: string): string[] {
+    const args = [
+      '-p',                        // Print mode (non-interactive)
+      '--no-session-persistence',  // Don't persist session - clean context every time
+    ];
+
+    if (this.options.model) {
+      args.push('--model', this.options.model);
+    }
+
+    if (this.options.maxBudget) {
+      args.push('--max-budget-usd', String(this.options.maxBudget));
+    }
+
+    // Pass prompt directly - shell: true handles quoting
+    args.push(prompt);
+
+    return args;
+  }
+
+  /**
+   * Build prompt for a feature
+   *
+   * Since each agent starts with a fresh context (no memory of previous sessions),
+   * the prompt must be self-contained with all necessary instructions.
+   */
+  private buildPrompt(feature: Feature): string {
+    return `# Task Assignment: ${feature.id}
+
+## Your Mission
+Complete feature **${feature.id}**: ${feature.description}
+
+## Steps to Complete
+${feature.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+
+${feature.notes ? `## Additional Notes\n${feature.notes}\n` : ''}
+
+## Harness Protocol (MANDATORY)
+
+You are part of an automated harness system. Each task runs in an **isolated context** with no memory of previous sessions.
+
+### Before Starting
+1. **READ** \`progress.txt\` to understand current project state
+2. **READ** \`CLAUDE.md\` for project-specific instructions
+3. **READ** \`features.json\` to understand your task and its dependencies
+
+### During Implementation
+4. Implement the feature following the steps above
+5. Test your implementation
+6. Keep changes focused on this feature only
+
+### After Completing
+7. **UPDATE** \`features.json\`: Set \`passes: true\` for feature ${feature.id}
+8. **APPEND** to \`progress.txt\`: Add session notes with what was done
+9. **COMMIT** only changes for this feature (git add + git commit)
+
+### Critical Rules
+- Do NOT modify features that aren't assigned to you
+- Do NOT leave the codebase in a broken state
+- If blocked, document the issue in progress.txt and stop
+- Each commit message should reference the feature ID: "${feature.id}"
+
+## Success Criteria
+The feature is complete when:
+- All steps above are implemented
+- \`features.json\` has \`passes: true\` for ${feature.id}
+- Changes are committed to git
+- No build errors or test failures
+`;
+  }
+
+  /**
+   * Kill the agent process
+   */
+  kill(reason?: string): void {
+    if (this.process) {
+      this.emit('killed', reason);
+      this.process.kill('SIGTERM');
+      this.process = null;
+    }
+  }
+
+  /**
+   * Check if agent is running
+   */
+  isRunning(): boolean {
+    return this.process !== null;
+  }
+
+  /**
+   * Get agent PID
+   */
+  getPid(): number | undefined {
+    return this.process?.pid;
+  }
+}

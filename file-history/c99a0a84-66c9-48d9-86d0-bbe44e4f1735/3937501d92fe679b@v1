@@ -1,0 +1,601 @@
+/**
+ * MicroLayer (deck.gl) - Detailed task card visualization
+ *
+ * Renders detailed task cards with labels at zoom > 2.0x (MICRO LOD level).
+ *
+ * Features:
+ * - SolidPolygonLayer for task cards and backgrounds
+ * - TextLayer for task labels
+ * - PathLayer for grid lines and dependency arrows
+ * - Viewport culling for performance
+ * - Hover/selection/focus highlighting
+ *
+ * DECK-MIGRATE-002: Replaces R3F MicroLayer
+ */
+
+import { SolidPolygonLayer, PathLayer, TextLayer } from '@deck.gl/layers';
+import type { Layer } from '@deck.gl/core';
+import type { TaskRender } from '../../data/types';
+import { DEFAULT_VIEW_CONFIG } from '../../data/types';
+
+// ─────────────────────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────────────────────
+
+const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+
+// Task card dimensions
+const CARD_PADDING = 2;
+const CARD_HEIGHT = pxPerTrain - CARD_PADDING * 2 - 2;
+
+// Color palette (as RGBA)
+const COLORS: Record<string, [number, number, number, number]> = {
+  blue: [59, 130, 246, 255],
+  orange: [245, 158, 11, 255],
+  gray: [156, 163, 175, 255],
+};
+
+const CONFLICT_COLOR: [number, number, number, number] = [239, 68, 68, 255];
+const SELECTION_COLOR: [number, number, number, number] = [6, 182, 212, 255];
+const FOCUS_COLOR: [number, number, number, number] = [139, 92, 246, 255];
+
+// Grid colors
+const GRID_COLOR_MAJOR: [number, number, number, number] = [209, 213, 219, 128];
+const GRID_COLOR_MINOR: [number, number, number, number] = [229, 231, 235, 102];
+
+// Row background colors
+const ROW_BG_EVEN: [number, number, number, number] = [255, 255, 255, 128];
+const ROW_BG_ODD: [number, number, number, number] = [248, 250, 252, 128];
+
+// Dependency line colors
+const DEPENDENCY_LINE_COLOR: [number, number, number, number] = [139, 92, 246, 204];
+
+// ─────────────────────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────────────────────
+
+export interface ViewportBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+interface TaskPolygon {
+  id: string;
+  polygon: [number, number][];
+  task: TaskRender;
+}
+
+interface RowBackground {
+  trainIndex: number;
+  polygon: [number, number][];
+  isEven: boolean;
+}
+
+interface GridLine {
+  path: [number, number][];
+  isMajor: boolean;
+}
+
+interface TaskLabel {
+  position: [number, number];
+  text: string;
+  taskId: string;
+}
+
+interface DependencyPath {
+  path: [number, number][];
+  fromId: string;
+  toId: string;
+}
+
+interface EffectPolygon {
+  taskId: string;
+  polygon: [number, number][];
+}
+
+// ─────────────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ─────────────────────────────────────────────────────────────
+
+function brightenColor(
+  color: [number, number, number, number],
+  factor: number
+): [number, number, number, number] {
+  return [
+    Math.min(255, Math.round(color[0] * factor)),
+    Math.min(255, Math.round(color[1] * factor)),
+    Math.min(255, Math.round(color[2] * factor)),
+    color[3],
+  ];
+}
+
+function applyOpacity(
+  color: [number, number, number, number],
+  opacity: number
+): [number, number, number, number] {
+  return [color[0], color[1], color[2], Math.round(color[3] * opacity)];
+}
+
+function createRectPolygon(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number
+): [number, number][] {
+  return [
+    [x1, y1],
+    [x2, y1],
+    [x2, y2],
+    [x1, y2],
+    [x1, y1],
+  ];
+}
+
+/**
+ * Filter tasks visible within viewport bounds
+ */
+function filterVisibleTasks(
+  tasks: TaskRender[],
+  viewportBounds?: ViewportBounds
+): TaskRender[] {
+  if (!viewportBounds) return tasks;
+
+  const padding = 100;
+  const minX = viewportBounds.minX - padding;
+  const maxX = viewportBounds.maxX + padding;
+  const minY = viewportBounds.minY - padding;
+  const maxY = viewportBounds.maxY + padding;
+
+  return tasks.filter((task) => {
+    const taskStartX = task.startDay * pxPerDay;
+    const taskEndX = taskStartX + task.duration * pxPerDay;
+    const taskY = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+
+    const xOverlap = taskEndX >= minX && taskStartX <= maxX;
+    const yOverlap = taskY + pxPerTrain / 2 >= minY && taskY - pxPerTrain / 2 <= maxY;
+
+    return xOverlap && yOverlap;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// DATA GENERATION
+// ─────────────────────────────────────────────────────────────
+
+function generateRowBackgrounds(
+  trainCount: number,
+  totalDays: number,
+  viewportBounds?: ViewportBounds
+): RowBackground[] {
+  const totalWidth = totalDays * pxPerDay;
+  const backgrounds: RowBackground[] = [];
+
+  // Calculate visible range
+  let minTrainIndex = 0;
+  let maxTrainIndex = trainCount - 1;
+
+  if (viewportBounds) {
+    minTrainIndex = Math.max(0, Math.floor(-viewportBounds.maxY / pxPerTrain) - 1);
+    maxTrainIndex = Math.min(trainCount - 1, Math.ceil(-viewportBounds.minY / pxPerTrain) + 1);
+  }
+
+  for (let i = minTrainIndex; i <= maxTrainIndex; i++) {
+    const y1 = -i * pxPerTrain;
+    const y2 = -(i + 1) * pxPerTrain;
+
+    backgrounds.push({
+      trainIndex: i,
+      polygon: createRectPolygon(0, y1, totalWidth, y2),
+      isEven: i % 2 === 0,
+    });
+  }
+
+  return backgrounds;
+}
+
+function generateGridLines(
+  totalDays: number,
+  trainCount: number,
+  viewportBounds?: ViewportBounds
+): { horizontal: GridLine[]; vertical: GridLine[] } {
+  const totalWidth = totalDays * pxPerDay;
+  const totalHeight = trainCount * pxPerTrain;
+
+  const horizontal: GridLine[] = [];
+  const vertical: GridLine[] = [];
+
+  // Visible horizontal lines (train boundaries)
+  let minTrainIndex = 0;
+  let maxTrainIndex = trainCount;
+
+  if (viewportBounds) {
+    minTrainIndex = Math.max(0, Math.floor(-viewportBounds.maxY / pxPerTrain) - 1);
+    maxTrainIndex = Math.min(trainCount, Math.ceil(-viewportBounds.minY / pxPerTrain) + 1);
+  }
+
+  for (let i = minTrainIndex; i <= maxTrainIndex; i++) {
+    const y = -i * pxPerTrain;
+    horizontal.push({
+      path: [[0, y], [totalWidth, y]],
+      isMajor: true,
+    });
+  }
+
+  // Visible vertical lines (week boundaries)
+  let minDay = 0;
+  let maxDay = totalDays;
+
+  if (viewportBounds) {
+    minDay = Math.max(0, Math.floor(viewportBounds.minX / pxPerDay / 7) * 7 - 7);
+    maxDay = Math.min(totalDays, Math.ceil(viewportBounds.maxX / pxPerDay / 7) * 7 + 7);
+  }
+
+  for (let day = minDay; day <= maxDay; day += 7) {
+    const x = day * pxPerDay;
+    const isMajor = day % 30 === 0;
+    vertical.push({
+      path: [[x, 0], [x, -totalHeight]],
+      isMajor,
+    });
+  }
+
+  return { horizontal, vertical };
+}
+
+function generateTaskPolygons(tasks: TaskRender[]): TaskPolygon[] {
+  return tasks.map((task) => {
+    const width = task.duration * pxPerDay - CARD_PADDING * 2;
+    const x1 = task.startDay * pxPerDay + CARD_PADDING;
+    const x2 = x1 + width;
+    const y1 = -task.trainIndex * pxPerTrain - CARD_PADDING;
+    const y2 = y1 - CARD_HEIGHT;
+
+    return {
+      id: task.id,
+      polygon: createRectPolygon(x1, y1, x2, y2),
+      task,
+    };
+  });
+}
+
+function generateTaskLabels(
+  tasks: TaskRender[],
+  linearZoom: number,
+  maxLabels: number = 50
+): TaskLabel[] {
+  // Only show labels on tasks wide enough
+  const minWidthForLabel = 40 / linearZoom;
+  const filtered = tasks.filter((t) => t.duration * pxPerDay > minWidthForLabel);
+
+  // Sort by width (largest first) and take top N
+  const sorted = filtered
+    .sort((a, b) => b.duration - a.duration)
+    .slice(0, maxLabels);
+
+  return sorted.map((task) => {
+    const width = task.duration * pxPerDay;
+    const x = task.startDay * pxPerDay + width / 2;
+    const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+    const label = task.type.charAt(0).toUpperCase() + task.type.slice(1);
+
+    return {
+      position: [x, y] as [number, number],
+      text: label,
+      taskId: task.id,
+    };
+  });
+}
+
+function generateConflictGlows(tasks: TaskRender[]): EffectPolygon[] {
+  return tasks
+    .filter((t) => t.hasConflict)
+    .map((task) => {
+      const padding = 2;
+      const width = task.duration * pxPerDay;
+      const x1 = task.startDay * pxPerDay - padding;
+      const x2 = x1 + width + padding * 2;
+      const y1 = -task.trainIndex * pxPerTrain - CARD_PADDING + padding;
+      const y2 = y1 - CARD_HEIGHT - padding * 2;
+
+      return {
+        taskId: task.id,
+        polygon: createRectPolygon(x1, y1, x2, y2),
+      };
+    });
+}
+
+function generateFocusRing(
+  tasks: TaskRender[],
+  focusedTaskId: string | null
+): EffectPolygon | null {
+  if (!focusedTaskId) return null;
+
+  const task = tasks.find((t) => t.id === focusedTaskId);
+  if (!task) return null;
+
+  const padding = 3;
+  const width = task.duration * pxPerDay;
+  const x1 = task.startDay * pxPerDay - padding;
+  const x2 = x1 + width + padding * 2;
+  const y1 = -task.trainIndex * pxPerTrain - CARD_PADDING + padding;
+  const y2 = y1 - CARD_HEIGHT - padding * 2;
+
+  return {
+    taskId: task.id,
+    polygon: createRectPolygon(x1, y1, x2, y2),
+  };
+}
+
+function generateDependencyPaths(tasks: TaskRender[]): DependencyPath[] {
+  const taskMap = new Map(tasks.map((t) => [t.id, t]));
+  const paths: DependencyPath[] = [];
+
+  for (const task of tasks) {
+    if (task.predecessorId) {
+      const predecessor = taskMap.get(task.predecessorId);
+      if (predecessor) {
+        // From: right edge of predecessor
+        const fromX = (predecessor.startDay + predecessor.duration) * pxPerDay;
+        const fromY = -predecessor.trainIndex * pxPerTrain - pxPerTrain / 2;
+
+        // To: left edge of dependent
+        const toX = task.startDay * pxPerDay;
+        const toY = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+
+        const midX = (fromX + toX) / 2;
+        const isSameRow = predecessor.trainIndex === task.trainIndex;
+
+        let path: [number, number][];
+        if (isSameRow) {
+          const offsetY = 8;
+          path = [
+            [fromX, fromY + offsetY],
+            [midX, fromY + offsetY + 5],
+            [toX, toY + offsetY],
+          ];
+        } else {
+          const controlOffset = Math.abs(toY - fromY) * 0.3;
+          path = [
+            [fromX, fromY],
+            [fromX + controlOffset, fromY],
+            [midX, (fromY + toY) / 2],
+            [toX - controlOffset, toY],
+            [toX, toY],
+          ];
+        }
+
+        paths.push({
+          path,
+          fromId: predecessor.id,
+          toId: task.id,
+        });
+      }
+    }
+  }
+
+  return paths;
+}
+
+// ─────────────────────────────────────────────────────────────
+// LAYER FACTORY
+// ─────────────────────────────────────────────────────────────
+
+export interface MicroLayerOptions {
+  tasks: TaskRender[];
+  trainCount: number;
+  totalDays?: number;
+  visible?: boolean;
+  opacity?: number;
+  linearZoom?: number;
+  viewportBounds?: ViewportBounds;
+  hoveredTaskId?: string | null;
+  selectedTaskId?: string | null;
+  focusedTaskId?: string | null;
+}
+
+/**
+ * Create MicroLayer (deck.gl layers) for detailed task visualization
+ *
+ * Returns an array of layers:
+ * - Row backgrounds
+ * - Grid lines
+ * - Conflict glows
+ * - Focus ring
+ * - Task cards
+ * - Task labels
+ * - Dependency lines
+ */
+export function createMicroLayers({
+  tasks,
+  trainCount,
+  totalDays = 365 * 10,
+  visible = true,
+  opacity = 1,
+  linearZoom = 3,
+  viewportBounds,
+  hoveredTaskId = null,
+  selectedTaskId = null,
+  focusedTaskId = null,
+}: MicroLayerOptions): Layer[] {
+  if (!visible) {
+    return [];
+  }
+
+  // Don't render labels during low opacity transitions
+  const showLabels = opacity >= 0.3;
+
+  // Filter to visible tasks
+  const visibleTasks = filterVisibleTasks(tasks, viewportBounds);
+
+  // Generate data
+  const rowBackgrounds = generateRowBackgrounds(trainCount, totalDays, viewportBounds);
+  const { horizontal: hGridLines, vertical: vGridLines } = generateGridLines(
+    totalDays,
+    trainCount,
+    viewportBounds
+  );
+  const taskPolygons = generateTaskPolygons(visibleTasks);
+  const conflictGlows = generateConflictGlows(visibleTasks);
+  const focusRing = generateFocusRing(visibleTasks, focusedTaskId);
+  const taskLabels = showLabels ? generateTaskLabels(visibleTasks, linearZoom) : [];
+  const dependencyPaths = generateDependencyPaths(visibleTasks);
+
+  const layers: Layer[] = [];
+
+  // Layer 1: Row backgrounds (bottom)
+  layers.push(
+    new SolidPolygonLayer<RowBackground>({
+      id: 'micro-row-backgrounds',
+      data: rowBackgrounds,
+      getPolygon: (d) => d.polygon,
+      getFillColor: (d) =>
+        applyOpacity(d.isEven ? ROW_BG_EVEN : ROW_BG_ODD, opacity),
+      pickable: false,
+      updateTriggers: {
+        getFillColor: [opacity],
+      },
+    })
+  );
+
+  // Layer 2: Grid lines
+  if (hGridLines.length > 0 || vGridLines.length > 0) {
+    const allGridLines = [...hGridLines, ...vGridLines];
+    layers.push(
+      new PathLayer<GridLine>({
+        id: 'micro-grid-lines',
+        data: allGridLines,
+        getPath: (d) => d.path,
+        getColor: (d) =>
+          applyOpacity(d.isMajor ? GRID_COLOR_MAJOR : GRID_COLOR_MINOR, opacity),
+        getWidth: (d) => (d.isMajor ? 1.5 : 1),
+        widthUnits: 'pixels',
+        pickable: false,
+        updateTriggers: {
+          getColor: [opacity],
+        },
+      })
+    );
+  }
+
+  // Layer 3: Conflict glows
+  if (conflictGlows.length > 0) {
+    layers.push(
+      new SolidPolygonLayer<EffectPolygon>({
+        id: 'micro-conflict-glows',
+        data: conflictGlows,
+        getPolygon: (d) => d.polygon,
+        getFillColor: applyOpacity([239, 68, 68, 76], opacity),
+        pickable: false,
+        updateTriggers: {
+          getFillColor: [opacity],
+        },
+      })
+    );
+  }
+
+  // Layer 4: Focus ring
+  if (focusRing) {
+    layers.push(
+      new SolidPolygonLayer<EffectPolygon>({
+        id: 'micro-focus-ring',
+        data: [focusRing],
+        getPolygon: (d) => d.polygon,
+        getFillColor: applyOpacity([139, 92, 246, 102], opacity),
+        pickable: false,
+        updateTriggers: {
+          getFillColor: [opacity],
+        },
+      })
+    );
+  }
+
+  // Layer 5: Task cards (pickable)
+  layers.push(
+    new SolidPolygonLayer<TaskPolygon>({
+      id: 'micro-task-cards',
+      data: taskPolygons,
+      getPolygon: (d) => d.polygon,
+      getFillColor: (d) => {
+        const { task } = d;
+        const isSelected = task.id === selectedTaskId;
+        const isFocused = task.id === focusedTaskId;
+        const isHovered = task.id === hoveredTaskId;
+
+        let color: [number, number, number, number];
+
+        if (isSelected) {
+          color = SELECTION_COLOR;
+        } else if (isFocused) {
+          color = FOCUS_COLOR;
+        } else if (task.hasConflict) {
+          color = isHovered ? brightenColor(CONFLICT_COLOR, 1.3) : CONFLICT_COLOR;
+        } else {
+          const baseColor = COLORS[task.color] || COLORS.gray;
+          color = isHovered ? brightenColor(baseColor, 1.3) : baseColor;
+        }
+
+        return applyOpacity(color, opacity);
+      },
+      pickable: true,
+      updateTriggers: {
+        getFillColor: [opacity, hoveredTaskId, selectedTaskId, focusedTaskId],
+      },
+    })
+  );
+
+  // Layer 6: Task labels
+  if (taskLabels.length > 0) {
+    layers.push(
+      new TextLayer<TaskLabel>({
+        id: 'micro-task-labels',
+        data: taskLabels,
+        getPosition: (d) => d.position,
+        getText: (d) => d.text,
+        getSize: 10,
+        getColor: applyOpacity([255, 255, 255, 255], opacity),
+        getTextAnchor: 'middle',
+        getAlignmentBaseline: 'center',
+        fontFamily: 'system-ui, -apple-system, sans-serif',
+        fontWeight: 'bold',
+        pickable: false,
+        updateTriggers: {
+          getColor: [opacity],
+        },
+      })
+    );
+  }
+
+  // Layer 7: Dependency lines
+  if (dependencyPaths.length > 0 && opacity >= 0.3) {
+    layers.push(
+      new PathLayer<DependencyPath>({
+        id: 'micro-dependency-lines',
+        data: dependencyPaths,
+        getPath: (d) => d.path,
+        getColor: applyOpacity(DEPENDENCY_LINE_COLOR, opacity),
+        getWidth: 2,
+        widthUnits: 'pixels',
+        pickable: false,
+        updateTriggers: {
+          getColor: [opacity],
+        },
+      })
+    );
+  }
+
+  return layers;
+}
+
+/**
+ * Export constants for use in other modules
+ */
+export const MICRO_CONSTANTS = {
+  CARD_PADDING,
+  CARD_HEIGHT,
+  COLORS,
+  CONFLICT_COLOR,
+  SELECTION_COLOR,
+  FOCUS_COLOR,
+};

@@ -1,0 +1,343 @@
+import {
+  assertErrorLike,
+  captureStackTrace,
+  createErrorList,
+  hasCaptureStackTrace,
+  invariant,
+  InvariantError,
+  isErrorLike,
+  moveStackTrace,
+  tryCatch,
+} from '../error-utils';
+
+describe('error-utils', () => {
+  describe('isErrorLike', () => {
+    it('should return true for error-like objects', () => {
+      expect(isErrorLike(new Error())).toBe(true);
+      expect(
+        isErrorLike({
+          message: 'msg',
+          stack: 'stk',
+        }),
+      ).toBe(true);
+    });
+
+    it('should return false for non-error-like objects', () => {
+      expect(isErrorLike(null)).toBe(false);
+      expect(isErrorLike(undefined)).toBe(false);
+      expect(isErrorLike({})).toBe(false);
+      expect(isErrorLike({ message: 'msg' })).toBe(false);
+      expect(isErrorLike({ stack: 'stk' })).toBe(false);
+      expect(isErrorLike('a string')).toBe(false);
+      expect(isErrorLike(123)).toBe(false);
+    });
+  });
+
+  describe('assertErrorLike', () => {
+    it('should not throw for error-like objects', () => {
+      const error = new Error('test');
+      expect(() => assertErrorLike(error)).not.toThrow();
+    });
+
+    it('should throw the value if it is not error-like', () => {
+      const notAnError = { message: 'only message' };
+      try {
+        assertErrorLike(notAnError);
+      } catch (e) {
+        expect(e).toBe(notAnError);
+      }
+
+      const aString = 'a string';
+      expect(() => assertErrorLike(aString)).toThrow(aString);
+    });
+  });
+
+  describe('InvariantError', () => {
+    it('should create an error with a default message', () => {
+      // @ts-expect-error
+      const error = new InvariantError(undefined, undefined);
+      expect(error.message).toBe('Expected value to be defined.');
+    });
+
+    it('should create an error with a custom string message', () => {
+      // @ts-expect-error
+      const error = new InvariantError('Custom message', undefined);
+      expect(error.message).toBe('Custom message');
+    });
+
+    it('should create an error with a message from an object', () => {
+      const error = new InvariantError(
+        { message: 'Object message' },
+        // @ts-expect-error
+        undefined,
+      );
+      expect(error.message).toBe('Object message');
+    });
+
+    it('should use the provided stack from an object', () => {
+      const customStack = 'custom stack trace';
+      // @ts-expect-error
+      const error = new InvariantError({ stack: customStack }, undefined);
+      expect(error.stack).toBe(customStack);
+    });
+
+    it('should use a default message if object has no message', () => {
+      // @ts-expect-error
+      const error = new InvariantError({}, undefined);
+      expect(error.message).toBe('Expected value to be defined.');
+    });
+
+    it('should capture stack trace if custom parent is provided', () => {
+      const parentFn = () => {};
+      const error = new InvariantError('test', parentFn);
+
+      // The error should have a stack trace
+      expect(error.stack).toBeDefined();
+      expect(typeof error.stack).toBe('string');
+      // Stack should contain the error message
+      expect(error.stack).toContain('test');
+    });
+
+    it('should modify stack trace regardless of runtime', () => {
+      const parentFn = function namedParentFn() {};
+      const error = new InvariantError('test message', parentFn);
+
+      // Stack should exist and be modified
+      expect(error.stack).toBeDefined();
+      // In both V8 and JSC, the stack should contain the error info
+      expect(error.stack).toMatch(/test message|InvariantError/);
+    });
+  });
+
+  describe('invariant', () => {
+    it('should not throw for truthy values', () => {
+      expect(() => invariant(true)).not.toThrow();
+      expect(() => invariant(1)).not.toThrow();
+      expect(() => invariant('a')).not.toThrow();
+      expect(() => invariant({})).not.toThrow();
+    });
+
+    it('should throw InvariantError for falsy values', () => {
+      expect(() => invariant(false)).toThrow(InvariantError);
+      expect(() => invariant(0)).toThrow(InvariantError);
+      expect(() => invariant('')).toThrow(InvariantError);
+      expect(() => invariant(null)).toThrow(InvariantError);
+      expect(() => invariant(undefined)).toThrow(InvariantError);
+    });
+
+    it('should throw with the default message', () => {
+      expect(() => invariant(false)).toThrow('Expected value not to be falsy.');
+    });
+
+    it('should throw with a custom message', () => {
+      const customMessage = 'Value must be truthy';
+      expect(() => invariant(false, customMessage)).toThrow(customMessage);
+    });
+
+    it('should use the correct stack trace parent function', () => {
+      const myCustomParent = function customParentFn() {};
+
+      try {
+        invariant(false, 'test', myCustomParent);
+      } catch (e: any) {
+        // The error should have a stack
+        expect(e.stack).toBeDefined();
+        expect(typeof e.stack).toBe('string');
+      }
+
+      // Check default behavior
+      try {
+        invariant(false, 'another test');
+      } catch (e: any) {
+        expect(e.stack).toBeDefined();
+        expect(e.message).toBe('another test');
+      }
+    });
+  });
+
+  describe('tryCatch', () => {
+    it('should return the result in a tuple on success', () => {
+      const result = tryCatch(() => 42);
+      expect(result).toEqual([
+        undefined,
+        42,
+      ]);
+    });
+
+    it('should return the error in a tuple on failure', () => {
+      const error = new Error('Failure');
+      const result = tryCatch(() => {
+        throw error;
+      });
+      expect(result[0]).toBe(error);
+      expect(result[1]).toBeUndefined();
+    });
+
+    it('should re-throw non-error-like values', () => {
+      const nonError = 'this is not an error';
+      expect(() =>
+        tryCatch(() => {
+          throw nonError;
+        })).toThrow(nonError);
+    });
+
+    it('should move the stack trace on error', () => {
+      const error = new Error('Failure');
+
+      const result = tryCatch(() => {
+        throw error;
+      });
+
+      expect(result[0]).toBeInstanceOf(Error);
+      expect(result[0]?.stack).toBeDefined();
+      // The stack should contain the error message
+      expect(result[0]?.stack).toContain('Failure');
+      // After moving, the stack should be modified (may or may not equal original
+      // depending on runtime, but should still be valid)
+      expect(typeof result[0]?.stack).toBe('string');
+    });
+
+    it('should use the provided parent function for stack trace', () => {
+      const myParent = function myParentFn() {};
+
+      const result = tryCatch(() => {
+        throw new Error('test');
+      }, myParent);
+
+      // The error should have a valid stack
+      expect(result[0]).toBeInstanceOf(Error);
+      expect(result[0]?.stack).toBeDefined();
+    });
+  });
+
+  describe('moveStackTrace', () => {
+    const parentFn = function parentFn() {};
+
+    // Overload 1: moveStackTrace(error, newStack)
+    describe('when given an error', () => {
+      it('should modify the error stack and return the error', () => {
+        const error = new Error('test');
+        // @ts-expect-error
+        const returnedError = moveStackTrace(error, parentFn);
+        expect(returnedError).toBe(error);
+        // Stack should be defined and contain error info
+        expect(error.stack).toBeDefined();
+        expect(error.stack).toContain('test');
+      });
+
+      it('should throw if the value is not error-like', () => {
+        const notAnError = { message: 'not an error' };
+        try {
+          moveStackTrace(notAnError as any, parentFn);
+        } catch (e) {
+          expect(e).toBe(notAnError);
+        }
+      });
+    });
+
+    // Overload 2: moveStackTrace(fn, newStack)
+    describe('when given a function', () => {
+      it('should return the result of the function if it does not throw', () => {
+        const result = moveStackTrace(() => 42, parentFn);
+        expect(result).toBe(42);
+      });
+
+      it('should throw a modified error if the function throws an error', () => {
+        const error = new Error('test');
+        let caughtError: Error | null = null;
+
+        try {
+          moveStackTrace(() => {
+            throw error;
+          }, parentFn);
+        } catch (e: any) {
+          caughtError = e;
+        }
+
+        expect(caughtError).toBe(error);
+        expect(caughtError?.stack).toBeDefined();
+        expect(caughtError?.stack).toContain('test');
+      });
+
+      it('should re-throw non-error-like values without modification', () => {
+        const nonError = 'just a string';
+        expect(() =>
+          moveStackTrace(() => {
+            throw nonError;
+          }, parentFn)).toThrow(nonError);
+      });
+    });
+  });
+
+  describe('captureStackTrace', () => {
+    it('should modify error stack in any runtime', () => {
+      const error = new Error('test error');
+      const parentFn = function testParent() {};
+
+      captureStackTrace(error, parentFn);
+
+      expect(error.stack).toBeDefined();
+      expect(typeof error.stack).toBe('string');
+      // Stack should contain error info
+      expect(error.stack).toMatch(/test error|Error/);
+    });
+
+    it('should work without constructor option', () => {
+      const error = new Error('no parent');
+      captureStackTrace(error);
+      expect(error.stack).toBeDefined();
+    });
+
+    it('hasCaptureStackTrace should be a boolean', () => {
+      expect(typeof hasCaptureStackTrace).toBe('boolean');
+    });
+  });
+
+  describe('createErrorList', () => {
+    it('should allow adding errors', () => {
+      const errorList = createErrorList();
+      errorList.add('First error');
+      errorList.add('Second error');
+      // Adding the same error again should have no effect
+      errorList.add('First error');
+
+      expect(() => errorList.check()).toThrow(
+        'Multiple errors found: First error, Second error',
+      );
+    });
+
+    it('check() should not throw if no errors are added', () => {
+      const errorList = createErrorList();
+      expect(() => errorList.check()).not.toThrow();
+    });
+
+    it('getError() should always throw with the current error list', () => {
+      const errorList = createErrorList();
+      errorList.add('Error 1');
+      expect(() => errorList.getError()).toThrow(
+        new InvariantError(
+          'Multiple errors found: Error 1',
+          expect.any(Function),
+        ),
+      );
+    });
+
+    it('should accept function message', () => {
+      const err = new InvariantError(
+        typeName => `Hmm ${typeName}`,
+        expect.any(Function),
+        1,
+      );
+      expect(err.message).toEqual('Hmm Number');
+    });
+
+    it('should use a custom prefix', () => {
+      const customPrefix = 'Validation failed: ';
+      const errorList = createErrorList(customPrefix);
+      errorList.add('Invalid name');
+      expect(() => errorList.check()).toThrow(
+        'Validation failed: Invalid name',
+      );
+    });
+  });
+});

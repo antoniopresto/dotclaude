@@ -1,0 +1,209 @@
+import { EMPTY } from './symbol';
+import type { AnyFunction } from './type-utils';
+import { getTypeOf } from './typeof';
+
+export type ErrorLike = {
+  message: string;
+  stack: string;
+};
+
+export function isErrorLike(value: any): value is ErrorLike {
+  return Boolean(typeof value?.message === 'string' && typeof value?.stack === 'string');
+}
+
+/**
+ * Check if we're running in Bun (which has captureStackTrace but with different behavior)
+ */
+const isBun = typeof (globalThis as any).Bun !== 'undefined';
+
+/**
+ * Check if Error.captureStackTrace is available and works correctly
+ * Note: Bun has captureStackTrace but the second argument causes undefined stack
+ */
+export const hasCaptureStackTrace = typeof Error.captureStackTrace === 'function';
+
+/**
+ * Universal stack trace capture that works in both V8 (Node.js) and JSC (Bun)
+ * In V8: uses Error.captureStackTrace for clean stack traces
+ * In Bun: uses captureStackTrace without second arg (avoids undefined stack bug)
+ */
+export function captureStackTrace(targetError: Error, constructorOpt?: Function): void {
+  if (!hasCaptureStackTrace) {
+    // No captureStackTrace available - keep original stack
+    return;
+  }
+
+  if (isBun) {
+    // Bun has a bug where passing constructorOpt makes stack undefined
+    // Just call without the second argument to get a valid stack
+    Error.captureStackTrace(targetError);
+  } else {
+    // Node.js / V8 - full support
+    Error.captureStackTrace(targetError, constructorOpt);
+  }
+}
+
+export function assertErrorLike(value: unknown): asserts value is ErrorLike {
+  if (!isErrorLike(value)) {
+    throw value;
+  }
+}
+
+const IS_NOT_PRODUCTION = typeof process === 'object' && process.env?.NODE_ENV !== 'production';
+
+export type InvariantMessage =
+  | string
+  | ((typeName: string) => string)
+  | {
+      message?: string;
+      stack?: string;
+    };
+
+export function parseInvariantMessage(
+  errorOrMessage: InvariantMessage | undefined,
+  value: unknown,
+) {
+  if (typeof errorOrMessage === 'string') return errorOrMessage;
+  if (
+    errorOrMessage &&
+    typeof errorOrMessage === 'object' &&
+    typeof errorOrMessage.message === 'string'
+  ) {
+    return errorOrMessage.message;
+  }
+  if (typeof errorOrMessage === 'function') {
+    return errorOrMessage(getTypeOf(value));
+  }
+  return `Expected value to be defined.`;
+}
+
+/**
+ * Custom error used by the invariant() helper;
+ */
+export class InvariantError extends Error {
+  static logSensitiveData = IS_NOT_PRODUCTION;
+
+  constructor(
+    /**
+     * Error information
+     */
+    message: InvariantMessage,
+    /**
+     * Function to move stack trace to.
+     */
+    customStackTraceParentFn: Function,
+    /**
+     *  will be logged withing the error if InvariantError.isNotProduction === true
+     */
+    extraInfo: any = EMPTY,
+  ) {
+    const textMessage = parseInvariantMessage(message, extraInfo === EMPTY ? undefined : extraInfo);
+
+    super(textMessage);
+
+    if (typeof message === 'object' && 'stack' in message) {
+      this.stack = message.stack;
+    }
+
+    if (customStackTraceParentFn) {
+      captureStackTrace(this, customStackTraceParentFn);
+    }
+
+    if (extraInfo !== EMPTY && InvariantError.logSensitiveData) {
+      console.trace(message, `\n‣ Error info: `, extraInfo);
+    }
+  }
+}
+
+/**
+ * Asserts against 'falsy' values
+ * @param value
+ * @param message
+ * @param customStackTraceParentFn
+ */
+export function invariant(
+  value: unknown,
+  message: string | ((typeName: string) => string) = 'Expected value not to be falsy.',
+  customStackTraceParentFn?: Function,
+): asserts value {
+  if (!value) {
+    throw new InvariantError(
+      typeof message === 'string' ? message : message(getTypeOf(value)),
+      customStackTraceParentFn ?? invariant,
+    );
+  }
+}
+
+export function tryCatch<T>(
+  handler: () => T,
+  parentStack?: Function,
+): readonly [Error, never] | readonly [never, T] {
+  try {
+    const result: [Error | undefined, T | undefined] = [undefined, undefined];
+    result[1] = handler();
+    return result as never;
+  } catch (e) {
+    if (!isErrorLike(e)) throw e;
+    moveStackTrace(e, parentStack ?? tryCatch);
+    return [e] as never;
+  }
+}
+
+/**
+ * Move stack trace of an error to improve debugging,
+ * using Error.captureStackTrace
+ * @see: `https://mzl.la/47YMzdu`
+ */
+export function moveStackTrace<Err>(
+  error: ErrorLike, // error to move stack trace
+  newStack: AnyFunction, // function to point as origin in error stack traces
+): Err;
+export function moveStackTrace<Result>(
+  fn: () => Result, // function to wrap
+  newStack: AnyFunction, // function to point as origin in error stack traces
+): Result;
+export function moveStackTrace(errorOrFunction: ErrorLike | AnyFunction, newStack: AnyFunction) {
+  if (typeof errorOrFunction === 'function') {
+    try {
+      return errorOrFunction();
+    } catch (error) {
+      if (!isErrorLike(error)) throw error;
+      captureStackTrace(error as Error, newStack);
+      throw error;
+    }
+  }
+
+  const error = errorOrFunction;
+  if (!isErrorLike(error)) throw error;
+  captureStackTrace(error as Error, newStack);
+  return error;
+}
+
+/**
+ * Captures multiple error messages and throw a single error if the
+ * resulting messages list is not empty.
+ * @param prefix
+ * @constructor
+ */
+export function createErrorList(prefix = 'Multiple errors found: ') {
+  const errors = new Set<string>();
+
+  const getError = () => {
+    const message = prefix + [...errors].join(', ');
+    throw new InvariantError(message, createErrorList);
+  };
+
+  const check = () => {
+    if (errors.size) throw getError();
+  };
+
+  const add = (message: string) => {
+    errors.add(message);
+  };
+
+  return {
+    add,
+    getError,
+    check,
+  };
+}

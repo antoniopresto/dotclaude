@@ -1,0 +1,87 @@
+import type { Key } from './type-utils';
+
+/**
+ * Creates a lazy-initialized proxy object. The thunk is executed only once,
+ * the first time any property of the object is accessed.
+ * @param thunk A function that returns the object to be lazily initialized.
+ * @param target
+ */
+export function createProxy<T extends object>(thunk: () => T, target?: object): T {
+  const proxyTarget = (() => {
+    if (target) return target;
+    const draft = Object.create(null);
+    return Object.defineProperties(draft, {
+      '~whoami': {
+        value: 'proxy_target',
+        enumerable: false,
+      },
+    });
+  })();
+
+  let RESULT = null as unknown as T;
+  const resolve = () => {
+    if (RESULT === null) {
+      RESULT = thunk();
+      Object.setPrototypeOf(proxyTarget, Object.getPrototypeOf(RESULT));
+      Object.defineProperties(proxyTarget, Object.getOwnPropertyDescriptors(RESULT));
+    }
+  };
+
+  // biome-ignore lint/complexity/noBannedTypes: Required for proxy caching of arbitrary functions
+  const cache = new Map<Key, Function>();
+
+  // biome-ignore lint/complexity/noBannedTypes: Required for Reflect.apply compatibility
+  function wrapFunction(original: Function, prop: Key) {
+    const cached = cache.get(prop);
+    if (cached) return cached;
+    // biome-ignore lint/suspicious/noExplicitAny: Required for Reflect.apply
+    function fn(...args: any[]) {
+      return Reflect.apply(original, RESULT, args);
+    }
+    const name = Object.getOwnPropertyDescriptor(RESULT, prop);
+    if (name) Object.defineProperties(fn, { name });
+    cache.set(prop, fn);
+    return fn;
+  }
+
+  return new Proxy(proxyTarget, {
+    get(target, prop, receiver) {
+      resolve();
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value === 'function') return wrapFunction(value, prop);
+      return value;
+    },
+    set(target, prop, value, receiver) {
+      resolve();
+      return Reflect.set(target, prop, value, receiver);
+    },
+    has(target, prop) {
+      resolve();
+      return Reflect.has(target, prop);
+    },
+    deleteProperty(target, prop) {
+      resolve();
+      return Reflect.deleteProperty(target, prop);
+    },
+    ownKeys(target) {
+      resolve();
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      resolve();
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+    defineProperty(target, prop, descriptor) {
+      resolve();
+      return Reflect.defineProperty(target, prop, descriptor);
+    },
+    getPrototypeOf(target) {
+      resolve();
+      return Reflect.getPrototypeOf(target);
+    },
+    setPrototypeOf(target, proto) {
+      resolve();
+      return Reflect.setPrototypeOf(target, proto);
+    },
+  });
+}

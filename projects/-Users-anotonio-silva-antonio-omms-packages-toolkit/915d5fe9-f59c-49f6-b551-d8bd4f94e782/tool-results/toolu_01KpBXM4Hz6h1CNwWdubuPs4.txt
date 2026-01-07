@@ -1,0 +1,254 @@
+     1→import { produce } from 'immer';
+     2→import { describe, expect, it, vi } from 'vitest';
+     3→
+     4→import { createMachineConfig } from '../helpers';
+     5→import { createMachine } from '../machine';
+     6→
+     7→import { createAsyncSlice, createSlice, Slices } from '../slice';
+     8→
+     9→import { AnyAction, METADATA_FIELD_NAME, SliceContext } from '../models';
+    10→
+    11→describe('createMachine', () => {
+    12→  const mockLoadUser = vi.fn();
+    13→  const mockGetUserID = vi.fn(() => 'user-123');
+    14→
+    15→  const defaultContext = {
+    16→    api: { loadUser: mockLoadUser },
+    17→    auth: { getUserID: mockGetUserID },
+    18→    userID: null,
+    19→  } satisfies SliceContext;
+    20→
+    21→  const userSlice = createAsyncSlice({
+    22→    id: 'user',
+    23→    cache: { policy: 'private' },
+    24→    context: defaultContext,
+    25→    load: async (id: string, context) => {
+    26→      const user = await context.api.loadUser(id);
+    27→      return {
+    28→        ...user,
+    29→        loadedBy: context.auth.getUserID(),
+    30→      };
+    31→    },
+    32→  });
+    33→
+    34→  const counterSlice = createSlice({
+    35→    id: 'counter',
+    36→    cache: { policy: 'private' },
+    37→    initial: { value: 0 },
+    38→    reducers: {
+    39→      increment: state => {
+    40→        state.value += 1;
+    41→      },
+    42→      add: (state, payload: number) => {
+    43→        state.value += payload;
+    44→      },
+    45→      reset: state => {
+    46→        state.value = 0;
+    47→      },
+    48→    },
+    49→  });
+    50→
+    51→  const configSlice = createSlice({
+    52→    id: 'config',
+    53→    cache: { policy: 'public' },
+    54→    initial: { enabled: false },
+    55→    reducers: {
+    56→      toggle: state => {
+    57→        state.enabled = !state.enabled;
+    58→      },
+    59→    },
+    60→  });
+    61→
+    62→  const getMachineConfig = () => {
+    63→    return createMachineConfig({
+    64→      id: 'testMachine',
+    65→      slices: {
+    66→        user: userSlice,
+    67→        counter: counterSlice,
+    68→        config: configSlice,
+    69→      },
+    70→      context: {
+    71→        userID: 'test-user',
+    72→        api: { loadUser: mockLoadUser },
+    73→        auth: { getUserID: mockGetUserID },
+    74→      },
+    75→      initial: {
+    76→        counter: { value: 10 },
+    77→      },
+    78→      selectors: {
+    79→        doubledCounter: state => state.counter.value * 2,
+    80→        userAndCounter: state => {
+    81→          return {
+    82→            user: state.user.value,
+    83→            counter: state.counter.value,
+    84→          };
+    85→        },
+    86→      },
+    87→    });
+    88→  };
+    89→
+    90→  it('should create a machine with the correct structure', () => {
+    91→    const machine = createMachine(getMachineConfig());
+    92→
+    93→    expect(machine.ID).toBe('testMachine');
+    94→    expect(machine.reducer).toBeInstanceOf(Function);
+    95→    expect(Object.keys(machine.actions)).toEqual([
+    96→      'user',
+    97→      'counter',
+    98→      'config',
+    99→    ]);
+   100→    expect(Object.keys(machine.actionTypes)).toEqual([
+   101→      'user',
+   102→      'counter',
+   103→      'config',
+   104→    ]);
+   105→  });
+   106→
+   107→  it('should generate correct action types', () => {
+   108→    const machine = createMachine(getMachineConfig());
+   109→    expect(machine.actionTypes.counter.increment).toBe(
+   110→      '@testMachine/counter/increment',
+   111→    );
+   112→    expect(machine.actionTypes.user.load).toBe('@testMachine/user/load');
+   113→  });
+   114→
+   115→  it('should initialize with the correct initial state, including provided state', () => {
+   116→    const config = getMachineConfig();
+   117→    const machine = createMachine(config);
+   118→    const initialState = machine.getInitialState();
+   119→
+   120→    expect(initialState.counter).toEqual({ value: 10 });
+   121→    expect(initialState.config).toEqual({ enabled: false });
+   122→    expect(initialState.user).toEqual(Slices.AsyncInitialState(null));
+   123→    expect(initialState.doubledCounter).toBe(20);
+   124→    expect(initialState[METADATA_FIELD_NAME]).toBeDefined();
+   125→  });
+   126→
+   127→  it('should handle sync slice actions correctly', () => {
+   128→    const machine = createMachine({
+   129→      ...getMachineConfig(),
+   130→      initial: undefined,
+   131→    });
+   132→
+   133→    machine.provideContext(defaultContext);
+   134→
+   135→    let state = machine.getInitialState();
+   136→
+   137→    expect(state.counter.value).toBe(0);
+   138→
+   139→    const incrementAction = machine.actions.counter.increment();
+   140→    state = machine.reducer(state, incrementAction);
+   141→    expect(state.counter.value).toBe(1);
+   142→
+   143→    const addAction = machine.actions.counter.add(5);
+   144→    state = machine.reducer(state, addAction);
+   145→    expect(state.counter.value).toBe(6);
+   146→  });
+   147→
+   148→  it('should not mutate state when a reducer does not change it', () => {
+   149→    const machine = createMachine(getMachineConfig());
+   150→    const initialState = machine.getState();
+   151→
+   152→    const noopAction = { type: 'NO_OP' };
+   153→    const nextState = machine.reducer(initialState, noopAction as AnyAction);
+   154→
+   155→    expect(nextState).toBe(initialState);
+   156→  });
+   157→
+   158→  describe('Async Slice Reducers', () => {
+   159→    const machine = createMachine({
+   160→      ...getMachineConfig(),
+   161→      initial: undefined,
+   162→    });
+   163→    const { actions, reducer } = machine;
+   164→    let state = machine.getInitialState();
+   165→
+   166→    it('should handle load action', () => {
+   167→      const loadAction = actions.user.load('1');
+   168→      state = reducer(state, loadAction);
+   169→      expect(state.user.loading).toBe(true);
+   170→      expect(state.user.failed).toBe(false);
+   171→      expect(state.user.error).toBeNull();
+   172→    });
+   173→
+   174→    it('should handle success action', () => {
+   175→      const loadAction = actions.user.load('1');
+   176→      let loadingState = reducer(state, loadAction);
+   177→      const successPayload = {
+   178→        id: '1',
+   179→        name: 'John',
+   180→      };
+   181→      const successAction = actions.user.success(successPayload);
+   182→      const successState = reducer(loadingState, successAction);
+   183→
+   184→      expect(successState.user.loading).toBe(false);
+   185→      expect(successState.user.loaded).toBe(true);
+   186→      expect(successState.user.value).toEqual(successPayload);
+   187→    });
+   188→
+   189→    it('should handle fail action', () => {
+   190→      const loadAction = actions.user.load('1');
+   191→      let loadingState = reducer(state, loadAction);
+   192→      const errorPayload = {
+   193→        error: 'Not Found',
+   194→        stack: '...',
+   195→      };
+   196→      const failAction = actions.user.fail(errorPayload);
+   197→      const failState = reducer(loadingState, failAction);
+   198→
+   199→      expect(failState.user.loading).toBe(false);
+   200→      expect(failState.user.failed).toBe(true);
+   201→      expect(failState.user.error).toBe('Not Found');
+   202→    });
+   203→
+   204→    it('should handle clear action', () => {
+   205→      const successState = produce(state, draft => {
+   206→        draft.user.loaded = true;
+   207→        draft.user.value = {
+   208→          id: '1',
+   209→          name: 'John',
+   210→        } as any;
+   211→      });
+   212→
+   213→      const clearAction = actions.user.clear();
+   214→      const clearedState = reducer(successState, clearAction);
+   215→
+   216→      expect(clearedState.user).toEqual(Slices.AsyncInitialState(null));
+   217→    });
+   218→  });
+   219→
+   220→  it('should compute selectors correctly on state changes', () => {
+   221→    const machine = createMachine({
+   222→      ...getMachineConfig(),
+   223→      initial: undefined,
+   224→    });
+   225→    let state = machine.getInitialState();
+   226→    expect(state.doubledCounter).toBe(0);
+   227→
+   228→    const action = machine.actions.counter.add(10);
+   229→    state = machine.reducer(state, action);
+   230→
+   231→    expect(state.counter.value).toBe(10);
+   232→    expect(state.doubledCounter).toBe(20);
+   233→  });
+   234→
+   235→  it('should provide the correct context to async slices', () => {
+   236→    const machine = createMachine(getMachineConfig());
+   237→    const context = machine.getContext();
+   238→    expect(context.api.loadUser).toBe(mockLoadUser);
+   239→    expect(context.auth.getUserID).toBe(mockGetUserID);
+   240→  });
+   241→
+   242→  it('should throw if a non-existent slice reducer is called', () => {
+   243→    const machine = createMachine(getMachineConfig());
+   244→    const state = machine.getInitialState();
+   245→    const invalidAction = { type: '@testMachine/nonExistent/action' };
+   246→    const nextState = machine.reducer(state, invalidAction as AnyAction);
+   247→    expect(nextState).toBe(state);
+   248→  });
+   249→});
+   250→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

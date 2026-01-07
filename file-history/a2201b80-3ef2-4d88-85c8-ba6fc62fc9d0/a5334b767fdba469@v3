@@ -1,0 +1,940 @@
+# MMS Beta - Demo What-If com Design Impressionante
+
+> **PLAN CORRECTION (2025-12-20):** Toolkit Core & Performance Priority
+> - Portabilidade do @mms/toolkit é PRÉ-REQUISITO (Fase 1)
+> - EntityStore com fork/diff é PRÉ-REQUISITO para What-If (Fase 2)
+> - RBush é ESTRUTURAL para Canvas, não polimento (Fase 3)
+> - Análise streetscape.gl é TAREFA EXPLÍCITA (Fase 1)
+
+## Resumo Executivo
+
+Criar uma demo de alta fidelidade em `./beta` para o sistema MMS (Mileage Management System) que implementa o cenário "what-if" da RFQ com dados mockados. A demo deve impressionar o cliente com visualização estilo Canvas Semantic Zoom (Google Maps) + simulações interativas de man-hours vs capacidade.
+
+**Fonte da Verdade:** `./deck/docs/RFQ.md`
+
+---
+
+## Arquitetura do Projeto
+
+### Stack Tecnológico
+
+```
+./beta/
+├── apps/
+│   └── demo/                    # Aplicação principal da demo
+├── packages/
+│   ├── toolkit/                 # ⚠️ PORTADO de ./deck/packages/toolkit
+│   │   ├── state-machine/       # Store, Machine, Slices, Hooks, Cache
+│   │   ├── helpers/             # Utilitários (create-proxy, date-utils, etc)
+│   │   └── schema/              # Validação de tipos
+│   ├── entity-store/            # ⚠️ PORTADO + EXTENDIDO com fork/diff
+│   │   ├── EntityStore.ts       # TypedArray SoA storage
+│   │   ├── SandboxStore.ts      # ⚠️ NOVO: fork/diff para What-If
+│   │   └── types.ts             # TaskArrays, TaskCursor, etc
+│   ├── spatial/                 # ⚠️ PORTADO - RBush spatial index
+│   │   └── RBushSpatialIndex.ts # R-tree para queries O(log n)
+│   ├── ui/                      # Design system (tokens, componentes)
+│   └── data/                    # Mock data generators
+├── CLAUDE.md                    # Harness principal
+├── features.json                # Features com status (JSON)
+├── claude-progress.txt          # Histórico de sessões
+├── init.sh                      # Script de inicialização
+└── .claude/
+    └── hooks/                   # Hooks do Claude Code
+```
+
+### Tecnologias Core
+
+| Camada | Tecnologia | Justificativa |
+|--------|------------|---------------|
+| Runtime | Bun 1.2+ | Monorepo rápido, scripts nativos |
+| Build | Vite 5.x | HMR rápido, ESM nativo |
+| Frontend | React 18 | Required para BlueprintJS |
+| Visualização | deck.gl 9.x | GPU-accelerated, LOD nativo |
+| **State Engine** | **@mms/toolkit** | **Portado de ./deck - Engine sem React hooks** |
+| **Entity Data** | **EntityStore + SandboxStore** | **TypedArrays + fork/diff para What-If** |
+| **Spatial Index** | **RBush** | **R-tree para 60k+ items** |
+| UI Base | BlueprintJS 6 | Enterprise-grade, dark theme |
+| Charts | Visx (d3-based) | Gráficos man-hours vs capacity |
+| Styling | Tailwind CSS | Utility-first, customizável |
+
+### Inspirações de Design
+
+| Aspecto | Referência | Aplicação |
+|---------|------------|-----------|
+| **Interação** | AVS/streetscape.gl | Playback temporal, streaming-like |
+| **Timeline** | Linear.app milestones | Diamantes, zoom Year/Quarter/Month |
+| **Scheduling** | Dime Scheduler | Drag-drop, planning board |
+| **Visual** | IntelliJ Islands | Dark theme, espaçamentos generosos |
+| **Data Viz** | Kepler.gl | Layers com filtros temporais |
+
+---
+
+## Componentes Críticos a Portar de ./deck
+
+### 1. @mms/toolkit (OBRIGATÓRIO)
+**Origem:** `./deck/packages/toolkit/`
+
+A "engine" que permite state management sem React hooks. Inclui:
+
+| Arquivo | Função | Crítico |
+|---------|--------|---------|
+| `state-machine/store.ts` | Store minimalista (dispatch/subscribe/getState) | ✅ |
+| `state-machine/machine.ts` | Factory `Machine.Create()` com slices | ✅ |
+| `state-machine/slice.ts` | Sistema de slices (Redux-like) | ✅ |
+| `state-machine/hooks.ts` | Gera `useSelector` via `useSyncExternalStore` | ✅ |
+| `state-machine/cache.ts` | Cache invalidation strategy | ⚠️ |
+| `helpers/*` | Utilitários (object-utils, date-utils, etc) | ✅ |
+
+**Sem o toolkit, é IMPOSSÍVEL cumprir o requisito "evitar hooks React".**
+
+### 2. EntityStore (OBRIGATÓRIO + EXTENSÃO)
+**Origem:** `./deck/apps/canvas/src/entity-store/`
+
+Store de alta performance com TypedArrays (Structure of Arrays):
+
+| Feature | Status | Crítico para |
+|---------|--------|--------------|
+| TypedArrays (Float32, Uint16, etc) | ✅ Existe | Performance 60fps |
+| Cursor-based access | ✅ Existe | Zero GC |
+| Bulk load | ✅ Existe | 100k entities |
+| **fork()** | ❌ NÃO EXISTE | What-If mode |
+| **diff()** | ❌ NÃO EXISTE | Impact analysis |
+| **apply()** | ❌ NÃO EXISTE | Commit changes |
+
+**NOVO: SandboxStore** - Wrapper que adiciona:
+```typescript
+class SandboxStore {
+  private baseline: EntityStore;
+  private sandbox: EntityStore | null = null;
+
+  fork(): void {
+    // Cria cópia shallow dos TypedArrays
+    this.sandbox = this.baseline.clone();
+  }
+
+  diff(): ChangeSet {
+    // Compara sandbox vs baseline
+    return computeDiff(this.baseline, this.sandbox);
+  }
+
+  apply(): void {
+    // Copia sandbox para baseline
+    this.baseline = this.sandbox;
+    this.sandbox = null;
+  }
+
+  discard(): void {
+    this.sandbox = null;
+  }
+}
+```
+
+### 3. RBushSpatialIndex (OBRIGATÓRIO)
+**Origem:** `./deck/apps/canvas/src/deck/spatial/`
+
+Indexação espacial para queries O(log n):
+
+| Feature | Uso |
+|---------|-----|
+| `bulkLoad(tasks)` | Construção inicial do R-tree |
+| `queryViewport(bounds)` | Retorna IDs visíveis |
+| `getVisibleTasks(bounds)` | Retorna tasks para render |
+
+**Sem RBush, o canvas TRAVA com 60k items.**
+
+---
+
+## Fases de Implementação (CORRIGIDAS)
+
+### FASE 0: Harness Setup (CRÍTICO)
+
+**Objetivo:** Criar estrutura de harness que persiste contexto entre sessões.
+
+#### Arquivos do Harness
+
+```
+./beta/
+├── CLAUDE.md               # Regras do projeto + instruções AI
+├── claude-progress.txt     # Histórico: "O que foi feito, próximos passos"
+├── features.json           # Features com status (JSON, não MD)
+├── init.sh                 # Verifica deps, inicia dev server
+└── .claude/
+    └── settings.json       # Config do Claude Code
+```
+
+#### Tarefas
+
+1. **Criar `./beta/CLAUDE.md`**
+   - Copiar estrutura de `./deck/CLAUDE.md`
+   - Adaptar para novo projeto (remover referências ao deck existente)
+   - Incluir regras: evitar hooks React, usar @mms/toolkit
+
+2. **Criar `./beta/features.json`**
+   - Formato JSON com features da demo
+   - Incluir: passes, blockedBy, tasks
+
+3. **Criar `./beta/claude-progress.txt`**
+   - Template inicial vazio
+
+4. **Criar `./beta/init.sh`**
+   ```bash
+   #!/bin/bash
+   bun --version || (echo "Bun not installed" && exit 1)
+   bun install
+   echo "✅ Environment ready"
+   ```
+
+5. **Configurar Claude Code Hooks**
+   - Hook `UserPromptSubmit`: Verificar se progress.txt está atualizado
+   - Hook `Stop`: Lembrar de commitar e atualizar harness
+
+---
+
+### FASE 1: Toolkit Core + Streetscape Analysis (FUNDAÇÃO)
+
+**Objetivo:** Portar a engine de state management que permite rodar sem React hooks.
+
+#### 1.1 Portar @mms/toolkit
+
+**Origem:** `./deck/packages/toolkit/`
+**Destino:** `./beta/packages/toolkit/`
+
+Arquivos a portar:
+```
+packages/toolkit/
+├── src/
+│   ├── state-machine/
+│   │   ├── store.ts         # Store.create()
+│   │   ├── machine.ts       # Machine.Create()
+│   │   ├── slice.ts         # Slices.Create()
+│   │   ├── hooks.ts         # useMachine, useSelector
+│   │   ├── cache.ts         # Cache invalidation
+│   │   ├── context.ts       # Context handler
+│   │   ├── helpers.ts       # GLOBAL_APP_SESSION_ID, etc
+│   │   └── models/          # Types
+│   ├── helpers/
+│   │   ├── object-utils.ts
+│   │   ├── date-utils.ts
+│   │   ├── string-utils.ts
+│   │   └── type-utils.ts
+│   ├── schema/
+│   │   └── schema.ts        # invariantType
+│   └── index.ts
+└── package.json             # @mms/toolkit
+```
+
+#### 1.2 Análise Streetscape.gl (TAREFA EXPLÍCITA)
+
+**Objetivo:** Extrair padrões de UI de controle temporal para o design system.
+
+**Tarefas:**
+1. Clonar/analisar https://github.com/uber/streetscape.gl
+2. Identificar componentes de PlaybackControl
+3. Identificar StreamSettingsPanel patterns
+4. Documentar padrões aplicáveis ao TimeScrubber
+5. Criar `./beta/docs/STREETSCAPE_PATTERNS.md`
+
+**Output esperado:**
+- Lista de componentes a adaptar
+- Decisão: usar biblioteca existente ou implementar custom
+
+---
+
+### FASE 2: EntityStore + SandboxStore (PRÉ-REQUISITO WHAT-IF)
+
+**Objetivo:** Portar EntityStore e IMPLEMENTAR fork/diff para What-If.
+
+#### 2.1 Portar EntityStore
+
+**Origem:** `./deck/apps/canvas/src/entity-store/`
+**Destino:** `./beta/packages/entity-store/`
+
+Arquivos a portar:
+```
+packages/entity-store/
+├── src/
+│   ├── EntityStore.ts       # TypedArray SoA storage
+│   ├── types.ts             # TaskArrays, TaskCursor, TaskData
+│   └── index.ts
+└── package.json             # @mms/entity-store
+```
+
+#### 2.2 IMPLEMENTAR SandboxStore (NOVO)
+
+**Arquivo:** `./beta/packages/entity-store/src/SandboxStore.ts`
+
+```typescript
+/**
+ * SandboxStore - Enables What-If scenarios with fork/diff
+ *
+ * Architecture:
+ * - baseline: EntityStore (read-only during sandbox)
+ * - sandbox: EntityStore | null (writable copy)
+ *
+ * Operations:
+ * - fork(): Creates shallow copy of TypedArrays
+ * - diff(): Computes ChangeSet between baseline and sandbox
+ * - apply(): Commits sandbox to baseline
+ * - discard(): Abandons sandbox changes
+ */
+
+interface ChangeSet {
+  added: number[];      // Indices of new tasks
+  removed: number[];    // Indices of deleted tasks
+  modified: Array<{
+    index: number;
+    field: keyof TaskArrays;
+    oldValue: number;
+    newValue: number;
+  }>;
+}
+
+class SandboxStore {
+  private baseline: EntityStore;
+  private sandbox: EntityStore | null = null;
+
+  get isInSandbox(): boolean {
+    return this.sandbox !== null;
+  }
+
+  get activeStore(): EntityStore {
+    return this.sandbox ?? this.baseline;
+  }
+
+  fork(): void;
+  diff(): ChangeSet;
+  apply(): void;
+  discard(): void;
+}
+```
+
+---
+
+### FASE 3: Canvas + Spatial Index (ESTRUTURAL)
+
+**Objetivo:** Canvas deck.gl funcional com indexação espacial para 60k+ items.
+
+#### 3.1 Portar RBushSpatialIndex
+
+**Origem:** `./deck/apps/canvas/src/deck/spatial/`
+**Destino:** `./beta/packages/spatial/`
+
+```
+packages/spatial/
+├── src/
+│   ├── RBushSpatialIndex.ts  # R-tree queries
+│   ├── types.ts              # ViewportBounds, SpatialItem
+│   └── index.ts
+└── package.json              # @mms/spatial
+```
+
+#### 3.2 Setup Canvas básico
+
+**Destino:** `./beta/apps/demo/src/canvas/`
+
+```
+apps/demo/src/canvas/
+├── DeckCanvas.tsx           # Wrapper deck.gl
+├── layers/
+│   ├── MacroLayer.ts        # Heatmap (zoom < 0.5x)
+│   ├── MesoLayer.ts         # Blocks (0.5x - 2x)
+│   └── MicroLayer.ts        # Details (> 2x)
+├── viewport/
+│   └── ViewportController.ts # Pan, zoom, LOD
+└── index.ts
+```
+
+#### 3.3 Integração RBush + deck.gl
+
+```typescript
+// DeckCanvas.tsx
+const visibleTaskIds = useMemo(() => {
+  return spatialIndex.queryViewport(viewportBounds);
+}, [viewportBounds]);
+
+const layers = useMemo(() => {
+  const tasks = spatialIndex.getTasksByIds(visibleTaskIds);
+  return createLODLayers(tasks, zoomLevel);
+}, [visibleTaskIds, zoomLevel]);
+```
+
+**Sem esta fase, o canvas não funciona com dados reais (60k items).**
+
+---
+
+### FASE 4: Design System + UI (packages/ui)
+
+**Objetivo:** Estabelecer tokens e componentes base com design impressionante.
+
+#### 4.1 Design Tokens (CSS Variables)
+
+```css
+/* Cores - Inspirado IntelliJ Islands + Linear */
+--bg-canvas: #0f0f0f;        /* Fundo principal (quase preto) */
+--bg-panel: #1a1a1a;         /* Painéis */
+--bg-elevated: #242424;      /* Cards, dropdowns */
+--border-subtle: #2a2a2a;    /* Bordas sutis */
+--border-default: #3a3a3a;   /* Bordas padrão */
+
+--text-primary: #ffffff;     /* Texto principal */
+--text-secondary: #a0a0a0;   /* Texto secundário */
+--text-muted: #666666;       /* Texto mudo */
+
+--accent-primary: #5c7cfa;   /* Azul Linear */
+--accent-success: #40c057;   /* Verde */
+--accent-warning: #fab005;   /* Amarelo */
+--accent-danger: #fa5252;    /* Vermelho */
+--accent-sandbox: #be4bdb;   /* Violeta (modo what-if) */
+
+/* Tipografia - Inter */
+--font-sans: 'Inter', -apple-system, system-ui, sans-serif;
+--font-mono: 'JetBrains Mono', monospace;
+
+/* Espaçamento - Generoso como Islands UI */
+--space-xs: 4px;
+--space-sm: 8px;
+--space-md: 16px;
+--space-lg: 24px;
+--space-xl: 32px;
+--space-2xl: 48px;
+```
+
+#### 4.2 Componentes Base
+
+1. **Panel** - Container com borda sutil, padding generoso
+2. **TimelineRuler** - Régua temporal com zoom levels
+3. **ResourceBar** - Barra de utilização (man-hours)
+4. **TrainRow** - Linha de trem no canvas
+5. **MilestoneMarker** - Diamante estilo Linear
+6. **SandboxToggle** - Toggle Live/What-If
+
+#### 4.3 TimeScrubber (baseado em Streetscape patterns)
+
+Componente de controle temporal inspirado no streetscape.gl:
+- PlaybackControl-like slider
+- Zoom temporal (Year/Quarter/Month/Week)
+- Jump to date
+- Sync com deck.gl viewport
+
+---
+
+### FASE 5: What-If Mode (USA SandboxStore)
+
+**Objetivo:** Implementar simulação interativa usando SandboxStore.fork/diff.
+
+#### 5.1 Integração SandboxStore + UI
+
+```typescript
+// Fluxo What-If
+1. User clicks "Enter What-If Mode"
+2. sandboxStore.fork() → cria cópia dos dados
+3. User edita tarefas (drag, resize, delete)
+4. Cada edição modifica sandboxStore.activeStore
+5. UI mostra diff em tempo real: sandboxStore.diff()
+6. User clicks "Apply" → sandboxStore.apply()
+   OU User clicks "Discard" → sandboxStore.discard()
+```
+
+#### 5.2 Painel de Impacto
+
+```
+┌─────────────────────────────────────┐
+│ 📊 What-If Impact Analysis          │
+├─────────────────────────────────────┤
+│ Changes: 3 tasks modified           │
+│                                     │
+│ Man-Hours Impact:                   │
+│   Week 12: -45h (was overcapacity)  │
+│   Week 14: +30h                     │
+│   Week 15: +15h                     │
+│                                     │
+│ [Apply Changes]  [Discard]          │
+└─────────────────────────────────────┘
+```
+
+#### 5.3 Gráfico Comparativo (RFQ Page 4)
+
+- Chart estilo RFQ: barras "Sem ajuste" vs "Com ajuste"
+- Linha de capacidade máxima
+- Usa Visx para renderização
+
+---
+
+### FASE 6: Mock Data + Integration
+
+**Objetivo:** Gerar dados realistas baseados na RFQ.
+
+#### 6.1 Data Layer (packages/data)
+
+Tipos baseados na RFQ:
+
+```typescript
+// types.ts
+interface Fleet {
+  id: string;
+  name: 'Kinki Sharyo' | 'Alstom';
+  trainCount: number; // 49 ou 79
+  baseDepot: string;
+}
+
+interface Train {
+  id: string;
+  fleetId: string;
+  currentMileage: number;
+  fitnessStatus: 'fit' | 'limited' | 'unfit';
+  nextPM: MaintenanceTask;
+}
+
+interface MaintenanceTask {
+  id: string;
+  trainId: string;
+  type: 'PM1' | 'PM2' | 'PM3' | 'Overhaul';
+  scheduledDate: Date;
+  estimatedDuration: number; // hours
+  manHoursRequired: number;
+  trackId: string;
+  status: 'scheduled' | 'in-progress' | 'completed' | 'overdue';
+}
+
+interface ResourceCapacity {
+  date: Date;
+  manHoursAvailable: number;
+  manHoursRequired: number;
+  tracksAvailable: number;
+  tracksRequired: number;
+}
+```
+
+#### 6.2 Mock Data Generator
+
+- 128 trens (49 Kinki + 79 Alstom)
+- 10 anos de tarefas PM (~60k tasks)
+- Cenários pré-definidos: "Sem ajuste" vs "Com ajuste"
+- Conflitos de capacidade intencionais para demo
+
+---
+
+### FASE 7: Polish Visual
+
+**Objetivo:** Refinamento para apresentação ao cliente.
+
+#### 7.1 Animações
+- Transições suaves de zoom (ease-out-expo)
+- Fade in/out de elementos
+- Hover effects sutis
+
+#### 7.2 Responsividade
+- Desktop (1920x1080) prioritário
+- Tablet landscape suportado
+
+#### 7.3 Dark Theme Consistente
+- Todos os componentes com tema escuro
+- Sem elementos brancos brilhantes
+
+#### 7.4 Micro-interações
+- Loading states
+- Skeleton placeholders
+- Toast notifications
+
+---
+
+## Layout da Aplicação
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ NAVBAR  [Live ◉] [What-If ○]     [Today]  [Zoom: Month ▼]  [⚙]  │
+├──────────────────────────────────────────────────────────────────┤
+│          │                                                       │
+│  SIDEBAR │                  CANVAS (deck.gl)                     │
+│          │                                                       │
+│  Fleet   │   ┌─────────────────────────────────────────────┐    │
+│  Filter  │   │ Timeline Ruler (Year/Quarter/Month)          │    │
+│          │   ├─────────────────────────────────────────────┤    │
+│  ──────  │   │ Train 001 ▓▓▓░░░▓▓░░▓▓▓▓░░░░░░▓▓▓░░░░░    │    │
+│          │   │ Train 002 ░░▓▓▓░░░░▓▓░░░░▓▓▓░░░░░░░░░░    │    │
+│  Train   │   │ Train 003 ▓░░░░▓▓▓░░░░░▓▓░░░▓▓▓░░░░░░░    │    │
+│  List    │   │ ...                                          │    │
+│          │   └─────────────────────────────────────────────┘    │
+│          │                                                       │
+│          ├───────────────────────────────────────────────────────┤
+│          │                  RESOURCE PANEL                       │
+│          │   Man-Hours: [====████████░░░░░░░░░░░░░] 65%          │
+│          │   Tracks:    [████████████░░░░░░░░░░░░░] 80%          │
+│          │                                                       │
+│          │   ⚠ Week 12: Over capacity by 45 man-hours            │
+│          │                                                       │
+└──────────┴───────────────────────────────────────────────────────┘
+```
+
+#### Layers deck.gl
+
+1. **HeatmapLayer** (zoom < 0.5x) - Density de tarefas
+2. **ScatterplotLayer** (0.5x - 2x) - Blocos de manutenção
+3. **TextLayer** (> 2x) - Detalhes de tarefas
+4. **PathLayer** - Linhas de dependência
+5. **IconLayer** - Milestones (diamantes)
+
+#### Interações
+
+- **Pan**: Arrastar para navegar no tempo
+- **Zoom**: Scroll para mudar granularidade (Year → Month → Week)
+- **Hover**: Tooltip com detalhes da tarefa
+- **Click**: Selecionar tarefa para edição (modo What-If)
+- **Drag** (What-If): Mover tarefa para nova data
+
+---
+
+## Features JSON Inicial (CORRIGIDO)
+
+```json
+{
+  "project": "MMS Beta Demo",
+  "version": "1.0.0",
+  "lastUpdated": "2025-12-20",
+  "corrections": "Plan Correction: Toolkit Core & Performance Priority",
+  "features": [
+    {
+      "id": "HARNESS-001",
+      "phase": 0,
+      "description": "Setup Harness completo",
+      "passes": false,
+      "blockedBy": null,
+      "tasks": [
+        "Criar ./beta/CLAUDE.md",
+        "Criar ./beta/features.json",
+        "Criar ./beta/claude-progress.txt",
+        "Criar ./beta/init.sh",
+        "Configurar Claude Code hooks"
+      ]
+    },
+    {
+      "id": "TOOLKIT-001",
+      "phase": 1,
+      "description": "Portar @mms/toolkit (state engine)",
+      "passes": false,
+      "blockedBy": "HARNESS-001",
+      "critical": true,
+      "reason": "Engine que permite state management sem React hooks",
+      "tasks": [
+        "Copiar ./deck/packages/toolkit → ./beta/packages/toolkit",
+        "Ajustar imports e dependências",
+        "Validar build do package",
+        "Testar Machine.Create() funciona"
+      ]
+    },
+    {
+      "id": "STREETSCAPE-001",
+      "phase": 1,
+      "description": "Análise streetscape.gl patterns",
+      "passes": false,
+      "blockedBy": "HARNESS-001",
+      "tasks": [
+        "Clonar/analisar streetscape.gl",
+        "Documentar PlaybackControl patterns",
+        "Documentar StreamSettingsPanel patterns",
+        "Criar STREETSCAPE_PATTERNS.md"
+      ]
+    },
+    {
+      "id": "ENTITY-001",
+      "phase": 2,
+      "description": "Portar EntityStore (TypedArrays)",
+      "passes": false,
+      "blockedBy": "TOOLKIT-001",
+      "critical": true,
+      "reason": "Storage de alta performance para 100k entities",
+      "tasks": [
+        "Copiar EntityStore.ts → ./beta/packages/entity-store",
+        "Copiar types.ts",
+        "Validar build"
+      ]
+    },
+    {
+      "id": "SANDBOX-001",
+      "phase": 2,
+      "description": "IMPLEMENTAR SandboxStore (fork/diff)",
+      "passes": false,
+      "blockedBy": "ENTITY-001",
+      "critical": true,
+      "reason": "PRÉ-REQUISITO para What-If mode",
+      "tasks": [
+        "Criar SandboxStore.ts",
+        "Implementar fork() - cópia shallow",
+        "Implementar diff() - computa ChangeSet",
+        "Implementar apply() - commit changes",
+        "Implementar discard() - abandon changes",
+        "Testes unitários"
+      ]
+    },
+    {
+      "id": "SPATIAL-001",
+      "phase": 3,
+      "description": "Portar RBushSpatialIndex",
+      "passes": false,
+      "blockedBy": "ENTITY-001",
+      "critical": true,
+      "reason": "Sem RBush, canvas TRAVA com 60k items",
+      "tasks": [
+        "Copiar RBushSpatialIndex.ts → ./beta/packages/spatial",
+        "Instalar rbush dependency",
+        "Validar build"
+      ]
+    },
+    {
+      "id": "CANVAS-001",
+      "phase": 3,
+      "description": "deck.gl canvas com LOD layers",
+      "passes": false,
+      "blockedBy": ["TOOLKIT-001", "SPATIAL-001"],
+      "tasks": [
+        "Setup DeckCanvas.tsx",
+        "Criar MacroLayer (heatmap)",
+        "Criar MesoLayer (blocks)",
+        "Criar MicroLayer (details)",
+        "Integrar RBush para viewport culling"
+      ]
+    },
+    {
+      "id": "DESIGN-001",
+      "phase": 4,
+      "description": "Design tokens + componentes base",
+      "passes": false,
+      "blockedBy": "CANVAS-001",
+      "tasks": [
+        "Criar tokens.css",
+        "Criar Panel component",
+        "Criar TimelineRuler",
+        "Criar ResourceBar",
+        "Criar SandboxToggle"
+      ]
+    },
+    {
+      "id": "TIMESCRUB-001",
+      "phase": 4,
+      "description": "TimeScrubber (streetscape patterns)",
+      "passes": false,
+      "blockedBy": ["DESIGN-001", "STREETSCAPE-001"],
+      "tasks": [
+        "Implementar TimeScrubber baseado em análise",
+        "Integrar com viewport machine"
+      ]
+    },
+    {
+      "id": "WHATIF-001",
+      "phase": 5,
+      "description": "What-If mode toggle",
+      "passes": false,
+      "blockedBy": ["SANDBOX-001", "CANVAS-001"],
+      "tasks": [
+        "UI toggle Live/What-If",
+        "Integrar SandboxStore.fork() no toggle",
+        "Visual indicator (violet border)"
+      ]
+    },
+    {
+      "id": "WHATIF-002",
+      "phase": 5,
+      "description": "Impact analysis panel",
+      "passes": false,
+      "blockedBy": "WHATIF-001",
+      "tasks": [
+        "Criar ImpactPanel component",
+        "Mostrar diff em tempo real",
+        "Botões Apply/Discard"
+      ]
+    },
+    {
+      "id": "WHATIF-003",
+      "phase": 5,
+      "description": "Gráfico comparativo RFQ",
+      "passes": false,
+      "blockedBy": "WHATIF-002",
+      "tasks": [
+        "Chart man-hours vs capacity",
+        "Comparação antes/depois",
+        "Usar Visx"
+      ]
+    },
+    {
+      "id": "DATA-001",
+      "phase": 6,
+      "description": "Mock data generators",
+      "passes": false,
+      "blockedBy": "ENTITY-001",
+      "tasks": [
+        "Generator para 128 trens",
+        "Generator para 10 anos de tasks (~60k)",
+        "Cenários pré-definidos"
+      ]
+    },
+    {
+      "id": "POLISH-001",
+      "phase": 7,
+      "description": "Animações e refinamento visual",
+      "passes": false,
+      "blockedBy": ["WHATIF-003", "TIMESCRUB-001"],
+      "tasks": [
+        "Transições suaves",
+        "Hover effects",
+        "Loading states"
+      ]
+    }
+  ]
+}
+```
+
+### Grafo de Dependências (Visual)
+
+```
+HARNESS-001
+    │
+    ├──────────────────┐
+    ▼                  ▼
+TOOLKIT-001        STREETSCAPE-001
+    │                  │
+    ▼                  │
+ENTITY-001             │
+    │                  │
+    ├──────────┐       │
+    ▼          ▼       │
+SANDBOX-001  SPATIAL-001
+    │          │       │
+    │          ▼       │
+    │     CANVAS-001───┘
+    │          │
+    │          ▼
+    │     DESIGN-001
+    │          │
+    │          ├───────┐
+    │          ▼       ▼
+    │     TIMESCRUB-001
+    │          │
+    └────┬─────┘
+         ▼
+    WHATIF-001
+         │
+         ▼
+    WHATIF-002
+         │
+         ▼
+    WHATIF-003
+         │
+         ▼
+    POLISH-001
+```
+
+---
+
+## Arquivos Críticos a Criar (ORDEM CORRIGIDA)
+
+### Fase 0 (Harness)
+- `./beta/CLAUDE.md`
+- `./beta/features.json`
+- `./beta/claude-progress.txt`
+- `./beta/init.sh`
+- `./beta/.claude/settings.json`
+
+### Fase 1 (Toolkit Core + Streetscape)
+**PORTAR de ./deck/packages/toolkit:**
+- `./beta/packages/toolkit/src/state-machine/store.ts`
+- `./beta/packages/toolkit/src/state-machine/machine.ts`
+- `./beta/packages/toolkit/src/state-machine/slice.ts`
+- `./beta/packages/toolkit/src/state-machine/hooks.ts`
+- `./beta/packages/toolkit/src/state-machine/cache.ts`
+- `./beta/packages/toolkit/src/helpers/*.ts`
+- `./beta/packages/toolkit/package.json`
+
+**CRIAR:**
+- `./beta/docs/STREETSCAPE_PATTERNS.md`
+
+### Fase 2 (EntityStore + SandboxStore)
+**PORTAR de ./deck/apps/canvas/src/entity-store:**
+- `./beta/packages/entity-store/src/EntityStore.ts`
+- `./beta/packages/entity-store/src/types.ts`
+
+**CRIAR (NOVO):**
+- `./beta/packages/entity-store/src/SandboxStore.ts` ⚠️ **CRÍTICO**
+
+### Fase 3 (Spatial + Canvas)
+**PORTAR de ./deck/apps/canvas/src/deck/spatial:**
+- `./beta/packages/spatial/src/RBushSpatialIndex.ts`
+- `./beta/packages/spatial/src/types.ts`
+
+**CRIAR:**
+- `./beta/apps/demo/src/canvas/DeckCanvas.tsx`
+- `./beta/apps/demo/src/canvas/layers/MacroLayer.ts`
+- `./beta/apps/demo/src/canvas/layers/MesoLayer.ts`
+- `./beta/apps/demo/src/canvas/layers/MicroLayer.ts`
+
+### Fase 4 (Design + UI)
+- `./beta/packages/ui/src/tokens.css`
+- `./beta/packages/ui/src/components/Panel.tsx`
+- `./beta/packages/ui/src/components/TimelineRuler.tsx`
+- `./beta/packages/ui/src/components/TimeScrubber.tsx`
+
+### Fase 5 (What-If)
+- `./beta/apps/demo/src/components/SandboxToggle.tsx`
+- `./beta/apps/demo/src/components/ImpactPanel.tsx`
+- `./beta/apps/demo/src/components/ComparisonChart.tsx`
+
+### Fase 6 (Data)
+- `./beta/packages/data/src/types.ts`
+- `./beta/packages/data/src/generators/fleet.ts`
+- `./beta/packages/data/src/generators/tasks.ts`
+
+---
+
+## Referências de Código do ./deck
+
+### PORTAR INTEGRALMENTE (Crítico)
+
+| Componente | Origem | Destino | Razão |
+|------------|--------|---------|-------|
+| **@mms/toolkit** | `./deck/packages/toolkit/` | `./beta/packages/toolkit/` | Engine state sem hooks |
+| **EntityStore** | `./deck/apps/canvas/src/entity-store/` | `./beta/packages/entity-store/` | TypedArrays performance |
+| **RBushSpatialIndex** | `./deck/apps/canvas/src/deck/spatial/` | `./beta/packages/spatial/` | O(log n) queries |
+
+### ESTUDAR E ADAPTAR
+
+| Componente | Origem | Uso |
+|------------|--------|-----|
+| LOD Layers | `./deck/apps/canvas/src/deck/layers/` | Padrão para Macro/Meso/Micro |
+| TimeScrubber POCs | `./deck/apps/canvas/src/stories/time-scrubber/` | Avaliar melhores patterns |
+| Style Guide | `./deck/docs/MMS_STYLE_GUIDE.md` | Design tokens base |
+
+### IGNORAR
+
+- Código com alucinações/erros
+- Estrutura confusa que não segue RFQ
+- Arquivos duplicados ou desatualizados
+
+---
+
+## Resumo das Correções Aplicadas
+
+| Erro Original | Correção | Impacto |
+|---------------|----------|---------|
+| Toolkit era "copiar machines" | Portar @mms/toolkit INTEIRO (Fase 1) | State sem hooks funciona |
+| EntityStore era "só tipos" | Portar + criar SandboxStore (Fase 2) | What-If mode possível |
+| RBush era "polimento" | Mover para Fase 3 (Canvas) | 60k items sem travar |
+| Streetscape era "inspiração" | Análise explícita (Fase 1) | TimeScrubber bem desenhado |
+
+---
+
+## Próximo Passo Imediato
+
+Após aprovação deste plano CORRIGIDO:
+
+1. **Criar `./beta/` directory**
+2. **HARNESS-001:** Setup completo do harness
+3. **TOOLKIT-001:** Portar @mms/toolkit (CRÍTICO)
+4. **STREETSCAPE-001:** Análise de patterns (paralelo)
+5. **ENTITY-001 + SANDBOX-001:** EntityStore + fork/diff
+6. **SPATIAL-001:** RBush antes do canvas
+
+**NÃO iniciar canvas (CANVAS-001) antes de ter:**
+- ✅ Toolkit portado
+- ✅ EntityStore portado
+- ✅ SandboxStore implementado
+- ✅ RBush portado

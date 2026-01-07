@@ -1,0 +1,140 @@
+#!/bin/bash
+# Hook: Stop (Quality Gate + Harness Save Verification)
+# Purpose: End-of-turn validation - typecheck, visual test reminders, HARNESS SAVE CHECK
+# Exit 2 = BLOCK continuation, Exit 0 = Allow
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR" 2>/dev/null || exit 0
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔍 END-OF-TURN QUALITY CHECK"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ============================================================
+# 1. HARNESS SAVE VERIFICATION (CRITICAL)
+# ============================================================
+# Check when claude-progress.txt was last modified
+PROGRESS_FILE="claude-progress.txt"
+HARNESS_STALE=false
+MINUTES_SINCE_UPDATE=0
+
+if [ -f "$PROGRESS_FILE" ]; then
+  # Get modification time in seconds since epoch
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    LAST_MOD=$(stat -f %m "$PROGRESS_FILE" 2>/dev/null)
+  else
+    LAST_MOD=$(stat -c %Y "$PROGRESS_FILE" 2>/dev/null)
+  fi
+
+  NOW=$(date +%s)
+  DIFF_SECONDS=$((NOW - LAST_MOD))
+  MINUTES_SINCE_UPDATE=$((DIFF_SECONDS / 60))
+
+  # Stale if not updated in last 10 minutes
+  if [ "$MINUTES_SINCE_UPDATE" -gt 10 ]; then
+    HARNESS_STALE=true
+  fi
+fi
+
+# Count uncommitted changes (proxy for "work done without saving")
+UNCOMMITTED_CHANGES=0
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  UNCOMMITTED_CHANGES=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# Show harness status with strong warning if stale
+if [ "$HARNESS_STALE" = true ] || [ "$UNCOMMITTED_CHANGES" -gt 5 ]; then
+  echo ""
+  echo "┌──────────────────────────────────────────────────────────────┐"
+  echo "│ ⚠️  HARNESS SAVE WARNING                                     │"
+  echo "├──────────────────────────────────────────────────────────────┤"
+  echo "│                                                              │"
+  echo "│  claude-progress.txt last updated: $MINUTES_SINCE_UPDATE minutes ago"
+  echo "│  Uncommitted changes: $UNCOMMITTED_CHANGES files"
+  echo "│                                                              │"
+  echo "│  🔴 ASK YOURSELF:                                            │"
+  echo "│  \"If this chat were lost RIGHT NOW, would the next agent    │"
+  echo "│   have enough context to continue without loss?\"            │"
+  echo "│                                                              │"
+  echo "│  If NO → SAVE NOW:                                           │"
+  echo "│    1. Update claude-progress.txt with current state          │"
+  echo "│    2. git add -A && git commit                               │"
+  echo "│                                                              │"
+  echo "│  Context limit: ~168k tokens                                 │"
+  echo "│  Baby Steps: Commit small, frequent. WIP > lost work.        │"
+  echo "│                                                              │"
+  echo "└──────────────────────────────────────────────────────────────┘"
+else
+  echo "✅ Harness: progress updated $MINUTES_SINCE_UPDATE min ago, $UNCOMMITTED_CHANGES uncommitted files"
+fi
+
+# ============================================================
+# 2. TypeScript check (if .ts/.tsx changed)
+# ============================================================
+TS_CHANGED=false
+if git diff --name-only HEAD 2>/dev/null | grep -qE '\.(ts|tsx)$'; then
+  TS_CHANGED=true
+fi
+if git ls-files --others --exclude-standard 2>/dev/null | grep -qE '\.(ts|tsx)$'; then
+  TS_CHANGED=true
+fi
+
+if [ "$TS_CHANGED" = true ]; then
+  echo ""
+  echo "📝 TypeScript files changed - running typecheck..."
+  if ! bun run typecheck 2>&1 | head -20; then
+    echo "" >&2
+    echo "❌ TYPECHECK FAILED" >&2
+    echo "Fix TypeScript errors before continuing." >&2
+    exit 2
+  fi
+  echo "✅ Typecheck passed"
+fi
+
+# ============================================================
+# 3. Check for canvas app changes (visual test reminder)
+# ============================================================
+CANVAS_CHANGED=false
+if git diff --name-only HEAD 2>/dev/null | grep -q 'apps/canvas/'; then
+  CANVAS_CHANGED=true
+fi
+if git ls-files --others --exclude-standard 2>/dev/null | grep -q 'apps/canvas/'; then
+  CANVAS_CHANGED=true
+fi
+
+if [ "$CANVAS_CHANGED" = true ]; then
+  echo ""
+  echo "┌──────────────────────────────────────────────────────────────┐"
+  echo "│ 📸 QA PROTOCOL REQUIRED (see docs/QA_PROTOCOL.md)           │"
+  echo "├──────────────────────────────────────────────────────────────┤"
+  echo "│                                                              │"
+  echo "│ Canvas app changed. Complete QA checklist before marking:   │"
+  echo "│                                                              │"
+  echo "│  □ bun run typecheck                    (TypeScript OK?)    │"
+  echo "│  □ mcp__playwright__browser_navigate    (App loads?)        │"
+  echo "│  □ mcp__playwright__browser_take_screenshot (Content visible?)│"
+  echo "│  □ mcp__playwright__browser_console_messages (No errors?)   │"
+  echo "│  □ Pan/zoom tested                      (Interactions work?)│"
+  echo "│  □ LOD transitions tested               (Smooth changes?)   │"
+  echo "│  □ mcp__playwright__browser_close       (Cleanup)           │"
+  echo "│                                                              │"
+  echo "│  ALL PASS? → features.json (passes: true)                   │"
+  echo "│  ANY FAIL? → Fix first, repeat QA                           │"
+  echo "│                                                              │"
+  echo "└──────────────────────────────────────────────────────────────┘"
+fi
+
+# ============================================================
+# 4. Harness file validation
+# ============================================================
+if [ ! -f "features.json" ]; then
+  echo "⚠️  features.json not found - harness incomplete" >&2
+fi
+
+if [ ! -f "claude-progress.txt" ]; then
+  echo "⚠️  claude-progress.txt not found - update progress log" >&2
+fi
+
+echo ""
+echo "✅ End-of-turn check complete"
+exit 0

@@ -1,0 +1,605 @@
+/**
+ * HQ Web Backend Server
+ *
+ * Replaces Tauri backend with pure Node.js/Bun implementation.
+ * Provides:
+ * - PTY support via node-pty
+ * - WebSocket for real-time communication
+ * - REST API for harness CLI commands
+ * - File system watching
+ */
+
+import { spawn, type Subprocess } from "bun";
+import { watch, type FSWatcher } from "fs";
+import { readFile, writeFile, mkdir, access, stat } from "fs/promises";
+import { join, basename } from "path";
+import { randomBytes } from "crypto";
+import { homedir } from "os";
+
+// Expand ~ to home directory
+function expandPath(path: string): string {
+  if (path.startsWith("~")) {
+    return join(homedir(), path.slice(1));
+  }
+  return path;
+}
+
+// Types
+interface ProcessInfo {
+  id: string;
+  cmd: string;
+  args: string[];
+  cwd: string;
+  rows: number;
+  cols: number;
+  running: boolean;
+  createdAt: number;
+}
+
+interface PtyProcess {
+  info: ProcessInfo;
+  process: Subprocess;
+}
+
+interface RpcRequest {
+  id: string;
+  cmd: string;
+  args: Record<string, unknown>;
+}
+
+interface RpcResponse {
+  id: string;
+  success: boolean;
+  result?: unknown;
+  error?: string;
+}
+
+interface RpcEvent {
+  event: string;
+  payload: unknown;
+}
+
+interface WatcherEntry {
+  watcher: FSWatcher;
+  projectPath: string;
+}
+
+// Global state
+const processes = new Map<string, PtyProcess>();
+const watchers = new Map<string, WatcherEntry>();
+const wsClients = new Set<{ send: (data: string) => void; readyState: number }>();
+
+// Generate unique ID
+function generateId(): string {
+  return randomBytes(16).toString("hex");
+}
+
+// Broadcast event to all WebSocket clients
+function broadcast(event: RpcEvent): void {
+  const data = JSON.stringify(event);
+  for (const client of wsClients) {
+    if (client.readyState === 1) {
+      try {
+        client.send(data);
+      } catch (e) {
+        console.error("[WS] Failed to send:", e);
+      }
+    }
+  }
+}
+
+// PTY Commands
+async function ptySpawn(
+  cmd: string,
+  args: string[] = [],
+  cwd: string = process.cwd(),
+  rows: number = 24,
+  cols: number = 80
+): Promise<ProcessInfo> {
+  const id = generateId();
+
+  // Expand ~ and resolve cwd
+  const resolvedCwd = expandPath(cwd);
+
+  // Use Bun's spawn with PTY-like behavior
+  const proc = spawn({
+    cmd: [cmd, ...args],
+    cwd: resolvedCwd,
+    env: {
+      ...process.env,
+      TERM: "xterm-256color",
+      COLUMNS: String(cols),
+      LINES: String(rows),
+    },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const info: ProcessInfo = {
+    id,
+    cmd,
+    args,
+    cwd: resolvedCwd,
+    rows,
+    cols,
+    running: true,
+    createdAt: Date.now(),
+  };
+
+  processes.set(id, {
+    info,
+    process: proc,
+  });
+
+  // Stream stdout
+  (async () => {
+    const reader = proc.stdout.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = new TextDecoder().decode(value);
+        broadcast({
+          event: "pty-output",
+          payload: { id, data: text },
+        });
+      }
+    } catch (e) {
+      console.error(`[PTY ${id}] stdout error:`, e);
+    }
+  })();
+
+  // Stream stderr
+  (async () => {
+    const reader = proc.stderr.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = new TextDecoder().decode(value);
+        broadcast({
+          event: "pty-output",
+          payload: { id, data: text },
+        });
+      }
+    } catch (e) {
+      console.error(`[PTY ${id}] stderr error:`, e);
+    }
+  })();
+
+  // Handle exit
+  proc.exited.then((code) => {
+    const entry = processes.get(id);
+    if (entry) {
+      entry.info.running = false;
+    }
+    broadcast({
+      event: "pty-exit",
+      payload: { id, code },
+    });
+    console.log(`[PTY ${id}] Process exited with code: ${code}`);
+  });
+
+  console.log(`[PTY ${id}] Spawned: ${cmd} ${args.join(" ")}`);
+  return info;
+}
+
+async function ptyWrite(id: string, data: string): Promise<void> {
+  const entry = processes.get(id);
+  if (!entry) {
+    throw new Error(`Process not found: ${id}`);
+  }
+  if (!entry.info.running) {
+    throw new Error(`Process not running: ${id}`);
+  }
+
+  // Bun's stdin is a FileSink with a write() method
+  const stdin = entry.process.stdin;
+  if (stdin && typeof stdin.write === "function") {
+    stdin.write(data);
+    stdin.flush();
+  } else {
+    throw new Error("stdin not available or not writable");
+  }
+}
+
+async function ptyKill(id: string): Promise<void> {
+  const entry = processes.get(id);
+  if (!entry) {
+    throw new Error(`Process not found: ${id}`);
+  }
+
+  entry.process.kill();
+  entry.info.running = false;
+  console.log(`[PTY ${id}] Killed`);
+}
+
+function ptyList(): ProcessInfo[] {
+  return Array.from(processes.values()).map((e) => e.info);
+}
+
+function ptyGet(id: string): ProcessInfo | null {
+  return processes.get(id)?.info || null;
+}
+
+// Harness CLI wrapper
+async function runHarnessCommand(
+  projectPath: string,
+  args: string[]
+): Promise<string> {
+  // Find harness binary - check common locations
+  const possiblePaths = [
+    join(process.cwd(), "target", "release", "harness"),
+    join(process.cwd(), "target", "debug", "harness"),
+    join(process.cwd(), "src-tauri", "target", "release", "harness"),
+    join(process.cwd(), "src-tauri", "target", "debug", "harness"),
+    "harness", // In PATH
+  ];
+
+  let harnessPath = "harness";
+  for (const p of possiblePaths) {
+    try {
+      await access(p);
+      harnessPath = p;
+      break;
+    } catch {
+      // Try next
+    }
+  }
+
+  console.log(`[Harness] Running: ${harnessPath} ${args.join(" ")} in ${projectPath}`);
+
+  const proc = spawn({
+    cmd: [harnessPath, ...args],
+    cwd: projectPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0) {
+    throw new Error(`Harness command failed (exit ${exitCode}): ${stderr || stdout}`);
+  }
+
+  return stdout;
+}
+
+// File watcher commands
+async function watcherStart(projectPath: string): Promise<boolean> {
+  if (watchers.has(projectPath)) {
+    return true; // Already watching
+  }
+
+  const harnessDir = join(projectPath, ".harness");
+
+  try {
+    await access(harnessDir);
+  } catch {
+    console.log(`[Watcher] .harness dir not found: ${harnessDir}`);
+    return false;
+  }
+
+  const watcher = watch(harnessDir, { recursive: true }, (eventType, filename) => {
+    if (!filename) return;
+
+    let changeType: "db" | "config" | "unknown" = "unknown";
+    if (filename.endsWith(".db") || filename.endsWith(".db-wal") || filename.endsWith(".db-shm")) {
+      changeType = "db";
+    } else if (filename.endsWith(".json")) {
+      changeType = "config";
+    }
+
+    broadcast({
+      event: "harness-change",
+      payload: {
+        project_path: projectPath,
+        change_type: changeType,
+        file: filename,
+      },
+    });
+  });
+
+  watchers.set(projectPath, { watcher, projectPath });
+  console.log(`[Watcher] Started watching: ${harnessDir}`);
+  return true;
+}
+
+function watcherStop(projectPath: string): boolean {
+  const entry = watchers.get(projectPath);
+  if (!entry) return false;
+
+  entry.watcher.close();
+  watchers.delete(projectPath);
+  console.log(`[Watcher] Stopped watching: ${projectPath}`);
+  return true;
+}
+
+function watcherList(): string[] {
+  return Array.from(watchers.keys());
+}
+
+// Check if path has .harness folder
+async function checkHarnessExists(path: string): Promise<boolean> {
+  try {
+    const harnessPath = join(path, ".harness");
+    await access(harnessPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Get project info from package.json
+async function getProjectInfo(path: string): Promise<{ name: string; version?: string } | null> {
+  try {
+    const pkgPath = join(path, "package.json");
+    const content = await readFile(pkgPath, "utf-8");
+    const pkg = JSON.parse(content);
+    return {
+      name: pkg.name || basename(path),
+      version: pkg.version,
+    };
+  } catch {
+    return {
+      name: basename(path),
+    };
+  }
+}
+
+// Get git info
+async function getGitInfo(path: string): Promise<{ hash: string; message: string; author: string; date: string } | null> {
+  try {
+    const proc = spawn({
+      cmd: ["git", "log", "-1", "--format=%H%n%s%n%an%n%aI"],
+      cwd: path,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const stdout = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+
+    if (exitCode !== 0) return null;
+
+    const lines = stdout.trim().split("\n");
+    if (lines.length < 4) return null;
+
+    return {
+      hash: lines[0],
+      message: lines[1],
+      author: lines[2],
+      date: lines[3],
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Handle RPC request
+async function handleRpcRequest(request: RpcRequest): Promise<RpcResponse> {
+  const { id, cmd, args } = request;
+
+  try {
+    let result: unknown;
+
+    switch (cmd) {
+      case "pty_spawn":
+        result = await ptySpawn(
+          args.cmd as string,
+          args.args as string[],
+          args.cwd as string,
+          args.rows as number,
+          args.cols as number
+        );
+        break;
+
+      case "pty_write":
+        await ptyWrite(args.id as string, args.data as string);
+        result = null;
+        break;
+
+      case "pty_resize":
+        // Not fully supported with Bun spawn, but we can store the values
+        const entry = processes.get(args.id as string);
+        if (entry) {
+          entry.info.rows = args.rows as number;
+          entry.info.cols = args.cols as number;
+        }
+        result = null;
+        break;
+
+      case "pty_kill":
+        await ptyKill(args.id as string);
+        result = null;
+        break;
+
+      case "pty_list":
+        result = ptyList();
+        break;
+
+      case "pty_get":
+        result = ptyGet(args.id as string);
+        break;
+
+      case "run_harness_command":
+        result = await runHarnessCommand(
+          args.projectPath as string,
+          args.args as string[]
+        );
+        break;
+
+      case "harness_watch_start":
+        result = await watcherStart(args.projectPath as string);
+        break;
+
+      case "harness_watch_stop":
+        result = watcherStop(args.projectPath as string);
+        break;
+
+      case "harness_watch_list":
+        result = watcherList();
+        break;
+
+      case "check_harness_exists":
+        result = await checkHarnessExists(args.path as string);
+        break;
+
+      case "get_project_info":
+        result = await getProjectInfo(args.path as string);
+        break;
+
+      case "get_git_info":
+        result = await getGitInfo(args.path as string);
+        break;
+
+      default:
+        throw new Error(`Unknown command: ${cmd}`);
+    }
+
+    return { id, success: true, result };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[RPC] Error in ${cmd}:`, message);
+    return { id, success: false, error: message };
+  }
+}
+
+// Create HTTP server with WebSocket support
+const PORT = parseInt(process.env.PORT || "9876");
+
+console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║  HQ Web Backend Server                                       ║
+╠══════════════════════════════════════════════════════════════╣
+║  Port: ${PORT}                                                 ║
+║  WebSocket: ws://localhost:${PORT}/ws                          ║
+║  Health: http://localhost:${PORT}/health                       ║
+╚══════════════════════════════════════════════════════════════╝
+`);
+
+const server = Bun.serve({
+  port: PORT,
+
+  async fetch(req, server) {
+    const url = new URL(req.url);
+
+    // CORS headers
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    // Handle CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // Health check
+    if (url.pathname === "/health") {
+      return Response.json(
+        { status: "ok", processes: processes.size, watchers: watchers.size },
+        { headers: corsHeaders }
+      );
+    }
+
+    // WebSocket upgrade
+    if (url.pathname === "/ws") {
+      const upgraded = server.upgrade(req);
+      if (!upgraded) {
+        return new Response("WebSocket upgrade failed", { status: 400 });
+      }
+      return undefined;
+    }
+
+    // REST API for RPC (alternative to WebSocket)
+    if (url.pathname === "/rpc" && req.method === "POST") {
+      try {
+        const request = await req.json() as RpcRequest;
+        const response = await handleRpcRequest(request);
+        return Response.json(response, { headers: corsHeaders });
+      } catch (e) {
+        return Response.json(
+          { id: "error", success: false, error: String(e) },
+          { status: 400, headers: corsHeaders }
+        );
+      }
+    }
+
+    // Serve static files (if needed for production)
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      return new Response("HQ Web Backend Server is running. Connect via WebSocket at /ws", {
+        headers: { "Content-Type": "text/plain", ...corsHeaders },
+      });
+    }
+
+    return new Response("Not found", { status: 404, headers: corsHeaders });
+  },
+
+  websocket: {
+    open(ws) {
+      wsClients.add(ws as any);
+      console.log(`[WS] Client connected. Total: ${wsClients.size}`);
+    },
+
+    close(ws) {
+      wsClients.delete(ws as any);
+      console.log(`[WS] Client disconnected. Total: ${wsClients.size}`);
+    },
+
+    async message(ws, message) {
+      try {
+        const request = JSON.parse(message as string) as RpcRequest;
+        const response = await handleRpcRequest(request);
+
+        // Send response as RPC event
+        ws.send(
+          JSON.stringify({
+            event: "rpc-response",
+            payload: response,
+          })
+        );
+      } catch (e) {
+        ws.send(
+          JSON.stringify({
+            event: "rpc-response",
+            payload: {
+              id: "error",
+              success: false,
+              error: String(e),
+            },
+          })
+        );
+      }
+    },
+  },
+});
+
+console.log(`Server running at http://localhost:${PORT}`);
+
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.log("\n[Server] Shutting down...");
+
+  // Kill all processes
+  for (const [id, entry] of processes) {
+    try {
+      entry.process.kill();
+      console.log(`[PTY ${id}] Killed on shutdown`);
+    } catch {
+      // Ignore
+    }
+  }
+
+  // Close all watchers
+  for (const [path, entry] of watchers) {
+    entry.watcher.close();
+    console.log(`[Watcher] Stopped: ${path}`);
+  }
+
+  process.exit(0);
+});

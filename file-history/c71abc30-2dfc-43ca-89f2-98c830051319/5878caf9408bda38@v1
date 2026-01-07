@@ -1,0 +1,178 @@
+"""PHAROS Data Schemas using Pydantic."""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class TicketStatus(str, Enum):
+    """Ticket workflow status."""
+
+    DRAFT = "draft"  # Initial creation
+    SPEC_PENDING = "spec_pending"  # Waiting for PRODUCT_DESIGN
+    SPEC_READY = "spec_ready"  # Spec approved, ready for implementation
+    IN_PROGRESS = "in_progress"  # SENIOR_ENGINEER working
+    REVIEW_PENDING = "review_pending"  # Waiting for THE_AUDITOR
+    APPROVED = "approved"  # All gates passed
+    REJECTED = "rejected"  # Failed audit, needs rework
+    MERGED = "merged"  # Successfully completed
+
+
+class GateStatus(str, Enum):
+    """Individual gate status."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    SKIPPED = "skipped"  # Not applicable for this ticket
+
+
+class AgentType(str, Enum):
+    """The 4 PHAROS agents."""
+
+    ORCHESTRATOR = "orchestrator"
+    PRODUCT_DESIGN = "product_design"
+    SENIOR_ENGINEER = "senior_engineer"
+    THE_AUDITOR = "the_auditor"
+
+
+class GateResult(BaseModel):
+    """Result from an agent gate review."""
+
+    status: GateStatus = GateStatus.PENDING
+    agent: AgentType | None = None
+    reviewed_at: datetime | None = None
+    feedback: str | None = None
+    evidence: list[str] = Field(default_factory=list)  # Paths to screenshots, logs, etc.
+
+
+class VisualSpec(BaseModel):
+    """Visual specification from PRODUCT_DESIGN agent."""
+
+    description: str
+    expected_elements: list[str] = Field(default_factory=list)
+    color_palette: list[str] = Field(default_factory=list)
+    layout_rules: list[str] = Field(default_factory=list)
+    wording: dict[str, str] = Field(default_factory=dict)  # key -> text
+    accessibility: list[str] = Field(default_factory=list)
+
+
+class TechnicalSpec(BaseModel):
+    """Technical specification from PRODUCT_DESIGN agent."""
+
+    requirements: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    performance_targets: dict[str, Any] = Field(default_factory=dict)
+    constraints: list[str] = Field(default_factory=list)
+
+
+class ImplementationPlan(BaseModel):
+    """Implementation plan from SENIOR_ENGINEER agent."""
+
+    approach: str
+    files_to_modify: list[str] = Field(default_factory=list)
+    files_to_create: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+
+
+class AuditResult(BaseModel):
+    """Audit result from THE_AUDITOR agent."""
+
+    visual_check: GateStatus = GateStatus.PENDING
+    visual_feedback: str | None = None
+    screenshots: list[str] = Field(default_factory=list)
+
+    performance_check: GateStatus = GateStatus.PENDING
+    performance_feedback: str | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+    qa_check: GateStatus = GateStatus.PENDING
+    qa_feedback: str | None = None
+    test_results: dict[str, Any] = Field(default_factory=dict)
+
+    overall: GateStatus = GateStatus.PENDING
+    summary: str | None = None
+
+
+class Ticket(BaseModel):
+    """Main ticket schema for PHAROS workflow."""
+
+    # Identity
+    ticket_id: str
+    feature_id: str | None = None  # Reference to features.json
+    title: str
+    description: str
+
+    # Metadata
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_by: str = "human"
+
+    # Workflow status
+    status: TicketStatus = TicketStatus.DRAFT
+    current_agent: AgentType | None = None
+    retry_count: int = 0
+    max_retries: int = 3
+
+    # Specifications (filled by PRODUCT_DESIGN)
+    visual_spec: VisualSpec | None = None
+    technical_spec: TechnicalSpec | None = None
+
+    # Implementation (filled by SENIOR_ENGINEER)
+    implementation_plan: ImplementationPlan | None = None
+    code_changes: list[str] = Field(default_factory=list)  # Commit SHAs or file paths
+
+    # Audit (filled by THE_AUDITOR)
+    audit_result: AuditResult | None = None
+
+    # Gates summary
+    gates: dict[str, GateResult] = Field(default_factory=lambda: {
+        "product_design": GateResult(),
+        "senior_engineer": GateResult(),
+        "the_auditor": GateResult(),
+    })
+
+    # History of all agent interactions
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+    def add_history(self, agent: AgentType, action: str, details: dict[str, Any] | None = None) -> None:
+        """Add an entry to ticket history."""
+        self.history.append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "agent": agent.value,
+            "action": action,
+            "details": details or {},
+        })
+        self.updated_at = datetime.utcnow()
+
+
+class AgentHistoryEntry(BaseModel):
+    """Record of an agent execution."""
+
+    ticket_id: str
+    agent: AgentType
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    action: str
+    input_state: dict[str, Any] = Field(default_factory=dict)
+    output_state: dict[str, Any] = Field(default_factory=dict)
+    tokens_used: int | None = None
+    duration_ms: int | None = None
+    error: str | None = None
+
+
+class Decision(BaseModel):
+    """Architecture Decision Record (ADR)."""
+
+    decision_id: str
+    title: str
+    status: str = "proposed"  # proposed, accepted, deprecated, superseded
+    context: str
+    options: list[dict[str, str]] = Field(default_factory=list)
+    decision: str
+    rationale: str
+    consequences: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    decided_by: AgentType | None = None

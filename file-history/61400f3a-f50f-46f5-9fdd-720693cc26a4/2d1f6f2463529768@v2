@@ -1,0 +1,484 @@
+---
+title: Technology Stack Recommendations
+category: implementation
+difficulty: intermediate
+tags: [tech-stack, typescript, python, mongodb, architecture]
+related_docs: [02-data-model, 03-api-design, 06-database-decision]
+summary: Recommended technology stack for fleet maintenance scheduling systems with rationale for each choice.
+version: 1.1
+last_updated: 2025-12-10
+---
+
+# Technology Stack Recommendations
+
+This document provides technology recommendations for building a fleet maintenance scheduling system, with rationale for each choice.
+
+> **Note:** See `06-database-decision.md` for detailed MongoDB decision rationale.
+
+## Current Stack (Dubai Metro MMS)
+
+```typescript
+interface CurrentStack {
+  backend: {
+    primary: 'TypeScript + Bun runtime';
+    solver: 'Python + HiGHS MIP';
+    api: 'Hono framework';
+  };
+
+  database: {
+    primary: 'MongoDB';
+    validation: 'TypeBox schemas';
+  };
+
+  frontend: {
+    framework: 'React 18 + TypeScript';
+    meta: 'Astro 5.x';
+    ui: 'Blueprint JS 6.x';
+  };
+
+  infrastructure: {
+    containers: 'Docker';
+    orchestration: 'Docker Compose';
+    cloud: 'AWS/GCP/Azure agnostic';
+  };
+}
+```
+
+## Backend: TypeScript + Bun
+
+### Why TypeScript
+
+```typescript
+interface TypeScriptBenefits {
+  typeSafety: 'Catch errors at compile time';
+  developer: 'Excellent IDE support, refactoring';
+  ecosystem: 'Largest package ecosystem (npm)';
+  hiring: 'Large developer pool';
+  fullStack: 'Same language frontend and backend';
+}
+```
+
+### Why Bun Runtime
+
+```typescript
+interface BunBenefits {
+  performance: '3-4x faster than Node.js';
+  native: 'TypeScript without transpilation';
+  bundler: 'Built-in bundler and test runner';
+  compatibility: 'Node.js API compatible';
+  modern: 'ESM-first, Web APIs built-in';
+}
+```
+
+### Setup Example
+
+```bash
+# Initialize Bun project
+bun init
+
+# Install dependencies
+bun add hono drizzle-orm postgres zod
+bun add -d typescript @types/node
+```
+
+```typescript
+// src/index.ts
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+
+const app = new Hono();
+
+app.use('*', logger());
+app.use('*', cors());
+
+app.get('/health', (c) => c.json({ status: 'ok' }));
+
+export default {
+  port: process.env.PORT ?? 3000,
+  fetch: app.fetch
+};
+```
+
+## Solver: Python
+
+### Why Python for Solver
+
+```typescript
+interface PythonSolverBenefits {
+  libraries: 'Best optimization library support';
+  highs: 'Native highspy bindings';
+  ortools: 'Official Google OR-Tools support';
+  scientific: 'NumPy, Pandas for data processing';
+  academic: 'Optimization research uses Python';
+}
+```
+
+### Integration Pattern
+
+```typescript
+// TypeScript calls Python solver via subprocess
+import { spawn } from 'bun';
+
+interface SolverInput {
+  events: MaintenanceEvent[];
+  periods: number[];
+  capacity: number;
+  timeLimit: number;
+}
+
+interface SolverOutput {
+  status: string;
+  schedule: Record<string, number>;
+  objective: number;
+  solveTime: number;
+}
+
+async function callSolver(input: SolverInput): Promise<SolverOutput> {
+  const proc = spawn(['python3', 'solver/main.py'], {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe'
+  });
+
+  // Send input
+  proc.stdin.write(JSON.stringify(input));
+  proc.stdin.end();
+
+  // Read output
+  const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
+
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    throw new Error(`Solver failed: ${stderr}`);
+  }
+
+  return JSON.parse(stdout);
+}
+```
+
+```python
+# solver/main.py
+import sys
+import json
+import highspy
+
+def solve(input_data: dict) -> dict:
+    # Build and solve model
+    h = highspy.Highs()
+    h.silent()
+
+    # ... model building ...
+
+    h.run()
+
+    return {
+        'status': str(h.getModelStatus()),
+        'schedule': extract_schedule(h),
+        'objective': h.getInfo().objective_function_value,
+        'solveTime': h.getInfo().run_time
+    }
+
+if __name__ == '__main__':
+    input_data = json.load(sys.stdin)
+    result = solve(input_data)
+    print(json.dumps(result))
+```
+
+## Database: MongoDB
+
+> **Decision:** MongoDB was selected over PostgreSQL. See `06-database-decision.md` for full rationale.
+
+### Why MongoDB (for this project)
+
+```typescript
+interface MongoDBBenefits {
+  teamExperience: 'Team has production MongoDB experience';
+  existingCode: 'TypeBox → MongoDB validation already implemented';
+  flexibility: 'Schema evolution without migrations';
+  railwayUse: 'Used by SBB Swiss Railways, Bosch SI';
+  biAccess: 'Atlas SQL Interface for reporting';
+}
+```
+
+### Schema Example
+
+```typescript
+// Using TypeBox for schema definition
+import { Type, Static } from '@sinclair/typebox';
+
+export const AssetSchema = Type.Object({
+  _id: Type.String(),
+  code: Type.String({ minLength: 1, maxLength: 10 }),
+  fleet: Type.Union([
+    Type.Literal('alstom'),
+    Type.Literal('kinki-sharyo')
+  ]),
+  status: Type.Union([
+    Type.Literal('operational'),
+    Type.Literal('maintenance'),
+    Type.Literal('retired')
+  ]),
+  currentMileage: Type.Number({ minimum: 0 }),
+});
+
+export type Asset = Static<typeof AssetSchema>;
+```
+
+### Collection Setup
+
+```typescript
+// packages/api/src/db/connection.ts
+import { MongoClient, Db } from 'mongodb';
+
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
+const DB_NAME = process.env.DB_NAME || 'mms';
+
+let db: Db | null = null;
+
+export async function connectDb(): Promise<Db> {
+  if (db) return db;
+  const client = new MongoClient(MONGO_URI);
+  await client.connect();
+  db = client.db(DB_NAME);
+  return db;
+}
+
+export const COLLECTIONS = {
+  ASSETS: 'assets',
+  SCENARIOS: 'scenarios',
+  MAINTENANCE_TYPES: 'maintenance_types'
+} as const;
+```
+
+## Cache: Redis
+
+### Why Redis
+
+```typescript
+interface RedisBenefits {
+  speed: 'Microsecond latency';
+  versatile: 'Cache, queue, pub/sub, sessions';
+  simple: 'Easy to operate';
+  scalable: 'Cluster mode for HA';
+}
+```
+
+### Use Cases
+
+```typescript
+// Session caching
+await redis.set(`session:${userId}`, JSON.stringify(session), 'EX', 3600);
+
+// API response caching
+const cached = await redis.get(`schedule:${scheduleId}`);
+if (cached) return JSON.parse(cached);
+
+// Job queue
+await redis.lpush('solver:jobs', JSON.stringify(job));
+
+// Pub/sub for real-time updates
+redis.publish('schedule:updated', JSON.stringify({ scheduleId }));
+```
+
+## Frontend: React + Astro + Blueprint JS
+
+### Why React
+
+```typescript
+interface ReactBenefits {
+  ecosystem: 'Largest component ecosystem';
+  hiring: 'Most developers know React';
+  tooling: 'Excellent development tools';
+  flexibility: 'Works with any backend';
+}
+```
+
+### Why Astro
+
+```typescript
+interface AstroBenefits {
+  islands: 'Partial hydration for performance';
+  routing: 'File-based routing';
+  ssr: 'Server-side rendering built-in';
+  react: 'Native React integration';
+  fast: 'Zero JavaScript by default';
+}
+```
+
+### Why Blueprint JS
+
+```typescript
+interface BlueprintBenefits {
+  enterprise: 'Professional, data-dense UI';
+  react18: 'Full React 18 compatibility';
+  components: 'Complete component set';
+  tables: 'Built-in data tables';
+  typescript: 'First-class TypeScript support';
+}
+```
+
+> **Decision:** Blueprint JS was selected over Cloudscape due to SSR compatibility issues. See `docs/internal/UI-LIBRARY-REQUIREMENTS.md`.
+
+### Project Structure
+
+```
+apps/web/
+├── src/
+│   ├── pages/              # Astro pages
+│   │   ├── index.astro     # Dashboard
+│   │   ├── fleet.astro     # Fleet list
+│   │   ├── schedule.astro  # Schedule view
+│   │   ├── calendar.astro  # Calendar view
+│   │   └── what-if.astro   # What-If Simulator
+│   ├── components/         # React components
+│   │   ├── Dashboard.tsx
+│   │   ├── FleetTable.tsx
+│   │   ├── ScheduleTable.tsx
+│   │   ├── CalendarView.tsx
+│   │   └── WhatIfSimulator.tsx
+│   ├── layouts/
+│   │   └── MainLayout.astro
+│   ├── lib/
+│   │   ├── api.ts          # API client
+│   │   └── export-utils.ts # Excel/CSV export
+│   └── styles/
+│       └── global.css      # Blueprint CSS imports
+├── astro.config.mjs
+└── package.json
+```
+
+## Visualization: ECharts
+
+### Why ECharts
+
+```typescript
+interface EChartsBenefits {
+  performance: 'Handles 100k+ data points';
+  features: 'Gantt, heatmaps, calendars';
+  customization: 'Highly configurable';
+  opensource: 'Apache 2.0 license';
+}
+```
+
+### Schedule Visualization Example
+
+```typescript
+import ReactECharts from 'echarts-for-react';
+
+function ScheduleGantt({ events }: { events: ScheduledEvent[] }) {
+  const option = {
+    tooltip: { trigger: 'item' },
+    xAxis: {
+      type: 'time',
+      min: startDate,
+      max: endDate
+    },
+    yAxis: {
+      type: 'category',
+      data: assets.map(a => a.name)
+    },
+    series: [{
+      type: 'custom',
+      renderItem: renderGanttBar,
+      encode: { x: [0, 1], y: 2 },
+      data: events.map(e => [
+        e.startDate,
+        e.endDate,
+        e.assetIndex,
+        e.maintenanceType
+      ])
+    }]
+  };
+
+  return <ReactECharts option={option} style={{ height: 600 }} />;
+}
+```
+
+## Infrastructure
+
+### Docker Setup
+
+```dockerfile
+# Dockerfile for API
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile
+
+FROM base AS runner
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+EXPOSE 3000
+CMD ["bun", "run", "src/index.ts"]
+```
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    build: ./apps/api
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/mms
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+
+  solver:
+    build: ./packages/solver
+    environment:
+      - REDIS_URL=redis://redis:6379
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=mms
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
+```
+
+## Package Structure
+
+### Monorepo Layout
+
+```
+uptime/
+├── apps/
+│   └── web/                    # Astro + React frontend
+├── packages/
+│   ├── api/                    # Hono + Bun API server
+│   ├── solver/                 # Python MIP solver
+│   ├── db/                     # MongoDB document client
+│   └── types/                  # Shared TypeScript types
+├── docs/
+│   ├── @start-here/            # Client docs (RFQ, SoW)
+│   ├── knowledge-base/         # Domain knowledge
+│   └── internal/               # Confidential notes
+├── docker-compose.yml
+├── package.json                # pnpm workspace root
+└── CLAUDE.md                   # AI instructions
+```
+
+## Next Steps
+
+With tech stack selected:
+
+- Study `02-data-model.md` for database design
+- Explore `03-api-design.md` for API patterns
+- Review `06-FEATURES/` for feature implementation

@@ -1,0 +1,92 @@
+import React from 'react';
+
+import { defineFunctionName } from '../helpers/function';
+import { getProperty } from '../helpers/object-utils';
+import { capitalize } from '../helpers/string-utils';
+
+import type { SliceContext, StringTypes, UnknownAction } from './models';
+import type { Slices } from './slice';
+import type { Store } from './store';
+
+export function Hooks(params: {
+  machineID: string;
+  store: Store.Instance;
+  getContext(): SliceContext;
+  mappedSlices: Slices.SlicesMap;
+}) {
+  const { machineID, store, getContext, mappedSlices } = params;
+
+  function useSelector<T>(selector: (state: any) => T): T {
+    return React.useSyncExternalStore(store.subscribe, () => {
+      const fullState = store.getState();
+      return selector(fullState);
+    });
+  }
+
+  // transforming action creators into action dispatchers
+  const runtimeActions = {} as {
+    [K: StringTypes.SliceKey]: {
+      [K: StringTypes.SliceReducerName]: (payload: unknown) => UnknownAction;
+    };
+  };
+
+  mappedSlices.info.forEach(({ sliceKey }) => {
+    const actions = mappedSlices.actionCreatorListBySliceKey[sliceKey];
+    actions.forEach(actionCreator => {
+      function dispatch(payload: unknown) {
+        const context = getContext();
+        const actionObject = actionCreator(payload, context);
+        return store.dispatch(actionObject);
+      }
+
+      defineFunctionName(
+        dispatch,
+        `${machineID}Runtime${capitalize(actionCreator.sliceReducerName)}`,
+      );
+      runtimeActions[sliceKey] = runtimeActions[sliceKey] || {};
+      runtimeActions[sliceKey][actionCreator.sliceReducerName] = dispatch;
+    });
+  });
+
+  /**
+   * Custom React hook to interact with a specific slice of the state machine.
+   * @param path The key of the slice or selector to access.
+   * @returns Object with state and actions (not hybrid array+object)
+   *
+   * BREAKING CHANGE: Now returns { state, actions, dispatch } instead of array+object hybrid.
+   * This fixes V8 de-optimization caused by Object.assign([...], ...) pattern.
+   */
+  function useMachine(path?: string) {
+    // If no path provided, return full machine interface
+    if (!path) {
+      const fullState = useSelector(state => state);
+      return {
+        state: fullState,
+        actions: runtimeActions,
+        dispatch: store.dispatch,
+      };
+    }
+
+    const isSliceKey = Boolean(
+      mappedSlices.reducerBySliceKey[path as StringTypes.SliceKey],
+    );
+
+    const actions = isSliceKey
+      ? runtimeActions[path as StringTypes.SliceKey]
+      : undefined;
+
+    const selection = useSelector(state => getProperty(state, path, true));
+
+    // Return clean object shape for V8 optimization
+    return {
+      state: selection,
+      actions,
+      dispatch: store.dispatch,
+    };
+  }
+
+  return {
+    useSelector,
+    useMachine,
+  };
+}

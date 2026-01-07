@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+#
+# claude-search - Interactive search in Claude Code history
+# Usage: claude-search [term]   or   cs [term]
+#
+# Shortcuts:
+#   Enter    - Resume conversation
+#   Ctrl-Y   - Copy sessionId
+#   Ctrl-L   - Open debug log
+#   Ctrl-R   - Reload cache
+#   Ctrl-/   - Toggle preview
+#
+
+set -euo pipefail
+
+# === CONFIG ===
+readonly HISTORY_FILE="${HOME}/.claude/history.jsonl"
+readonly DEBUG_DIR="${HOME}/.claude/debug"
+readonly CACHE_FILE="/tmp/claude-search-cache-$(id -u).tsv"
+readonly CACHE_TTL=60
+readonly UUID_REGEX='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+# === COLORS ===
+readonly C_RESET='\033[0m'
+readonly C_RED='\033[31m'
+readonly C_GREEN='\033[32m'
+readonly C_YELLOW='\033[33m'
+readonly C_CYAN='\033[36m'
+readonly C_DIM='\033[2m'
+
+# === LOGGING ===
+log_error() { echo -e "${C_RED}Error:${C_RESET} $*" >&2; }
+log_warn()  { echo -e "${C_YELLOW}Warning:${C_RESET} $*" >&2; }
+log_info()  { echo -e "${C_GREEN}$*${C_RESET}"; }
+
+# === VALIDATION ===
+
+# Validate UUID format
+is_valid_uuid() {
+    local uuid="$1"
+    [[ -n "$uuid" && "$uuid" =~ $UUID_REGEX ]]
+}
+
+# Sanitize input - remove dangerous characters
+sanitize_input() {
+    local input="$1"
+    echo "$input" | tr -cd '[:alnum:][:space:]._-'
+}
+
+# Check if file exists and is readable
+check_file() {
+    local file="$1"
+    local desc="$2"
+
+    if [[ ! -f "$file" ]]; then
+        log_error "$desc not found: $file"
+        return 1
+    fi
+
+    if [[ ! -r "$file" ]]; then
+        log_error "$desc not readable: $file"
+        return 1
+    fi
+
+    if [[ ! -s "$file" ]]; then
+        log_error "$desc is empty: $file"
+        return 1
+    fi
+
+    return 0
+}
+
+# Check required dependencies
+check_dependencies() {
+    local missing=()
+
+    command -v fzf >/dev/null 2>&1 || missing+=("fzf")
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing dependencies: ${missing[*]}"
+        echo "Install with: brew install ${missing[*]}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# === FUNCTIONS ===
+
+show_help() {
+    cat << 'EOF'
+claude-search - Interactive search in Claude Code history
+
+USAGE:
+    claude-search [options] [term]
+    cs [term]
+
+OPTIONS:
+    -p, --project FILTER   Filter by project name
+    -f, --fuzzy            Use fuzzy search (default: exact)
+    -h, --help             Show this help
+    --clear-cache          Clear cached data
+
+FZF SHORTCUTS:
+    Enter      Resume conversation in original project
+    Ctrl-Y     Copy sessionId to clipboard
+    Ctrl-L     Open debug log
+    Ctrl-R     Reload cache
+    Ctrl-F     Toggle fuzzy/exact mode
+    Ctrl-/     Toggle preview
+
+SEARCH TIPS:
+    webgl      Exact match for "webgl"
+    'webgl     Force exact match (prefix with ')
+    ^webgl     Starts with "webgl"
+    webgl$     Ends with "webgl"
+    !webgl     Does NOT contain "webgl"
+
+EXAMPLES:
+    cs                  # interactive search
+    cs "docker"         # exact search for "docker"
+    cs -f "dock"        # fuzzy search for "dock"
+    cs -p my-project    # filter by project
+    cs --clear-cache    # reset cache
+EOF
+    exit 0
+}
+
+# Generate processed cache with validation
+generate_cache() {
+    # Check if cache is fresh
+    if [[ -f "$CACHE_FILE" ]]; then
+        local cache_age
+        cache_age=$(( $(date +%s) - $(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0) ))
+        if (( cache_age < CACHE_TTL )); then
+            return 0
+        fi
+    fi
+
+    # Validate history file
+    if ! check_file "$HISTORY_FILE" "History file"; then
+        return 1
+    fi
+
+    # Validate JSON structure (sample first line)
+    if ! head -1 "$HISTORY_FILE" | jq -e '.sessionId and .timestamp and .project' >/dev/null 2>&1; then
+        log_error "Invalid history file format"
+        return 1
+    fi
+
+    # Process history.jsonl to tabular format
+    local temp_cache="${CACHE_FILE}.tmp"
+
+    if ! jq -r '[.sessionId, .timestamp, .project, (.display | gsub("\n"; " ") | .[0:200])] | @tsv' "$HISTORY_FILE" 2>/dev/null | \
+    while IFS=$'\t' read -r sid ts proj msg; do
+        # Validate each record
+        if ! is_valid_uuid "$sid"; then
+            continue
+        fi
+
+        if [[ -z "$ts" || ! "$ts" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+
+        local date_fmt
+        date_fmt=$(date -r $((ts / 1000)) "+%Y-%m-%d %H:%M" 2>/dev/null || echo "???")
+
+        local short_proj
+        short_proj=$(echo "${proj:-unknown}" | rev | cut -d'/' -f1-2 | rev)
+
+        printf '%s\t%s\t%s\t%s\n' "$sid" "$date_fmt" "$short_proj" "${msg:-<empty>}"
+    done > "$temp_cache"; then
+        log_error "Failed to process history file"
+        rm -f "$temp_cache"
+        return 1
+    fi
+
+    # Validate output
+    if [[ ! -s "$temp_cache" ]]; then
+        log_error "No valid entries found in history"
+        rm -f "$temp_cache"
+        return 1
+    fi
+
+    mv "$temp_cache" "$CACHE_FILE"
+    return 0
+}
+
+# Preview handler with validation
+show_preview() {
+    local session_id="$1"
+
+    # Validate sessionId
+    if ! is_valid_uuid "$session_id"; then
+        echo -e "${C_RED}Invalid session ID${C_RESET}"
+        return 1
+    fi
+
+    echo -e "${C_CYAN}═══ Session: ${session_id:0:8}... ═══${C_RESET}"
+    echo ""
+
+    # Session info with error handling
+    local project msg_count
+    project=$(jq -r --arg sid "$session_id" 'select(.sessionId == $sid) | .project' "$HISTORY_FILE" 2>/dev/null | head -1)
+    msg_count=$(jq --arg sid "$session_id" 'select(.sessionId == $sid)' "$HISTORY_FILE" 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ -z "$project" ]]; then
+        echo -e "${C_YELLOW}Session not found in history${C_RESET}"
+        return 1
+    fi
+
+    echo -e "${C_YELLOW}Project:${C_RESET} ${project:-unknown}"
+    echo -e "${C_YELLOW}Messages:${C_RESET} ${msg_count:-0}"
+
+    # Debug log info
+    local debug_file="${DEBUG_DIR}/${session_id}.txt"
+    if [[ -f "$debug_file" && -r "$debug_file" ]]; then
+        local debug_size
+        debug_size=$(ls -lh "$debug_file" 2>/dev/null | awk '{print $5}')
+        echo -e "${C_GREEN}Debug log:${C_RESET} ${debug_size:-?} (Ctrl-L to open)"
+    fi
+
+    echo ""
+    echo -e "${C_CYAN}─── Messages ───${C_RESET}"
+    echo ""
+
+    # List session messages
+    jq -r --arg sid "$session_id" '
+        select(.sessionId == $sid) | .display // "<empty>"
+    ' "$HISTORY_FILE" 2>/dev/null | \
+    while IFS= read -r msg; do
+        echo -e "${C_DIM}•${C_RESET} $msg"
+        echo ""
+    done | fold -s -w 70
+}
+
+# Force cache regeneration
+regenerate_cache() {
+    rm -f "$CACHE_FILE"
+    if generate_cache; then
+        cat "$CACHE_FILE"
+    else
+        exit 1
+    fi
+}
+
+# Clear cache
+clear_cache() {
+    rm -f "$CACHE_FILE"
+    log_info "Cache cleared"
+    exit 0
+}
+
+# === MAIN ===
+
+main() {
+    local filter_project=""
+    local query=""
+    local fuzzy_mode=false
+
+    # Parse arguments with validation
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--fuzzy)
+                fuzzy_mode=true
+                shift
+                ;;
+            -p|--project)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option -p requires a project name"
+                    exit 1
+                fi
+                filter_project=$(sanitize_input "$2")
+                if [[ -z "$filter_project" ]]; then
+                    log_error "Invalid project filter"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            -h|--help)
+                show_help
+                ;;
+            --preview)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --preview requires a session ID"
+                    exit 1
+                fi
+                show_preview "$2"
+                exit 0
+                ;;
+            --regenerate)
+                regenerate_cache
+                exit 0
+                ;;
+            --clear-cache)
+                clear_cache
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                echo "Use -h for help" >&2
+                exit 1
+                ;;
+            *)
+                query=$(sanitize_input "$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Check dependencies
+    if ! check_dependencies; then
+        exit 1
+    fi
+
+    # Generate cache
+    if ! generate_cache; then
+        exit 1
+    fi
+
+    # Apply project filter
+    local input_data
+    if [[ -n "$filter_project" ]]; then
+        input_data=$(grep -i "$filter_project" "$CACHE_FILE" 2>/dev/null || true)
+        if [[ -z "$input_data" ]]; then
+            log_warn "No messages found for project filter: $filter_project"
+            exit 0
+        fi
+    else
+        input_data=$(cat "$CACHE_FILE")
+    fi
+
+    if [[ -z "$input_data" ]]; then
+        log_warn "No messages found in history"
+        exit 0
+    fi
+
+    # Count entries
+    local entry_count
+    entry_count=$(echo "$input_data" | wc -l | tr -d ' ')
+
+    # Build fzf options
+    local fzf_opts=(
+        --ansi
+        --delimiter=$'\t'
+        --with-nth=2,3,4
+        --nth=3,4
+        --preview="$0 --preview {1}"
+        --preview-window=right:50%:wrap
+        --bind='ctrl-y:execute-silent(echo -n {1} | pbcopy)+abort'
+        --bind="ctrl-l:execute(less \"${DEBUG_DIR}/{1}.txt\" 2>/dev/null || echo 'Debug log not found')"
+        --bind="ctrl-r:reload($0 --regenerate)"
+        --bind='ctrl-f:toggle-search'
+        --query="$query"
+        --prompt='claude> '
+        --height=80%
+        --layout=reverse
+        --border=rounded
+        --info=inline
+        --color='header:italic:dim'
+    )
+
+    # Default to exact mode unless -f flag is passed
+    local search_mode="EXACT"
+    if [[ "$fuzzy_mode" == false ]]; then
+        fzf_opts+=(--exact)
+    else
+        search_mode="FUZZY"
+    fi
+
+    fzf_opts+=(--header="$entry_count entries [$search_mode] │ Enter:Resume │ Ctrl-Y:Copy │ Ctrl-L:Log │ Ctrl-F:Toggle")
+
+    # Run fzf
+    local selected
+    selected=$(echo "$input_data" | fzf "${fzf_opts[@]}" || true)
+
+    # User cancelled
+    [[ -z "$selected" ]] && exit 0
+
+    # Extract and validate selection
+    local session_id
+    session_id=$(echo "$selected" | cut -f1)
+
+    if ! is_valid_uuid "$session_id"; then
+        log_error "Invalid session ID selected"
+        exit 1
+    fi
+
+    local project
+    project=$(jq -r --arg sid "$session_id" 'select(.sessionId == $sid) | .project' "$HISTORY_FILE" 2>/dev/null | head -1)
+
+    if [[ -z "$project" ]]; then
+        log_error "Session not found: $session_id"
+        exit 1
+    fi
+
+    echo ""
+    log_info "Resuming session: ${session_id:0:8}..."
+    echo -e "${C_GREEN}Project:${C_RESET} $project"
+    echo ""
+
+    # Navigate to project and resume
+    if [[ -d "$project" ]]; then
+        cd "$project" || {
+            log_warn "Failed to cd to project, using current directory"
+        }
+    else
+        log_warn "Project directory does not exist: $project"
+        echo "Using current directory instead"
+    fi
+
+    # Verify claude command exists
+    if ! command -v claude >/dev/null 2>&1; then
+        log_error "claude command not found"
+        exit 1
+    fi
+
+    exec claude --resume "$session_id"
+}
+
+main "$@"

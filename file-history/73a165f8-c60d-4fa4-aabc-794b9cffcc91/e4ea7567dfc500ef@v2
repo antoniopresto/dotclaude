@@ -1,0 +1,148 @@
+/**
+ * Background service worker for the Video Downloader extension
+ * Handles download operations and manages extension state
+ */
+
+import { type DetectedVideo } from '../utils/video-detector';
+
+interface DownloadOptions {
+  video: DetectedVideo;
+  filename?: string;
+}
+
+interface BadgeState {
+  count: number;
+  tabId: number;
+}
+
+const badgeStates = new Map<number, BadgeState>();
+
+export default defineBackground(() => {
+  console.log('[Video Downloader] Background service worker started');
+
+  // Listen for messages from content scripts and popup
+  browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.action === 'download') {
+      handleDownload(message.options as DownloadOptions)
+        .then((downloadId) => sendResponse({ success: true, downloadId }))
+        .catch((error) => sendResponse({ success: false, error: error.message }));
+      return true;
+    }
+
+    if (message.action === 'videosDetected' && sender.tab?.id) {
+      updateBadge(sender.tab.id, message.count);
+      sendResponse({ received: true });
+      return true;
+    }
+
+    if (message.action === 'videosUpdated' && sender.tab?.id) {
+      // Could trigger a re-scan here if needed
+      sendResponse({ received: true });
+      return true;
+    }
+
+    if (message.action === 'getBadgeCount') {
+      const tabId = message.tabId;
+      const state = badgeStates.get(tabId);
+      sendResponse({ count: state?.count || 0 });
+      return true;
+    }
+
+    return false;
+  });
+
+  // Clean up badge state when tab is closed
+  browser.tabs.onRemoved.addListener((tabId) => {
+    badgeStates.delete(tabId);
+  });
+
+  // Update badge when tab is updated
+  browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === 'loading') {
+      // Reset badge when navigating
+      badgeStates.delete(tabId);
+      browser.action.setBadgeText({ tabId, text: '' });
+    }
+  });
+});
+
+/**
+ * Update the extension badge with video count
+ */
+async function updateBadge(tabId: number, count: number): Promise<void> {
+  badgeStates.set(tabId, { count, tabId });
+
+  await browser.action.setBadgeText({
+    tabId,
+    text: count > 0 ? count.toString() : '',
+  });
+
+  await browser.action.setBadgeBackgroundColor({
+    tabId,
+    color: count > 0 ? '#4CAF50' : '#9E9E9E',
+  });
+}
+
+/**
+ * Handle video download request
+ */
+async function handleDownload(options: DownloadOptions): Promise<number> {
+  const { video, filename } = options;
+
+  // Generate filename from title or URL
+  const sanitizedTitle = sanitizeFilename(filename || video.title);
+  const extension = getFileExtension(video.url, video.type);
+  const finalFilename = `${sanitizedTitle}.${extension}`;
+
+  try {
+    const downloadId = await browser.downloads.download({
+      url: video.url,
+      filename: finalFilename,
+      saveAs: true,
+    });
+
+    console.log(`[Video Downloader] Started download: ${finalFilename} (ID: ${downloadId})`);
+    return downloadId;
+  } catch (error) {
+    console.error('[Video Downloader] Download failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Sanitize filename to remove invalid characters
+ */
+function sanitizeFilename(filename: string): string {
+  return filename
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 100)
+    .trim();
+}
+
+/**
+ * Get appropriate file extension from URL or MIME type
+ */
+function getFileExtension(url: string, mimeType: string): string {
+  // Try to extract from URL
+  const urlExtension = url.split('.').pop()?.split('?')[0]?.toLowerCase();
+  if (urlExtension && ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv'].includes(urlExtension)) {
+    return urlExtension;
+  }
+
+  // Map MIME type to extension
+  const mimeToExt: Record<string, string> = {
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+    'video/ogg': 'ogg',
+    'video/quicktime': 'mov',
+    'video/x-msvideo': 'avi',
+    'video/x-matroska': 'mkv',
+  };
+
+  return mimeToExt[mimeType] || 'mp4';
+}
+
+// Type declaration for WXT's defineBackground
+declare function defineBackground(fn: () => void): void;

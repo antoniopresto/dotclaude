@@ -1,0 +1,365 @@
+#!/usr/bin/env node
+
+/**
+ * MMS Harness Runner
+ *
+ * Automated script to run Claude Code sessions sequentially,
+ * starting a fresh context for each feature in the harness.
+ *
+ * Usage:
+ *   node scripts/harness-runner.js [options]
+ *
+ * Options:
+ *   --dry-run    Show what would be executed without running
+ *   --feature    Start from a specific feature ID (e.g., --feature F112)
+ *   --max        Maximum number of features to process (default: unlimited)
+ *   --model      Model to use: sonnet, opus, haiku (default: sonnet)
+ */
+
+import { spawn } from 'child_process';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const ROOT_DIR = join(__dirname, '..');
+
+// Configuration
+const CONFIG = {
+  featuresPath: join(ROOT_DIR, 'features.json'),
+  progressPath: join(ROOT_DIR, 'claude-progress.txt'),
+  maxBudgetUsd: 5, // Max budget per feature
+  defaultModel: 'sonnet',
+};
+
+// Parse command line arguments
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const options = {
+    dryRun: false,
+    startFeature: null,
+    maxFeatures: Infinity,
+    model: CONFIG.defaultModel,
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case '--dry-run':
+        options.dryRun = true;
+        break;
+      case '--feature':
+        options.startFeature = args[++i];
+        break;
+      case '--max':
+        options.maxFeatures = parseInt(args[++i], 10);
+        break;
+      case '--model':
+        options.model = args[++i];
+        break;
+      case '--help':
+      case '-h':
+        printHelp();
+        process.exit(0);
+    }
+  }
+
+  return options;
+}
+
+function printHelp() {
+  console.log(`
+MMS Harness Runner - Automated Claude Code session manager
+
+Usage:
+  node scripts/harness-runner.js [options]
+
+Options:
+  --dry-run           Show what would be executed without running
+  --feature <id>      Start from a specific feature ID (e.g., --feature F112)
+  --max <n>           Maximum number of features to process
+  --model <model>     Model to use: sonnet, opus, haiku (default: sonnet)
+  -h, --help          Show this help message
+
+Examples:
+  # Run all pending features
+  node scripts/harness-runner.js
+
+  # Start from F112
+  node scripts/harness-runner.js --feature F112
+
+  # Process only 3 features
+  node scripts/harness-runner.js --max 3
+
+  # Dry run to see what would happen
+  node scripts/harness-runner.js --dry-run
+`);
+}
+
+// Load features from JSON
+function loadFeatures() {
+  const content = readFileSync(CONFIG.featuresPath, 'utf-8');
+  const data = JSON.parse(content);
+  return data.features;
+}
+
+// Get next incomplete feature
+function getNextFeature(features, startFrom = null) {
+  let foundStart = startFrom === null;
+
+  for (const feature of features) {
+    if (startFrom && feature.id === startFrom) {
+      foundStart = true;
+    }
+
+    if (foundStart && !feature.passes) {
+      // Check if blocked
+      if (feature.blockedBy) {
+        const blocker = features.find(f => f.id === feature.blockedBy);
+        if (blocker && !blocker.passes) {
+          continue; // Skip blocked features
+        }
+      }
+      return feature;
+    }
+  }
+
+  return null;
+}
+
+// Get all pending features (not blocked)
+function getPendingFeatures(features, startFrom = null) {
+  const pending = [];
+  let foundStart = startFrom === null;
+
+  for (const feature of features) {
+    if (startFrom && feature.id === startFrom) {
+      foundStart = true;
+    }
+
+    if (foundStart && !feature.passes) {
+      // Check if blocked
+      if (feature.blockedBy) {
+        const blocker = features.find(f => f.id === feature.blockedBy);
+        if (blocker && !blocker.passes) {
+          continue;
+        }
+      }
+      pending.push(feature);
+    }
+  }
+
+  return pending;
+}
+
+// Build prompt for Claude
+function buildPrompt(feature) {
+  return `# HARNESS TASK: ${feature.id}
+
+You are working on the MMS project harness. Your task is to implement and verify ONE feature.
+
+## Feature Details
+- **ID:** ${feature.id}
+- **Category:** ${feature.category}
+- **Description:** ${feature.description}
+
+## Steps to Complete
+${feature.steps.map((step, i) => `${i + 1}. ${step}`).join('\n')}
+
+## Instructions
+
+1. **READ** claude-progress.txt first to understand context
+2. **IMPLEMENT** the feature following the steps above
+3. **TEST** visually using Playwright MCP (mandatory for UI features)
+4. **VERIFY** all steps pass
+5. **UPDATE** features.json to set "passes": true for ${feature.id}
+6. **COMMIT** your changes with message: "feat(${feature.category}): ${feature.description}"
+7. **UPDATE** claude-progress.txt with session notes
+
+## Important Rules
+- Only mark passes:true after ALL steps are verified
+- Use Playwright MCP for visual testing (browser_navigate, browser_take_screenshot)
+- Commit after feature passes
+- Keep code production-ready
+
+## Exit Criteria
+When you have:
+1. Implemented all steps
+2. Visually verified the feature works
+3. Updated features.json with passes: true
+4. Committed the changes
+5. Updated claude-progress.txt
+
+Say "HARNESS COMPLETE: ${feature.id}" when done.
+`;
+}
+
+// Run Claude Code for a feature
+function runClaude(feature, options) {
+  return new Promise((resolve, reject) => {
+    const prompt = buildPrompt(feature);
+
+    console.log('\n' + '='.repeat(60));
+    console.log(`Starting: ${feature.id} - ${feature.description}`);
+    console.log('='.repeat(60) + '\n');
+
+    if (options.dryRun) {
+      console.log('[DRY RUN] Would execute:');
+      console.log(`  claude --model ${options.model} -p "prompt..."`);
+      console.log('\nPrompt:');
+      console.log(prompt);
+      resolve({ success: true, dryRun: true });
+      return;
+    }
+
+    // Use -p (print mode) for non-interactive execution
+    // This allows the runner to process multiple features sequentially
+    const claudeArgs = [
+      '-p', // Print mode (non-interactive)
+      '--model', options.model,
+      prompt
+    ];
+
+    const claude = spawn('claude', claudeArgs, {
+      cwd: ROOT_DIR,
+      stdio: 'inherit', // Show Claude's output in terminal
+      shell: true,
+    });
+
+    claude.on('error', (err) => {
+      console.error('Failed to start Claude:', err);
+      reject(err);
+    });
+
+    claude.on('close', (code) => {
+      console.log(`\nClaude exited with code ${code}`);
+
+      // Reload features to check if it was marked as complete
+      const features = loadFeatures();
+      const updated = features.find(f => f.id === feature.id);
+
+      resolve({
+        success: code === 0,
+        completed: updated?.passes === true,
+        exitCode: code,
+      });
+    });
+  });
+}
+
+// Append to progress log
+function logProgress(message) {
+  const timestamp = new Date().toISOString();
+  const entry = `\n[${timestamp}] ${message}\n`;
+
+  if (existsSync(CONFIG.progressPath)) {
+    const content = readFileSync(CONFIG.progressPath, 'utf-8');
+    writeFileSync(CONFIG.progressPath, content + entry);
+  }
+}
+
+// Main execution
+async function main() {
+  const options = parseArgs();
+
+  console.log('\n' + '='.repeat(60));
+  console.log('        MMS HARNESS RUNNER');
+  console.log('='.repeat(60));
+  console.log(`Model: ${options.model}`);
+  console.log(`Max features: ${options.maxFeatures === Infinity ? 'unlimited' : options.maxFeatures}`);
+  console.log(`Dry run: ${options.dryRun}`);
+  if (options.startFeature) {
+    console.log(`Starting from: ${options.startFeature}`);
+  }
+  console.log('='.repeat(60) + '\n');
+
+  const features = loadFeatures();
+  const pending = getPendingFeatures(features, options.startFeature);
+
+  if (pending.length === 0) {
+    console.log('No pending features found. All features are complete or blocked.');
+    process.exit(0);
+  }
+
+  console.log(`Found ${pending.length} pending feature(s):`);
+  pending.slice(0, 10).forEach(f => {
+    console.log(`  - ${f.id}: ${f.description}`);
+  });
+  if (pending.length > 10) {
+    console.log(`  ... and ${pending.length - 10} more`);
+  }
+
+  let processed = 0;
+  let completed = 0;
+  const processedIds = new Set();
+  let startFromFeature = options.startFeature;
+
+  while (processed < options.maxFeatures) {
+    const features = loadFeatures(); // Reload to get latest state
+
+    // Find next feature that hasn't been processed in this run
+    let feature = null;
+    let foundStart = startFromFeature === null;
+
+    for (const f of features) {
+      if (startFromFeature && f.id === startFromFeature) {
+        foundStart = true;
+      }
+
+      if (foundStart && !f.passes && !processedIds.has(f.id)) {
+        // Check if blocked
+        if (f.blockedBy) {
+          const blocker = features.find(b => b.id === f.blockedBy);
+          if (blocker && !blocker.passes) {
+            continue; // Skip blocked features
+          }
+        }
+        feature = f;
+        break;
+      }
+    }
+
+    if (!feature) {
+      console.log('\nNo more features to process.');
+      break;
+    }
+
+    startFromFeature = null; // After first feature, continue sequentially
+    processedIds.add(feature.id);
+
+    try {
+      const result = await runClaude(feature, options);
+
+      processed++;
+
+      if (result.completed) {
+        completed++;
+        console.log(`\n${feature.id} marked as COMPLETE`);
+        logProgress(`HARNESS: ${feature.id} completed by runner`);
+      } else if (!result.dryRun) {
+        console.log(`\n${feature.id} not yet complete. Continuing to next feature...`);
+        logProgress(`HARNESS: ${feature.id} attempted but not completed`);
+      }
+
+      // Brief pause between sessions
+      if (!options.dryRun && processed < options.maxFeatures) {
+        console.log('\nStarting next feature in 3 seconds...');
+        await new Promise(r => setTimeout(r, 3000));
+      }
+
+    } catch (error) {
+      console.error(`\nError processing ${feature.id}:`, error.message);
+      logProgress(`HARNESS: ${feature.id} failed with error: ${error.message}`);
+      break;
+    }
+  }
+
+  console.log('\n' + '='.repeat(60));
+  console.log('        HARNESS RUNNER SUMMARY');
+  console.log('='.repeat(60));
+  console.log(`Features processed: ${processed}`);
+  console.log(`Features completed: ${completed}`);
+  console.log('='.repeat(60) + '\n');
+}
+
+main().catch(console.error);

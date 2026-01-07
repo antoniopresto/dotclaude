@@ -1,0 +1,212 @@
+     1→'use client';
+     2→
+     3→import React, { useEffect, useState, useCallback } from 'react';
+     4→import dynamic from 'next/dynamic';
+     5→import { trainsApi, depotsApi, Train, Depot } from '@/lib/api';
+     6→
+     7→// Train status types
+     8→type TrainStatus = 'available' | 'in-service' | 'maintenance';
+     9→
+    10→interface TrainWithStatus extends Train {
+    11→  status: TrainStatus;
+    12→}
+    13→
+    14→// Status colors
+    15→const statusColors: Record<TrainStatus, string> = {
+    16→  available: '#22c55e',    // green-500
+    17→  'in-service': '#3b82f6', // blue-500
+    18→  maintenance: '#ef4444',  // red-500
+    19→};
+    20→
+    21→const statusLabels: Record<TrainStatus, string> = {
+    22→  available: 'Available',
+    23→  'in-service': 'In Service',
+    24→  maintenance: 'Maintenance',
+    25→};
+    26→
+    27→// Dynamically import the map component to avoid SSR issues
+    28→const MapWithNoSSR = dynamic(
+    29→  () => import('./MapContent'),
+    30→  {
+    31→    ssr: false,
+    32→    loading: () => (
+    33→      <div className="h-[600px] bg-gray-100 rounded-lg flex items-center justify-center">
+    34→        <div className="text-gray-500">Loading map...</div>
+    35→      </div>
+    36→    )
+    37→  }
+    38→);
+    39→
+    40→interface FleetMapProps {
+    41→  onTrainSelect?: (train: TrainWithStatus) => void;
+    42→}
+    43→
+    44→/**
+    45→ * Fleet Map Component
+    46→ *
+    47→ * Displays an interactive map of Portugal showing:
+    48→ * - Train positions with status-colored markers
+    49→ * - Depot locations with capacity indicators
+    50→ */
+    51→export function FleetMap({ onTrainSelect }: FleetMapProps) {
+    52→  const [trains, setTrains] = useState<TrainWithStatus[]>([]);
+    53→  const [depots, setDepots] = useState<(Depot & { trainCount: number })[]>([]);
+    54→  const [loading, setLoading] = useState(true);
+    55→  const [error, setError] = useState<string | null>(null);
+    56→  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+    57→  const [showDepots, setShowDepots] = useState(true);
+    58→  const [statusFilters, setStatusFilters] = useState<Record<TrainStatus, boolean>>({
+    59→    available: true,
+    60→    'in-service': true,
+    61→    maintenance: true,
+    62→  });
+    63→
+    64→  const fetchData = useCallback(async () => {
+    65→    try {
+    66→      const [trainsRes, depotsRes] = await Promise.all([
+    67→        trainsApi.getAll(),
+    68→        depotsApi.getAll(),
+    69→      ]);
+    70→
+    71→      if (trainsRes.error) throw new Error(trainsRes.error);
+    72→      if (depotsRes.error) throw new Error(depotsRes.error);
+    73→
+    74→      // Add status to trains
+    75→      const trainsWithStatus: TrainWithStatus[] = (trainsRes.data?.trains || []).map((train) => {
+    76→        let status: TrainStatus = 'available';
+    77→        if (train.fitnessStatus === 'unfit') {
+    78→          status = 'maintenance';
+    79→        }
+    80→        return { ...train, status };
+    81→      });
+    82→
+    83→      setTrains(trainsWithStatus);
+    84→      setDepots(depotsRes.data?.depots || []);
+    85→      setLastUpdated(new Date());
+    86→      setError(null);
+    87→    } catch (err) {
+    88→      setError(err instanceof Error ? err.message : 'Failed to load map data');
+    89→    } finally {
+    90→      setLoading(false);
+    91→    }
+    92→  }, []);
+    93→
+    94→  useEffect(() => {
+    95→    fetchData();
+    96→  }, [fetchData]);
+    97→
+    98→  // Auto-refresh every 30 seconds
+    99→  useEffect(() => {
+   100→    const interval = setInterval(fetchData, 30000);
+   101→    return () => clearInterval(interval);
+   102→  }, [fetchData]);
+   103→
+   104→  const toggleStatusFilter = (status: TrainStatus) => {
+   105→    setStatusFilters((prev) => ({ ...prev, [status]: !prev[status] }));
+   106→  };
+   107→
+   108→  const filteredTrains = trains.filter((train) => statusFilters[train.status]);
+   109→
+   110→  if (loading) {
+   111→    return (
+   112→      <div className="h-[600px] bg-gray-100 rounded-lg flex items-center justify-center animate-pulse">
+   113→        <div className="text-gray-500">Loading fleet data...</div>
+   114→      </div>
+   115→    );
+   116→  }
+   117→
+   118→  if (error) {
+   119→    return (
+   120→      <div className="h-[600px] bg-red-50 rounded-lg flex items-center justify-center">
+   121→        <div className="text-red-600">
+   122→          <strong>Error:</strong> {error}
+   123→        </div>
+   124→      </div>
+   125→    );
+   126→  }
+   127→
+   128→  return (
+   129→    <div className="space-y-4">
+   130→      {/* Controls */}
+   131→      <div className="flex flex-wrap items-center justify-between gap-4 bg-white rounded-lg p-4 shadow">
+   132→        {/* Status Filters */}
+   133→        <div className="flex items-center gap-4">
+   134→          <span className="text-sm font-medium text-gray-700">Filter:</span>
+   135→          {(Object.keys(statusFilters) as TrainStatus[]).map((status) => (
+   136→            <label key={status} className="flex items-center gap-2 cursor-pointer">
+   137→              <input
+   138→                type="checkbox"
+   139→                checked={statusFilters[status]}
+   140→                onChange={() => toggleStatusFilter(status)}
+   141→                className="rounded border-gray-300"
+   142→              />
+   143→              <span
+   144→                className="w-3 h-3 rounded-full"
+   145→                style={{ backgroundColor: statusColors[status] }}
+   146→              />
+   147→              <span className="text-sm text-gray-600">{statusLabels[status]}</span>
+   148→            </label>
+   149→          ))}
+   150→        </div>
+   151→
+   152→        {/* Depot Toggle */}
+   153→        <label className="flex items-center gap-2 cursor-pointer">
+   154→          <input
+   155→            type="checkbox"
+   156→            checked={showDepots}
+   157→            onChange={(e) => setShowDepots(e.target.checked)}
+   158→            className="rounded border-gray-300"
+   159→          />
+   160→          <span className="text-sm text-gray-600">Show Depots</span>
+   161→        </label>
+   162→
+   163→        {/* Refresh */}
+   164→        <div className="flex items-center gap-4">
+   165→          {lastUpdated && (
+   166→            <span className="text-xs text-gray-500">
+   167→              Last updated: {lastUpdated.toLocaleTimeString()}
+   168→            </span>
+   169→          )}
+   170→          <button
+   171→            onClick={fetchData}
+   172→            className="px-3 py-1 text-sm bg-primary-100 text-primary-700 rounded hover:bg-primary-200 transition-colors"
+   173→          >
+   174→            Refresh Now
+   175→          </button>
+   176→        </div>
+   177→      </div>
+   178→
+   179→      {/* Map */}
+   180→      <MapWithNoSSR
+   181→        trains={filteredTrains}
+   182→        depots={showDepots ? depots : []}
+   183→        onTrainSelect={onTrainSelect}
+   184→        statusColors={statusColors}
+   185→        statusLabels={statusLabels}
+   186→      />
+   187→
+   188→      {/* Legend */}
+   189→      <div className="flex items-center gap-6 bg-white rounded-lg p-3 shadow text-sm">
+   190→        <span className="font-medium text-gray-700">Legend:</span>
+   191→        {(Object.keys(statusColors) as TrainStatus[]).map((status) => (
+   192→          <div key={status} className="flex items-center gap-2">
+   193→            <span
+   194→              className="w-4 h-4 rounded-full"
+   195→              style={{ backgroundColor: statusColors[status] }}
+   196→            />
+   197→            <span className="text-gray-600">{statusLabels[status]}</span>
+   198→          </div>
+   199→        ))}
+   200→        <div className="flex items-center gap-2">
+   201→          <span className="w-4 h-4 rounded bg-gray-400" />
+   202→          <span className="text-gray-600">Depot</span>
+   203→        </div>
+   204→      </div>
+   205→    </div>
+   206→  );
+   207→}
+   208→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

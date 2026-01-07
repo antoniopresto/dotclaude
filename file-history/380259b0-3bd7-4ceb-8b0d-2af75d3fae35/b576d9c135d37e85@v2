@@ -1,0 +1,551 @@
+/**
+ * Viewport State Machine (XState v5)
+ *
+ * Manages viewport state including zoom, pan, and LOD (Level of Detail).
+ * Follows FSM pattern for deterministic, testable state management.
+ */
+
+import { createMachine, assign } from 'xstate';
+import type { LODLevel } from '../data/mock-config';
+import { LOD_THRESHOLDS, TIME_RANGE, TOTAL_TRAINS, ANIMATION } from '../data/mock-config';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+export interface ViewportContext {
+  // Camera position
+  zoom: number;
+  panX: number; // World X (time axis, in days)
+  panY: number; // World Y (train axis, in train indices)
+
+  // LOD state
+  lod: LODLevel;
+  prevLod: LODLevel | null;
+  lodTransitionProgress: number; // 0-1 for crossfade
+
+  // Viewport dimensions
+  viewportWidth: number;
+  viewportHeight: number;
+
+  // Animation state
+  targetZoom: number | null;
+  targetPanX: number | null;
+  targetPanY: number | null;
+  animationStartTime: number | null;
+  animationDuration: number;
+  animationStartZoom: number;
+  animationStartPanX: number;
+  animationStartPanY: number;
+
+  // Momentum state (for inertial panning)
+  velocityX: number;
+  velocityY: number;
+
+  // Interaction state
+  isPinching: boolean;
+  pinchStartZoom: number;
+  pointerStartX: number;
+  pointerStartY: number;
+  panStartX: number;
+  panStartY: number;
+}
+
+export type ViewportEvent =
+  | { type: 'ZOOM'; delta: number; centerX: number; centerY: number }
+  | { type: 'ZOOM_TO'; zoom: number; centerX?: number; centerY?: number; animate?: boolean }
+  | { type: 'PAN'; deltaX: number; deltaY: number }
+  | { type: 'PAN_TO'; x: number; y: number; animate?: boolean }
+  | { type: 'PAN_START'; pointerX: number; pointerY: number }
+  | { type: 'PAN_MOVE'; pointerX: number; pointerY: number }
+  | { type: 'PAN_END'; velocityX?: number; velocityY?: number }
+  | { type: 'PINCH_START'; zoom: number }
+  | { type: 'PINCH_MOVE'; scale: number; centerX: number; centerY: number }
+  | { type: 'PINCH_END' }
+  | { type: 'DOUBLE_TAP'; x: number; y: number }
+  | { type: 'RESET' }
+  | { type: 'JUMP_TO_TODAY' }
+  | { type: 'JUMP_TO_TRAIN'; trainIndex: number }
+  | { type: 'ANIMATION_TICK'; timestamp: number }
+  | { type: 'MOMENTUM_TICK'; timestamp: number }
+  | { type: 'LOD_TRANSITION_COMPLETE' }
+  | { type: 'RESIZE'; width: number; height: number };
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 10;
+const ZOOM_SENSITIVITY = 0.002;
+const DOUBLE_TAP_ZOOM_FACTOR = 2;
+const MOMENTUM_FRICTION = 0.92;
+const MOMENTUM_MIN_VELOCITY = 0.5;
+
+// World bounds
+const WORLD_MIN_X = 0;
+const WORLD_MAX_X = TIME_RANGE.days; // 4383 days
+const WORLD_MIN_Y = 0;
+const WORLD_MAX_Y = TOTAL_TRAINS; // 128 trains
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+function getLODLevel(zoom: number): LODLevel {
+  if (zoom < LOD_THRESHOLDS.strategic) return 'strategic';
+  if (zoom < LOD_THRESHOLDS.tactical) return 'tactical';
+  if (zoom < LOD_THRESHOLDS.operational) return 'operational';
+  return 'execution';
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function clampZoom(zoom: number): number {
+  return clamp(zoom, MIN_ZOOM, MAX_ZOOM);
+}
+
+function clampPan(x: number, y: number): { x: number; y: number } {
+  return {
+    x: clamp(x, WORLD_MIN_X, WORLD_MAX_X),
+    y: clamp(y, WORLD_MIN_Y, WORLD_MAX_Y),
+  };
+}
+
+// Ease out expo for smooth animations
+function easeOutExpo(t: number): number {
+  return t === 1 ? 1 : 1 - Math.pow(2, -10 * t);
+}
+
+// Get "today" position in days from start
+function getTodayDayIndex(): number {
+  const today = new Date();
+  const start = TIME_RANGE.start;
+  const diffMs = today.getTime() - start.getTime();
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+  return clamp(diffDays, 0, TIME_RANGE.days);
+}
+
+// =============================================================================
+// INITIAL CONTEXT
+// =============================================================================
+
+const initialContext: ViewportContext = {
+  zoom: 0.2, // Start at strategic level
+  panX: 0,
+  panY: TOTAL_TRAINS / 2, // Center on trains
+
+  lod: 'strategic',
+  prevLod: null,
+  lodTransitionProgress: 1,
+
+  viewportWidth: 1200,
+  viewportHeight: 800,
+
+  targetZoom: null,
+  targetPanX: null,
+  targetPanY: null,
+  animationStartTime: null,
+  animationDuration: ANIMATION.duration.zoom,
+  animationStartZoom: 0.2,
+  animationStartPanX: 0,
+  animationStartPanY: TOTAL_TRAINS / 2,
+
+  velocityX: 0,
+  velocityY: 0,
+
+  isPinching: false,
+  pinchStartZoom: 1,
+  pointerStartX: 0,
+  pointerStartY: 0,
+  panStartX: 0,
+  panStartY: 0,
+};
+
+// =============================================================================
+// STATE MACHINE
+// =============================================================================
+
+export const viewportMachine = createMachine({
+  id: 'viewport',
+  initial: 'idle',
+  context: initialContext,
+  states: {
+    idle: {
+      on: {
+        ZOOM: {
+          actions: assign(({ context, event }) => {
+            const zoomFactor = 1 - event.delta * ZOOM_SENSITIVITY;
+            const newZoom = clampZoom(context.zoom * zoomFactor);
+
+            // Zoom toward cursor position
+            const zoomRatio = newZoom / context.zoom;
+            const newPanX = event.centerX - (event.centerX - context.panX) * zoomRatio;
+            const newPanY = event.centerY - (event.centerY - context.panY) * zoomRatio;
+            const clamped = clampPan(newPanX, newPanY);
+
+            const newLod = getLODLevel(newZoom);
+            const lodChanged = newLod !== context.lod;
+
+            return {
+              zoom: newZoom,
+              panX: clamped.x,
+              panY: clamped.y,
+              lod: newLod,
+              prevLod: lodChanged ? context.lod : context.prevLod,
+              lodTransitionProgress: lodChanged ? 0 : context.lodTransitionProgress,
+            };
+          }),
+        },
+        ZOOM_TO: {
+          target: 'animating',
+          actions: assign(({ context, event }) => ({
+            targetZoom: clampZoom(event.zoom),
+            targetPanX: event.centerX ?? context.panX,
+            targetPanY: event.centerY ?? context.panY,
+            animationStartTime: performance.now(),
+            animationDuration: event.animate === false ? 0 : ANIMATION.duration.zoom,
+            animationStartZoom: context.zoom,
+            animationStartPanX: context.panX,
+            animationStartPanY: context.panY,
+          })),
+        },
+        PAN: {
+          actions: assign(({ context, event }) => {
+            const clamped = clampPan(
+              context.panX - event.deltaX / context.zoom,
+              context.panY - event.deltaY / context.zoom
+            );
+            return {
+              panX: clamped.x,
+              panY: clamped.y,
+            };
+          }),
+        },
+        PAN_START: {
+          target: 'panning',
+          actions: assign(({ context, event }) => ({
+            pointerStartX: event.pointerX,
+            pointerStartY: event.pointerY,
+            panStartX: context.panX,
+            panStartY: context.panY,
+            velocityX: 0,
+            velocityY: 0,
+          })),
+        },
+        PAN_TO: {
+          target: 'animating',
+          actions: assign(({ context, event }) => ({
+            targetZoom: context.zoom,
+            targetPanX: event.x,
+            targetPanY: event.y,
+            animationStartTime: performance.now(),
+            animationDuration: event.animate === false ? 0 : ANIMATION.duration.zoom,
+            animationStartZoom: context.zoom,
+            animationStartPanX: context.panX,
+            animationStartPanY: context.panY,
+          })),
+        },
+        PINCH_START: {
+          target: 'pinching',
+          actions: assign(({ context, event }) => ({
+            isPinching: true,
+            pinchStartZoom: context.zoom,
+          })),
+        },
+        DOUBLE_TAP: {
+          target: 'animating',
+          actions: assign(({ context, event }) => {
+            const newZoom = clampZoom(context.zoom * DOUBLE_TAP_ZOOM_FACTOR);
+            return {
+              targetZoom: newZoom,
+              targetPanX: event.x,
+              targetPanY: event.y,
+              animationStartTime: performance.now(),
+              animationDuration: ANIMATION.duration.zoom,
+              animationStartZoom: context.zoom,
+              animationStartPanX: context.panX,
+              animationStartPanY: context.panY,
+            };
+          }),
+        },
+        RESET: {
+          target: 'animating',
+          actions: assign(({ context }) => ({
+            targetZoom: initialContext.zoom,
+            targetPanX: initialContext.panX,
+            targetPanY: initialContext.panY,
+            animationStartTime: performance.now(),
+            animationDuration: ANIMATION.duration.zoom,
+            animationStartZoom: context.zoom,
+            animationStartPanX: context.panX,
+            animationStartPanY: context.panY,
+          })),
+        },
+        JUMP_TO_TODAY: {
+          target: 'animating',
+          actions: assign(({ context }) => ({
+            targetZoom: 1.0, // Tactical level
+            targetPanX: getTodayDayIndex(),
+            targetPanY: context.panY,
+            animationStartTime: performance.now(),
+            animationDuration: ANIMATION.duration.zoom,
+            animationStartZoom: context.zoom,
+            animationStartPanX: context.panX,
+            animationStartPanY: context.panY,
+          })),
+        },
+        JUMP_TO_TRAIN: {
+          target: 'animating',
+          actions: assign(({ context, event }) => ({
+            targetZoom: context.zoom,
+            targetPanX: context.panX,
+            targetPanY: event.trainIndex,
+            animationStartTime: performance.now(),
+            animationDuration: ANIMATION.duration.zoom,
+            animationStartZoom: context.zoom,
+            animationStartPanX: context.panX,
+            animationStartPanY: context.panY,
+          })),
+        },
+        RESIZE: {
+          actions: assign(({ event }) => ({
+            viewportWidth: event.width,
+            viewportHeight: event.height,
+          })),
+        },
+        LOD_TRANSITION_COMPLETE: {
+          actions: assign(() => ({
+            lodTransitionProgress: 1,
+            prevLod: null,
+          })),
+        },
+      },
+    },
+    panning: {
+      on: {
+        PAN_MOVE: {
+          actions: assign(({ context, event }) => {
+            const deltaX = (event.pointerX - context.pointerStartX) / context.zoom;
+            const deltaY = (event.pointerY - context.pointerStartY) / context.zoom;
+            const clamped = clampPan(
+              context.panStartX - deltaX,
+              context.panStartY - deltaY
+            );
+
+            // Calculate velocity for momentum
+            const velocityX = (context.panX - clamped.x) * 0.5;
+            const velocityY = (context.panY - clamped.y) * 0.5;
+
+            return {
+              panX: clamped.x,
+              panY: clamped.y,
+              velocityX,
+              velocityY,
+            };
+          }),
+        },
+        PAN_END: [
+          {
+            target: 'momentum',
+            guard: ({ context }) =>
+              Math.abs(context.velocityX) > MOMENTUM_MIN_VELOCITY ||
+              Math.abs(context.velocityY) > MOMENTUM_MIN_VELOCITY,
+          },
+          {
+            target: 'idle',
+          },
+        ],
+        ZOOM: {
+          actions: assign(({ context, event }) => {
+            const zoomFactor = 1 - event.delta * ZOOM_SENSITIVITY;
+            const newZoom = clampZoom(context.zoom * zoomFactor);
+            const newLod = getLODLevel(newZoom);
+            const lodChanged = newLod !== context.lod;
+
+            return {
+              zoom: newZoom,
+              lod: newLod,
+              prevLod: lodChanged ? context.lod : context.prevLod,
+              lodTransitionProgress: lodChanged ? 0 : context.lodTransitionProgress,
+            };
+          }),
+        },
+      },
+    },
+    pinching: {
+      on: {
+        PINCH_MOVE: {
+          actions: assign(({ context, event }) => {
+            const newZoom = clampZoom(context.pinchStartZoom * event.scale);
+
+            // Zoom toward pinch center
+            const zoomRatio = newZoom / context.zoom;
+            const newPanX = event.centerX - (event.centerX - context.panX) * zoomRatio;
+            const newPanY = event.centerY - (event.centerY - context.panY) * zoomRatio;
+            const clamped = clampPan(newPanX, newPanY);
+
+            const newLod = getLODLevel(newZoom);
+            const lodChanged = newLod !== context.lod;
+
+            return {
+              zoom: newZoom,
+              panX: clamped.x,
+              panY: clamped.y,
+              lod: newLod,
+              prevLod: lodChanged ? context.lod : context.prevLod,
+              lodTransitionProgress: lodChanged ? 0 : context.lodTransitionProgress,
+            };
+          }),
+        },
+        PINCH_END: {
+          target: 'idle',
+          actions: assign(() => ({
+            isPinching: false,
+          })),
+        },
+      },
+    },
+    momentum: {
+      on: {
+        MOMENTUM_TICK: [
+          {
+            target: 'idle',
+            guard: ({ context }) =>
+              Math.abs(context.velocityX) < MOMENTUM_MIN_VELOCITY &&
+              Math.abs(context.velocityY) < MOMENTUM_MIN_VELOCITY,
+          },
+          {
+            actions: assign(({ context }) => {
+              const clamped = clampPan(
+                context.panX + context.velocityX,
+                context.panY + context.velocityY
+              );
+              return {
+                panX: clamped.x,
+                panY: clamped.y,
+                velocityX: context.velocityX * MOMENTUM_FRICTION,
+                velocityY: context.velocityY * MOMENTUM_FRICTION,
+              };
+            }),
+          },
+        ],
+        PAN_START: {
+          target: 'panning',
+          actions: assign(({ context, event }) => ({
+            pointerStartX: event.pointerX,
+            pointerStartY: event.pointerY,
+            panStartX: context.panX,
+            panStartY: context.panY,
+            velocityX: 0,
+            velocityY: 0,
+          })),
+        },
+        ZOOM: {
+          target: 'idle',
+          actions: assign(({ context, event }) => {
+            const zoomFactor = 1 - event.delta * ZOOM_SENSITIVITY;
+            const newZoom = clampZoom(context.zoom * zoomFactor);
+            const newLod = getLODLevel(newZoom);
+
+            return {
+              zoom: newZoom,
+              lod: newLod,
+              velocityX: 0,
+              velocityY: 0,
+            };
+          }),
+        },
+      },
+    },
+    animating: {
+      on: {
+        ANIMATION_TICK: [
+          {
+            target: 'idle',
+            guard: ({ context, event }) => {
+              if (!context.animationStartTime) return true;
+              const elapsed = event.timestamp - context.animationStartTime;
+              return elapsed >= context.animationDuration;
+            },
+            actions: assign(({ context }) => {
+              const finalZoom = context.targetZoom ?? context.animationStartZoom;
+              const finalPanX = context.targetPanX ?? context.animationStartPanX;
+              const finalPanY = context.targetPanY ?? context.animationStartPanY;
+              const newLod = getLODLevel(finalZoom);
+              const lodChanged = newLod !== context.lod;
+
+              return {
+                zoom: finalZoom,
+                panX: finalPanX,
+                panY: finalPanY,
+                lod: newLod,
+                prevLod: lodChanged ? context.lod : null,
+                lodTransitionProgress: lodChanged ? 0 : 1,
+                targetZoom: null,
+                targetPanX: null,
+                targetPanY: null,
+                animationStartTime: null,
+              };
+            }),
+          },
+          {
+            actions: assign(({ context, event }) => {
+              if (!context.animationStartTime) return {};
+
+              const elapsed = event.timestamp - context.animationStartTime;
+              const progress = Math.min(1, elapsed / context.animationDuration);
+              const eased = easeOutExpo(progress);
+
+              const startZoom = context.animationStartZoom;
+              const startPanX = context.animationStartPanX;
+              const startPanY = context.animationStartPanY;
+              const targetZoom = context.targetZoom ?? startZoom;
+              const targetPanX = context.targetPanX ?? startPanX;
+              const targetPanY = context.targetPanY ?? startPanY;
+
+              const newZoom = startZoom + (targetZoom - startZoom) * eased;
+              const newPanX = startPanX + (targetPanX - startPanX) * eased;
+              const newPanY = startPanY + (targetPanY - startPanY) * eased;
+
+              const newLod = getLODLevel(newZoom);
+
+              return {
+                zoom: newZoom,
+                panX: newPanX,
+                panY: newPanY,
+                lod: newLod,
+              };
+            }),
+          },
+        ],
+        PAN_START: {
+          target: 'panning',
+          actions: assign(({ context, event }) => ({
+            // Cancel animation
+            targetZoom: null,
+            targetPanX: null,
+            targetPanY: null,
+            animationStartTime: null,
+            // Start panning
+            pointerStartX: event.pointerX,
+            pointerStartY: event.pointerY,
+            panStartX: context.panX,
+            panStartY: context.panY,
+            velocityX: 0,
+            velocityY: 0,
+          })),
+        },
+      },
+    },
+  },
+});
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+export type ViewportMachine = typeof viewportMachine;
+export type ViewportState = ReturnType<typeof viewportMachine.getInitialSnapshot>;

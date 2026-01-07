@@ -1,0 +1,219 @@
+import { createMachine, createSlice, InferMachineState } from '@zazcart/tools';
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+export type Project = {
+  id: string;
+  path: string;
+  name: string;
+  harness: {
+    progressFile: string;
+    featuresFile: string;
+  };
+};
+
+export type Feature = {
+  id: string;
+  description: string;
+  category: string;
+  priority: string;
+  status: string;
+  passes: boolean;
+  steps: string[];
+};
+
+export type Process = {
+  id: string;
+  projectId: string;
+  command: string;
+  status: 'running' | 'stopped' | 'error';
+  pid?: number;
+};
+
+export type LogEntry = {
+  id: string;
+  processId: string;
+  timestamp: number;
+  content: string;
+  level: 'info' | 'warn' | 'error' | 'debug';
+};
+
+// ============================================================================
+// SLICES
+// ============================================================================
+
+const uiSlice = createSlice({
+  id: 'ui',
+  cache: { policy: 'session' },
+  initial: {
+    activeTab: '' as string,
+    theme: 'system' as 'light' | 'dark' | 'system',
+    projectOrder: [] as string[],
+    sidebarCollapsed: false,
+    logPanelHeight: 200,
+  },
+  reducers: {
+    setActiveTab: (state, tabId: string) => {
+      state.activeTab = tabId;
+    },
+    setTheme: (state, theme: 'light' | 'dark' | 'system') => {
+      state.theme = theme;
+    },
+    addProject: (state, projectId: string) => {
+      if (!state.projectOrder.includes(projectId)) {
+        state.projectOrder.push(projectId);
+      }
+      state.activeTab = projectId;
+    },
+    removeProject: (state, projectId: string) => {
+      const idx = state.projectOrder.indexOf(projectId);
+      state.projectOrder = state.projectOrder.filter((id) => id !== projectId);
+      if (state.activeTab === projectId) {
+        state.activeTab = state.projectOrder[Math.max(0, idx - 1)] || '';
+      }
+    },
+    reorderProjects: (state, order: string[]) => {
+      state.projectOrder = order;
+    },
+    toggleSidebar: (state) => {
+      state.sidebarCollapsed = !state.sidebarCollapsed;
+    },
+    setLogPanelHeight: (state, height: number) => {
+      state.logPanelHeight = height;
+    },
+  },
+});
+
+const projectsSlice = createSlice({
+  id: 'projects',
+  cache: { policy: 'private' },
+  initial: {} as Record<string, Project>,
+  reducers: {
+    set: (state, project: Project) => {
+      state[project.id] = project;
+    },
+    remove: (state, projectId: string) => {
+      delete state[projectId];
+    },
+  },
+});
+
+const processesSlice = createSlice({
+  id: 'processes',
+  cache: { policy: 'session' },
+  initial: {} as Record<string, Process>,
+  reducers: {
+    spawn: (state, process: Process) => {
+      state[process.id] = process;
+    },
+    updateStatus: (state, payload: { id: string; status: 'running' | 'stopped' | 'error' }) => {
+      if (state[payload.id]) {
+        state[payload.id].status = payload.status;
+      }
+    },
+    kill: (state, processId: string) => {
+      delete state[processId];
+    },
+  },
+});
+
+const MAX_LOGS_PER_PROCESS = 10000;
+
+const logsSlice = createSlice({
+  id: 'logs',
+  cache: { policy: 'session' },
+  initial: {
+    entries: {} as Record<string, LogEntry[]>,
+    autoScroll: true,
+    filter: '' as string,
+  },
+  reducers: {
+    append: (state, entry: LogEntry) => {
+      if (!state.entries[entry.processId]) {
+        state.entries[entry.processId] = [];
+      }
+      state.entries[entry.processId].push(entry);
+      if (state.entries[entry.processId].length > MAX_LOGS_PER_PROCESS) {
+        state.entries[entry.processId] = state.entries[entry.processId].slice(-MAX_LOGS_PER_PROCESS);
+      }
+    },
+    clear: (state, processId: string) => {
+      state.entries[processId] = [];
+    },
+    clearAll: (state) => {
+      state.entries = {};
+    },
+    setAutoScroll: (state, autoScroll: boolean) => {
+      state.autoScroll = autoScroll;
+    },
+    setFilter: (state, filter: string) => {
+      state.filter = filter;
+    },
+  },
+});
+
+const featuresSlice = createSlice({
+  id: 'features',
+  cache: { policy: 'private' },
+  initial: {
+    items: [] as Feature[],
+    loading: false,
+    error: null as string | null,
+  },
+  reducers: {
+    setFeatures: (state, features: Feature[]) => {
+      state.items = features;
+      state.loading = false;
+      state.error = null;
+    },
+    setLoading: (state, loading: boolean) => {
+      state.loading = loading;
+    },
+    setError: (state, error: string) => {
+      state.error = error;
+      state.loading = false;
+    },
+  },
+});
+
+// ============================================================================
+// APP MACHINE
+// ============================================================================
+
+export const appMachine = createMachine({
+  id: 'hq',
+  slices: {
+    ui: uiSlice,
+    projects: projectsSlice,
+    processes: processesSlice,
+    logs: logsSlice,
+    features: featuresSlice,
+  },
+  selectors: {
+    activeProject: (state) => {
+      const activeTab = state.ui.activeTab;
+      return activeTab ? state.projects[activeTab] : null;
+    },
+
+    projectsArray: (state) => {
+      const projectOrder = state.ui.projectOrder;
+      return projectOrder.map((id) => state.projects[id]).filter(Boolean);
+    },
+
+    activeProcesses: (state) => {
+      const activeTab = state.ui.activeTab;
+      return Object.values(state.processes).filter((p) => p.projectId === activeTab);
+    },
+
+    featureStats: (state) => {
+      const features = state.features.items;
+      const total = features.length;
+      const completed = features.filter((f) => f.passes).length;
+      return { total, completed, remaining: total - completed };
+    },
+  },
+});
+
+export type AppState = InferMachineState<typeof appMachine>

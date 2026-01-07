@@ -1,0 +1,406 @@
+#!/usr/bin/env node
+
+/**
+ * belt-ai-setup CLI
+ *
+ * Sets up or merges AgentRC configuration for Claude Code hooks
+ * in any project (empty or existing).
+ *
+ * Usage:
+ *   npx @belt/ai setup          # Setup in current directory
+ *   npx @belt/ai setup ./myproj # Setup in specific directory
+ */
+
+import { resolve, dirname, join } from 'path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from 'fs';
+
+interface ClaudeSettings {
+  $schema?: string;
+  hooks?: {
+    [key: string]: Array<{
+      matcher: string;
+      hooks: Array<{
+        type: string;
+        command: string;
+      }>;
+    }>;
+  };
+  [key: string]: unknown;
+}
+
+const TEMPLATES = {
+  agentrc: `import { defineAgent } from '@belt/ai';
+
+/**
+ * AgentRC configuration
+ *
+ * Define rules and hooks that cascade to all subdirectories.
+ * Child directories can have their own .agentrc.ts to extend or override.
+ */
+export default defineAgent({
+  rules: [
+    // Example: Block certain file extensions
+    // {
+    //   id: 'NO-FORBIDDEN-FILES',
+    //   match: (path) => path.endsWith('.forbidden'),
+    //   action: 'block',
+    //   message: 'Cannot create .forbidden files',
+    // },
+  ],
+
+  hooks: {
+    PreToolUse: async ({ tool, filePath, inject }) => {
+      // Inject context into LLM
+      // inject(\`Processing: \${filePath}\`);
+    },
+
+    SessionStart: ({ inject }) => {
+      // Welcome message at session start
+      // inject('AgentRC active');
+    },
+  },
+});
+`,
+
+  runner: `#!/usr/bin/env bun
+
+/**
+ * AgentRC Runner - TypeScript-based cascade rules enforcement
+ *
+ * Called by Claude Code hooks to evaluate .agentrc.ts files.
+ *
+ * Exit codes:
+ *   0 - Action allowed
+ *   2 - Action blocked
+ *   1 - Error
+ */
+
+import { resolve, dirname } from 'path';
+import { existsSync } from 'fs';
+import type { AgentConfig, AgentHookContext, AgentRule, RuleContext } from '@belt/ai';
+
+const DEBUG_LOG = '/tmp/agentrc-runner-debug.log';
+const PROJECT_ROOT = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+const AGENTRC_FILES = ['.agentrc.ts', 'agentrc.ts', '.agentrc.js', 'agentrc.js'];
+
+function logDebug(message: string): void {
+  const timestamp = new Date().toISOString();
+  Bun.write(DEBUG_LOG, \`[\${timestamp}] \${message}\\n\`, { append: true });
+}
+
+async function findAgentrcFiles(startDir: string): Promise<string[]> {
+  const files: string[] = [];
+  let currentDir = startDir;
+
+  while (currentDir.startsWith(PROJECT_ROOT) && currentDir !== '/' && currentDir.length >= PROJECT_ROOT.length) {
+    for (const filename of AGENTRC_FILES) {
+      const filePath = resolve(currentDir, filename);
+      if (existsSync(filePath)) {
+        files.push(filePath);
+        break;
+      }
+    }
+    const parent = dirname(currentDir);
+    if (parent === currentDir) break;
+    currentDir = parent;
+  }
+
+  return files.reverse();
+}
+
+async function loadAndMergeConfigs(files: string[]): Promise<AgentConfig> {
+  let mergedConfig: AgentConfig = { rules: [], hooks: {} };
+
+  for (const file of files) {
+    try {
+      logDebug(\`Loading: \${file}\`);
+      const module = await import(file);
+      const config: AgentConfig = module.default || module;
+
+      if (typeof config.extend === 'function') {
+        mergedConfig = config.extend(mergedConfig);
+      } else {
+        if (config.rules) {
+          mergedConfig.rules = [...(mergedConfig.rules || []), ...config.rules];
+        }
+        if (config.hooks) {
+          mergedConfig.hooks = { ...mergedConfig.hooks, ...config.hooks };
+        }
+      }
+    } catch (err) {
+      logDebug(\`Error loading \${file}: \${err}\`);
+    }
+  }
+
+  return mergedConfig;
+}
+
+async function evaluateRuleMatch(
+  rule: AgentRule,
+  filePath: string,
+  ctx: RuleContext
+): Promise<boolean> {
+  const { match } = rule;
+
+  if (typeof match === 'string') return filePath.includes(match);
+  if (match instanceof RegExp) return match.test(filePath);
+  if (typeof match === 'function') return await match(filePath, ctx);
+
+  return false;
+}
+
+async function main(): Promise<void> {
+  logDebug('=== AGENTRC RUNNER START ===');
+
+  let stdinJson: string;
+  try {
+    stdinJson = await Bun.stdin.text();
+    logDebug(\`STDIN: \${stdinJson.substring(0, 200)}...\`);
+  } catch {
+    process.exit(0);
+  }
+
+  let toolName: string;
+  let toolInput: Record<string, any>;
+  let filePath: string | undefined;
+
+  try {
+    const parsed = JSON.parse(stdinJson);
+    toolName = parsed.tool_name || 'unknown';
+    toolInput = parsed.tool_input || {};
+    filePath = toolInput.file_path;
+  } catch {
+    process.exit(0);
+  }
+
+  logDebug(\`Tool: \${toolName}, FilePath: \${filePath || 'none'}\`);
+
+  if (!filePath) {
+    process.exit(0);
+  }
+
+  const targetDir = dirname(filePath);
+  const agentrcFiles = await findAgentrcFiles(targetDir);
+  logDebug(\`Found \${agentrcFiles.length} agentrc files\`);
+
+  if (agentrcFiles.length === 0) {
+    process.exit(0);
+  }
+
+  const config = await loadAndMergeConfigs(agentrcFiles);
+
+  const ruleCtx: RuleContext = {
+    tool: toolName,
+    input: toolInput,
+    projectRoot: PROJECT_ROOT,
+  };
+
+  for (const rule of config.rules || []) {
+    const matches = await evaluateRuleMatch(rule, filePath, ruleCtx);
+
+    if (matches) {
+      logDebug(\`Rule \${rule.id} matched: \${rule.action}\`);
+
+      if (rule.action === 'block') {
+        console.error(\`\\n❌ RULE VIOLATION: \${rule.id}\`);
+        console.error(\`   \${rule.message || 'Action blocked'}\`);
+        console.error(\`   File: \${filePath}\\n\`);
+        process.exit(2);
+      }
+
+      if (rule.action === 'warn') {
+        console.error(\`\\n⚠️  WARNING: \${rule.id}\`);
+        console.error(\`   \${rule.message || 'Warning'}\\n\`);
+      }
+    }
+  }
+
+  if (config.hooks?.PreToolUse) {
+    let blocked = false;
+    let blockMessage = '';
+    const injectedContent: string[] = [];
+
+    const hookCtx: AgentHookContext = {
+      tool: toolName,
+      input: toolInput,
+      projectRoot: PROJECT_ROOT,
+      filePath,
+      block: (msg: string) => { blocked = true; blockMessage = msg; },
+      warn: (msg: string) => console.error(\`⚠️  \${msg}\`),
+      inject: (content: string) => injectedContent.push(content),
+    };
+
+    try {
+      await config.hooks.PreToolUse(hookCtx);
+    } catch (err) {
+      logDebug(\`Hook error: \${err}\`);
+    }
+
+    if (injectedContent.length > 0) {
+      console.log(injectedContent.join('\\n'));
+    }
+
+    if (blocked) {
+      console.error(\`\\n❌ BLOCKED: \${blockMessage}\`);
+      process.exit(2);
+    }
+  }
+
+  logDebug(\`ALLOWED: \${filePath}\`);
+  process.exit(0);
+}
+
+main().catch((err) => {
+  console.error(\`Runner error: \${err}\`);
+  process.exit(1);
+});
+`,
+
+  wrapper: `#!/bin/bash
+# AgentRC Wrapper - Thin bash wrapper for TypeScript runner
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+RUNNER="\${SCRIPT_DIR}/agentrc-runner.ts"
+
+if [[ ! -f "$RUNNER" ]]; then
+    echo "ERROR: agentrc-runner.ts not found" >&2
+    exit 1
+fi
+
+if ! command -v bun &> /dev/null; then
+    echo "ERROR: bun is required. Install: curl -fsSL https://bun.sh/install | bash" >&2
+    exit 1
+fi
+
+exec bun run "$RUNNER"
+`,
+};
+
+const REQUIRED_HOOKS: ClaudeSettings['hooks'] = {
+  PreToolUse: [
+    {
+      matcher: 'Write',
+      hooks: [{ type: 'command', command: 'bash "$CLAUDE_PROJECT_DIR"/.claude/hooks/agentrc-wrapper.sh' }],
+    },
+    {
+      matcher: 'Edit',
+      hooks: [{ type: 'command', command: 'bash "$CLAUDE_PROJECT_DIR"/.claude/hooks/agentrc-wrapper.sh' }],
+    },
+  ],
+};
+
+function mergeHooks(
+  existing: ClaudeSettings['hooks'] = {},
+  required: ClaudeSettings['hooks'] = {}
+): ClaudeSettings['hooks'] {
+  const merged = { ...existing };
+
+  for (const [hookName, requiredMatchers] of Object.entries(required)) {
+    if (!merged[hookName]) {
+      merged[hookName] = [];
+    }
+
+    for (const requiredMatcher of requiredMatchers) {
+      // Check if matcher already exists
+      const existingMatcher = merged[hookName].find(
+        (m) => m.matcher === requiredMatcher.matcher
+      );
+
+      if (existingMatcher) {
+        // Merge hooks for this matcher
+        for (const hook of requiredMatcher.hooks) {
+          const hookExists = existingMatcher.hooks.some(
+            (h) => h.command === hook.command
+          );
+          if (!hookExists) {
+            existingMatcher.hooks.push(hook);
+          }
+        }
+      } else {
+        // Add new matcher
+        merged[hookName].push(requiredMatcher);
+      }
+    }
+  }
+
+  return merged;
+}
+
+function setup(targetDir: string): void {
+  const projectDir = resolve(targetDir);
+  const claudeDir = join(projectDir, '.claude');
+  const hooksDir = join(claudeDir, 'hooks');
+  const settingsPath = join(claudeDir, 'settings.json');
+  const agentrcPath = join(projectDir, '.agentrc.ts');
+
+  console.log('\\n🔧 belt-ai-setup');
+  console.log(`   Target: ${projectDir}\\n`);
+
+  // Create directories
+  if (!existsSync(claudeDir)) {
+    mkdirSync(claudeDir, { recursive: true });
+    console.log('✅ Created .claude/');
+  }
+
+  if (!existsSync(hooksDir)) {
+    mkdirSync(hooksDir, { recursive: true });
+    console.log('✅ Created .claude/hooks/');
+  }
+
+  // Create or update settings.json
+  let settings: ClaudeSettings = {
+    $schema: 'https://json.schemastore.org/claude-code-settings.json',
+    hooks: {},
+  };
+
+  if (existsSync(settingsPath)) {
+    try {
+      const existing = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      settings = { ...settings, ...existing };
+      console.log('📝 Merging existing .claude/settings.json');
+    } catch {
+      console.log('⚠️  Could not parse existing settings.json, creating new');
+    }
+  }
+
+  settings.hooks = mergeHooks(settings.hooks, REQUIRED_HOOKS);
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\\n');
+  console.log('✅ Updated .claude/settings.json');
+
+  // Create runner
+  const runnerPath = join(hooksDir, 'agentrc-runner.ts');
+  writeFileSync(runnerPath, TEMPLATES.runner);
+  console.log('✅ Created .claude/hooks/agentrc-runner.ts');
+
+  // Create wrapper
+  const wrapperPath = join(hooksDir, 'agentrc-wrapper.sh');
+  writeFileSync(wrapperPath, TEMPLATES.wrapper, { mode: 0o755 });
+  console.log('✅ Created .claude/hooks/agentrc-wrapper.sh');
+
+  // Create .agentrc.ts if not exists
+  if (!existsSync(agentrcPath)) {
+    writeFileSync(agentrcPath, TEMPLATES.agentrc);
+    console.log('✅ Created .agentrc.ts');
+  } else {
+    console.log('📝 .agentrc.ts already exists, skipping');
+  }
+
+  console.log('\\n✨ AgentRC setup complete!');
+  console.log('\\nNext steps:');
+  console.log('  1. Edit .agentrc.ts to define your rules and hooks');
+  console.log('  2. Start a Claude Code session in this project');
+  console.log('  3. Rules will be automatically enforced\\n');
+}
+
+// Main
+const args = process.argv.slice(2);
+const command = args[0];
+const targetDir = args[1] || process.cwd();
+
+if (command === 'setup' || !command) {
+  setup(targetDir);
+} else {
+  console.log('Usage: belt-ai setup [directory]');
+  process.exit(1);
+}

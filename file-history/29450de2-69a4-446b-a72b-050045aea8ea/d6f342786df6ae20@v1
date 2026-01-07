@@ -1,0 +1,161 @@
+/**
+ * useEntityStore - React hook for EntityStore access
+ *
+ * STATE-ARCH-001 Phase 3: UI State Bridge
+ *
+ * This hook provides React components with access to the EntityStore.
+ * It handles:
+ * - Lazy initialization of the store
+ * - Loading data from the generator
+ * - Providing cursor access to entities
+ *
+ * Usage:
+ * ```tsx
+ * const { store, isLoaded, getTask, taskCount } = useEntityStore(tasks);
+ * ```
+ *
+ * Architecture notes:
+ * - EntityStore is Simulation State (60fps, direct access)
+ * - @mms/toolkit is UI State (event-driven, reactive)
+ * - This hook bridges the two: EntityStore data → React components
+ */
+
+import { useRef, useMemo, useEffect, useState } from 'react';
+import { EntityStore, getEntityStore } from './EntityStore';
+import type { TaskData, TaskCursor } from './types';
+import type { TaskRender } from '../data/types';
+import { TASK_TYPE_TO_VALUE, TASK_COLOR_TO_VALUE } from './types';
+
+/**
+ * Convert TaskRender to TaskData format for EntityStore
+ */
+function taskRenderToTaskData(task: TaskRender): TaskData {
+  return {
+    id: task.id,
+    trainIndex: task.trainIndex,
+    startDay: task.startDay,
+    duration: task.duration,
+    type: task.type as 'maintenance' | 'overhaul' | 'inspection',
+    color: task.color as 'blue' | 'orange' | 'gray',
+    hasConflict: task.hasConflict,
+    predecessorId: task.predecessorId,
+  };
+}
+
+/**
+ * Hook result interface
+ */
+export interface UseEntityStoreResult {
+  /** The EntityStore instance */
+  store: EntityStore;
+  /** Whether data has been loaded */
+  isLoaded: boolean;
+  /** Number of tasks in the store */
+  taskCount: number;
+  /** Get a task cursor by ID (returns new cursor, safe to store) */
+  getTask: (id: string) => TaskCursor | null;
+  /** Get a task cursor by index (returns new cursor, safe to store) */
+  getTaskByIndex: (index: number) => TaskCursor | null;
+  /** Iterate over all tasks (yields fresh cursors) */
+  iterateTasks: () => IterableIterator<TaskCursor>;
+}
+
+/**
+ * Hook that manages EntityStore lifecycle and provides access to entity data.
+ *
+ * @param tasks - Array of TaskRender objects from the generator
+ * @returns EntityStore access interface
+ */
+export function useEntityStore(tasks: TaskRender[]): UseEntityStoreResult {
+  const storeRef = useRef<EntityStore | null>(null);
+  const [isLoaded, setIsLoaded] = useState(false);
+
+  // Get or create the store
+  if (!storeRef.current) {
+    storeRef.current = getEntityStore();
+  }
+
+  const store = storeRef.current;
+
+  // Load tasks into EntityStore when tasks change
+  useEffect(() => {
+    if (tasks.length > 0) {
+      const taskData = tasks.map(taskRenderToTaskData);
+      store.load(taskData);
+      setIsLoaded(true);
+
+      // Log memory stats in development
+      if (import.meta.env.DEV) {
+        store.logMemoryStats();
+      }
+    }
+  }, [tasks, store]);
+
+  // Memoized accessor functions
+  const accessors = useMemo(
+    () => ({
+      getTask: (id: string): TaskCursor | null => {
+        const index = store.strings.idToIndex.get(id);
+        if (index === undefined) return null;
+        return store.getCursor(index);
+      },
+      getTaskByIndex: (index: number): TaskCursor | null => {
+        if (index < 0 || index >= store.count) return null;
+        return store.getCursor(index);
+      },
+      iterateTasks: function* (): IterableIterator<TaskCursor> {
+        yield* store;
+      },
+    }),
+    [store]
+  );
+
+  return {
+    store,
+    isLoaded,
+    taskCount: store.count,
+    ...accessors,
+  };
+}
+
+/**
+ * Hook that provides direct TypedArray access for high-performance rendering.
+ *
+ * Use this in rendering loops where you need maximum performance.
+ * The arrays are read directly without any wrapper overhead.
+ *
+ * WARNING: Do not modify these arrays directly - they are owned by EntityStore.
+ *
+ * @returns TypedArray references and count
+ */
+export function useEntityArrays() {
+  const store = getEntityStore();
+
+  return useMemo(
+    () => ({
+      arrays: store.arrays,
+      strings: store.strings,
+      count: store.count,
+    }),
+    [store, store.count]
+  );
+}
+
+/**
+ * Hook that provides a single task by ID with reactive updates.
+ *
+ * This is useful for detail panels and tooltips.
+ *
+ * @param taskId - Task ID to retrieve
+ * @returns Task cursor or null
+ */
+export function useTask(taskId: string | null): TaskCursor | null {
+  const store = getEntityStore();
+
+  return useMemo(() => {
+    if (!taskId) return null;
+    const index = store.strings.idToIndex.get(taskId);
+    if (index === undefined) return null;
+    return store.getCursor(index);
+  }, [taskId, store]);
+}

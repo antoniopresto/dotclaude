@@ -1,0 +1,583 @@
+#!/bin/bash
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MMS Root Harness Development Manager
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# This script manages development of the MMS root project (apps/canvas).
+# It ensures Claude Code works on the ROOT project and ignores packages
+# that have their own harness (features.json + progress.txt).
+#
+# Usage: ./harness-root.sh [command] [options]
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+set -e
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_FEATURES="$SCRIPT_DIR/features.json"
+ROOT_PROGRESS="$SCRIPT_DIR/claude-progress.txt"
+APP_DIR="$SCRIPT_DIR/apps/canvas"
+
+# Packages with their own harness (auto-detected)
+ISOLATED_PACKAGES=()
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+print_header() {
+    echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${BLUE}  $1${NC}"
+    echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+}
+
+print_section() {
+    echo -e "\n${CYAN}▸ $1${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠ $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}✗ $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ $1${NC}"
+}
+
+print_dim() {
+    echo -e "${DIM}  $1${NC}"
+}
+
+# Detect packages with their own harness (features.json)
+detect_isolated_packages() {
+    ISOLATED_PACKAGES=()
+    while IFS= read -r features_file; do
+        local pkg_dir=$(dirname "$features_file")
+        local pkg_name=$(basename "$pkg_dir")
+        ISOLATED_PACKAGES+=("$pkg_name")
+    done < <(find "$SCRIPT_DIR/packages" -maxdepth 2 -name "features.json" 2>/dev/null)
+}
+
+# List isolated packages for display
+list_isolated_packages() {
+    detect_isolated_packages
+    if [[ ${#ISOLATED_PACKAGES[@]} -eq 0 ]]; then
+        echo "  (none)"
+    else
+        for pkg in "${ISOLATED_PACKAGES[@]}"; do
+            echo -e "  ${DIM}packages/$pkg/${NC}"
+        done
+    fi
+}
+
+# Generate exclude pattern for git commands
+get_exclude_pattern() {
+    detect_isolated_packages
+    local pattern=""
+    for pkg in "${ISOLATED_PACKAGES[@]}"; do
+        pattern+=" ':!packages/$pkg'"
+    done
+    echo "$pattern"
+}
+
+# Validate root files exist
+check_root() {
+    if [[ ! -f "$ROOT_FEATURES" ]]; then
+        print_error "Root features.json not found: $ROOT_FEATURES"
+        exit 1
+    fi
+    if [[ ! -d "$APP_DIR" ]]; then
+        print_error "App directory not found: $APP_DIR"
+        exit 1
+    fi
+}
+
+# Count features by status (from root features.json)
+count_features() {
+    local total=$(jq '.features | length' "$ROOT_FEATURES" 2>/dev/null || echo "0")
+    local completed=$(jq '[.features[] | select(.passes == true)] | length' "$ROOT_FEATURES" 2>/dev/null || echo "0")
+    local pending=$((total - completed))
+    echo "$total $completed $pending"
+}
+
+# Get next incomplete feature
+get_next_feature() {
+    jq -r '.features[] | select(.passes == false) | "\(.id): \(.description)"' "$ROOT_FEATURES" 2>/dev/null | head -1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    print_header "🏠 MMS Root Harness Development Manager"
+
+    echo -e "${BOLD}PURPOSE:${NC}"
+    echo "    Manage development of the MMS root project (apps/canvas)."
+    echo "    This script ensures Claude Code works on the ROOT project"
+    echo "    and ignores packages with their own harness."
+    echo ""
+
+    echo -e "${BOLD}USAGE:${NC}"
+    echo "    ./harness-root.sh [command] [options]"
+    echo ""
+
+    echo -e "${BOLD}COMMANDS:${NC}"
+    echo -e "    ${CYAN}status${NC}        Show root project development status"
+    echo -e "    ${CYAN}next${NC}          Show next feature to implement"
+    echo -e "    ${CYAN}dev${NC}           Start development server (apps/canvas)"
+    echo -e "    ${CYAN}build${NC}         Build the app"
+    echo -e "    ${CYAN}typecheck${NC}     Run TypeScript type checking"
+    echo -e "    ${CYAN}claude${NC}        Start Claude Code with root isolation"
+    echo -e "    ${CYAN}log${NC} <msg>     Add note to claude-progress.txt"
+    echo -e "    ${CYAN}commit${NC}        Commit root changes (excludes isolated packages)"
+    echo -e "    ${CYAN}packages${NC}      List packages with their own harness"
+    echo -e "    ${CYAN}help${NC}          Show this help message"
+    echo ""
+
+    echo -e "${BOLD}SCOPE RULES:${NC}"
+    echo -e "    ${GREEN}✓${NC} Work on: apps/canvas/, root files, packages/toolkit/"
+    echo -e "    ${RED}✗${NC} Ignore: packages with own harness (auto-detected)"
+    echo ""
+
+    echo -e "${BOLD}QUICK START:${NC}"
+    echo "    1. ./harness-root.sh status    # Check project state"
+    echo "    2. ./harness-root.sh next      # See next feature"
+    echo "    3. ./harness-root.sh claude    # Start Claude (root scope)"
+    echo ""
+
+    echo -e "${BOLD}FILES:${NC}"
+    echo "    App:        apps/canvas/"
+    echo "    Features:   features.json"
+    echo "    Progress:   claude-progress.txt"
+    echo "    Docs:       CLAUDE.md"
+    echo ""
+}
+
+cmd_status() {
+    check_root
+    detect_isolated_packages
+    print_header "📊 MMS Root Project - Development Status"
+
+    # Project info
+    local project=$(jq -r '.project // "MMS"' "$ROOT_FEATURES")
+    local version=$(jq -r '.version // "0.0.0"' "$ROOT_FEATURES")
+    local updated=$(jq -r '.lastUpdated // "unknown"' "$ROOT_FEATURES")
+
+    echo -e "${BOLD}Project:${NC} $project"
+    echo -e "${BOLD}Version:${NC} $version"
+    echo -e "${BOLD}Updated:${NC} $updated"
+    echo -e "${BOLD}App:${NC} ${DIM}apps/canvas/${NC}"
+    echo ""
+
+    # Progress stats
+    read total completed pending <<< $(count_features)
+    local percent=0
+    if [[ $total -gt 0 ]]; then
+        percent=$((completed * 100 / total))
+    fi
+
+    # Progress bar
+    local filled=$((percent / 5))
+    local empty=$((20 - filled))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    echo -e "${BOLD}Progress:${NC} [$bar] $percent%"
+    echo -e "  ${GREEN}$completed${NC} completed / ${YELLOW}$pending${NC} pending / $total total"
+
+    # Next feature
+    print_section "Next Feature to Implement"
+    local next=$(get_next_feature)
+    if [[ -n "$next" ]]; then
+        echo -e "  ${CYAN}$next${NC}"
+    else
+        print_success "All features complete!"
+    fi
+
+    # Isolated packages
+    print_section "Packages with Own Harness (Ignored)"
+    if [[ ${#ISOLATED_PACKAGES[@]} -eq 0 ]]; then
+        echo "  (none detected)"
+    else
+        for pkg in "${ISOLATED_PACKAGES[@]}"; do
+            local pkg_features="$SCRIPT_DIR/packages/$pkg/features.json"
+            local pkg_total=$(jq '.features | length' "$pkg_features" 2>/dev/null || echo "?")
+            local pkg_done=$(jq '[.features[] | select(.passes == true)] | length' "$pkg_features" 2>/dev/null || echo "?")
+            echo -e "  ${DIM}packages/$pkg/${NC} ($pkg_done/$pkg_total features)"
+        done
+        echo ""
+        echo -e "  ${DIM}Use ./harness-package-01.sh to work on isolated packages${NC}"
+    fi
+
+    # Recent progress
+    if [[ -f "$ROOT_PROGRESS" ]]; then
+        print_section "Recent Sessions (from claude-progress.txt)"
+        grep -E "^## Session|^## O[0-9]" "$ROOT_PROGRESS" 2>/dev/null | tail -5 | while read line; do
+            echo -e "  ${DIM}$line${NC}"
+        done
+    fi
+
+    echo ""
+}
+
+cmd_next() {
+    check_root
+    print_header "🎯 Next Feature to Implement"
+
+    # Find first incomplete feature
+    local feature=$(jq -r '.features[] | select(.passes == false) | . | @json' "$ROOT_FEATURES" 2>/dev/null | head -1)
+
+    if [[ -z "$feature" ]]; then
+        print_success "All features are complete! 🎉"
+        exit 0
+    fi
+
+    # Parse feature details
+    local id=$(echo "$feature" | jq -r '.id')
+    local desc=$(echo "$feature" | jq -r '.description')
+    local category=$(echo "$feature" | jq -r '.category // "general"')
+    local blocked=$(echo "$feature" | jq -r '.blockedBy // empty')
+    local notes=$(echo "$feature" | jq -r '.notes // empty')
+    local priority=$(echo "$feature" | jq -r '.priority // 99')
+
+    echo -e "${BOLD}Feature:${NC} ${CYAN}$id${NC}"
+    echo -e "${BOLD}Description:${NC} $desc"
+    echo -e "${BOLD}Category:${NC} $category"
+    echo -e "${BOLD}Priority:${NC} $priority"
+
+    if [[ -n "$blocked" && "$blocked" != "null" ]]; then
+        echo -e "${BOLD}Blocked By:${NC} $blocked"
+    fi
+
+    # Show steps if available
+    local steps=$(echo "$feature" | jq -r '.steps // empty')
+    if [[ -n "$steps" && "$steps" != "null" && "$steps" != "[]" ]]; then
+        echo ""
+        echo -e "${BOLD}Steps:${NC}"
+        echo "$feature" | jq -r '.steps[]' 2>/dev/null | nl -w2 -s'. '
+    fi
+
+    if [[ -n "$notes" && "$notes" != "null" ]]; then
+        echo ""
+        echo -e "${BOLD}Notes:${NC}"
+        echo "  $notes"
+    fi
+
+    echo ""
+    echo -e "${DIM}Run: ./harness-root.sh claude${NC}"
+}
+
+cmd_dev() {
+    check_root
+    print_header "🚀 Starting Development Server"
+
+    echo -e "${DIM}Starting apps/canvas at http://localhost:5173${NC}"
+    echo -e "${DIM}Press Ctrl+C to stop${NC}"
+    echo ""
+
+    cd "$APP_DIR"
+    bun run dev
+}
+
+cmd_build() {
+    check_root
+    print_header "🔨 Building App"
+
+    cd "$APP_DIR"
+
+    print_section "Installing dependencies"
+    bun install
+
+    print_section "Building app"
+    bun run build
+
+    print_success "Build complete!"
+    echo ""
+    echo -e "${DIM}Output: apps/canvas/dist/${NC}"
+
+    cd "$SCRIPT_DIR"
+}
+
+cmd_typecheck() {
+    check_root
+    print_header "🔍 Type Checking"
+
+    cd "$SCRIPT_DIR"
+    bun run typecheck
+
+    print_success "Type check complete!"
+}
+
+cmd_log() {
+    check_root
+
+    if [[ -z "$1" ]]; then
+        print_error "Usage: ./harness-root.sh log <message>"
+        exit 1
+    fi
+
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local message="- [$timestamp] $1"
+
+    echo "$message" >> "$ROOT_PROGRESS"
+
+    print_success "Added to claude-progress.txt:"
+    echo -e "  ${DIM}$message${NC}"
+}
+
+cmd_commit() {
+    check_root
+    detect_isolated_packages
+    print_header "📦 Commit Root Changes"
+
+    cd "$SCRIPT_DIR"
+
+    # Build exclude args for git
+    local exclude_args=""
+    for pkg in "${ISOLATED_PACKAGES[@]}"; do
+        exclude_args+=" -- . ':!packages/$pkg'"
+    done
+
+    # Show root changes (excluding isolated packages)
+    print_section "Root Changes (to be committed)"
+    if [[ ${#ISOLATED_PACKAGES[@]} -gt 0 ]]; then
+        eval "git diff --stat HEAD $exclude_args" 2>/dev/null || echo "  (no changes)"
+    else
+        git diff --stat HEAD 2>/dev/null || echo "  (no changes)"
+    fi
+
+    # Warn about isolated package changes
+    print_section "Isolated Package Changes (will NOT be committed)"
+    for pkg in "${ISOLATED_PACKAGES[@]}"; do
+        local pkg_changes=$(git status --short "packages/$pkg" 2>/dev/null)
+        if [[ -n "$pkg_changes" ]]; then
+            echo -e "  ${YELLOW}packages/$pkg/:${NC}"
+            echo "$pkg_changes" | while read line; do
+                echo -e "    ${DIM}$line${NC}"
+            done
+        fi
+    done
+
+    # Generate commit command
+    print_section "Commit Command"
+    echo -e "${DIM}Run manually after review:${NC}"
+    echo ""
+
+    if [[ ${#ISOLATED_PACKAGES[@]} -gt 0 ]]; then
+        echo "  # Stage root changes only (excludes isolated packages)"
+        echo "  git add ."
+        for pkg in "${ISOLATED_PACKAGES[@]}"; do
+            echo "  git reset HEAD packages/$pkg/"
+        done
+    else
+        echo "  git add ."
+    fi
+    echo "  git commit -m \"feat(canvas): <description>\""
+    echo ""
+}
+
+cmd_packages() {
+    detect_isolated_packages
+    print_header "📦 Packages with Own Harness"
+
+    if [[ ${#ISOLATED_PACKAGES[@]} -eq 0 ]]; then
+        print_info "No packages with their own harness detected."
+        echo ""
+        echo -e "${DIM}A package has its own harness if it contains:${NC}"
+        echo -e "${DIM}  - features.json${NC}"
+        echo -e "${DIM}  - progress.txt (optional)${NC}"
+        exit 0
+    fi
+
+    echo -e "${BOLD}These packages have their own harness and are IGNORED by root:${NC}"
+    echo ""
+
+    for pkg in "${ISOLATED_PACKAGES[@]}"; do
+        local pkg_dir="$SCRIPT_DIR/packages/$pkg"
+        local pkg_features="$pkg_dir/features.json"
+
+        local pkg_total=$(jq '.features | length' "$pkg_features" 2>/dev/null || echo "?")
+        local pkg_done=$(jq '[.features[] | select(.passes == true)] | length' "$pkg_features" 2>/dev/null || echo "?")
+        local pkg_desc=$(jq -r '.project // .description // "No description"' "$pkg_features" 2>/dev/null | head -c 50)
+
+        echo -e "  ${CYAN}$pkg${NC}"
+        echo -e "    Path:     packages/$pkg/"
+        echo -e "    Progress: $pkg_done/$pkg_total features"
+        echo -e "    Desc:     ${DIM}$pkg_desc${NC}"
+        echo ""
+    done
+
+    echo -e "${DIM}To work on an isolated package, use its dedicated harness script.${NC}"
+    echo -e "${DIM}Example: ./harness-package-01.sh claude${NC}"
+    echo ""
+}
+
+cmd_claude() {
+    check_root
+    detect_isolated_packages
+    print_header "🤖 Starting Claude Code (Root Scope)"
+
+    # Get next feature for context
+    local next=$(get_next_feature)
+    read total completed pending <<< $(count_features)
+
+    echo -e "${BOLD}Project:${NC} MMS Root (apps/canvas)"
+    echo -e "${BOLD}Progress:${NC} $completed/$total features complete"
+    echo -e "${BOLD}Next:${NC} ${next:-"All features complete!"}"
+    echo ""
+
+    # Build isolated packages list for prompt
+    local isolated_list=""
+    for pkg in "${ISOLATED_PACKAGES[@]}"; do
+        isolated_list+="   - packages/$pkg/ (has own harness)
+"
+    done
+
+    # Build isolation prompt
+    local isolation_prompt="You are working on the MMS ROOT project (apps/canvas).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏠 ROOT SCOPE RULES - READ CAREFULLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ YOU MAY MODIFY:
+   - apps/canvas/**/* (the main MMS app)
+   - packages/toolkit/**/* (shared utilities, no own harness)
+   - Root features.json (MMS features)
+   - Root claude-progress.txt (MMS session history)
+   - Root CLAUDE.md (MMS instructions)
+   - docs/**/* (documentation)
+   - agent_docs/**/* (AI agent documentation)
+
+❌ DO NOT MODIFY (these have their OWN harness):
+$isolated_list
+   These packages have their own features.json and progress.txt.
+   Use their dedicated harness scripts to work on them.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 ROOT HARNESS PROTOCOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. READ claude-progress.txt → current state
+2. READ features.json → find next feature (passes: false)
+3. READ CLAUDE.md → project instructions
+4. IMPLEMENT the feature in apps/canvas/
+5. TEST visually with Playwright MCP
+6. RUN QA Protocol (see docs/QA_PROTOCOL.md)
+7. UPDATE features.json → set passes: true
+8. UPDATE claude-progress.txt → add session notes
+9. COMMIT changes (excludes isolated packages)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 CURRENT STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Progress: $completed/$total features complete
+Next feature: ${next:-"All complete!"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  REMINDER: If you need to work on an isolated package,
+    exit and use its dedicated harness script instead.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Show what Claude will receive
+    print_section "Root Scope Prompt (sent to Claude)"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────────${NC}"
+    echo -e "${DIM}$isolation_prompt${NC}" | head -35
+    echo -e "${DIM}... (truncated for display)${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+
+    print_info "Starting Claude Code with root scope..."
+    echo ""
+
+    # Start Claude with isolation prompt (stay in root)
+    cd "$SCRIPT_DIR"
+    claude --append-system-prompt="$isolation_prompt"
+}
+
+cmd_quick() {
+    # One-liner for shell prompt integration
+    check_root 2>/dev/null || { echo "⚠ no root"; exit 0; }
+    read total completed pending <<< $(count_features)
+    local percent=0
+    if [[ $total -gt 0 ]]; then
+        percent=$((completed * 100 / total))
+    fi
+    echo "🏠 mms-root: $completed/$total ($percent%)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+    local command="${1:-claude}"
+    shift 2>/dev/null || true
+
+    case "$command" in
+        status|s)
+            cmd_status
+            ;;
+        next|n)
+            cmd_next
+            ;;
+        dev|d)
+            cmd_dev
+            ;;
+        build|b)
+            cmd_build
+            ;;
+        typecheck|tc)
+            cmd_typecheck
+            ;;
+        claude|c)
+            cmd_claude
+            ;;
+        log|l)
+            cmd_log "$@"
+            ;;
+        commit)
+            cmd_commit
+            ;;
+        packages|p)
+            cmd_packages
+            ;;
+        quick|q)
+            cmd_quick
+            ;;
+        help|h|--help|-h)
+            cmd_help
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            echo "Run './harness-root.sh help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

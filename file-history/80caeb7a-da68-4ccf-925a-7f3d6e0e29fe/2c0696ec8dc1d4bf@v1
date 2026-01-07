@@ -1,0 +1,231 @@
+'use client';
+
+/**
+ * Schedule Page - Semantic Zoom Canvas
+ *
+ * Multi-year maintenance schedule visualization with 4 LOD levels:
+ * - LOD 0: Strategic (10-12 years) - Heatmap aggregation
+ * - LOD 1: Tactical (1-3 years) - Campaign bars
+ * - LOD 2: Operational (1-6 months) - Work orders
+ * - LOD 3: Execution (1-4 weeks) - Task details
+ */
+
+import React, { useState, useEffect } from 'react';
+import { ScheduleCanvas, ViewportControls } from '@/components/schedule';
+import { apiFetch } from '@/lib/api';
+import { LODLevel, LOD_THRESHOLDS } from '@/stores/viewportStore';
+
+interface MaintenanceEvent {
+  id: string;
+  trainId: string;
+  trainName: string;
+  type: 'PM1' | 'PM2' | 'HM' | 'OVH';
+  startDate: Date;
+  endDate: Date;
+  depot: string;
+}
+
+export default function SchedulePage() {
+  const [events, setEvents] = useState<MaintenanceEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedEvent, setSelectedEvent] = useState<MaintenanceEvent | null>(null);
+  const [hoveredEvent, setHoveredEvent] = useState<MaintenanceEvent | null>(null);
+  const [currentLOD, setCurrentLOD] = useState<LODLevel>(2);
+  const [scale, setScale] = useState(0.5);
+
+  useEffect(() => {
+    loadMaintenanceEvents();
+  }, []);
+
+  const loadMaintenanceEvents = async () => {
+    setLoading(true);
+    setError(null);
+
+    const { data, error: apiError } = await apiFetch<{ schedules: any[] }>(
+      '/api/maintenance/gantt'
+    );
+
+    if (apiError) {
+      // Generate demo data if API fails
+      setEvents(generateDemoEvents());
+    } else if (data?.schedules) {
+      // Transform API data to MaintenanceEvent format
+      const transformed = data.schedules.map((s: any) => ({
+        id: s.id,
+        trainId: s.trainId,
+        trainName: s.train?.trainId || 'Unknown',
+        type: s.maintenanceType as 'PM1' | 'PM2' | 'HM' | 'OVH',
+        startDate: new Date(s.scheduledDate),
+        endDate: new Date(new Date(s.scheduledDate).getTime() + s.durationDays * 24 * 60 * 60 * 1000),
+        depot: s.depot?.code || 'Unknown',
+      }));
+      setEvents(transformed);
+    }
+
+    setLoading(false);
+  };
+
+  const handleZoomToLOD = (lod: LODLevel) => {
+    const scaleMap: Record<LODLevel, number> = {
+      0: 0.1,  // Strategic
+      1: 0.35, // Tactical
+      2: 0.7,  // Operational
+      3: 2.0,  // Execution
+    };
+    setScale(scaleMap[lod]);
+    setCurrentLOD(lod);
+  };
+
+  return (
+    <div className="min-h-screen bg-canvas">
+      {/* Header */}
+      <div className="bg-panel border-b border-border px-6 py-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-semibold text-text-primary">
+              Maintenance Schedule
+            </h1>
+            <p className="text-sm text-text-secondary mt-1">
+              Semantic zoom timeline - Scroll to zoom, drag to pan
+            </p>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <button
+              onClick={loadMaintenanceEvents}
+              className="px-4 py-2 bg-elevated hover:bg-hover rounded text-text-primary text-sm transition-colors"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Main content */}
+      <div className="flex">
+        {/* Canvas area */}
+        <div className="flex-1 p-6">
+          {loading ? (
+            <div className="flex items-center justify-center h-[600px] bg-panel rounded-lg">
+              <div className="text-text-secondary">Loading schedule...</div>
+            </div>
+          ) : error ? (
+            <div className="flex items-center justify-center h-[600px] bg-panel rounded-lg">
+              <div className="text-red-500">{error}</div>
+            </div>
+          ) : (
+            <ScheduleCanvas
+              events={events}
+              onEventSelect={setSelectedEvent}
+              onEventHover={setHoveredEvent}
+              width={1000}
+              height={600}
+            />
+          )}
+        </div>
+
+        {/* Sidebar */}
+        <div className="w-64 bg-panel border-l border-border p-4">
+          <ViewportControls
+            currentLOD={currentLOD}
+            scale={scale}
+            onZoomIn={() => setScale((s) => Math.min(4, s * 1.2))}
+            onZoomOut={() => setScale((s) => Math.max(0.05, s / 1.2))}
+            onFit={() => {
+              setScale(0.5);
+              setCurrentLOD(2);
+            }}
+            onReset={() => {
+              setScale(0.5);
+              setCurrentLOD(2);
+            }}
+            onJumpToLOD={handleZoomToLOD}
+          />
+        </div>
+      </div>
+
+      {/* Event details panel */}
+      {(selectedEvent || hoveredEvent) && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-panel border border-border rounded-lg shadow-xl p-4 min-w-[300px]">
+          <div className="flex items-start justify-between">
+            <div>
+              <div className="text-sm font-medium text-text-primary">
+                {(selectedEvent || hoveredEvent)?.trainName}
+              </div>
+              <div className="text-xs text-text-secondary mt-1">
+                {(selectedEvent || hoveredEvent)?.type} at{' '}
+                {(selectedEvent || hoveredEvent)?.depot}
+              </div>
+            </div>
+            <span
+              className={`px-2 py-1 rounded text-xs font-medium ${
+                (selectedEvent || hoveredEvent)?.type === 'PM1'
+                  ? 'bg-maint-pm1/20 text-maint-pm1'
+                  : (selectedEvent || hoveredEvent)?.type === 'PM2'
+                  ? 'bg-maint-pm2/20 text-maint-pm2'
+                  : (selectedEvent || hoveredEvent)?.type === 'HM'
+                  ? 'bg-maint-pm3/20 text-maint-pm3'
+                  : 'bg-maint-overhaul/20 text-maint-overhaul'
+              }`}
+            >
+              {(selectedEvent || hoveredEvent)?.type}
+            </span>
+          </div>
+          <div className="mt-2 text-xs text-text-muted">
+            {(selectedEvent || hoveredEvent)?.startDate.toLocaleDateString()} -{' '}
+            {(selectedEvent || hoveredEvent)?.endDate.toLocaleDateString()}
+          </div>
+          {selectedEvent && (
+            <button
+              onClick={() => setSelectedEvent(null)}
+              className="mt-3 w-full px-3 py-1.5 bg-elevated hover:bg-hover rounded text-xs text-text-secondary transition-colors"
+            >
+              Close
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Generate demo events for visualization
+function generateDemoEvents(): MaintenanceEvent[] {
+  const events: MaintenanceEvent[] = [];
+  const types: ('PM1' | 'PM2' | 'HM' | 'OVH')[] = ['PM1', 'PM2', 'HM', 'OVH'];
+  const depots = ['LIS', 'PRT', 'FAR', 'BRG'];
+  const trainPrefixes = ['EMU', 'DMU', 'LOC'];
+
+  const now = Date.now();
+  const msPerDay = 24 * 60 * 60 * 1000;
+
+  // Generate 50 demo events spread over 2 years
+  for (let i = 0; i < 50; i++) {
+    const type = types[Math.floor(Math.random() * types.length)];
+    const depot = depots[Math.floor(Math.random() * depots.length)];
+    const prefix = trainPrefixes[Math.floor(Math.random() * trainPrefixes.length)];
+
+    const durationDays =
+      type === 'PM1' ? 1 + Math.random() * 2 :
+      type === 'PM2' ? 3 + Math.random() * 5 :
+      type === 'HM' ? 7 + Math.random() * 14 :
+      30 + Math.random() * 60;
+
+    const startOffset = Math.floor(Math.random() * 365 * 2) - 180; // -6 months to +18 months
+    const startDate = new Date(now + startOffset * msPerDay);
+    const endDate = new Date(startDate.getTime() + durationDays * msPerDay);
+
+    events.push({
+      id: `event-${i}`,
+      trainId: `train-${i % 15}`,
+      trainName: `${prefix}-${1000 + (i % 15)}`,
+      type,
+      startDate,
+      endDate,
+      depot,
+    });
+  }
+
+  return events.sort((a, b) => a.startDate.getTime() - b.startDate.getTime());
+}

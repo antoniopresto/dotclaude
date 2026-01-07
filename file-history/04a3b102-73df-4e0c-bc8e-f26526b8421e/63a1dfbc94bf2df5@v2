@@ -1,0 +1,287 @@
+# F013 + F014: SQLite Storage Architecture + CLI Utility
+
+## Overview
+
+Replace JSON/TXT files with SQLite + FTS5 for projects managed by HQ.
+Provide a CLI utility (`harness`) for AI agents and humans to interact programmatically.
+
+**Scope:** This is for projects that HQ will manage, NOT for HQ's own `.harness/` folder.
+
+---
+
+## F013: Storage Architecture
+
+### Database Location
+```
+<project>/.harness/harness.db
+```
+
+### Schema
+
+```sql
+-- Tasks (replaces features.json)
+CREATE TABLE tasks (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'backlog'
+    CHECK(status IN ('backlog', 'todo', 'doing', 'review', 'qa', 'done')),
+  category TEXT,
+  "order" REAL NOT NULL DEFAULT 0.0,  -- float for flexible ordering
+  passes INTEGER NOT NULL DEFAULT 0,   -- boolean: 0 or 1
+  created_at INTEGER NOT NULL,         -- unix timestamp
+  updated_at INTEGER NOT NULL          -- unix timestamp
+);
+
+-- Task steps (child of tasks)
+CREATE TABLE task_steps (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  description TEXT NOT NULL,
+  completed INTEGER NOT NULL DEFAULT 0,
+  order_index INTEGER NOT NULL
+);
+
+-- Progress log (replaces progress.txt)
+CREATE TABLE progress (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+-- Sessions
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  summary TEXT
+);
+
+-- FTS5 virtual tables for full-text search
+CREATE VIRTUAL TABLE tasks_fts USING fts5(
+  title, description, category,
+  content='tasks',
+  content_rowid='rowid'
+);
+
+CREATE VIRTUAL TABLE progress_fts USING fts5(
+  content,
+  content='progress',
+  content_rowid='id'
+);
+
+-- Triggers to keep FTS in sync
+CREATE TRIGGER tasks_ai AFTER INSERT ON tasks BEGIN
+  INSERT INTO tasks_fts(rowid, title, description, category)
+  VALUES (NEW.rowid, NEW.title, NEW.description, NEW.category);
+END;
+
+CREATE TRIGGER tasks_ad AFTER DELETE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts, rowid, title, description, category)
+  VALUES('delete', OLD.rowid, OLD.title, OLD.description, OLD.category);
+END;
+
+CREATE TRIGGER tasks_au AFTER UPDATE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts, rowid, title, description, category)
+  VALUES('delete', OLD.rowid, OLD.title, OLD.description, OLD.category);
+  INSERT INTO tasks_fts(rowid, title, description, category)
+  VALUES (NEW.rowid, NEW.title, NEW.description, NEW.category);
+END;
+
+-- Same triggers for progress_fts...
+CREATE TRIGGER progress_ai AFTER INSERT ON progress BEGIN
+  INSERT INTO progress_fts(rowid, content) VALUES (NEW.id, NEW.content);
+END;
+
+CREATE TRIGGER progress_ad AFTER DELETE ON progress BEGIN
+  INSERT INTO progress_fts(progress_fts, rowid, content)
+  VALUES('delete', OLD.id, OLD.content);
+END;
+
+-- Indexes
+CREATE INDEX idx_tasks_status ON tasks(status);
+CREATE INDEX idx_tasks_order ON tasks("order");
+CREATE INDEX idx_progress_session ON progress(session_id);
+CREATE INDEX idx_progress_created ON progress(created_at);
+```
+
+### Pagination Model
+
+All list methods return:
+```typescript
+interface PaginatedResult<T> {
+  items: T[];
+  hasNext: boolean;
+  hasPrev: boolean;
+  nextCursor: string | null;  // base64 encoded cursor
+  prevCursor: string | null;
+}
+```
+
+Cursor-based using `id` or `created_at` for stable pagination.
+
+---
+
+## F014: CLI Utility (`harness`)
+
+### Binary Structure
+
+Add to `src-tauri/Cargo.toml`:
+```toml
+[[bin]]
+name = "harness"
+path = "src/bin/harness.rs"
+```
+
+Shared library code in `src-tauri/src/db/` used by both Tauri app and CLI.
+
+### Commands
+
+```bash
+# Setup
+harness init                              # Create .harness/harness.db
+harness migrate                           # Migrate from legacy TXT/JSON
+harness db status                         # Show DB info (size, counts)
+
+# Tasks
+harness task add "Title" [-d "desc"] [-c category] [-s status]
+harness task list [--status=X] [--limit=N] [--cursor=X]
+harness task search "query" [--limit=N] [--cursor=X]
+harness task get <id>
+harness task update <id> [--status=X] [--title=X] [--desc=X] [--order=X]
+harness task delete <id>
+harness task reorder <id> --after=<other_id>  # Reposition in order
+
+# Task Steps
+harness step add <task_id> "description"
+harness step complete <step_id>
+harness step uncomplete <step_id>
+harness step list <task_id>
+harness step delete <step_id>
+
+# Progress
+harness progress add "content" [--session=X]
+harness progress list [--limit=N] [--cursor=X]
+harness progress search "query" [--limit=N] [--cursor=X]
+
+# Sessions
+harness session start [--summary="X"]
+harness session end [--summary="X"]
+harness session list [--limit=N]
+harness session current
+
+# Info
+harness status                            # Project summary (tasks by status, etc.)
+```
+
+### Output Formats
+
+```bash
+harness task list              # Human-readable table
+harness task list --json       # JSON for AI consumption
+harness task list --quiet      # IDs only
+```
+
+### Exit Codes
+
+- `0`: Success
+- `1`: General error
+- `2`: Not a harness project (no .harness/)
+- `3`: Database error
+
+---
+
+## F006 Update: Project Setup
+
+When HQ opens a directory:
+
+| Scenario | Action |
+|----------|--------|
+| Has `.harness/harness.db` | Open normally |
+| Has `.harness/` with TXT/JSON (legacy) | Show "Migrate to SQLite" button |
+| No `.harness/` folder | Show "Initialize Harness" button |
+
+Both buttons invoke equivalent of `harness init` or `harness migrate`.
+
+---
+
+## Implementation Order
+
+### Phase 1: Core Storage (Rust)
+1. Add `rusqlite` dependency with FTS5 feature
+2. Create `src-tauri/src/db/mod.rs` - DB module
+3. Create `src-tauri/src/db/schema.rs` - Schema initialization
+4. Create `src-tauri/src/db/tasks.rs` - Task CRUD + FTS search
+5. Create `src-tauri/src/db/progress.rs` - Progress CRUD + FTS search
+6. Create `src-tauri/src/db/sessions.rs` - Session management
+7. Create `src-tauri/src/db/pagination.rs` - Cursor pagination helpers
+
+### Phase 2: CLI Binary
+1. Create `src-tauri/src/bin/harness.rs` - CLI entry point
+2. Add `clap` for argument parsing
+3. Implement subcommands: init, task, step, progress, session, status
+4. Add output formatters (table, json, quiet)
+
+### Phase 3: Tauri Integration
+1. Create Tauri commands that wrap DB operations
+2. Update frontend to use new commands
+3. Add project detection logic (has DB? has legacy? nothing?)
+
+### Phase 4: Migration Tool
+1. Create `harness migrate` command
+2. Parse `features.json` → insert into `tasks` table
+3. Parse `progress.txt` → insert into `progress` table
+4. Preserve original files as `.harness/backup/`
+
+---
+
+## Files to Create
+
+```
+src-tauri/
+├── src/
+│   ├── bin/
+│   │   └── harness.rs          # CLI entry point
+│   ├── db/
+│   │   ├── mod.rs              # Module exports
+│   │   ├── schema.rs           # CREATE TABLE statements
+│   │   ├── connection.rs       # DB connection management
+│   │   ├── tasks.rs            # Task CRUD + search
+│   │   ├── steps.rs            # Step CRUD
+│   │   ├── progress.rs         # Progress CRUD + search
+│   │   ├── sessions.rs         # Session management
+│   │   ├── pagination.rs       # Cursor pagination
+│   │   └── migrate.rs          # Legacy migration
+│   └── lib.rs                  # Add db module
+```
+
+## Files to Modify
+
+```
+src-tauri/Cargo.toml            # Add rusqlite, clap
+src-tauri/src/lib.rs            # Register db module + Tauri commands
+src/components/KanbanBoard.tsx  # Use new Tauri commands (later)
+.harness/features.json          # Add F013, F014 entries
+```
+
+## Dependencies to Add
+
+```toml
+# src-tauri/Cargo.toml
+rusqlite = { version = "0.32", features = ["bundled", "fts5"] }
+clap = { version = "4", features = ["derive"] }
+```
+
+---
+
+## Success Criteria
+
+- [ ] `harness init` creates `.harness/harness.db` with correct schema
+- [ ] `harness task add/list/search/update/delete` work correctly
+- [ ] `harness progress add/list/search` work correctly
+- [ ] FTS5 search returns relevant results
+- [ ] Pagination with prev/next cursors works
+- [ ] `--json` output is valid JSON parseable by AI
+- [ ] `harness migrate` successfully imports legacy TXT/JSON
+- [ ] Tauri app can detect and handle all 3 project states

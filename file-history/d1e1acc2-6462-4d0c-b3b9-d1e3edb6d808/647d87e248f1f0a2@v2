@@ -1,0 +1,78 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
+import type { DiscoveredImport } from './types.js';
+
+interface DiscoverOptions {
+  sourceDir: string;
+  patterns: string[];
+  ignore: string[];
+}
+
+export function discoverImports(options: DiscoverOptions): DiscoveredImport[] {
+  const { sourceDir, patterns, ignore } = options;
+
+  if (!fs.existsSync(sourceDir)) {
+    throw new Error(`Source directory does not exist: ${sourceDir}`);
+  }
+
+  const imports = new Map<string, DiscoveredImport>();
+  const files = findTsFiles(sourceDir);
+  const matcher = createMatcher(patterns, ignore);
+
+  for (const filePath of files) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+
+    ts.forEachChild(sourceFile, (node) => {
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+        const specifier = node.moduleSpecifier.text;
+        if (matcher(specifier)) {
+          imports.set(specifier, { specifier, fromFile: filePath });
+        }
+      }
+    });
+  }
+
+  return Array.from(imports.values());
+}
+
+function findTsFiles(dir: string): string[] {
+  const files: string[] = [];
+
+  function walk(currentDir: string) {
+    const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+
+      if (entry.isDirectory() && entry.name !== 'node_modules') {
+        walk(fullPath);
+      } else if (entry.isFile() && /\.(ts|tsx)$/.test(entry.name)) {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  walk(dir);
+  return files;
+}
+
+function createMatcher(patterns: string[], ignore: string[]): (value: string) => boolean {
+  const includeRegexes = patterns.map(patternToRegex);
+  const excludeRegexes = ignore.map(patternToRegex);
+
+  return (value: string) => {
+    const included = includeRegexes.some((r) => r.test(value));
+    const excluded = excludeRegexes.some((r) => r.test(value));
+    return included && !excluded;
+  };
+}
+
+function patternToRegex(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*');
+  return new RegExp(`^${escaped}$`);
+}

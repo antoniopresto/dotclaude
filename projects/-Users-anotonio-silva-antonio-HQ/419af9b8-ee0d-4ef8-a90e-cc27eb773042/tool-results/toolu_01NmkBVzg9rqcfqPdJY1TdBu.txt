@@ -1,0 +1,599 @@
+     1→import { useState, useCallback, useEffect } from 'react';
+     2→import {
+     3→  Button,
+     4→  Card,
+     5→  CardBody,
+     6→  CardTitle,
+     7→  Content,
+     8→  EmptyState,
+     9→  EmptyStateBody,
+    10→  EmptyStateFooter,
+    11→  EmptyStateActions,
+    12→  Label,
+    13→  Masthead,
+    14→  MastheadBrand,
+    15→  MastheadMain,
+    16→  Page,
+    17→  PageSection,
+    18→  Spinner,
+    19→  Title,
+    20→} from '@patternfly/react-core';
+    21→import { FolderOpenIcon, CogIcon, FolderIcon } from '@patternfly/react-icons';
+    22→import { TabBar, KanbanBoard, LogPanel, TerminalPanel, ProjectSelector, ProgressCard, Settings, TaskModal, TaskExecutionModal } from './components';
+    23→import type { HQSettings, TaskData } from './components';
+    24→import type { LogEntry } from './components';
+    25→import type { Project, Feature } from './state/store';
+    26→import { listen } from '@tauri-apps/api/event';
+    27→import { invoke } from '@tauri-apps/api/core';
+    28→
+    29→// PTY output event payload
+    30→interface PtyOutputEvent {
+    31→  process_id: string;
+    32→  data: string;
+    33→}
+    34→
+    35→// Process info for log panel
+    36→interface ProcessInfo {
+    37→  id: string;
+    38→  name: string;
+    39→}
+    40→
+    41→// Initialize harness database if it doesn't exist
+    42→async function initializeHarnessIfNeeded(projectPath: string): Promise<boolean> {
+    43→  try {
+    44→    // Try to run status command - if it fails, db doesn't exist
+    45→    await invoke<string>('run_harness_command', {
+    46→      projectPath,
+    47→      args: ['db', 'status'],
+    48→    });
+    49→    return true; // Already initialized
+    50→  } catch {
+    51→    // Database doesn't exist, initialize it
+    52→    try {
+    53→      await invoke<string>('run_harness_command', {
+    54→        projectPath,
+    55→        args: ['init'],
+    56→      });
+    57→      console.log('Harness database initialized for:', projectPath);
+    58→      return true;
+    59→    } catch (initError) {
+    60→      console.error('Failed to initialize harness:', initError);
+    61→      return false;
+    62→    }
+    63→  }
+    64→}
+    65→
+    66→// Fetch tasks from harness CLI and convert to Feature format
+    67→async function fetchProjectFeatures(projectPath: string): Promise<Feature[]> {
+    68→  try {
+    69→    const result = await invoke<string>('run_harness_command', {
+    70→      projectPath,
+    71→      args: ['task', 'list', '--format', 'json'],
+    72→    });
+    73→
+    74→    const response = JSON.parse(result);
+    75→    // CLI returns paginated response: { items: [...], has_next, has_prev, ... }
+    76→    const tasks = response.items || response;
+    77→    if (!Array.isArray(tasks)) return [];
+    78→
+    79→    return tasks.map((task: {
+    80→      id: string;
+    81→      title: string;
+    82→      description?: string;
+    83→      status: string;
+    84→      category?: string;
+    85→      is_passed?: boolean;
+    86→    }) => ({
+    87→      id: task.id,
+    88→      description: task.title,
+    89→      category: task.category || 'general',
+    90→      priority: 'medium',
+    91→      status: task.status.toLowerCase(),
+    92→      passes: task.is_passed || task.status.toLowerCase() === 'done',
+    93→      steps: task.description ? [task.description] : [],
+    94→    }));
+    95→  } catch (error) {
+    96→    console.error('Failed to fetch project features:', error);
+    97→    return [];
+    98→  }
+    99→}
+   100→
+   101→function App() {
+   102→  // Project state - start empty, no mock projects
+   103→  const [projects, setProjects] = useState<Project[]>([]);
+   104→  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+   105→
+   106→  // Features state - fetched from harness CLI
+   107→  const [features, setFeatures] = useState<Feature[]>([]);
+   108→  const [isLoadingFeatures, setIsLoadingFeatures] = useState(false);
+   109→
+   110→  // Project selector dialog state
+   111→  const [isProjectSelectorOpen, setIsProjectSelectorOpen] = useState(false);
+   112→
+   113→  // Settings dialog state
+   114→  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+   115→  const [settings, setSettings] = useState<HQSettings>({
+   116→    theme: 'system',
+   117→    logBufferSize: 10000,
+   118→    defaultShell: '/bin/zsh',
+   119→    ptyRows: 24,
+   120→    ptyCols: 80,
+   121→    autoScrollLogs: true,
+   122→    showTimestamps: true,
+   123→  });
+   124→
+   125→  // Log state - starts empty, filled by PTY events
+   126→  const [logs, setLogs] = useState<LogEntry[]>([]);
+   127→  const [processes, setProcesses] = useState<ProcessInfo[]>([]);
+   128→
+   129→  // Task modal state
+   130→  const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
+   131→  const [editingTask, setEditingTask] = useState<Feature | undefined>(undefined);
+   132→
+   133→  // Task execution modal state
+   134→  const [isExecutionModalOpen, setIsExecutionModalOpen] = useState(false);
+   135→  const [executingTask, setExecutingTask] = useState<Feature | null>(null);
+   136→
+   137→  // Open project selector on first launch if no projects
+   138→  useEffect(() => {
+   139→    if (projects.length === 0) {
+   140→      setIsProjectSelectorOpen(true);
+   141→    }
+   142→  }, []);
+   143→
+   144→  // Fetch features when active project changes (initialize harness if needed)
+   145→  useEffect(() => {
+   146→    const activeProject = projects.find(p => p.id === activeProjectId);
+   147→    if (activeProject) {
+   148→      setIsLoadingFeatures(true);
+   149→      // First ensure harness is initialized, then fetch features
+   150→      initializeHarnessIfNeeded(activeProject.path)
+   151→        .then((initialized) => {
+   152→          if (initialized) {
+   153→            return fetchProjectFeatures(activeProject.path);
+   154→          }
+   155→          return [];
+   156→        })
+   157→        .then(setFeatures)
+   158→        .finally(() => setIsLoadingFeatures(false));
+   159→    } else {
+   160→      setFeatures([]);
+   161→    }
+   162→  }, [activeProjectId, projects]);
+   163→
+   164→  // Listen for menu events
+   165→  useEffect(() => {
+   166→    const listeners = [
+   167→      listen('menu:open_project', () => {
+   168→        setIsProjectSelectorOpen(true);
+   169→      }),
+   170→      listen('menu:new_tab', () => {
+   171→        handleAddProject();
+   172→      }),
+   173→      listen('menu:close_tab', () => {
+   174→        if (activeProjectId) {
+   175→          handleCloseProject(activeProjectId);
+   176→        }
+   177→      }),
+   178→      listen('menu:settings', () => {
+   179→        setIsSettingsOpen(true);
+   180→      }),
+   181→    ];
+   182→
+   183→    return () => {
+   184→      listeners.forEach(async (unlistenPromise) => {
+   185→        const unlisten = await unlistenPromise;
+   186→        unlisten();
+   187→      });
+   188→    };
+   189→  }, [activeProjectId]);
+   190→
+   191→  // Listen for PTY output events to populate logs
+   192→  useEffect(() => {
+   193→    const unlistenPromise = listen<PtyOutputEvent>('pty-output', (event) => {
+   194→      const { process_id, data } = event.payload;
+   195→
+   196→      // Add process if not already tracked
+   197→      setProcesses(prev => {
+   198→        if (!prev.find(p => p.id === process_id)) {
+   199→          return [...prev, { id: process_id, name: `Process ${process_id.slice(0, 8)}` }];
+   200→        }
+   201→        return prev;
+   202→      });
+   203→
+   204→      // Add log entry
+   205→      setLogs(prev => {
+   206→        const newLogs = [...prev, {
+   207→          timestamp: Date.now(),
+   208→          processId: process_id,
+   209→          processName: `Process ${process_id.slice(0, 8)}`,
+   210→          message: data,
+   211→          level: 'info' as const,
+   212→        }];
+   213→        // Keep only last N logs based on settings
+   214→        return newLogs.slice(-settings.logBufferSize);
+   215→      });
+   216→    });
+   217→
+   218→    return () => {
+   219→      unlistenPromise.then(fn => fn());
+   220→    };
+   221→  }, [settings.logBufferSize]);
+   222→
+   223→  const handleClearLogs = useCallback(() => {
+   224→    setLogs([]);
+   225→  }, []);
+   226→
+   227→  // Tab handlers
+   228→  const handleSelectProject = useCallback((projectId: string) => {
+   229→    setActiveProjectId(projectId);
+   230→  }, []);
+   231→
+   232→  const handleCloseProject = useCallback((projectId: string) => {
+   233→    setProjects((prev) => {
+   234→      const filtered = prev.filter((p) => p.id !== projectId);
+   235→      // If closing active tab, switch to previous or next
+   236→      if (activeProjectId === projectId && filtered.length > 0) {
+   237→        const idx = prev.findIndex((p) => p.id === projectId);
+   238→        const newActive = filtered[Math.max(0, idx - 1)];
+   239→        setActiveProjectId(newActive.id);
+   240→      } else if (filtered.length === 0) {
+   241→        setActiveProjectId(null);
+   242→      }
+   243→      return filtered;
+   244→    });
+   245→  }, [activeProjectId]);
+   246→
+   247→  const handleAddProject = useCallback(() => {
+   248→    setIsProjectSelectorOpen(true);
+   249→  }, []);
+   250→
+   251→  // Handle selecting a project from the project selector
+   252→  const handleSelectProjectFromDialog = useCallback((path: string, name: string) => {
+   253→    // Check if project is already open
+   254→    const existing = projects.find(p => p.path === path);
+   255→    if (existing) {
+   256→      setActiveProjectId(existing.id);
+   257→      return;
+   258→    }
+   259→
+   260→    const id = `proj-${Date.now()}`;
+   261→    const newProject: Project = {
+   262→      id,
+   263→      path,
+   264→      name,
+   265→      harness: {
+   266→        progressFile: '.harness/progress.txt',
+   267→        featuresFile: '.harness/features.json',
+   268→      },
+   269→    };
+   270→    setProjects((prev) => [...prev, newProject]);
+   271→    setActiveProjectId(id);
+   272→  }, [projects]);
+   273→
+   274→  const handleReorderProjects = useCallback((order: string[]) => {
+   275→    setProjects((prev) => {
+   276→      const projectMap = new Map(prev.map((p) => [p.id, p]));
+   277→      return order.map((id) => projectMap.get(id)).filter(Boolean) as Project[];
+   278→    });
+   279→  }, []);
+   280→
+   281→  // Refresh features for active project
+   282→  const handleRefreshFeatures = useCallback(() => {
+   283→    const activeProject = projects.find(p => p.id === activeProjectId);
+   284→    if (activeProject) {
+   285→      setIsLoadingFeatures(true);
+   286→      fetchProjectFeatures(activeProject.path)
+   287→        .then(setFeatures)
+   288→        .finally(() => setIsLoadingFeatures(false));
+   289→    }
+   290→  }, [activeProjectId, projects]);
+   291→
+   292→  // Task CRUD handlers
+   293→  const handleOpenAddTask = useCallback(() => {
+   294→    setEditingTask(undefined);
+   295→    setIsTaskModalOpen(true);
+   296→  }, []);
+   297→
+   298→  const handleOpenEditTask = useCallback((task: Feature) => {
+   299→    setEditingTask(task);
+   300→    setIsTaskModalOpen(true);
+   301→  }, []);
+   302→
+   303→  const handleCloseTaskModal = useCallback(() => {
+   304→    setIsTaskModalOpen(false);
+   305→    setEditingTask(undefined);
+   306→  }, []);
+   307→
+   308→  const handleSaveTask = useCallback(async (taskData: TaskData, taskId?: string) => {
+   309→    const activeProject = projects.find(p => p.id === activeProjectId);
+   310→    if (!activeProject) {
+   311→      throw new Error('No active project selected');
+   312→    }
+   313→
+   314→    const args = taskId
+   315→      ? ['task', 'update', taskId]
+   316→      : ['task', 'add', taskData.title];
+   317→
+   318→    // Add flags for update or creation
+   319→    if (taskId) {
+   320→      args.push('--title', taskData.title);
+   321→    }
+   322→    if (taskData.description) {
+   323→      args.push('--description', taskData.description);
+   324→    }
+   325→    args.push('--status', taskData.status.toLowerCase());
+   326→    if (taskData.category) {
+   327→      args.push('--category', taskData.category);
+   328→    }
+   329→
+   330→    try {
+   331→      await invoke('run_harness_command', {
+   332→        projectPath: activeProject.path,
+   333→        args,
+   334→      });
+   335→      // Refresh the task list
+   336→      handleRefreshFeatures();
+   337→    } catch (error) {
+   338→      const message = error instanceof Error ? error.message : String(error);
+   339→      // Extract the actual error from "Harness command failed: Error: ..."
+   340→      const match = message.match(/Error:\s*(.+)/);
+   341→      throw new Error(match ? match[1] : message);
+   342→    }
+   343→  }, [activeProjectId, projects, handleRefreshFeatures]);
+   344→
+   345→  const handleDeleteTask = useCallback(async (taskId: string) => {
+   346→    const activeProject = projects.find(p => p.id === activeProjectId);
+   347→    if (!activeProject) return;
+   348→
+   349→    // Confirm before deleting
+   350→    if (!window.confirm('Are you sure you want to delete this task?')) {
+   351→      return;
+   352→    }
+   353→
+   354→    await invoke('run_harness_command', {
+   355→      projectPath: activeProject.path,
+   356→      args: ['task', 'delete', taskId],
+   357→    });
+   358→
+   359→    // Refresh the task list
+   360→    handleRefreshFeatures();
+   361→  }, [activeProjectId, projects, handleRefreshFeatures]);
+   362→
+   363→  const handleMoveTask = useCallback(async (taskId: string, newStatus: string) => {
+   364→    const activeProject = projects.find(p => p.id === activeProjectId);
+   365→    if (!activeProject) return;
+   366→
+   367→    try {
+   368→      await invoke('run_harness_command', {
+   369→        projectPath: activeProject.path,
+   370→        args: ['task', 'update', taskId, '--status', newStatus.toLowerCase()],
+   371→      });
+   372→      // Refresh the task list
+   373→      handleRefreshFeatures();
+   374→    } catch (error) {
+   375→      console.error('Failed to move task:', error);
+   376→    }
+   377→  }, [activeProjectId, projects, handleRefreshFeatures]);
+   378→
+   379→  // Play task - execute with Claude Code
+   380→  const handlePlayTask = useCallback((task: Feature) => {
+   381→    // First, move task to DOING status
+   382→    handleMoveTask(task.id, 'doing');
+   383→    // Open the execution modal
+   384→    setExecutingTask(task);
+   385→    setIsExecutionModalOpen(true);
+   386→  }, [handleMoveTask]);
+   387→
+   388→  // Handle task execution complete
+   389→  const handleTaskExecutionComplete = useCallback(async (taskId: string, success: boolean) => {
+   390→    const activeProject = projects.find(p => p.id === activeProjectId);
+   391→    if (!activeProject) return;
+   392→
+   393→    const newStatus = success ? 'done' : 'qa';
+   394→
+   395→    try {
+   396→      await invoke('run_harness_command', {
+   397→        projectPath: activeProject.path,
+   398→        args: ['task', 'update', taskId, '--status', newStatus],
+   399→      });
+   400→      // Refresh the task list
+   401→      handleRefreshFeatures();
+   402→    } catch (error) {
+   403→      console.error('Failed to update task status after execution:', error);
+   404→    }
+   405→  }, [activeProjectId, projects, handleRefreshFeatures]);
+   406→
+   407→  // Close execution modal
+   408→  const handleCloseExecutionModal = useCallback(() => {
+   409→    setIsExecutionModalOpen(false);
+   410→    setExecutingTask(null);
+   411→  }, []);
+   412→
+   413→  // Get active project
+   414→  const activeProject = projects.find((p) => p.id === activeProjectId);
+   415→
+   416→  // Calculate stats from actual features
+   417→  const stats = {
+   418→    completed: features.filter(f => f.status === 'done').length,
+   419→    total: features.length,
+   420→  };
+   421→
+   422→  const masthead = (
+   423→    <Masthead>
+   424→      <MastheadMain>
+   425→        <MastheadBrand>
+   426→          <Title headingLevel="h1" size="xl">HQ</Title>
+   427→        </MastheadBrand>
+   428→        <Label color="blue" isCompact>Harness Orchestrator</Label>
+   429→      </MastheadMain>
+   430→    </Masthead>
+   431→  );
+   432→
+   433→  return (
+   434→    <Page masthead={masthead}>
+   435→      {/* Tab Bar */}
+   436→      <TabBar
+   437→        projects={projects}
+   438→        activeProjectId={activeProjectId || ''}
+   439→        onSelect={handleSelectProject}
+   440→        onClose={handleCloseProject}
+   441→        onAdd={handleAddProject}
+   442→        onReorder={handleReorderProjects}
+   443→      />
+   444→
+   445→      {/* Empty State when no projects */}
+   446→      {projects.length === 0 && (
+   447→        <PageSection>
+   448→          <EmptyState
+   449→            titleText="No Projects Open"
+   450→            headingLevel="h2"
+   451→            icon={FolderIcon}
+   452→          >
+   453→            <EmptyStateBody>
+   454→              Open a Harness project to start managing your AI agent development sessions.
+   455→              Projects with a <code>.harness</code> directory can be opened and tracked.
+   456→            </EmptyStateBody>
+   457→            <EmptyStateFooter>
+   458→              <EmptyStateActions>
+   459→                <Button
+   460→                  variant="primary"
+   461→                  icon={<FolderOpenIcon />}
+   462→                  onClick={handleAddProject}
+   463→                >
+   464→                  Open Project
+   465→                </Button>
+   466→              </EmptyStateActions>
+   467→            </EmptyStateFooter>
+   468→          </EmptyState>
+   469→        </PageSection>
+   470→      )}
+   471→
+   472→      {/* Project Content - only show when there's an active project */}
+   473→      {activeProject && (
+   474→        <>
+   475→          <PageSection>
+   476→            <Card>
+   477→              <CardTitle>{activeProject.name}</CardTitle>
+   478→              <CardBody>
+   479→                <Content component="p">
+   480→                  <strong>Path:</strong> {activeProject.path}
+   481→                </Content>
+   482→                <Content component="p">
+   483→                  <strong>Tasks:</strong> {stats.completed}/{stats.total} complete
+   484→                </Content>
+   485→                <div style={{ marginTop: '16px', display: 'flex', gap: '8px' }}>
+   486→                  <Button
+   487→                    variant="secondary"
+   488→                    icon={<CogIcon />}
+   489→                    onClick={() => setIsSettingsOpen(true)}
+   490→                  >
+   491→                    Settings
+   492→                  </Button>
+   493→                  <Button
+   494→                    variant="secondary"
+   495→                    icon={<FolderOpenIcon />}
+   496→                    onClick={handleAddProject}
+   497→                  >
+   498→                    Open Another Project
+   499→                  </Button>
+   500→                </div>
+   501→              </CardBody>
+   502→            </Card>
+   503→          </PageSection>
+   504→
+   505→          {/* Progress Card */}
+   506→          <PageSection>
+   507→            <ProgressCard projectPath={activeProject.path} onRefresh={handleRefreshFeatures} />
+   508→          </PageSection>
+   509→
+   510→          {/* Kanban Board */}
+   511→          <PageSection>
+   512→            <Card>
+   513→              <CardTitle>
+   514→                Task Board
+   515→                {isLoadingFeatures && <Spinner size="md" style={{ marginLeft: 8 }} />}
+   516→              </CardTitle>
+   517→              <CardBody>
+   518→                <KanbanBoard
+   519→                  features={features}
+   520→                  onAddTask={handleOpenAddTask}
+   521→                  onEditTask={handleOpenEditTask}
+   522→                  onDeleteTask={handleDeleteTask}
+   523→                  onMoveTask={handleMoveTask}
+   524→                  onPlayTask={handlePlayTask}
+   525→                />
+   526→              </CardBody>
+   527→            </Card>
+   528→          </PageSection>
+   529→
+   530→          {/* Log Panel */}
+   531→          <PageSection>
+   532→            <Card>
+   533→              <CardTitle>Process Logs</CardTitle>
+   534→              <CardBody>
+   535→                {logs.length > 0 ? (
+   536→                  <LogPanel
+   537→                    logs={logs}
+   538→                    processes={processes}
+   539→                    onClear={handleClearLogs}
+   540→                    height={300}
+   541→                  />
+   542→                ) : (
+   543→                  <EmptyState titleText="No Logs" headingLevel="h4">
+   544→                    <EmptyStateBody>
+   545→                      Process logs will appear here when you start a terminal session.
+   546→                    </EmptyStateBody>
+   547→                  </EmptyState>
+   548→                )}
+   549→              </CardBody>
+   550→            </Card>
+   551→          </PageSection>
+   552→
+   553→          {/* Terminal Panel */}
+   554→          <PageSection>
+   555→            <TerminalPanel height={250} />
+   556→          </PageSection>
+   557→        </>
+   558→      )}
+   559→
+   560→      {/* Project Selector Dialog */}
+   561→      <ProjectSelector
+   562→        isOpen={isProjectSelectorOpen}
+   563→        onClose={() => setIsProjectSelectorOpen(false)}
+   564→        onSelectProject={handleSelectProjectFromDialog}
+   565→      />
+   566→
+   567→      {/* Settings Dialog */}
+   568→      <Settings
+   569→        isOpen={isSettingsOpen}
+   570→        onClose={() => setIsSettingsOpen(false)}
+   571→        onSettingsChange={setSettings}
+   572→      />
+   573→
+   574→      {/* Task Modal */}
+   575→      <TaskModal
+   576→        isOpen={isTaskModalOpen}
+   577→        onClose={handleCloseTaskModal}
+   578→        onSave={handleSaveTask}
+   579→        task={editingTask}
+   580→      />
+   581→
+   582→      {/* Task Execution Modal */}
+   583→      <TaskExecutionModal
+   584→        isOpen={isExecutionModalOpen}
+   585→        task={executingTask}
+   586→        projectPath={activeProject?.path || ''}
+   587→        onClose={handleCloseExecutionModal}
+   588→        onComplete={handleTaskExecutionComplete}
+   589→      />
+   590→    </Page>
+   591→  );
+   592→}
+   593→
+   594→export default App;
+   595→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

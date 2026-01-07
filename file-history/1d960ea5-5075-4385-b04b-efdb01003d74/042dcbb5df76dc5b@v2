@@ -1,0 +1,1158 @@
+# @zazcart/toolkit
+
+A TypeScript utility library providing runtime type validation, state management, and common helpers for complex frontend applications.
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+  - [Schema Validation](#schema-validation)
+  - [State Machine](#state-machine)
+  - [Helpers](#helpers)
+- [API Reference](#api-reference)
+  - [Schema Module](#schema-module)
+  - [State Machine Module](#state-machine-module)
+  - [Helpers Module](#helpers-module)
+- [Advanced Usage](#advanced-usage)
+- [TypeScript Support](#typescript-support)
+- [License](#license)
+
+---
+
+## Installation
+
+```bash
+npm install @zazcart/toolkit
+# or
+pnpm add @zazcart/toolkit
+# or
+bun add @zazcart/toolkit
+```
+
+**Peer Dependencies:**
+- `react` >= 18.0.0
+- `immer` >= 10.0.0
+
+---
+
+## Quick Start
+
+### Schema Validation
+
+```typescript
+import { createModel, createType, InferType, isType } from '@zazcart/toolkit';
+
+// Create a validated model
+const UserSchema = createModel({
+  id: 'number',
+  name: 'string',
+  email: 'string?',        // optional
+  roles: 'string[]',       // array
+});
+
+type User = InferType<typeof UserSchema>;
+
+// Parse and validate data
+const user = UserSchema.parse({
+  id: 1,
+  name: 'John',
+  roles: ['admin'],
+});
+
+// Type guard
+if (isType(someValue, 'number')) {
+  console.log(someValue.toFixed(2)); // TypeScript knows it's a number
+}
+```
+
+### State Machine
+
+```typescript
+import { createMachine, createSlice } from '@zazcart/toolkit';
+
+// Create a slice
+const counterSlice = createSlice({
+  id: 'counter',
+  initial: { count: 0 },
+  cache: { policy: 'session' },
+  reducers: {
+    increment: (state) => { state.count += 1; },
+    decrement: (state) => { state.count -= 1; },
+    set: (state, value: number) => { state.count = value; },
+  },
+});
+
+// Create the machine
+const appMachine = createMachine({
+  id: 'app',
+  slices: { counter: counterSlice },
+  context: { userID: null },
+});
+
+// Use in React components
+function Counter() {
+  const { state, actions } = appMachine.useMachine('counter');
+
+  return (
+    <div>
+      <span>{state.count}</span>
+      <button onClick={() => actions.increment()}>+</button>
+      <button onClick={() => actions.decrement()}>-</button>
+    </div>
+  );
+}
+```
+
+### Helpers
+
+```typescript
+import {
+  getProperty,
+  ms,
+  formatDate,
+  invariant,
+  tryCatch,
+} from '@zazcart/toolkit';
+
+// Deep property access
+const street = getProperty(user, 'address.street');
+
+// Time conversion
+const timeout = ms('5m');  // 300000 (5 minutes in ms)
+
+// Date formatting
+const formatted = formatDate(new Date(), 'yyyy-MM-dd'); // '2025-12-28'
+
+// Assertions
+invariant(user.id, 'User ID is required');
+
+// Safe error handling
+const [error, result] = tryCatch(() => JSON.parse(data));
+if (error) {
+  console.error('Parse failed:', error.message);
+}
+```
+
+---
+
+## API Reference
+
+### Schema Module
+
+The schema module provides runtime type validation using TypeBox under the hood.
+
+#### `createType(definition)`
+
+Creates a compiled type validator from a type definition. String definitions are cached (LRU, 2000 max entries, 1 minute TTL).
+
+```typescript
+function createType<Definition extends TypeDefinition>(
+  definition: Definition
+): Type<Definition, InferType<Definition>>
+```
+
+**Parameters:**
+- `definition` - Type definition (string or object format)
+
+**Returns:** Type wrapper with validation methods
+
+**Example:**
+```typescript
+// String definitions (cached)
+const stringType = createType('string');
+const optionalNumber = createType('number?');
+const stringArray = createType('string[]');
+
+// Object definitions
+const userType = createType({
+  properties: {
+    id: 'number',
+    name: 'string',
+  }
+});
+
+// Enum
+const statusType = createType({
+  enum: ['draft', 'published', 'archived'] as const
+});
+
+// Union
+const idType = createType({
+  union: ['string', 'number']
+});
+
+// Record (map)
+const configType = createType({
+  record: 'string'  // Record<string, string>
+});
+```
+
+#### `createModel(properties)`
+
+Convenience function for creating object schemas. Equivalent to `createType({ properties })`.
+
+```typescript
+function createModel<Schema extends ObjectTypeProperties>(
+  properties: Schema
+): Type<{ properties: Schema }, InferType<{ properties: Schema }>>
+```
+
+**Example:**
+```typescript
+const AddressSchema = createModel({
+  street: 'string',
+  city: 'string',
+  zip: 'string?',
+});
+
+type Address = InferType<typeof AddressSchema>;
+// { street: string; city: string; zip?: string }
+```
+
+#### Type Wrapper Methods
+
+The returned type wrapper provides these methods:
+
+| Method                    | Description                                                                              |
+|---------------------------|------------------------------------------------------------------------------------------|
+| `parse(value, path?)`     | Validates and returns typed value. Throws on failure. Optional `path` for nested access. |
+| `parseList(value, path?)` | Validates array of values. Throws on failure.                                            |
+| `isValid(value)`          | Type guard returning boolean.                                                            |
+| `list()`                  | Returns cached array schema for this type.                                               |
+
+```typescript
+const UserSchema = createModel({ id: 'number', name: 'string' });
+
+// Parse single value
+const user = UserSchema.parse({ id: 1, name: 'John' });
+
+// Parse from nested path
+const user = UserSchema.parse(apiResponse, 'data.user');
+
+// Parse array
+const users = UserSchema.parseList(apiResponse, 'data.users');
+
+// Type guard
+if (UserSchema.isValid(unknown)) {
+  console.log(unknown.name); // TypeScript knows the type
+}
+```
+
+#### `isType(value, definition)`
+
+Type guard that checks if a value matches a type definition.
+
+```typescript
+function isType<T extends TypeDefinitionString>(
+  value: unknown,
+  definition: T
+): value is InferType<T>
+```
+
+**Example:**
+```typescript
+if (isType(value, 'date')) {
+  console.log(value.toISOString()); // value is Date
+}
+
+if (isType(value, 'number?')) {
+  // value is number | undefined
+}
+```
+
+#### `invariantType(definition, value, parent?, message?)`
+
+Assertion that throws if value doesn't match the type definition.
+
+```typescript
+function invariantType<T extends TypeDefinition>(
+  definition: T,
+  value: unknown,
+  parentFunction?: Function,
+  customMessage?: string
+): asserts value is InferType<T>
+```
+
+**Parameters:**
+- `definition` - Type to validate against
+- `value` - Value to validate
+- `parentFunction` - Optional function for stack trace
+- `customMessage` - Custom error message with replacements:
+  - `$definition` - The type definition
+  - `$typename` - Actual type of value
+  - `$originalMessage` - Original validation error
+
+**Example:**
+```typescript
+function processUser(data: unknown) {
+  invariantType('object', data, processUser);
+  // data is now typed as object
+
+  invariantType(
+    { properties: { id: 'number' } },
+    data,
+    processUser,
+    'Invalid user: expected $definition, got $typename'
+  );
+}
+```
+
+#### Supported Types
+
+| Type        | Description               | Example      |
+|-------------|---------------------------|--------------|
+| `string`    | String values             | `'hello'`    |
+| `number`    | Number values             | `42`         |
+| `boolean`   | Boolean values            | `true`       |
+| `null`      | Null value                | `null`       |
+| `undefined` | Undefined value           | `undefined`  |
+| `date`      | Valid Date objects        | `new Date()` |
+| `function`  | Function values           | `() => {}`   |
+| `object`    | Generic object            | `{}`         |
+| `unknown`   | Any value                 | -            |
+| `any`       | Any value (no validation) | -            |
+
+**Modifiers:**
+- `?` suffix - Makes type optional (allows undefined)
+- `[]` suffix - Makes type an array
+
+**Examples:**
+```typescript
+'string?'     // string | undefined
+'number[]'    // number[]
+'string[]?'   // string[] | undefined
+'boolean?[]'  // (boolean | undefined)[]
+```
+
+#### `InferType<T>`
+
+Utility type to infer TypeScript type from a type definition.
+
+```typescript
+type User = InferType<typeof UserSchema>;
+
+// From string definition
+type ID = InferType<'number'>;  // number
+
+// From object definition
+type Config = InferType<{
+  properties: { debug: 'boolean' }
+}>;  // { debug: boolean }
+```
+
+---
+
+### State Machine Module
+
+A Redux-like state management system with built-in React hooks, Immer integration, and intelligent caching.
+
+#### `createMachine(config)`
+
+Factory function to create a state machine.
+
+```typescript
+function createMachine<Slices, Selectors, State, Context, ID extends string>(
+  config: MachineConfig<Slices, State, Selectors, Context, ID>
+): StateMachine<Slices, State, Selectors, Context, ID>
+```
+
+**Configuration Options:**
+
+| Option          | Type                           | Required | Default | Description                              |
+|-----------------|--------------------------------|----------|---------|------------------------------------------|
+| `id`            | `string`                       | Yes      | -       | Unique identifier for the machine        |
+| `slices`        | `Record<string, Slice>`        | Yes      | -       | Slice definitions                        |
+| `context`       | `{ userID, ...}`               | No       | -       | Runtime context with required `userID`   |
+| `selectors`     | `Record<string, (state) => T>` | No       | -       | Computed state selectors                 |
+| `initial`       | `Partial<State>`               | No       | -       | Initial state overrides (for hydration)  |
+| `sessionID`     | `string`                       | No       | auto    | App session ID for cache invalidation    |
+| `trackMetadata` | `boolean`                      | No       | `false` | Track state metadata (disable for 60fps) |
+
+**Example:**
+```typescript
+const appMachine = createMachine({
+  id: 'app',
+  slices: {
+    counter: counterSlice,
+    user: userSlice,
+  },
+  context: {
+    userID: getCurrentUserId(),
+  },
+  selectors: {
+    totalItems: (state) => state.cart.items.length,
+    isLoggedIn: (state) => state.user.id !== null,
+  },
+  trackMetadata: false, // For high-frequency updates
+});
+```
+
+**Returned Machine Properties:**
+
+| Property              | Type             | Description                     |
+|-----------------------|------------------|---------------------------------|
+| `ID`                  | `string`         | Machine identifier              |
+| `useMachine(path)`    | Hook             | React hook for slice access     |
+| `useSelector(fn)`     | Hook             | React hook for state selection  |
+| `use{ID}`             | Hook             | Aliased useMachine              |
+| `use{ID}Selector`     | Hook             | Aliased useSelector             |
+| `actions`             | `object`         | Nested action creators by slice |
+| `actionTypes`         | `object`         | Nested action type strings      |
+| `{ID}Actions`         | `object`         | Flattened action creators       |
+| `{ID}ActionTypes`     | `object`         | Flattened action types          |
+| `dispatch(action)`    | `function`       | Dispatch action                 |
+| `getState()`          | `function`       | Get current state               |
+| `subscribe(listener)` | `function`       | Subscribe to changes            |
+| `reset()`             | `function`       | Reset to initial state          |
+| `getContext()`        | `function`       | Get runtime context             |
+| `provideContext(ctx)` | `function`       | Update runtime context          |
+| `invalidations`       | `object \| null` | Cache invalidation report       |
+
+#### `createSlice(config)` / `createSyncSlice(config)`
+
+Factory for creating synchronous slices with Immer-based reducers.
+
+```typescript
+function createSlice<State, Reducers, ID extends string>(
+  config: SliceConfig<State, Reducers, ID>
+): Slice<State, Reducers, ID>
+```
+
+**Configuration Options:**
+
+| Option     | Type                                        | Required | Description             |
+|------------|---------------------------------------------|----------|-------------------------|
+| `id`       | `string`                                    | Yes      | Unique slice identifier |
+| `initial`  | `State`                                     | Yes      | Initial state           |
+| `reducers` | `Record<string, (draft, payload?) => void>` | Yes      | Immer-based reducers    |
+| `cache`    | `CacheStrategy`                             | Yes      | Cache configuration     |
+
+**Example:**
+```typescript
+const todoSlice = createSlice({
+  id: 'todo',
+  initial: {
+    items: [] as string[],
+    filter: 'all' as 'all' | 'active' | 'completed',
+  },
+  cache: { policy: 'private', ttl: '1h' },
+  reducers: {
+    add: (state, text: string) => {
+      state.items.push(text);
+    },
+    remove: (state, index: number) => {
+      state.items.splice(index, 1);
+    },
+    setFilter: (state, filter: 'all' | 'active' | 'completed') => {
+      state.filter = filter;
+    },
+    clear: (state) => {
+      state.items = [];
+    },
+  },
+});
+```
+
+#### `createAsyncSlice(config)`
+
+Factory for creating asynchronous slices for data fetching.
+
+```typescript
+function createAsyncSlice<Payload, Result, Context, ID extends string>(
+  config: AsyncSliceConfig<Payload, Result, Context, ID>
+): AsyncSlice<Result, Payload, Context, ID>
+```
+
+**Configuration Options:**
+
+| Option    | Type                                    | Required | Description                   |
+|-----------|-----------------------------------------|----------|-------------------------------|
+| `id`      | `string`                                | Yes      | Unique slice identifier       |
+| `load`    | `(payload, context) => Promise<Result>` | Yes      | Async loader function         |
+| `context` | `SliceContext`                          | Yes      | Required context dependencies |
+| `cache`   | `CacheStrategy`                         | Yes      | Cache configuration           |
+| `initial` | `AsyncSliceState<Result>`               | No       | Initial state override        |
+
+**Auto-generated State Shape:**
+```typescript
+type AsyncSliceState<Value> = {
+  loading: boolean;    // Currently loading
+  loaded: boolean;     // Has loaded successfully
+  failed: boolean;     // Last load failed
+  error: string | null; // Error message
+  value: Value | null; // Loaded data
+  changes: number;     // State change count
+}
+```
+
+**Auto-generated Actions:**
+- `load(payload)` - Start loading
+- `success(data)` - Handle success
+- `fail(error)` - Handle failure
+- `clear()` - Reset state
+
+**Example:**
+```typescript
+const userSlice = createAsyncSlice({
+  id: 'user',
+  cache: { policy: 'private', ttl: '30m', swr: true },
+  context: {
+    api: {} as ApiClient,
+  },
+  async load(userId: string, { api }) {
+    return api.getUser(userId);
+  },
+});
+
+// Usage in component
+function UserProfile({ userId }: { userId: string }) {
+  const { state, actions } = appMachine.useMachine('user');
+
+  useEffect(() => {
+    actions.load(userId);
+  }, [userId]);
+
+  if (state.loading) return <Spinner />;
+  if (state.failed) return <Error message={state.error} />;
+  if (!state.loaded) return null;
+
+  return <Profile user={state.value} />;
+}
+```
+
+#### Cache Strategy
+
+Configuration for slice caching behavior.
+
+```typescript
+type CacheStrategy = {
+  policy: 'public' | 'private' | 'session';
+  ttl?: MSTimeString;
+  swr?: boolean;
+}
+```
+
+**Policies:**
+
+| Policy    | Invalidation Trigger | Use Case                                  |
+|-----------|----------------------|-------------------------------------------|
+| `public`  | TTL only             | Global data (prices, feature flags)       |
+| `private` | User change OR TTL   | User-specific data (profile, permissions) |
+| `session` | App restart OR TTL   | Screen-specific temporary data            |
+
+**Options:**
+
+| Option   | Type      | Default | Description                                                |
+|----------|-----------|---------|------------------------------------------------------------|
+| `policy` | `string`  | -       | Cache lifecycle policy                                     |
+| `ttl`    | `string`  | -       | Time-to-live (e.g., `'1h'`, `'30m'`, `'5s'`)               |
+| `swr`    | `boolean` | `true`  | Stale-While-Revalidate: return stale data while refetching |
+
+**Examples:**
+```typescript
+// Public data cached for 1 hour
+{ policy: 'public', ttl: '1h' }
+
+// User data, invalidated on logout
+{ policy: 'private' }
+
+// Session data with 5 minute TTL
+{ policy: 'session', ttl: '5m' }
+
+// Always fresh (TTL = 0)
+{ policy: 'public', ttl: '0' }
+```
+
+#### React Hooks
+
+**`useMachine(path)`**
+
+Access slice state and actions in React components.
+
+```typescript
+// For slices - returns { state, actions }
+const { state, actions } = machine.useMachine('counter');
+
+// For selectors - returns value directly
+const totalItems = machine.useMachine('totalItems');
+```
+
+**`useSelector(selector)`**
+
+Select specific state with minimal re-renders.
+
+```typescript
+// Prefer useSelector for frequently updating state
+const count = machine.useSelector(state => state.counter.count);
+
+// Select derived data
+const activeItems = machine.useSelector(
+  state => state.todo.items.filter(i => !i.completed)
+);
+```
+
+#### Action Types
+
+Action type format: `@{machineID}/{sliceID}/{actionName}`
+
+```typescript
+const machine = createMachine({
+  id: 'app',
+  slices: { counter: counterSlice },
+});
+
+// Access action types
+machine.actionTypes.counter.increment
+// => '@app/counter/increment'
+
+// Flattened alias
+machine.appActionTypes.CounterIncrement
+// => '@app/counter/increment'
+```
+
+---
+
+### Helpers Module
+
+Pure utility functions with no side effects.
+
+#### Object Utilities
+
+**`objectKeys(obj)`**
+```typescript
+function objectKeys<T extends object>(obj: T): Extract<keyof T, string>[]
+```
+Type-safe Object.keys.
+
+**`objectEntries(obj)`**
+```typescript
+function objectEntries<T extends object>(obj: T): ObjectEntries<T>
+```
+Type-safe Object.entries with proper tuple types.
+
+**`objectValues(obj)`**
+```typescript
+function objectValues<T extends object>(obj: T): T[keyof T][]
+```
+Type-safe Object.values.
+
+**`isObject(value)`**
+```typescript
+function isObject(value: unknown): value is Record<string, unknown>
+```
+Checks if value is a plain object.
+
+**`assertObject(value, message?)`**
+```typescript
+function assertObject(
+  value: unknown,
+  message?: string
+): asserts value is Record<string, unknown>
+```
+Asserts value is an object, throws otherwise.
+
+**`getProperty(obj, path, allowFalsy?)`**
+```typescript
+function getProperty<T, P extends Paths<T>>(
+  obj: T,
+  path: P,
+  allowFalsy?: boolean
+): PathType<T, P>
+```
+Deep property access with dot notation. Throws on falsy values unless `allowFalsy` is true.
+
+```typescript
+const user = { address: { street: '123 Main' } };
+const street = getProperty(user, 'address.street'); // '123 Main'
+const zip = getProperty(user, 'address.zip', true); // undefined (allowed)
+```
+
+**`setProperty(obj, path, value)`**
+```typescript
+function setProperty<T extends object, P extends Paths<T>>(
+  obj: T,
+  path: P,
+  value: PathType<T, P>
+): T
+```
+Deep property setter.
+
+**`keyBy(arr, key, onDuplicate?)`**
+```typescript
+function keyBy<T>(
+  arr: T[],
+  key: keyof T | ((item: T) => string),
+  onDuplicate?: (key: string, value: T) => void
+): Record<string, T>
+```
+Convert array to keyed object.
+
+```typescript
+const users = [{ id: 1, name: 'John' }, { id: 2, name: 'Jane' }];
+const byId = keyBy(users, 'id');
+// { '1': { id: 1, name: 'John' }, '2': { id: 2, name: 'Jane' } }
+```
+
+**`reduceObject(obj, reducer)`**
+```typescript
+function reduceObject<R extends object, O extends object>(
+  obj: O,
+  reducer: (entry: [keyof O, O[keyof O]]) => Partial<R>
+): R
+```
+O(N) object reduction using mutation (performant).
+
+**`deepFreeze(obj)`**
+```typescript
+function deepFreeze<T extends object>(obj: T): Readonly<T>
+```
+Recursively freeze an object.
+
+**`requireAll(record)`**
+```typescript
+function requireAll<T>(record: Partial<T>): T
+```
+Assert all values in record are non-falsy.
+
+**`objectHasOwnProperty(obj, key)`**
+```typescript
+function objectHasOwnProperty<T>(obj: T, key: unknown): key is keyof T
+```
+Type-safe hasOwnProperty check.
+
+**`flatRecordRecords(prefix, record)`**
+```typescript
+function flatRecordRecords<Prefix extends string, Record>(
+  prefix: Prefix,
+  record: Record
+): FlatRecordRecords<Prefix, Record>
+```
+Flatten nested records with CamelCase keys.
+
+```typescript
+flatRecordRecords('App', { user: { load: fn } });
+// { AppUserLoad: fn }
+```
+
+#### Error Utilities
+
+**`invariant(value, message?, parent?)`**
+```typescript
+function invariant(
+  value: unknown,
+  message?: string | ((typeName: string) => string),
+  parent?: Function
+): asserts value
+```
+Assert value is truthy.
+
+```typescript
+invariant(user.id, 'User ID is required');
+invariant(data, typeName => `Expected data, got ${typeName}`);
+```
+
+**`InvariantError`**
+```typescript
+class InvariantError extends Error {
+  static logSensitiveData: boolean;
+  constructor(
+    message: string | { message: string; stack?: string },
+    parentFn: Function,
+    extraInfo?: any
+  )
+}
+```
+Custom error with stack trace manipulation.
+
+**`tryCatch(handler, parent?)`**
+```typescript
+function tryCatch<T>(
+  handler: () => T,
+  parent?: Function
+): readonly [Error, never] | readonly [never, T]
+```
+Safe error handling returning tuple.
+
+```typescript
+const [error, result] = tryCatch(() => JSON.parse(data));
+if (error) {
+  console.error('Parse failed:', error.message);
+} else {
+  console.log('Parsed:', result);
+}
+```
+
+**`moveStackTrace(errorOrFn, newStack)`**
+```typescript
+function moveStackTrace<T>(error: Error, newStack: Function): Error
+function moveStackTrace<T>(fn: () => T, newStack: Function): T
+```
+Relocate error stack trace or wrap function with stack manipulation.
+
+**`createErrorList(prefix?)`**
+```typescript
+function createErrorList(prefix?: string): {
+  add(message: string): void;
+  check(): void;
+  getError(): never;
+}
+```
+Collect multiple errors and throw single combined error.
+
+```typescript
+const errors = createErrorList('Validation failed: ');
+if (!name) errors.add('name is required');
+if (!email) errors.add('email is required');
+errors.check(); // Throws if any errors were added
+```
+
+**`isErrorLike(value)` / `assertErrorLike(value)`**
+```typescript
+function isErrorLike(value: unknown): value is { message: string; stack: string }
+function assertErrorLike(value: unknown): asserts value is ErrorLike
+```
+Error type guards.
+
+**`captureStackTrace(error, constructor?)`**
+```typescript
+function captureStackTrace(error: Error, constructor?: Function): void
+```
+Cross-platform (Node.js/Bun) stack trace capture.
+
+#### String Utilities
+
+**`isString(value)`**
+```typescript
+function isString(value: unknown): value is string
+```
+String type guard.
+
+**`assertString(value, options?)`**
+```typescript
+function assertString(
+  value: unknown,
+  options?: { notEmpty?: boolean; message?: string }
+): asserts value is string
+```
+Assert value is string, optionally non-empty.
+
+```typescript
+assertString(name);
+assertString(name, { notEmpty: true, message: 'Name is required' });
+```
+
+**`capitalize(value)`**
+```typescript
+function capitalize<T extends string>(value: T): Capitalize<T>
+```
+Capitalize first letter.
+
+```typescript
+capitalize('hello'); // 'Hello'
+```
+
+#### Time Utilities
+
+**`ms(timeString)`**
+```typescript
+function ms(timeString: MSTimeString): number
+```
+Convert time string to milliseconds.
+
+| Unit                    | Description  | Example   |
+|-------------------------|--------------|-----------|
+| `y`                     | Years        | `'1y'`    |
+| `mo` / `mon` / `months` | Months       | `'6mo'`   |
+| `w`                     | Weeks        | `'2w'`    |
+| `d`                     | Days         | `'7d'`    |
+| `h`                     | Hours        | `'24h'`   |
+| `m` / `min`             | Minutes      | `'30m'`   |
+| `s`                     | Seconds      | `'60s'`   |
+| `ms`                    | Milliseconds | `'500ms'` |
+
+```typescript
+ms('1s');   // 1000
+ms('5m');   // 300000
+ms('1h');   // 3600000
+ms('1d');   // 86400000
+ms(500);    // 500 (number passthrough)
+```
+
+**`delay(time?)`**
+```typescript
+function delay(time?: number): Promise<void>
+```
+Promise-based delay (default 500ms).
+
+```typescript
+await delay(1000); // Wait 1 second
+await delay();     // Wait 500ms
+```
+
+#### Date Utilities
+
+**`formatDate(date, pattern, options?)`**
+```typescript
+function formatDate(
+  date: Date | string | number,
+  pattern: string,
+  options?: { locale?: Locale }
+): string
+```
+Format dates using date-fns patterns.
+
+```typescript
+formatDate(new Date(), 'yyyy-MM-dd');     // '2025-12-28'
+formatDate(new Date(), 'MMMM dd, yyyy');  // 'December 28, 2025'
+formatDate('2025-01-15', 'MMM dd');       // 'Jan 15'
+```
+
+**`setDefaultDateLocale(locale)` / `getDefaultDateLocale()`**
+```typescript
+function setDefaultDateLocale(locale: Locale | null): void
+function getDefaultDateLocale(): Locale | null
+```
+Set/get global date locale.
+
+```typescript
+import { ptBR } from 'date-fns/locale';
+setDefaultDateLocale(ptBR);
+formatDate(new Date(), 'MMMM'); // 'dezembro'
+```
+
+#### Development Utilities
+
+**`devLog(message, ...args)`**
+```typescript
+function devLog(message: string | Error, ...args: any[]): void
+```
+Log only in development mode. Does NOT throw - safe to use in catch blocks.
+
+**`devAssert(error)`**
+```typescript
+function devAssert(error: Error): void
+```
+Throw only in development mode. Silent in production.
+
+**`setLogMode(mode)`**
+```typescript
+function setLogMode(mode: 'production' | 'development'): void
+```
+Set logging mode (auto-detected from `NODE_ENV`).
+
+```typescript
+import { devLog, devAssert, setLogMode } from '@zazcart/toolkit';
+
+// Log in development only
+devLog('Debug info:', someData);
+devLog(new Error('Something went wrong')); // Logs error, doesn't throw
+
+// Throw in development only
+devAssert(new Error('Invalid state')); // Throws in dev, silent in prod
+
+// Override auto-detection
+setLogMode('development');
+```
+
+#### Other Utilities
+
+**`createProxy(thunk, target?)`**
+```typescript
+function createProxy<T extends object>(thunk: () => T, target?: object): T
+```
+Lazy initialization proxy. Thunk executed on first property access.
+
+```typescript
+const config = createProxy(() => {
+  console.log('Initializing...');
+  return loadExpensiveConfig();
+});
+// 'Initializing...' only prints when config is first accessed
+```
+
+**`maskData(value)`**
+```typescript
+function maskData(value: any): object
+```
+Replace leaf values with type names for safe logging.
+
+```typescript
+maskData({ id: 123, email: 'john@example.com' });
+// { id: 'Number', email: 'String' }
+```
+
+**`getTypeOf(value)`**
+```typescript
+function getTypeOf(value: any): string
+```
+Human-readable type name.
+
+```typescript
+getTypeOf(null);           // 'Null'
+getTypeOf(NaN);            // 'NaN'
+getTypeOf(new Date());     // 'Date'
+getTypeOf(new Date('x'));  // 'Invalid Date'
+getTypeOf({});             // 'Object'
+getTypeOf([]);             // 'Array'
+```
+
+**`EMPTY`**
+```typescript
+const EMPTY: unique symbol
+```
+Unique sentinel value to distinguish from `undefined`/`null`.
+
+---
+
+## Advanced Usage
+
+### High-Frequency Machines (60fps)
+
+For game loops or high-frequency updates, disable metadata tracking:
+
+```typescript
+const gameMachine = createMachine({
+  id: 'game',
+  trackMetadata: false, // Critical: avoids GC thrashing
+  slices: {
+    player: createSlice({
+      id: 'player',
+      initial: { x: 0, y: 0 },
+      cache: { policy: 'session' },
+      reducers: {
+        move: (state, { x, y }: { x: number; y: number }) => {
+          state.x = x;
+          state.y = y;
+        },
+      },
+    }),
+  },
+  context: { userID: null },
+});
+```
+
+### Custom Selectors
+
+Compute derived state efficiently:
+
+```typescript
+const shopMachine = createMachine({
+  id: 'shop',
+  slices: { cart: cartSlice, products: productsSlice },
+  selectors: {
+    cartTotal: (state) =>
+      state.cart.items.reduce((sum, item) => {
+        const product = state.products.byId[item.productId];
+        return sum + (product?.price ?? 0) * item.quantity;
+      }, 0),
+    itemCount: (state) =>
+      state.cart.items.reduce((sum, item) => sum + item.quantity, 0),
+  },
+  context: { userID: null },
+});
+
+// Access directly
+function CartSummary() {
+  const total = shopMachine.useMachine('cartTotal');
+  const count = shopMachine.useMachine('itemCount');
+  return <div>{count} items: ${total}</div>;
+}
+```
+
+### Cache Invalidation Handling
+
+Handle stale data after cache invalidation:
+
+```typescript
+const machine = createMachine({
+  id: 'app',
+  slices: { user: userSlice },
+  initial: cachedState, // Hydrated from storage
+  context: { userID: currentUserId },
+});
+
+// Check for invalidations
+if (machine.invalidations) {
+  const { stale, reset } = machine.invalidations;
+
+  // Slices that need refetching (SWR mode)
+  if (stale.length) {
+    stale.forEach(sliceKey => {
+      machine.actions[sliceKey]?.load?.();
+    });
+  }
+
+  // Slices that were fully reset
+  console.log('Reset slices:', reset);
+}
+```
+
+### Context Management
+
+Provide runtime dependencies to slices:
+
+```typescript
+const appMachine = createMachine({
+  id: 'app',
+  slices: { data: dataSlice },
+  context: {
+    userID: null,
+    api: apiClient,
+    analytics: analyticsService,
+  },
+});
+
+// Update context after login
+function onLogin(user: User) {
+  appMachine.provideContext({
+    userID: user.id,
+  });
+}
+```
+
+---
+
+## TypeScript Support
+
+### Type Inference
+
+All APIs are fully typed with automatic inference:
+
+```typescript
+// Schema type inference
+const UserSchema = createModel({
+  id: 'number',
+  name: 'string',
+  email: 'string?',
+  roles: 'string[]',
+});
+
+type User = InferType<typeof UserSchema>;
+// { id: number; name: string; email?: string; roles: string[] }
+
+// Machine state inference
+type AppState = InferMachineState<typeof appMachine>;
+```
+
+### Utility Types
+
+Available type utilities from `@zazcart/toolkit`:
+
+| Type                     | Description                        |
+|--------------------------|------------------------------------|
+| `Writable<T>`            | Remove readonly modifiers          |
+| `Compute<T>`             | Flatten intersection types         |
+| `Paths<T>`               | All dot-notation paths of object   |
+| `PathType<T, P>`         | Type at specific path              |
+| `Falsy`                  | Union of falsy values              |
+| `UnionToIntersection<T>` | Convert union to intersection      |
+| `NullableToPartial<T>`   | Convert nullable props to optional |
+| `Serializable`           | JSON-serializable types            |
+| `AnyFunction`            | Generic function type              |
+| `PromiseValue<T>`        | Extract resolved type from Promise |
+
+---
+
+## License
+
+MIT

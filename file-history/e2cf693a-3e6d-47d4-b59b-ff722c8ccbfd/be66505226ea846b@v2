@@ -1,0 +1,162 @@
+/**
+ * MMS - Viewport Store for Semantic Zoom Canvas
+ *
+ * State management for the schedule canvas
+ * Manages zoom level, pan position, LOD (Level of Detail), and selection
+ */
+
+// LOD Level definitions
+export type LODLevel = 0 | 1 | 2 | 3;
+
+export const LOD_THRESHOLDS = {
+  STRATEGIC: { min: 0.05, max: 0.2 },   // LOD 0: 10-12 years
+  TACTICAL: { min: 0.2, max: 0.5 },      // LOD 1: 1-3 years
+  OPERATIONAL: { min: 0.5, max: 1.0 },   // LOD 2: 1-6 months
+  EXECUTION: { min: 1.0, max: 4.0 },     // LOD 3: 1-4 weeks
+} as const;
+
+// Determine LOD level from scale
+export function getLODFromScale(scale: number): LODLevel {
+  if (scale < LOD_THRESHOLDS.TACTICAL.min) return 0;
+  if (scale < LOD_THRESHOLDS.OPERATIONAL.min) return 1;
+  if (scale < LOD_THRESHOLDS.EXECUTION.min) return 2;
+  return 3;
+}
+
+// State interface
+export interface ViewportState {
+  scale: number;
+  translateX: number;
+  translateY: number;
+  currentLOD: LODLevel;
+  visibleStartDate: Date;
+  visibleEndDate: Date;
+  isZooming: boolean;
+  isPanning: boolean;
+  selectedItems: Set<string>;
+  hoveredItem: string | null;
+}
+
+// Simple singleton store for viewport state
+class ViewportStore {
+  private state: ViewportState = {
+    scale: 0.5,
+    translateX: 0,
+    translateY: 0,
+    currentLOD: 2,
+    visibleStartDate: new Date(),
+    visibleEndDate: new Date(Date.now() + 180 * 24 * 60 * 60 * 1000),
+    isZooming: false,
+    isPanning: false,
+    selectedItems: new Set(),
+    hoveredItem: null,
+  };
+
+  private listeners: Set<() => void> = new Set();
+
+  getState(): ViewportState {
+    return this.state;
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notify() {
+    this.listeners.forEach((listener) => listener());
+  }
+
+  zoom(scale: number, centerX = 0, centerY = 0) {
+    const newScale = Math.max(0.05, Math.min(4.0, scale));
+    this.state = {
+      ...this.state,
+      scale: newScale,
+      currentLOD: getLODFromScale(newScale),
+      isZooming: true,
+    };
+    this.notify();
+  }
+
+  pan(deltaX: number, deltaY: number) {
+    this.state = {
+      ...this.state,
+      translateX: this.state.translateX + deltaX,
+      translateY: this.state.translateY + deltaY,
+      isPanning: true,
+    };
+    this.notify();
+  }
+
+  selectItem(itemId: string, additive = false) {
+    const newSelection = new Set(additive ? this.state.selectedItems : []);
+    newSelection.add(itemId);
+    this.state = { ...this.state, selectedItems: newSelection };
+    this.notify();
+  }
+
+  deselectItem(itemId: string) {
+    const newSelection = new Set(this.state.selectedItems);
+    newSelection.delete(itemId);
+    this.state = { ...this.state, selectedItems: newSelection };
+    this.notify();
+  }
+
+  clearSelection() {
+    this.state = { ...this.state, selectedItems: new Set() };
+    this.notify();
+  }
+
+  hoverItem(itemId: string | null) {
+    this.state = { ...this.state, hoveredItem: itemId };
+    this.notify();
+  }
+
+  setVisibleRange(startDate: Date, endDate: Date) {
+    this.state = { ...this.state, visibleStartDate: startDate, visibleEndDate: endDate };
+    this.notify();
+  }
+
+  reset() {
+    this.state = {
+      scale: 0.5,
+      translateX: 0,
+      translateY: 0,
+      currentLOD: 2,
+      visibleStartDate: new Date(),
+      visibleEndDate: new Date(Date.now() + 180 * 24 * 60 * 60 * 1000),
+      isZooming: false,
+      isPanning: false,
+      selectedItems: new Set(),
+      hoveredItem: null,
+    };
+    this.notify();
+  }
+}
+
+// Singleton instance
+const viewportStore = new ViewportStore();
+
+// Export actions as functions
+export const viewportActions = {
+  zoom: (scale: number, centerX = 0, centerY = 0) => viewportStore.zoom(scale, centerX, centerY),
+  pan: (deltaX: number, deltaY: number) => viewportStore.pan(deltaX, deltaY),
+  zoomIn: () => viewportStore.zoom(viewportStore.getState().scale * 1.2),
+  zoomOut: () => viewportStore.zoom(viewportStore.getState().scale / 1.2),
+  selectItem: (itemId: string, additive = false) => viewportStore.selectItem(itemId, additive),
+  deselectItem: (itemId: string) => viewportStore.deselectItem(itemId),
+  clearSelection: () => viewportStore.clearSelection(),
+  hoverItem: (itemId: string | null) => viewportStore.hoverItem(itemId),
+  reset: () => viewportStore.reset(),
+};
+
+// Export for direct access
+export function getViewportStore() {
+  return viewportStore;
+}
+
+// React hook for subscribing to viewport state
+export function useViewportState(): ViewportState {
+  // Note: In a real implementation, use useSyncExternalStore
+  return viewportStore.getState();
+}

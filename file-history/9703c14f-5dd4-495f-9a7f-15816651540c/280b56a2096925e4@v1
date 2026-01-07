@@ -1,0 +1,126 @@
+/**
+ * MMS - Balancing Routes
+ *
+ * Endpoints for km balancing analysis
+ */
+
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { db, schema } from '../db/client';
+import { eq, sql, asc, desc } from 'drizzle-orm';
+
+interface BalancingQueryParams {
+  fleet?: string;
+}
+
+export async function balancingRoutes(fastify: FastifyInstance) {
+  // GET /api/balancing/distribution
+  fastify.get('/distribution', async (request: FastifyRequest<{ Querystring: BalancingQueryParams }>, reply: FastifyReply) => {
+    try {
+      const { fleet } = request.query;
+
+      // Get all trains (optionally filtered by fleet)
+      const trains = fleet
+        ? await db.select().from(schema.trains).where(eq(schema.trains.fleetId, fleet))
+        : await db.select().from(schema.trains);
+
+      if (trains.length === 0) {
+        return { average: 0, variance: 0, distribution: [], outliers: [] };
+      }
+
+      // Calculate statistics
+      const kmValues = trains.map(t => t.currentKm);
+      const average = kmValues.reduce((a, b) => a + b, 0) / kmValues.length;
+      const variance = Math.sqrt(
+        kmValues.reduce((sum, km) => sum + Math.pow(km - average, 2), 0) / kmValues.length
+      );
+      const variancePercent = (variance / average) * 100;
+
+      // Create distribution buckets (10 buckets)
+      const minKm = Math.min(...kmValues);
+      const maxKm = Math.max(...kmValues);
+      const bucketSize = (maxKm - minKm) / 10;
+      const distribution: { kmRange: string; count: number }[] = [];
+
+      for (let i = 0; i < 10; i++) {
+        const rangeStart = Math.round(minKm + i * bucketSize);
+        const rangeEnd = Math.round(minKm + (i + 1) * bucketSize);
+        const count = kmValues.filter(km => km >= rangeStart && km < rangeEnd).length;
+        distribution.push({
+          kmRange: `${rangeStart.toLocaleString()}-${rangeEnd.toLocaleString()}`,
+          count,
+        });
+      }
+
+      // Identify outliers (>15% deviation from average)
+      const outliers = trains
+        .map(train => {
+          const delta = train.currentKm - average;
+          const deltaPercent = (delta / average) * 100;
+          return {
+            trainId: train.trainId,
+            currentKm: train.currentKm,
+            delta: Math.round(delta),
+            deltaPercent: Math.round(deltaPercent),
+            status: (deltaPercent > 0 ? 'over' : 'under') as 'over' | 'under',
+          };
+        })
+        .filter(o => Math.abs(o.deltaPercent) > 15)
+        .sort((a, b) => Math.abs(b.deltaPercent) - Math.abs(a.deltaPercent));
+
+      return {
+        average: Math.round(average),
+        variance: Math.round(variancePercent * 10) / 10,
+        distribution,
+        outliers,
+      };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to fetch distribution data' });
+    }
+  });
+
+  // GET /api/balancing/ranking
+  fastify.get('/ranking', async (request: FastifyRequest<{ Querystring: BalancingQueryParams }>, reply: FastifyReply) => {
+    try {
+      const { fleet } = request.query;
+
+      // Get average km
+      const avgResult = await db.execute(sql`
+        SELECT AVG(current_km) as avg_km FROM trains
+        ${fleet ? sql`WHERE fleet_id = ${fleet}` : sql``}
+      `);
+      const average = Number((avgResult as any)[0]?.avg_km) || 0;
+
+      // Get trains ordered by delta
+      const trains = await db.query.trains.findMany({
+        where: fleet ? eq(schema.trains.fleetId, fleet) : undefined,
+        with: {
+          fleet: true,
+          baseDepot: true,
+        },
+      });
+
+      const ranked = trains
+        .map(train => ({
+          id: train.id,
+          trainId: train.trainId,
+          fleetName: train.fleet?.name,
+          depotCode: train.baseDepot?.code,
+          currentKm: train.currentKm,
+          targetKm: train.targetKm,
+          delta: train.currentKm - average,
+          deltaPercent: Math.round(((train.currentKm - average) / average) * 100),
+          status: train.currentKm > average ? 'over' : train.currentKm < average ? 'under' : 'balanced',
+        }))
+        .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+      return {
+        average: Math.round(average),
+        trains: ranked,
+      };
+    } catch (error) {
+      request.log.error(error);
+      reply.status(500).send({ error: 'Failed to fetch ranking data' });
+    }
+  });
+}

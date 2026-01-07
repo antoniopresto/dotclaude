@@ -1,0 +1,113 @@
+/**
+ * useHarnessWatcher - Hook for watching .harness directory changes (F008)
+ *
+ * Watches the .harness directory for file changes and triggers
+ * a callback when changes are detected. Uses debouncing on the
+ * server side (500ms) to avoid excessive updates.
+ */
+
+import { useEffect, useCallback, useRef } from 'react';
+import {
+  watcherStart,
+  watcherStop,
+  onHarnessChange,
+  isBackendAvailable,
+} from '../lib/rpc';
+
+export interface HarnessChangeEvent {
+  /** The project path being watched */
+  project_path: string;
+  /** Type of change: "db", "config", or "unknown" */
+  change_type: 'db' | 'config' | 'unknown';
+  /** The file that changed (relative to .harness/) */
+  file: string;
+}
+
+export interface UseHarnessWatcherOptions {
+  /** Project path to watch */
+  projectPath: string;
+  /** Callback when changes are detected */
+  onChange?: (event: HarnessChangeEvent) => void;
+  /** Whether to enable watching (default: true) */
+  enabled?: boolean;
+}
+
+/**
+ * Hook to watch a project's .harness directory for changes
+ *
+ * @example
+ * ```tsx
+ * useHarnessWatcher({
+ *   projectPath: '/path/to/project',
+ *   onChange: (event) => {
+ *     console.log('Change detected:', event.file);
+ *     refetchData();
+ *   },
+ * });
+ * ```
+ */
+export function useHarnessWatcher({
+  projectPath,
+  onChange,
+  enabled = true,
+}: UseHarnessWatcherOptions): void {
+  const isWatchingRef = useRef(false);
+  const onChangeRef = useRef(onChange);
+
+  // Keep onChange ref up to date
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    if (!enabled || !projectPath) {
+      return;
+    }
+
+    let unlistenFn: (() => void) | null = null;
+    let mounted = true;
+
+    const startWatching = async () => {
+      try {
+        // Check if backend is available
+        const available = await isBackendAvailable();
+        if (!available || !mounted) {
+          return;
+        }
+
+        // Start watching
+        await watcherStart(projectPath);
+        isWatchingRef.current = true;
+
+        // Listen for change events
+        unlistenFn = await onHarnessChange((event) => {
+          // Only handle events for this project
+          if (event.project_path === projectPath) {
+            onChangeRef.current?.(event);
+          }
+        });
+      } catch (error) {
+        console.error('Failed to start harness watcher:', error);
+      }
+    };
+
+    startWatching();
+
+    return () => {
+      mounted = false;
+
+      // Cleanup: stop watching and remove listener
+      if (isWatchingRef.current) {
+        watcherStop(projectPath).catch((e) =>
+          console.error('Failed to stop harness watcher:', e)
+        );
+        isWatchingRef.current = false;
+      }
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, [projectPath, enabled]);
+}
+
+export default useHarnessWatcher;

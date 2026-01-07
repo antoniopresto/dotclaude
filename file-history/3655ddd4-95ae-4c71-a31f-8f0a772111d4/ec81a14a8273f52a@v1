@@ -1,0 +1,144 @@
+import { exec } from "child_process";
+import { promisify } from "util";
+import { z } from "zod";
+
+const execAsync = promisify(exec);
+
+export const finderInputSchema = z.object({
+  path: z.string().describe("The path to open in Finder"),
+});
+
+export type FinderInput = z.infer<typeof finderInputSchema>;
+
+export interface FinderResult {
+  success: boolean;
+  message: string;
+  path: string;
+}
+
+/**
+ * Opens a specific path in the frontmost Finder window
+ */
+export async function openInFinder(input: FinderInput): Promise<FinderResult> {
+  const { path } = input;
+
+  const appleScript = `
+    tell application "Finder"
+      try
+        set targetFolder to POSIX file "${path}" as alias
+
+        if (count of windows) > 0 then
+          set target of front window to targetFolder
+        else
+          make new Finder window
+          set target of front window to targetFolder
+        end if
+
+        activate
+        return "success"
+      on error errMsg
+        return "error: " & errMsg
+      end try
+    end tell
+  `;
+
+  try {
+    const { stdout, stderr } = await execAsync(`osascript -e '${appleScript}'`);
+
+    if (stdout.trim().startsWith("error:")) {
+      return {
+        success: false,
+        message: stdout.trim(),
+        path,
+      };
+    }
+
+    return {
+      success: true,
+      message: `Finder navigated to: ${path}`,
+      path,
+    };
+  } catch (error: any) {
+    return {
+      success: false,
+      message: error.message,
+      path,
+    };
+  }
+}
+
+/**
+ * Gets the current path of the frontmost Finder window
+ */
+export async function getCurrentFinderPath(): Promise<string | null> {
+  const appleScript = `
+    tell application "Finder"
+      try
+        if (count of windows) > 0 then
+          return POSIX path of (target of front window as alias)
+        else
+          return ""
+        end if
+      on error
+        return ""
+      end try
+    end tell
+  `;
+
+  try {
+    const { stdout } = await execAsync(`osascript -e '${appleScript}'`);
+    const path = stdout.trim();
+    return path || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Syncs the Finder window to a specific path
+ * This is called automatically when 'cd' is used
+ */
+export async function syncFinderToPath(path: string): Promise<void> {
+  await openInFinder({ path });
+}
+
+/**
+ * Reveals a file in Finder (selects it)
+ */
+export async function revealInFinder(filePath: string): Promise<FinderResult> {
+  try {
+    await execAsync(`open -R "${filePath}"`);
+    return {
+      success: true,
+      message: `Revealed in Finder: ${filePath}`,
+      path: filePath,
+    };
+  } catch (error: any) {
+    return {
+      success: false,
+      message: error.message,
+      path: filePath,
+    };
+  }
+}
+
+export const finderToolDefinition = {
+  name: "finder",
+  description:
+    "Control macOS Finder. Use this to navigate Finder to a specific directory or reveal files.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["navigate", "reveal", "get_current"],
+        description: "The action to perform: navigate to path, reveal file, or get current path",
+      },
+      path: {
+        type: "string",
+        description: "The path to navigate to or reveal (not needed for get_current)",
+      },
+    },
+    required: ["action"],
+  },
+};

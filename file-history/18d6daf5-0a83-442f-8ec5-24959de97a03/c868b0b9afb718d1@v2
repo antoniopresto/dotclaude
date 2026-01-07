@@ -1,0 +1,334 @@
+/**
+ * InfiniteCanvas - Professional-grade pan/zoom canvas
+ *
+ * Features:
+ * - Pan with mouse drag (bounded to world limits)
+ * - Zoom with scroll wheel (centers on cursor position)
+ * - Camera positioned to show top-left corner initially
+ * - Sidebar sync via onPanChange callback
+ *
+ * Coordinate System:
+ * - X: 0 = first day, positive = future (right)
+ * - Y: 0 = first train (TRAIN-001), negative = more trains (down)
+ */
+
+import { Canvas, useThree } from '@react-three/fiber';
+import { OrthographicCamera } from '@react-three/drei';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { MesoLayer } from './layers/MesoLayer';
+import { getRenderData } from '../data/generator';
+import type { LODLevel, WorldBounds } from '../data/types';
+import { DEFAULT_VIEW_CONFIG, calculateWorldBounds } from '../data/types';
+
+interface InfiniteCanvasProps {
+  zoom: number;
+  lod: LODLevel;
+  onZoomChange: (zoom: number) => void;
+  /**
+   * Called when viewport position changes.
+   * @param topY - Y coordinate of the TOP of the viewport in world space (0 = first train, negative = more trains)
+   */
+  onViewportChange?: (topY: number) => void;
+}
+
+// Navigation limits
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 5.0;
+
+const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+
+/**
+ * Camera controller component (inside R3F context)
+ * Syncs camera position with external state
+ */
+function CameraSync({
+  cameraX,
+  cameraY,
+  zoom,
+}: {
+  cameraX: number;
+  cameraY: number;
+  zoom: number;
+}) {
+  const { camera, size } = useThree();
+
+  useEffect(() => {
+    camera.position.x = cameraX;
+    camera.position.y = cameraY;
+    // OrthographicCamera zoom is independent of position
+    (camera as any).zoom = zoom;
+    camera.updateProjectionMatrix();
+  }, [camera, cameraX, cameraY, zoom]);
+
+  return null;
+}
+
+export function InfiniteCanvas({
+  zoom,
+  lod,
+  onZoomChange,
+  onViewportChange,
+}: InfiniteCanvasProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [containerSize, setContainerSize] = useState({ width: 800, height: 600 });
+
+  // Get render data (memoized)
+  const { trains, tasks } = useMemo(() => getRenderData(), []);
+
+  // Calculate world bounds
+  const worldBounds = useMemo<WorldBounds>(() => {
+    const totalDays = 365 * 10; // 10 years
+    return calculateWorldBounds(trains.length, totalDays);
+  }, [trains.length]);
+
+  // Calculate initial camera position (show top-left corner)
+  const getInitialCameraPos = useCallback(() => {
+    // Camera should be positioned so that the TOP-LEFT of the viewport
+    // aligns with the TOP-LEFT of the world (0, 0)
+    // OrthographicCamera shows ±(size/2/zoom) around its position
+    const halfViewX = containerSize.width / 2 / zoom;
+    const halfViewY = containerSize.height / 2 / zoom;
+    return {
+      x: halfViewX,
+      y: -halfViewY, // Negative because Y=0 is top, negative is down
+    };
+  }, [containerSize, zoom]);
+
+  // Camera position state (initialized to show top-left)
+  const [cameraPos, setCameraPos] = useState(() => getInitialCameraPos());
+
+  // Pan state
+  const [isPanning, setIsPanning] = useState(false);
+  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  const [cameraPosAtPanStart, setCameraPosAtPanStart] = useState({ x: 0, y: 0 });
+
+  /**
+   * Calculate and notify the top Y position of the viewport
+   */
+  const notifyViewportChange = useCallback(
+    (camY: number, currentZoom: number) => {
+      // Top of viewport = cameraY + halfViewportHeight (in world coords)
+      const halfViewY = containerSize.height / 2 / currentZoom;
+      const topY = camY + halfViewY;
+      onViewportChange?.(topY);
+    },
+    [containerSize.height, onViewportChange]
+  );
+
+  // Track container size
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const updateSize = () => {
+      if (containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        setContainerSize({ width: rect.width, height: rect.height });
+      }
+    };
+
+    updateSize();
+
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(containerRef.current);
+
+    return () => observer.disconnect();
+  }, []);
+
+  // Reset camera position when container size changes
+  useEffect(() => {
+    const initial = getInitialCameraPos();
+    console.log('[DEBUG] Camera reset:', {
+      containerSize,
+      zoom,
+      initialCameraPos: initial,
+      viewportX: [initial.x - containerSize.width / 2 / zoom, initial.x + containerSize.width / 2 / zoom],
+    });
+    setCameraPos(initial);
+    notifyViewportChange(initial.y, zoom);
+  }, [containerSize.width, containerSize.height]);
+
+  // Debug: expose camera position on window
+  useEffect(() => {
+    (window as any).__DEBUG_CAMERA__ = {
+      cameraPos,
+      containerSize,
+      zoom,
+      viewportX: [cameraPos.x - containerSize.width / 2 / zoom, cameraPos.x + containerSize.width / 2 / zoom],
+      viewportY: [cameraPos.y - containerSize.height / 2 / zoom, cameraPos.y + containerSize.height / 2 / zoom],
+    };
+  }, [cameraPos, containerSize, zoom]);
+
+  /**
+   * Clamp camera position to world bounds
+   */
+  const clampCameraToWorld = useCallback(
+    (x: number, y: number, currentZoom: number): { x: number; y: number } => {
+      // Calculate half viewport size in world coordinates
+      const halfViewX = containerSize.width / 2 / currentZoom;
+      const halfViewY = containerSize.height / 2 / currentZoom;
+
+      // Camera position is the CENTER of the viewport
+      // So we need to ensure the edges stay within bounds
+
+      // Left edge of viewport: cameraX - halfViewX >= minX
+      // Right edge of viewport: cameraX + halfViewX <= maxX
+      const minCameraX = worldBounds.minX + halfViewX;
+      const maxCameraX = worldBounds.maxX - halfViewX;
+
+      // Top edge of viewport: cameraY + halfViewY <= maxY (0)
+      // Bottom edge of viewport: cameraY - halfViewY >= minY
+      const minCameraY = worldBounds.minY + halfViewY;
+      const maxCameraY = worldBounds.maxY - halfViewY;
+
+      // Handle case where world is smaller than viewport
+      const clampedX =
+        maxCameraX < minCameraX
+          ? (worldBounds.minX + worldBounds.maxX) / 2
+          : Math.max(minCameraX, Math.min(maxCameraX, x));
+
+      const clampedY =
+        maxCameraY < minCameraY
+          ? (worldBounds.minY + worldBounds.maxY) / 2
+          : Math.max(minCameraY, Math.min(maxCameraY, y));
+
+      return { x: clampedX, y: clampedY };
+    },
+    [containerSize, worldBounds]
+  );
+
+  /**
+   * Handle wheel zoom - zoom toward cursor position
+   */
+  const handleWheel = useCallback(
+    (e: WheelEvent) => {
+      e.preventDefault();
+
+      // Calculate new zoom level
+      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+      const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * zoomFactor));
+
+      if (newZoom === zoom) return;
+
+      // Get cursor position relative to canvas center
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      const cursorX = e.clientX - rect.left - rect.width / 2;
+      const cursorY = e.clientY - rect.top - rect.height / 2;
+
+      // Convert cursor position to world coordinates (before zoom)
+      const worldX = cursorX / zoom + cameraPos.x;
+      const worldY = -cursorY / zoom + cameraPos.y; // Invert Y for world coords
+
+      // Calculate new camera position to keep cursor point fixed
+      const newCameraX = worldX - cursorX / newZoom;
+      const newCameraY = worldY + cursorY / newZoom;
+
+      // Clamp to world bounds
+      const clamped = clampCameraToWorld(newCameraX, newCameraY, newZoom);
+
+      setCameraPos(clamped);
+      onZoomChange(newZoom);
+      notifyViewportChange(clamped.y, newZoom);
+    },
+    [zoom, cameraPos, clampCameraToWorld, onZoomChange, notifyViewportChange]
+  );
+
+  // Register wheel event with { passive: false } to allow preventDefault
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => container.removeEventListener('wheel', handleWheel);
+  }, [handleWheel]);
+
+  /**
+   * Handle pan start
+   */
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      setIsPanning(true);
+      setPanStart({ x: e.clientX, y: e.clientY });
+      setCameraPosAtPanStart(cameraPos);
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    },
+    [cameraPos]
+  );
+
+  /**
+   * Handle pan move
+   */
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!isPanning) return;
+
+      // Calculate delta in world coordinates
+      const dx = (e.clientX - panStart.x) / zoom;
+      const dy = (e.clientY - panStart.y) / zoom;
+
+      // Move camera opposite to drag direction
+      const newX = cameraPosAtPanStart.x - dx;
+      const newY = cameraPosAtPanStart.y + dy; // Invert Y for natural feel
+
+      // Clamp to world bounds
+      const clamped = clampCameraToWorld(newX, newY, zoom);
+
+      setCameraPos(clamped);
+      notifyViewportChange(clamped.y, zoom);
+    },
+    [isPanning, panStart, cameraPosAtPanStart, zoom, clampCameraToWorld, notifyViewportChange]
+  );
+
+  /**
+   * Handle pan end
+   */
+  const handlePointerUp = useCallback((e: React.PointerEvent) => {
+    setIsPanning(false);
+    (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+  }, []);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{
+        width: '100%',
+        height: '100%',
+        cursor: isPanning ? 'grabbing' : 'grab',
+        touchAction: 'none',
+      }}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerLeave={handlePointerUp}
+    >
+      <Canvas
+        gl={{ antialias: true, alpha: false }}
+        style={{ background: '#f4f4f5' }}
+        orthographic
+        camera={{
+          position: [cameraPos.x, cameraPos.y, 100],
+          zoom: zoom,
+          near: 0.1,
+          far: 1000,
+        }}
+      >
+        {/* Sync camera with state */}
+        <CameraSync cameraX={cameraPos.x} cameraY={cameraPos.y} zoom={zoom} />
+
+        <color attach="background" args={['#f4f4f5']} />
+
+        {/* LOD-based layer rendering */}
+        {lod === 'MACRO' && (
+          <MesoLayer tasks={tasks} trainCount={trains.length} />
+        )}
+        {lod === 'MESO' && (
+          <MesoLayer tasks={tasks} trainCount={trains.length} />
+        )}
+        {lod === 'MICRO' && (
+          <MesoLayer tasks={tasks} trainCount={trains.length} />
+        )}
+      </Canvas>
+    </div>
+  );
+}

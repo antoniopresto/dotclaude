@@ -1,0 +1,785 @@
+import { useState, useCallback, useEffect } from 'react';
+import {
+  Alert,
+  Button,
+  Card,
+  CardBody,
+  CardTitle,
+  Content,
+  Drawer,
+  DrawerContent,
+  DrawerContentBody,
+  DrawerPanelContent,
+  DrawerPanelBody,
+  DrawerHead,
+  DrawerActions,
+  DrawerCloseButton,
+  EmptyState,
+  EmptyStateBody,
+  EmptyStateFooter,
+  EmptyStateActions,
+  Flex,
+  FlexItem,
+  Label,
+  Masthead,
+  MastheadBrand,
+  MastheadMain,
+  MastheadContent,
+  Nav,
+  NavItem,
+  NavList,
+  Page,
+  PageSection,
+  PageSidebar,
+  PageSidebarBody,
+  Spinner,
+  Split,
+  SplitItem,
+  Stack,
+  StackItem,
+  Title,
+  Tooltip,
+} from '@patternfly/react-core';
+import {
+  FolderOpenIcon,
+  CogIcon,
+  FolderIcon,
+  PlusIcon,
+  TimesIcon,
+  BarsIcon,
+  TerminalIcon,
+} from '@patternfly/react-icons';
+import {
+  KanbanBoard,
+  LogPanel,
+  TerminalPanel,
+  ProjectSelector,
+  ProgressCard,
+  Settings,
+  TaskModal,
+  TaskExecutionModal,
+} from './components';
+import type { HQSettings, TaskData } from './components';
+import type { LogEntry } from './components';
+import type { Project, Feature } from './state/store';
+import {
+  isBackendAvailable,
+  runHarnessCommand,
+  onPtyOutput,
+  getSettings as rpcGetSettings,
+  type HQSettings as RpcHQSettings,
+} from './lib/rpc';
+
+// Default settings
+const DEFAULT_SETTINGS: RpcHQSettings = {
+  theme: 'dark',
+  logBufferSize: 10000,
+  defaultShell: '/bin/zsh',
+  ptyRows: 24,
+  ptyCols: 80,
+  autoScrollLogs: true,
+  showTimestamps: true,
+};
+
+// Process info for log panel
+interface ProcessInfo {
+  id: string;
+  name: string;
+}
+
+// Initialize harness database if it doesn't exist
+async function initializeHarnessIfNeeded(projectPath: string): Promise<boolean> {
+  try {
+    await runHarnessCommand(projectPath, ['db', 'status']);
+    return true;
+  } catch {
+    try {
+      await runHarnessCommand(projectPath, ['init']);
+      console.log('Harness database initialized for:', projectPath);
+      return true;
+    } catch (initError) {
+      console.error('Failed to initialize harness:', initError);
+      return false;
+    }
+  }
+}
+
+// Fetch tasks from harness CLI and convert to Feature format
+async function fetchProjectFeatures(projectPath: string): Promise<Feature[]> {
+  try {
+    const result = await runHarnessCommand(projectPath, ['task', 'list', '--format', 'json']);
+    const response = JSON.parse(result);
+    const tasks = response.items || response;
+    if (!Array.isArray(tasks)) return [];
+
+    return tasks.map((task: {
+      id: string;
+      title: string;
+      description?: string;
+      status: string;
+      category?: string;
+      is_passed?: boolean;
+    }) => ({
+      id: task.id,
+      description: task.title,
+      category: task.category || 'general',
+      priority: 'medium',
+      status: task.status.toLowerCase(),
+      passes: task.is_passed || task.status.toLowerCase() === 'done',
+      steps: task.description ? [task.description] : [],
+    }));
+  } catch (error) {
+    console.error('Failed to fetch project features:', error);
+    return [];
+  }
+}
+
+function App() {
+  // Backend connection state
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
+  // Project state
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+
+  // Features state
+  const [features, setFeatures] = useState<Feature[]>([]);
+  const [isLoadingFeatures, setIsLoadingFeatures] = useState(false);
+
+  // UI state
+  const [isProjectSelectorOpen, setIsProjectSelectorOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<HQSettings>(DEFAULT_SETTINGS);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isBottomPanelOpen, setIsBottomPanelOpen] = useState(true);
+
+  // Log state
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [processes, setProcesses] = useState<ProcessInfo[]>([]);
+
+  // Task modal state
+  const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Feature | undefined>(undefined);
+
+  // Task execution modal state
+  const [isExecutionModalOpen, setIsExecutionModalOpen] = useState(false);
+  const [executingTask, setExecutingTask] = useState<Feature | null>(null);
+
+  // Load settings from backend on mount
+  useEffect(() => {
+    if (isConnected) {
+      rpcGetSettings()
+        .then(setSettings)
+        .catch((e) => console.error('Failed to load settings:', e));
+    }
+  }, [isConnected]);
+
+  // Apply theme class to document
+  useEffect(() => {
+    const applyTheme = (theme: 'light' | 'dark' | 'system') => {
+      const isDark =
+        theme === 'dark' ||
+        (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.classList.toggle('pf-v6-theme-dark', isDark);
+    };
+
+    applyTheme(settings.theme);
+
+    if (settings.theme === 'system') {
+      const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      const handler = () => applyTheme('system');
+      mediaQuery.addEventListener('change', handler);
+      return () => mediaQuery.removeEventListener('change', handler);
+    }
+  }, [settings.theme]);
+
+  // Check backend connection on mount
+  useEffect(() => {
+    const checkConnection = async () => {
+      const available = await isBackendAvailable();
+      setIsConnected(available);
+      if (!available) {
+        setConnectionError('Backend server not available. Please start the server with: bun run server');
+      } else {
+        setConnectionError(null);
+      }
+    };
+
+    checkConnection();
+    const interval = setInterval(checkConnection, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Open project selector on first launch if no projects
+  useEffect(() => {
+    if (projects.length === 0 && isConnected) {
+      setIsProjectSelectorOpen(true);
+    }
+  }, [isConnected, projects.length]);
+
+  // Fetch features when active project changes
+  useEffect(() => {
+    const activeProject = projects.find(p => p.id === activeProjectId);
+    if (activeProject && isConnected) {
+      setIsLoadingFeatures(true);
+      initializeHarnessIfNeeded(activeProject.path)
+        .then((initialized) => {
+          if (initialized) {
+            return fetchProjectFeatures(activeProject.path);
+          }
+          return [];
+        })
+        .then(setFeatures)
+        .finally(() => setIsLoadingFeatures(false));
+    } else {
+      setFeatures([]);
+    }
+  }, [activeProjectId, projects, isConnected]);
+
+  // Listen for PTY output events
+  useEffect(() => {
+    if (!isConnected) return;
+
+    let unlistenFn: (() => void) | null = null;
+
+    const setupListener = async () => {
+      try {
+        unlistenFn = await onPtyOutput((payload) => {
+          const { id, data } = payload;
+
+          setProcesses(prev => {
+            if (!prev.find(p => p.id === id)) {
+              return [...prev, { id, name: `Process ${id.slice(0, 8)}` }];
+            }
+            return prev;
+          });
+
+          setLogs(prev => {
+            const newLogs = [...prev, {
+              timestamp: Date.now(),
+              processId: id,
+              processName: `Process ${id.slice(0, 8)}`,
+              message: data,
+              level: 'info' as const,
+            }];
+            return newLogs.slice(-settings.logBufferSize);
+          });
+        });
+      } catch (err) {
+        console.error('Failed to setup PTY listener:', err);
+      }
+    };
+
+    setupListener();
+
+    return () => {
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, [isConnected, settings.logBufferSize]);
+
+  const handleClearLogs = useCallback(() => {
+    setLogs([]);
+  }, []);
+
+  // Project handlers
+  const handleSelectProject = useCallback((projectId: string) => {
+    setActiveProjectId(projectId);
+  }, []);
+
+  const handleCloseProject = useCallback((projectId: string) => {
+    setProjects((prev) => {
+      const filtered = prev.filter((p) => p.id !== projectId);
+      if (activeProjectId === projectId && filtered.length > 0) {
+        const idx = prev.findIndex((p) => p.id === projectId);
+        const newActive = filtered[Math.max(0, idx - 1)];
+        setActiveProjectId(newActive.id);
+      } else if (filtered.length === 0) {
+        setActiveProjectId(null);
+      }
+      return filtered;
+    });
+  }, [activeProjectId]);
+
+  const handleAddProject = useCallback(() => {
+    setIsProjectSelectorOpen(true);
+  }, []);
+
+  const handleSelectProjectFromDialog = useCallback((path: string, name: string) => {
+    const existing = projects.find(p => p.path === path);
+    if (existing) {
+      setActiveProjectId(existing.id);
+      return;
+    }
+
+    const id = `proj-${Date.now()}`;
+    const newProject: Project = {
+      id,
+      path,
+      name,
+      harness: {
+        progressFile: '.harness/progress.txt',
+        featuresFile: '.harness/features.json',
+      },
+    };
+    setProjects((prev) => [...prev, newProject]);
+    setActiveProjectId(id);
+  }, [projects]);
+
+  // Refresh features
+  const handleRefreshFeatures = useCallback(() => {
+    const activeProject = projects.find(p => p.id === activeProjectId);
+    if (activeProject && isConnected) {
+      setIsLoadingFeatures(true);
+      fetchProjectFeatures(activeProject.path)
+        .then(setFeatures)
+        .finally(() => setIsLoadingFeatures(false));
+    }
+  }, [activeProjectId, projects, isConnected]);
+
+  // Task CRUD handlers
+  const handleOpenAddTask = useCallback(() => {
+    setEditingTask(undefined);
+    setIsTaskModalOpen(true);
+  }, []);
+
+  const handleOpenEditTask = useCallback((task: Feature) => {
+    setEditingTask(task);
+    setIsTaskModalOpen(true);
+  }, []);
+
+  const handleCloseTaskModal = useCallback(() => {
+    setIsTaskModalOpen(false);
+    setEditingTask(undefined);
+  }, []);
+
+  const handleSaveTask = useCallback(async (taskData: TaskData, taskId?: string) => {
+    const activeProject = projects.find(p => p.id === activeProjectId);
+    if (!activeProject) {
+      throw new Error('No active project selected');
+    }
+
+    const args = taskId
+      ? ['task', 'update', taskId]
+      : ['task', 'add', taskData.title];
+
+    if (taskId) {
+      args.push('--title', taskData.title);
+    }
+    if (taskData.description) {
+      args.push('--description', taskData.description);
+    }
+    args.push('--status', taskData.status.toLowerCase());
+    if (taskData.category) {
+      args.push('--category', taskData.category);
+    }
+
+    try {
+      await runHarnessCommand(activeProject.path, args);
+      handleRefreshFeatures();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const match = message.match(/Error:\s*(.+)/);
+      throw new Error(match ? match[1] : message);
+    }
+  }, [activeProjectId, projects, handleRefreshFeatures]);
+
+  const handleDeleteTask = useCallback(async (taskId: string) => {
+    const activeProject = projects.find(p => p.id === activeProjectId);
+    if (!activeProject) return;
+
+    if (!window.confirm('Are you sure you want to delete this task?')) {
+      return;
+    }
+
+    await runHarnessCommand(activeProject.path, ['task', 'delete', taskId]);
+    handleRefreshFeatures();
+  }, [activeProjectId, projects, handleRefreshFeatures]);
+
+  const handleMoveTask = useCallback(async (taskId: string, newStatus: string) => {
+    const activeProject = projects.find(p => p.id === activeProjectId);
+    if (!activeProject) return;
+
+    try {
+      await runHarnessCommand(activeProject.path, ['task', 'update', taskId, '--status', newStatus.toLowerCase()]);
+      handleRefreshFeatures();
+    } catch (error) {
+      console.error('Failed to move task:', error);
+    }
+  }, [activeProjectId, projects, handleRefreshFeatures]);
+
+  // Play task handler
+  const handlePlayTask = useCallback((task: Feature) => {
+    handleMoveTask(task.id, 'doing');
+    setExecutingTask(task);
+    setIsExecutionModalOpen(true);
+  }, [handleMoveTask]);
+
+  const handleTaskExecutionComplete = useCallback(async (taskId: string, success: boolean) => {
+    const activeProject = projects.find(p => p.id === activeProjectId);
+    if (!activeProject) return;
+
+    const newStatus = success ? 'done' : 'qa';
+
+    try {
+      await runHarnessCommand(activeProject.path, ['task', 'update', taskId, '--status', newStatus]);
+      handleRefreshFeatures();
+    } catch (error) {
+      console.error('Failed to update task status after execution:', error);
+    }
+  }, [activeProjectId, projects, handleRefreshFeatures]);
+
+  const handleCloseExecutionModal = useCallback(() => {
+    setIsExecutionModalOpen(false);
+    setExecutingTask(null);
+  }, []);
+
+  // Get active project
+  const activeProject = projects.find((p) => p.id === activeProjectId);
+
+  // Calculate stats
+  const stats = {
+    completed: features.filter(f => f.status === 'done').length,
+    total: features.length,
+  };
+
+  // Masthead
+  const masthead = (
+    <Masthead>
+      <MastheadMain>
+        <MastheadBrand>
+          <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+            <FlexItem>
+              <Tooltip content={isSidebarOpen ? 'Hide sidebar' : 'Show sidebar'}>
+                <Button
+                  variant="plain"
+                  onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                  aria-label="Toggle sidebar"
+                >
+                  <BarsIcon />
+                </Button>
+              </Tooltip>
+            </FlexItem>
+            <FlexItem>
+              <Title headingLevel="h1" size="xl">HQ</Title>
+            </FlexItem>
+          </Flex>
+        </MastheadBrand>
+      </MastheadMain>
+      <MastheadContent>
+        <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+          <FlexItem>
+            <Label color="blue" isCompact>Harness Orchestrator</Label>
+          </FlexItem>
+          <FlexItem>
+            <Label color={isConnected ? 'green' : 'red'} isCompact>
+              {isConnected ? 'Connected' : 'Disconnected'}
+            </Label>
+          </FlexItem>
+        </Flex>
+      </MastheadContent>
+    </Masthead>
+  );
+
+  // Sidebar
+  const sidebar = (
+    <PageSidebar isSidebarOpen={isSidebarOpen}>
+      <PageSidebarBody>
+        <Stack hasGutter>
+          <StackItem>
+            <Split hasGutter>
+              <SplitItem isFilled>
+                <Content component="h3">Projects</Content>
+              </SplitItem>
+              <SplitItem>
+                <Tooltip content="Open project">
+                  <Button
+                    variant="plain"
+                    onClick={handleAddProject}
+                    aria-label="Open project"
+                    size="sm"
+                  >
+                    <PlusIcon />
+                  </Button>
+                </Tooltip>
+              </SplitItem>
+            </Split>
+          </StackItem>
+          <StackItem>
+            <Nav aria-label="Projects navigation">
+              <NavList>
+                {projects.map((project) => (
+                  <NavItem
+                    key={project.id}
+                    isActive={project.id === activeProjectId}
+                    onClick={() => handleSelectProject(project.id)}
+                  >
+                    <Split>
+                      <SplitItem isFilled>
+                        <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+                          <FlexItem><FolderOpenIcon /></FlexItem>
+                          <FlexItem>{project.name}</FlexItem>
+                        </Flex>
+                      </SplitItem>
+                      {projects.length > 1 && (
+                        <SplitItem>
+                          <Button
+                            variant="plain"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleCloseProject(project.id);
+                            }}
+                            aria-label={`Close ${project.name}`}
+                            size="sm"
+                          >
+                            <TimesIcon />
+                          </Button>
+                        </SplitItem>
+                      )}
+                    </Split>
+                  </NavItem>
+                ))}
+                {projects.length === 0 && (
+                  <Content component="small">No projects open</Content>
+                )}
+              </NavList>
+            </Nav>
+          </StackItem>
+          <StackItem isFilled />
+          <StackItem>
+            <Button
+              variant="plain"
+              onClick={() => setIsSettingsOpen(true)}
+              isBlock
+            >
+              <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+                <FlexItem><CogIcon /></FlexItem>
+                <FlexItem>Settings</FlexItem>
+              </Flex>
+            </Button>
+          </StackItem>
+        </Stack>
+      </PageSidebarBody>
+    </PageSidebar>
+  );
+
+  // Bottom panel content (logs & terminal)
+  const bottomPanelContent = (
+    <DrawerPanelContent isResizable defaultSize="280px" minSize="150px">
+      <DrawerHead>
+        <Split hasGutter>
+          <SplitItem isFilled>
+            <Flex alignItems={{ default: 'alignItemsCenter' }} spaceItems={{ default: 'spaceItemsSm' }}>
+              <FlexItem><TerminalIcon /></FlexItem>
+              <FlexItem><Title headingLevel="h3" size="md">Process Logs & Terminal</Title></FlexItem>
+            </Flex>
+          </SplitItem>
+          <SplitItem>
+            <DrawerActions>
+              <DrawerCloseButton onClick={() => setIsBottomPanelOpen(false)} />
+            </DrawerActions>
+          </SplitItem>
+        </Split>
+      </DrawerHead>
+      <DrawerPanelBody>
+        <Stack hasGutter>
+          <StackItem>
+            {logs.length > 0 ? (
+              <LogPanel
+                logs={logs}
+                processes={processes}
+                onClear={handleClearLogs}
+                height={120}
+              />
+            ) : (
+              <Content component="small">Process logs will appear here when you start a terminal session.</Content>
+            )}
+          </StackItem>
+          <StackItem>
+            <TerminalPanel height={120} />
+          </StackItem>
+        </Stack>
+      </DrawerPanelBody>
+    </DrawerPanelContent>
+  );
+
+  return (
+    <Page masthead={masthead} sidebar={sidebar} isManagedSidebar={false}>
+      {/* Connection Error Alert */}
+      {connectionError && (
+        <PageSection>
+          <Alert variant="danger" title="Backend Connection Error" isInline>
+            <Stack hasGutter>
+              <StackItem>{connectionError}</StackItem>
+              <StackItem>
+                <code>cd /Users/anotonio.silva/antonio/HQ && bun run server</code>
+              </StackItem>
+            </Stack>
+          </Alert>
+        </PageSection>
+      )}
+
+      {/* Empty State when no projects */}
+      {projects.length === 0 && (
+        <PageSection isFilled>
+          <EmptyState
+            titleText="No Projects Open"
+            headingLevel="h2"
+            icon={FolderIcon}
+          >
+            <EmptyStateBody>
+              Open a Harness project to start managing your AI agent development sessions.
+              Projects with a <code>.harness</code> directory can be opened and tracked.
+            </EmptyStateBody>
+            <EmptyStateFooter>
+              <EmptyStateActions>
+                <Button
+                  variant="primary"
+                  icon={<FolderOpenIcon />}
+                  onClick={handleAddProject}
+                  isDisabled={!isConnected}
+                >
+                  Open Project
+                </Button>
+              </EmptyStateActions>
+            </EmptyStateFooter>
+          </EmptyState>
+        </PageSection>
+      )}
+
+      {/* Project Content */}
+      {activeProject && (
+        <Drawer isExpanded={isBottomPanelOpen} position="bottom" isInline>
+          <DrawerContent panelContent={bottomPanelContent}>
+            <DrawerContentBody>
+              <Stack hasGutter>
+                {/* Project Info */}
+                <StackItem>
+                  <PageSection>
+                    <Card>
+                      <CardTitle>{activeProject.name}</CardTitle>
+                      <CardBody>
+                        <Stack hasGutter>
+                          <StackItem>
+                            <Content component="p">
+                              <strong>Path:</strong> {activeProject.path}
+                            </Content>
+                          </StackItem>
+                          <StackItem>
+                            <Content component="p">
+                              <strong>Tasks:</strong> {stats.completed}/{stats.total} complete
+                            </Content>
+                          </StackItem>
+                          <StackItem>
+                            <Flex spaceItems={{ default: 'spaceItemsSm' }}>
+                              <FlexItem>
+                                <Button
+                                  variant="secondary"
+                                  icon={<CogIcon />}
+                                  onClick={() => setIsSettingsOpen(true)}
+                                >
+                                  Settings
+                                </Button>
+                              </FlexItem>
+                              <FlexItem>
+                                <Button
+                                  variant="secondary"
+                                  icon={<FolderOpenIcon />}
+                                  onClick={handleAddProject}
+                                >
+                                  Open Another Project
+                                </Button>
+                              </FlexItem>
+                              <FlexItem>
+                                <Tooltip content={isBottomPanelOpen ? 'Hide logs panel' : 'Show logs panel'}>
+                                  <Button
+                                    variant="plain"
+                                    onClick={() => setIsBottomPanelOpen(!isBottomPanelOpen)}
+                                    aria-label="Toggle logs panel"
+                                  >
+                                    <TerminalIcon />
+                                  </Button>
+                                </Tooltip>
+                              </FlexItem>
+                            </Flex>
+                          </StackItem>
+                        </Stack>
+                      </CardBody>
+                    </Card>
+                  </PageSection>
+                </StackItem>
+
+                {/* Progress Card */}
+                <StackItem>
+                  <PageSection>
+                    <ProgressCard projectPath={activeProject.path} onRefresh={handleRefreshFeatures} />
+                  </PageSection>
+                </StackItem>
+
+                {/* Kanban Board */}
+                <StackItem isFilled>
+                  <PageSection isFilled>
+                    <Card>
+                      <CardTitle>
+                        <Split hasGutter>
+                          <SplitItem isFilled>Task Board</SplitItem>
+                          {isLoadingFeatures && (
+                            <SplitItem>
+                              <Spinner size="md" />
+                            </SplitItem>
+                          )}
+                        </Split>
+                      </CardTitle>
+                      <CardBody>
+                        <KanbanBoard
+                          features={features}
+                          onAddTask={handleOpenAddTask}
+                          onEditTask={handleOpenEditTask}
+                          onDeleteTask={handleDeleteTask}
+                          onMoveTask={handleMoveTask}
+                          onPlayTask={handlePlayTask}
+                        />
+                      </CardBody>
+                    </Card>
+                  </PageSection>
+                </StackItem>
+              </Stack>
+            </DrawerContentBody>
+          </DrawerContent>
+        </Drawer>
+      )}
+
+      {/* Dialogs */}
+      <ProjectSelector
+        isOpen={isProjectSelectorOpen}
+        onClose={() => setIsProjectSelectorOpen(false)}
+        onSelectProject={handleSelectProjectFromDialog}
+      />
+
+      <Settings
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        onSettingsChange={setSettings}
+      />
+
+      <TaskModal
+        isOpen={isTaskModalOpen}
+        onClose={handleCloseTaskModal}
+        onSave={handleSaveTask}
+        task={editingTask}
+      />
+
+      <TaskExecutionModal
+        isOpen={isExecutionModalOpen}
+        task={executingTask}
+        projectPath={activeProject?.path || ''}
+        onClose={handleCloseExecutionModal}
+        onComplete={handleTaskExecutionComplete}
+      />
+    </Page>
+  );
+}
+
+export default App;

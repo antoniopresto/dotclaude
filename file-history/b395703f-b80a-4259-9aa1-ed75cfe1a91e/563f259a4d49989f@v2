@@ -1,0 +1,120 @@
+/**
+ * State Manager
+ *
+ * Manages atomic updates to features.json and provides
+ * state snapshots for recovery.
+ */
+
+import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import type { HarnessConfig, Feature } from '../types.js';
+import { FileLock } from './FileLock.js';
+
+export class StateManager {
+  private lock: FileLock = new FileLock();
+  private snapshotDir: string;
+
+  constructor(
+    private featuresPath: string,
+    snapshotDir?: string
+  ) {
+    this.snapshotDir = snapshotDir || dirname(featuresPath);
+  }
+
+  /**
+   * Load the current harness config
+   */
+  load(): HarnessConfig {
+    const content = readFileSync(this.featuresPath, 'utf-8');
+    return JSON.parse(content);
+  }
+
+  /**
+   * Save the harness config atomically
+   */
+  async save(config: HarnessConfig): Promise<void> {
+    await this.lock.withLock(this.featuresPath, async () => {
+      const content = JSON.stringify(config, null, 2);
+      writeFileSync(this.featuresPath, content, 'utf-8');
+    });
+  }
+
+  /**
+   * Update a specific feature's status
+   */
+  async updateFeature(
+    featureId: string,
+    updates: Partial<Feature>
+  ): Promise<void> {
+    await this.lock.withLock(this.featuresPath, async () => {
+      const config = this.load();
+      const feature = config.features.find((f) => f.id === featureId);
+
+      if (!feature) {
+        throw new Error(`Feature not found: ${featureId}`);
+      }
+
+      Object.assign(feature, updates);
+      config.lastUpdated = new Date().toISOString().split('T')[0];
+
+      const content = JSON.stringify(config, null, 2);
+      writeFileSync(this.featuresPath, content, 'utf-8');
+    });
+  }
+
+  /**
+   * Mark a feature as complete
+   */
+  async markComplete(featureId: string): Promise<void> {
+    await this.updateFeature(featureId, { passes: true });
+  }
+
+  /**
+   * Create a snapshot of current state
+   */
+  createSnapshot(name?: string): string {
+    const timestamp = Date.now();
+    const snapshotName = name || `snapshot-${timestamp}`;
+    const snapshotPath = join(this.snapshotDir, `${snapshotName}.json`);
+
+    copyFileSync(this.featuresPath, snapshotPath);
+
+    return snapshotPath;
+  }
+
+  /**
+   * Restore from a snapshot
+   */
+  async restoreSnapshot(snapshotPath: string): Promise<void> {
+    if (!existsSync(snapshotPath)) {
+      throw new Error(`Snapshot not found: ${snapshotPath}`);
+    }
+
+    await this.lock.withLock(this.featuresPath, async () => {
+      copyFileSync(snapshotPath, this.featuresPath);
+    });
+  }
+
+  /**
+   * Get progress summary
+   */
+  getProgress(): { total: number; completed: number; pending: number } {
+    const config = this.load();
+    const total = config.features.length;
+    const completed = config.features.filter((f) => f.passes).length;
+
+    return {
+      total,
+      completed,
+      pending: total - completed,
+    };
+  }
+
+  /**
+   * Check if harness is complete
+   */
+  isComplete(): boolean {
+    const config = this.load();
+    return config.features.every((f) => f.passes);
+  }
+}

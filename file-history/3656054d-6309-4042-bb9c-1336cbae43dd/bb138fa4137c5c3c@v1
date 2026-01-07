@@ -1,0 +1,412 @@
+/**
+ * Commit Workflow Enforcement for Harness CLI
+ *
+ * Ensures commits only happen after proper harness workflow:
+ * 1. Feature implementation complete
+ * 2. Visual tests passed (if required)
+ * 3. Progress file updated
+ * 4. features.json updated with passes: true
+ *
+ * Based on root CLAUDE.md git commit protocol.
+ */
+
+import { execSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+export interface CommitValidation {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface CommitContext {
+  featureId: string;
+  projectDir: string;
+  message: string;
+  filesChanged: string[];
+}
+
+/**
+ * Validate commit is allowed per harness protocol
+ */
+export function validateCommit(context: CommitContext): CommitValidation {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  const featuresPath = resolve(context.projectDir, 'features.json');
+  const progressPath = resolve(context.projectDir, 'claude-progress.txt');
+
+  // 1. Check features.json exists
+  if (!existsSync(featuresPath)) {
+    errors.push('features.json not found - harness not initialized');
+    return { valid: false, errors, warnings };
+  }
+
+  // 2. Parse features.json
+  let features;
+  try {
+    features = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+  } catch (e) {
+    errors.push('features.json is not valid JSON');
+    return { valid: false, errors, warnings };
+  }
+
+  // 3. Find the feature being committed
+  const feature = features.features?.find((f: { id: string }) => f.id === context.featureId);
+  if (!feature) {
+    warnings.push(`Feature ${context.featureId} not found in features.json`);
+  } else {
+    // 4. Check if feature is marked as complete
+    if (!feature.passes) {
+      errors.push(`Feature ${context.featureId} is not marked as complete (passes: false)`);
+      errors.push('Set passes: true in features.json before committing');
+    }
+  }
+
+  // 5. Check progress file exists and has been updated
+  if (!existsSync(progressPath)) {
+    warnings.push('claude-progress.txt not found - please update progress log');
+  } else {
+    const progressContent = readFileSync(progressPath, 'utf-8');
+    const today = new Date().toISOString().split('T')[0];
+
+    // Check if there's a session entry for today
+    if (!progressContent.includes(today)) {
+      warnings.push(`No session entry for today (${today}) in claude-progress.txt`);
+      warnings.push('Consider adding session notes before committing');
+    }
+  }
+
+  // 6. Check for uncommitted changes that shouldn't be there
+  const sensitiveFiles = ['.env', 'credentials', 'secret', 'private', 'password'];
+  for (const file of context.filesChanged) {
+    const lowerFile = file.toLowerCase();
+    for (const sensitive of sensitiveFiles) {
+      if (lowerFile.includes(sensitive)) {
+        errors.push(`SECURITY: File "${file}" appears to contain sensitive data`);
+        errors.push('Do NOT commit files with secrets, credentials, or passwords');
+      }
+    }
+  }
+
+  // 7. Check commit message format
+  if (context.message.length < 10) {
+    warnings.push('Commit message is very short - consider adding more detail');
+  }
+
+  if (!context.message.includes(context.featureId)) {
+    warnings.push(`Commit message should include feature ID: ${context.featureId}`);
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+  };
+}
+
+/**
+ * Get staged files
+ */
+export function getStagedFiles(projectDir: string): string[] {
+  try {
+    const output = execSync('git diff --name-only --cached', {
+      cwd: projectDir,
+      encoding: 'utf-8',
+    });
+    return output.trim().split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get unstaged changes
+ */
+export function getUnstagedFiles(projectDir: string): string[] {
+  try {
+    const output = execSync('git diff --name-only', {
+      cwd: projectDir,
+      encoding: 'utf-8',
+    });
+    return output.trim().split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get untracked files
+ */
+export function getUntrackedFiles(projectDir: string): string[] {
+  try {
+    const output = execSync('git ls-files --others --exclude-standard', {
+      cwd: projectDir,
+      encoding: 'utf-8',
+    });
+    return output.trim().split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Generate commit message following harness protocol
+ */
+export function generateCommitMessage(
+  featureId: string,
+  description: string,
+  type: 'feat' | 'fix' | 'docs' | 'refactor' | 'test' | 'chore' = 'feat'
+): string {
+  // Sanitize description
+  const sanitized = description
+    .replace(/[^\w\s-]/g, '')
+    .trim()
+    .toLowerCase()
+    .slice(0, 50);
+
+  return `${type}(harness): ${featureId} - ${sanitized}
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>`;
+}
+
+/**
+ * Commit workflow hook script
+ */
+export function getCommitWorkflowHook(): string {
+  return `#!/bin/bash
+# Hook: Pre-Commit Validation
+# Purpose: Ensure commits follow harness protocol
+# Exit 2 = BLOCK commit, Exit 0 = Allow
+
+PROJECT_DIR="\${CLAUDE_PROJECT_DIR:-\$(pwd)}"
+cd "$PROJECT_DIR" 2>/dev/null || exit 0
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔐 COMMIT WORKFLOW CHECK"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# 1. Check for features.json
+if [ ! -f "features.json" ]; then
+  echo "❌ features.json not found" >&2
+  echo "Initialize harness first: harness init" >&2
+  exit 2
+fi
+
+# 2. Check for uncommitted harness files
+if git diff --name-only HEAD 2>/dev/null | grep -q "features.json"; then
+  # Features.json has changes - check if passes is being set to true
+  if ! git diff features.json 2>/dev/null | grep -q '+.*"passes": true'; then
+    echo "⚠️  features.json changed but no feature marked as complete"
+    echo "   Make sure to set passes: true for completed features"
+  fi
+fi
+
+# 3. Check for progress file update
+if [ -f "claude-progress.txt" ]; then
+  TODAY=\$(date '+%Y-%m-%d')
+  if ! grep -q "\$TODAY" "claude-progress.txt"; then
+    echo "⚠️  No session entry for today in claude-progress.txt"
+    echo "   Consider adding session notes before committing"
+  fi
+fi
+
+# 4. Check for sensitive files
+STAGED_FILES=\$(git diff --name-only --cached 2>/dev/null)
+for FILE in \$STAGED_FILES; do
+  if echo "\$FILE" | grep -qiE '(\.env|credentials|secret|private|password)'; then
+    echo "❌ BLOCKED: Potentially sensitive file: \$FILE" >&2
+    echo "Do NOT commit files with secrets!" >&2
+    exit 2
+  fi
+done
+
+# 5. Reminder about visual testing for UI changes
+if echo "\$STAGED_FILES" | grep -qE '\\.(tsx|jsx|css|scss)$'; then
+  echo ""
+  echo "┌──────────────────────────────────────────────────────────────┐"
+  echo "│ 📸 UI FILES DETECTED                                        │"
+  echo "├──────────────────────────────────────────────────────────────┤"
+  echo "│ Did you run visual tests before committing?                 │"
+  echo "│                                                              │"
+  echo "│  □ mcp__playwright__browser_navigate                        │"
+  echo "│  □ mcp__playwright__browser_take_screenshot                 │"
+  echo "│  □ mcp__playwright__browser_console_messages                │"
+  echo "│                                                              │"
+  echo "└──────────────────────────────────────────────────────────────┘"
+fi
+
+echo ""
+echo "✅ Commit workflow check passed"
+exit 0
+`;
+}
+
+/**
+ * Generate Git commit command with proper format
+ */
+export function generateGitCommitCommand(
+  featureId: string,
+  description: string,
+  type: 'feat' | 'fix' | 'docs' | 'refactor' | 'test' | 'chore' = 'feat'
+): string {
+  const message = generateCommitMessage(featureId, description, type);
+
+  // Use HEREDOC for proper formatting
+  return `git commit -m "$(cat <<'EOF'
+${message}
+EOF
+)"`;
+}
+
+/**
+ * Validate that feature is ready for commit
+ */
+export interface FeatureReadyCheck {
+  ready: boolean;
+  featureId: string;
+  checks: Array<{
+    name: string;
+    passed: boolean;
+    message: string;
+  }>;
+}
+
+export function checkFeatureReadyForCommit(
+  featureId: string,
+  projectDir: string
+): FeatureReadyCheck {
+  const checks: FeatureReadyCheck['checks'] = [];
+  const featuresPath = resolve(projectDir, 'features.json');
+  const progressPath = resolve(projectDir, 'claude-progress.txt');
+
+  // Check 1: features.json exists
+  if (existsSync(featuresPath)) {
+    checks.push({
+      name: 'features.json exists',
+      passed: true,
+      message: 'Found features.json',
+    });
+
+    // Check 2: Feature is marked as complete
+    try {
+      const features = JSON.parse(readFileSync(featuresPath, 'utf-8'));
+      const feature = features.features?.find((f: { id: string }) => f.id === featureId);
+
+      if (feature) {
+        checks.push({
+          name: 'Feature exists',
+          passed: true,
+          message: `Found ${featureId}: ${feature.description}`,
+        });
+
+        checks.push({
+          name: 'Feature marked complete',
+          passed: feature.passes === true,
+          message: feature.passes ? 'passes: true' : 'passes: false - update before commit',
+        });
+      } else {
+        checks.push({
+          name: 'Feature exists',
+          passed: false,
+          message: `Feature ${featureId} not found in features.json`,
+        });
+      }
+    } catch {
+      checks.push({
+        name: 'features.json valid',
+        passed: false,
+        message: 'Could not parse features.json',
+      });
+    }
+  } else {
+    checks.push({
+      name: 'features.json exists',
+      passed: false,
+      message: 'features.json not found',
+    });
+  }
+
+  // Check 3: Progress file updated
+  if (existsSync(progressPath)) {
+    const content = readFileSync(progressPath, 'utf-8');
+    const today = new Date().toISOString().split('T')[0];
+    const hasToday = content.includes(today);
+
+    checks.push({
+      name: 'Progress updated today',
+      passed: hasToday,
+      message: hasToday
+        ? `Session entry found for ${today}`
+        : `No entry for ${today} - consider updating progress`,
+    });
+  } else {
+    checks.push({
+      name: 'Progress file exists',
+      passed: false,
+      message: 'claude-progress.txt not found',
+    });
+  }
+
+  // Check 4: Git status clean (no uncommitted changes)
+  try {
+    const staged = getStagedFiles(projectDir);
+    const unstaged = getUnstagedFiles(projectDir);
+
+    checks.push({
+      name: 'Changes staged',
+      passed: staged.length > 0,
+      message: staged.length > 0
+        ? `${staged.length} file(s) staged`
+        : 'No files staged - run git add first',
+    });
+
+    if (unstaged.length > 0) {
+      checks.push({
+        name: 'No unstaged changes',
+        passed: false,
+        message: `${unstaged.length} unstaged file(s) - consider staging or stashing`,
+      });
+    }
+  } catch {
+    checks.push({
+      name: 'Git status',
+      passed: false,
+      message: 'Could not check git status',
+    });
+  }
+
+  const allPassed = checks.every(c => c.passed);
+
+  return {
+    ready: allPassed,
+    featureId,
+    checks,
+  };
+}
+
+/**
+ * Format commit workflow check for display
+ */
+export function formatCommitWorkflowCheck(check: FeatureReadyCheck): string {
+  let output = `# Commit Readiness Check for ${check.featureId}\n\n`;
+  output += `**Status:** ${check.ready ? '✅ Ready to commit' : '❌ Not ready'}\n\n`;
+  output += '**Checks:**\n';
+
+  for (const c of check.checks) {
+    const icon = c.passed ? '✅' : '❌';
+    output += `- ${icon} ${c.name}: ${c.message}\n`;
+  }
+
+  if (!check.ready) {
+    output += '\n**Action Required:**\n';
+    for (const c of check.checks.filter(c => !c.passed)) {
+      output += `- Fix: ${c.name} - ${c.message}\n`;
+    }
+  }
+
+  return output;
+}

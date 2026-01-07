@@ -1,0 +1,255 @@
+"""Code manipulation tools for PHAROS agents.
+
+These tools allow agents to read, write, and validate code.
+"""
+
+import subprocess
+import os
+from pathlib import Path
+from typing import Any
+
+from langchain_core.tools import tool
+
+import sys
+sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
+from config.settings import get_settings
+
+
+def _get_project_root() -> Path:
+    """Get the project root directory."""
+    settings = get_settings()
+    pharos_dir = Path(__file__).parent.parent.parent
+    return (pharos_dir / settings.project_root).resolve()
+
+
+@tool
+def read_file(file_path: str) -> str:
+    """Read a file from the project.
+
+    Args:
+        file_path: Path relative to project root
+
+    Returns:
+        File contents or error message
+    """
+    try:
+        root = _get_project_root()
+        full_path = root / file_path
+
+        if not full_path.exists():
+            return f"Error: File not found: {file_path}"
+
+        if not full_path.is_file():
+            return f"Error: Not a file: {file_path}"
+
+        # Security check - must be within project
+        if not str(full_path.resolve()).startswith(str(root)):
+            return f"Error: Access denied - path outside project: {file_path}"
+
+        content = full_path.read_text(encoding="utf-8")
+
+        # Add line numbers for easier reference
+        lines = content.split("\n")
+        numbered = [f"{i+1:4d} | {line}" for i, line in enumerate(lines)]
+        return "\n".join(numbered)
+
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+
+@tool
+def write_file(file_path: str, content: str) -> str:
+    """Write content to a file in the project.
+
+    Args:
+        file_path: Path relative to project root
+        content: Content to write
+
+    Returns:
+        Success message or error
+    """
+    try:
+        root = _get_project_root()
+        full_path = root / file_path
+
+        # Security check
+        if not str(full_path.resolve()).startswith(str(root)):
+            return f"Error: Access denied - path outside project: {file_path}"
+
+        # Create directory if needed
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write file
+        full_path.write_text(content, encoding="utf-8")
+
+        return f"Successfully wrote {len(content)} bytes to {file_path}"
+
+    except Exception as e:
+        return f"Error writing file: {str(e)}"
+
+
+@tool
+def list_files(directory: str = ".", pattern: str = "*") -> str:
+    """List files in a directory.
+
+    Args:
+        directory: Directory relative to project root
+        pattern: Glob pattern to match
+
+    Returns:
+        List of files or error
+    """
+    try:
+        root = _get_project_root()
+        dir_path = root / directory
+
+        if not dir_path.exists():
+            return f"Error: Directory not found: {directory}"
+
+        files = list(dir_path.glob(pattern))
+        files = [str(f.relative_to(root)) for f in files if f.is_file()]
+        files.sort()
+
+        if not files:
+            return f"No files matching '{pattern}' in {directory}"
+
+        return "\n".join(files)
+
+    except Exception as e:
+        return f"Error listing files: {str(e)}"
+
+
+@tool
+def run_command(command: str, timeout: int = 60) -> dict[str, Any]:
+    """Run a shell command in the project directory.
+
+    Args:
+        command: Command to run
+        timeout: Timeout in seconds
+
+    Returns:
+        Dict with stdout, stderr, return_code
+    """
+    try:
+        root = _get_project_root()
+
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "return_code": result.returncode,
+            "success": result.returncode == 0,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "stdout": "",
+            "stderr": f"Command timed out after {timeout}s",
+            "return_code": -1,
+            "success": False,
+        }
+    except Exception as e:
+        return {
+            "stdout": "",
+            "stderr": str(e),
+            "return_code": -1,
+            "success": False,
+        }
+
+
+@tool
+def run_typecheck() -> dict[str, Any]:
+    """Run TypeScript type checking.
+
+    Returns:
+        Dict with success status and output
+    """
+    return run_command.invoke({"command": "pnpm typecheck", "timeout": 120})
+
+
+@tool
+def run_lint() -> dict[str, Any]:
+    """Run ESLint.
+
+    Returns:
+        Dict with success status and output
+    """
+    return run_command.invoke({"command": "pnpm lint", "timeout": 120})
+
+
+@tool
+def run_tests(test_path: str = "") -> dict[str, Any]:
+    """Run Vitest tests.
+
+    Args:
+        test_path: Optional specific test file or pattern
+
+    Returns:
+        Dict with success status and output
+    """
+    cmd = "pnpm test --run"
+    if test_path:
+        cmd += f" {test_path}"
+    return run_command.invoke({"command": cmd, "timeout": 300})
+
+
+@tool
+def run_e2e_tests(test_path: str = "") -> dict[str, Any]:
+    """Run Playwright E2E tests.
+
+    Args:
+        test_path: Optional specific test file
+
+    Returns:
+        Dict with success status and output
+    """
+    cmd = "pnpm test:e2e"
+    if test_path:
+        cmd += f" {test_path}"
+    return run_command.invoke({"command": cmd, "timeout": 300})
+
+
+@tool
+def git_status() -> dict[str, Any]:
+    """Get git status.
+
+    Returns:
+        Dict with git status information
+    """
+    status = run_command.invoke({"command": "git status --porcelain", "timeout": 30})
+    diff = run_command.invoke({"command": "git diff --stat", "timeout": 30})
+
+    return {
+        "modified_files": status.get("stdout", "").strip().split("\n") if status.get("stdout") else [],
+        "diff_summary": diff.get("stdout", ""),
+        "success": status.get("success", False),
+    }
+
+
+@tool
+def git_commit(message: str, files: list[str] | None = None) -> dict[str, Any]:
+    """Create a git commit.
+
+    Args:
+        message: Commit message
+        files: Optional list of files to commit (default: all staged)
+
+    Returns:
+        Dict with commit result
+    """
+    if files:
+        add_result = run_command.invoke({"command": f"git add {' '.join(files)}", "timeout": 30})
+        if not add_result.get("success"):
+            return add_result
+
+    # Escape message for shell
+    safe_message = message.replace('"', '\\"')
+    return run_command.invoke({"command": f'git commit -m "{safe_message}"', "timeout": 30})

@@ -1,0 +1,504 @@
+//! Work session management.
+//!
+//! This module provides CRUD operations for work sessions.
+//! Sessions represent time periods of work by AI agents or humans.
+//!
+//! ## Session Lifecycle
+//!
+//! 1. Start a session: `start_session()`
+//! 2. Add progress entries: `progress::add_progress()`
+//! 3. End the session: `end_session()`
+
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
+
+use super::types::{PaginatedResult, WorkSession};
+use super::DbResult;
+
+// =============================================================================
+// CREATE
+// =============================================================================
+
+/// Create a new session (internal use).
+pub fn create_session(conn: &Connection, session: &WorkSession) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO work_sessions (id, summary, started_at, ended_at)
+        VALUES (?1, ?2, ?3, ?4)
+        "#,
+        params![
+            session.id,
+            session.summary,
+            session.started_at.to_rfc3339(),
+            session.ended_at.map(|dt| dt.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Start a new session.
+///
+/// Returns the new session.
+pub fn start_session(conn: &Connection, summary: Option<&str>) -> DbResult<WorkSession> {
+    let mut session = WorkSession::new();
+    if let Some(s) = summary {
+        session = session.with_summary(s);
+    }
+    create_session(conn, &session)?;
+    Ok(session)
+}
+
+// =============================================================================
+// READ
+// =============================================================================
+
+/// Get a session by ID.
+pub fn get_session(conn: &Connection, id: &str) -> DbResult<Option<WorkSession>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT id, summary, started_at, ended_at
+            FROM work_sessions
+            WHERE id = ?1
+            "#,
+            [id],
+            |row| row_to_session(row),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Get the current (active) session if any.
+pub fn get_current_session(conn: &Connection) -> DbResult<Option<WorkSession>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT id, summary, started_at, ended_at
+            FROM work_sessions
+            WHERE ended_at IS NULL
+            ORDER BY started_at DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| row_to_session(row),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// List all sessions with pagination.
+///
+/// Returns sessions ordered by started_at descending (most recent first).
+pub fn list_sessions(
+    conn: &Connection,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> DbResult<PaginatedResult<WorkSession>> {
+    let limit = limit.unwrap_or(super::tasks::DEFAULT_PAGE_SIZE);
+
+    let after_id = cursor
+        .map(|c| super::tasks::decode_cursor(c))
+        .transpose()?;
+
+    let mut sessions = Vec::new();
+
+    if let Some(after_id) = after_id {
+        // Get the started_at of the cursor session
+        let cursor_started: Option<String> = conn
+            .query_row(
+                "SELECT started_at FROM work_sessions WHERE id = ?1",
+                [&after_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(started) = cursor_started {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, summary, started_at, ended_at
+                FROM work_sessions
+                WHERE (started_at < ?1) OR (started_at = ?1 AND id < ?2)
+                ORDER BY started_at DESC, id DESC
+                LIMIT ?3
+                "#,
+            )?;
+
+            let rows = stmt.query_map(params![started, after_id, (limit + 1) as i64], |row| {
+                row_to_session(row)
+            })?;
+            for row in rows {
+                sessions.push(row?);
+            }
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, summary, started_at, ended_at
+            FROM work_sessions
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+
+        let rows = stmt.query_map([(limit + 1) as i64], |row| row_to_session(row))?;
+        for row in rows {
+            sessions.push(row?);
+        }
+    }
+
+    let has_next = sessions.len() > limit;
+    if has_next {
+        sessions.pop();
+    }
+
+    let has_prev = cursor.is_some();
+
+    let next_cursor = if has_next {
+        sessions.last().map(|s| super::tasks::encode_cursor(&s.id))
+    } else {
+        None
+    };
+
+    let prev_cursor = if has_prev {
+        sessions.first().map(|s| super::tasks::encode_cursor(&s.id))
+    } else {
+        None
+    };
+
+    Ok(PaginatedResult::new(
+        sessions,
+        has_next,
+        has_prev,
+        next_cursor,
+        prev_cursor,
+    ))
+}
+
+/// Count total sessions.
+pub fn count_sessions(conn: &Connection) -> DbResult<i64> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM work_sessions", [], |row| row.get(0))?;
+    Ok(count)
+}
+
+/// Count active (ongoing) sessions.
+pub fn count_active_sessions(conn: &Connection) -> DbResult<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM work_sessions WHERE ended_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+// =============================================================================
+// UPDATE
+// =============================================================================
+
+/// End a session.
+pub fn end_session(conn: &Connection, id: &str, summary: Option<&str>) -> DbResult<bool> {
+    let now = Utc::now().to_rfc3339();
+
+    let rows_affected = if let Some(summary) = summary {
+        conn.execute(
+            "UPDATE work_sessions SET ended_at = ?1, summary = ?2 WHERE id = ?3 AND ended_at IS NULL",
+            params![now, summary, id],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE work_sessions SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+            params![now, id],
+        )?
+    };
+
+    Ok(rows_affected > 0)
+}
+
+/// End the current active session (if any).
+pub fn end_current_session(conn: &Connection, summary: Option<&str>) -> DbResult<Option<String>> {
+    if let Some(session) = get_current_session(conn)? {
+        end_session(conn, &session.id, summary)?;
+        Ok(Some(session.id))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Update session summary.
+pub fn update_session_summary(conn: &Connection, id: &str, summary: &str) -> DbResult<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE work_sessions SET summary = ?1 WHERE id = ?2",
+        params![summary, id],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+// =============================================================================
+// DELETE
+// =============================================================================
+
+/// Delete a session by ID.
+///
+/// Note: This should also delete related progress entries (handled by caller).
+pub fn delete_session(conn: &Connection, id: &str) -> DbResult<bool> {
+    let rows_affected = conn.execute("DELETE FROM work_sessions WHERE id = ?1", [id])?;
+    Ok(rows_affected > 0)
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<WorkSession> {
+    let started_at_str: String = row.get(2)?;
+    let ended_at_str: Option<String> = row.get(3)?;
+
+    Ok(WorkSession {
+        id: row.get(0)?,
+        summary: row.get(1)?,
+        started_at: chrono::DateTime::parse_from_rfc3339(&started_at_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        ended_at: ended_at_str.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        }),
+    })
+}
+
+// Make encode/decode cursor public for use in this module
+pub(crate) use super::tasks::{decode_cursor, encode_cursor};
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::connection::open_in_memory;
+
+    // -------------------------------------------------------------------------
+    // Create tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_start_session() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let session = start_session(&conn, None).expect("Failed to start session");
+
+        assert_eq!(session.id.len(), 26);
+        assert!(session.summary.is_none());
+        assert!(session.ended_at.is_none());
+    }
+
+    #[test]
+    fn test_start_session_with_summary() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let session = start_session(&conn, Some("Initial setup")).expect("Failed to start session");
+
+        assert_eq!(session.summary, Some("Initial setup".to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Read tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_session() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, Some("Test")).expect("Start session");
+
+        let retrieved = get_session(&conn, &session.id).expect("Get session").unwrap();
+
+        assert_eq!(retrieved.id, session.id);
+        assert_eq!(retrieved.summary, Some("Test".to_string()));
+    }
+
+    #[test]
+    fn test_get_session_not_found() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let result = get_session(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("Query failed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_current_session() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        // No current session initially
+        let current = get_current_session(&conn).expect("Get current");
+        assert!(current.is_none());
+
+        // Start a session
+        let session = start_session(&conn, None).expect("Start session");
+
+        // Now there is a current session
+        let current = get_current_session(&conn).expect("Get current").unwrap();
+        assert_eq!(current.id, session.id);
+    }
+
+    #[test]
+    fn test_get_current_session_after_end() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let session = start_session(&conn, None).expect("Start session");
+        end_session(&conn, &session.id, None).expect("End session");
+
+        let current = get_current_session(&conn).expect("Get current");
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn test_list_sessions_empty() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let result = list_sessions(&conn, None, None).expect("List sessions");
+
+        assert!(result.items.is_empty());
+        assert!(!result.has_next);
+        assert!(!result.has_prev);
+    }
+
+    #[test]
+    fn test_list_sessions_ordered_by_recent() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let s1 = start_session(&conn, Some("First")).expect("Start session 1");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let s2 = start_session(&conn, Some("Second")).expect("Start session 2");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let s3 = start_session(&conn, Some("Third")).expect("Start session 3");
+
+        let result = list_sessions(&conn, None, None).expect("List sessions");
+
+        assert_eq!(result.items.len(), 3);
+        // Most recent first
+        assert_eq!(result.items[0].id, s3.id);
+        assert_eq!(result.items[1].id, s2.id);
+        assert_eq!(result.items[2].id, s1.id);
+    }
+
+    #[test]
+    fn test_count_sessions() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        start_session(&conn, None).expect("Start session");
+        start_session(&conn, None).expect("Start session");
+
+        let count = count_sessions(&conn).expect("Count sessions");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_active_sessions() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let s1 = start_session(&conn, None).expect("Start session");
+        start_session(&conn, None).expect("Start session");
+
+        // End one session
+        end_session(&conn, &s1.id, None).expect("End session");
+
+        let active = count_active_sessions(&conn).expect("Count active");
+        assert_eq!(active, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Update tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_end_session() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, None).expect("Start session");
+
+        assert!(session.ended_at.is_none());
+
+        let ended = end_session(&conn, &session.id, None).expect("End session");
+        assert!(ended);
+
+        let retrieved = get_session(&conn, &session.id).expect("Get session").unwrap();
+        assert!(retrieved.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_end_session_with_summary() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, None).expect("Start session");
+
+        end_session(&conn, &session.id, Some("Completed work")).expect("End session");
+
+        let retrieved = get_session(&conn, &session.id).expect("Get session").unwrap();
+        assert_eq!(retrieved.summary, Some("Completed work".to_string()));
+        assert!(retrieved.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_end_session_already_ended() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, None).expect("Start session");
+
+        end_session(&conn, &session.id, None).expect("End session first time");
+        let ended_again = end_session(&conn, &session.id, None).expect("End session second time");
+
+        assert!(!ended_again); // Already ended, no rows affected
+    }
+
+    #[test]
+    fn test_end_current_session() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, None).expect("Start session");
+
+        let ended_id = end_current_session(&conn, Some("Done")).expect("End current").unwrap();
+        assert_eq!(ended_id, session.id);
+
+        // No more current session
+        let current = get_current_session(&conn).expect("Get current");
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn test_end_current_session_none_active() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let ended_id = end_current_session(&conn, None).expect("End current");
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_update_session_summary() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, Some("Original")).expect("Start session");
+
+        update_session_summary(&conn, &session.id, "Updated").expect("Update summary");
+
+        let retrieved = get_session(&conn, &session.id).expect("Get session").unwrap();
+        assert_eq!(retrieved.summary, Some("Updated".to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Delete tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_session() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let session = start_session(&conn, None).expect("Start session");
+
+        let deleted = delete_session(&conn, &session.id).expect("Delete session");
+        assert!(deleted);
+
+        let retrieved = get_session(&conn, &session.id).expect("Get session");
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_delete_session_not_found() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        let deleted = delete_session(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("Delete");
+        assert!(!deleted);
+    }
+}

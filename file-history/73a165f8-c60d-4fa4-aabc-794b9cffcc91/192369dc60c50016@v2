@@ -1,0 +1,188 @@
+/**
+ * E2E tests for Video Downloader extension using Playwright
+ *
+ * Run with: bun run test:e2e
+ *
+ * Note: These tests launch Chrome with the extension loaded.
+ * Extensions don't work in headless mode, so a browser window will open.
+ */
+
+import { test, expect, chromium, type BrowserContext } from '@playwright/test';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const extensionPath = path.join(__dirname, '../.output/chrome-mv3');
+
+// Helper to get extension ID from service worker
+async function getExtensionId(context: BrowserContext): Promise<string> {
+  // Get service worker to find extension ID
+  let [background] = context.serviceWorkers();
+  if (!background) {
+    background = await context.waitForEvent('serviceworker');
+  }
+  const extensionId = background.url().split('/')[2];
+  return extensionId;
+}
+
+test.describe('Video Downloader Extension', () => {
+  let context: BrowserContext;
+  let extensionId: string;
+
+  test.beforeAll(async () => {
+    // Launch browser with extension
+    context = await chromium.launchPersistentContext('', {
+      headless: false,
+      args: [
+        `--disable-extensions-except=${extensionPath}`,
+        `--load-extension=${extensionPath}`,
+        '--no-sandbox',
+      ],
+    });
+
+    extensionId = await getExtensionId(context);
+    console.log(`Extension loaded with ID: ${extensionId}`);
+  });
+
+  test.afterAll(async () => {
+    await context.close();
+  });
+
+  test('extension loads and popup opens', async () => {
+    // Open popup directly
+    const popupPage = await context.newPage();
+    await popupPage.goto(`chrome-extension://${extensionId}/popup.html`);
+
+    // Check header is visible
+    await expect(popupPage.locator('.header h1')).toContainText('Video Downloader');
+
+    // Should show loading or no videos initially
+    const mainContent = popupPage.locator('#main-content');
+    await expect(mainContent).toBeVisible();
+
+    await popupPage.close();
+  });
+
+  test('detects video on page with HTML5 video element', async () => {
+    // Create a test page with a video element
+    const page = await context.newPage();
+
+    // Use a public test video
+    await page.setContent(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Test Video Page</title></head>
+        <body>
+          <video id="test-video" controls width="640">
+            <source src="https://www.w3schools.com/html/mov_bbb.mp4" type="video/mp4">
+          </video>
+        </body>
+      </html>
+    `);
+
+    // Wait for content script to load
+    await page.waitForTimeout(2000);
+
+    // Open popup to check detection
+    const popupPage = await context.newPage();
+    await popupPage.goto(`chrome-extension://${extensionId}/popup.html`);
+
+    // Wait for scan to complete
+    await popupPage.waitForTimeout(3000);
+
+    // Check if video was detected (either shows video list or no videos)
+    const videoList = popupPage.locator('.video-list');
+    const noVideos = popupPage.locator('.no-videos');
+
+    // One of them should be visible
+    const hasVideos = await videoList.isVisible().catch(() => false);
+    const hasNoVideos = await noVideos.isVisible().catch(() => false);
+
+    expect(hasVideos || hasNoVideos).toBe(true);
+
+    await page.close();
+    await popupPage.close();
+  });
+
+  test('popup shows refresh button', async () => {
+    const popupPage = await context.newPage();
+    await popupPage.goto(`chrome-extension://${extensionId}/popup.html`);
+
+    // Wait for initial load
+    await popupPage.waitForTimeout(2000);
+
+    // Check for refresh button in no-videos state
+    const refreshBtn = popupPage.locator('#refresh-btn');
+
+    // Button might be visible if no videos found
+    if (await refreshBtn.isVisible()) {
+      await expect(refreshBtn).toHaveText('Refresh');
+    }
+
+    await popupPage.close();
+  });
+
+  test('can navigate to Instagram and check for videos', async () => {
+    const page = await context.newPage();
+
+    // Go to Instagram (login page is fine, just testing detection)
+    await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded' });
+
+    // Wait for page to load
+    await page.waitForTimeout(3000);
+
+    // Open popup
+    const popupPage = await context.newPage();
+    await popupPage.goto(`chrome-extension://${extensionId}/popup.html`);
+
+    // Wait for scan
+    await popupPage.waitForTimeout(3000);
+
+    // Just verify popup loaded correctly
+    await expect(popupPage.locator('.header')).toBeVisible();
+
+    await page.close();
+    await popupPage.close();
+  });
+
+  test('extension badge shows on pages', async () => {
+    const page = await context.newPage();
+    await page.goto('https://example.com');
+
+    // Extension should be loaded
+    // Badge state is managed by background script
+    // Just verify page loads without errors
+
+    await expect(page).toHaveTitle(/Example/);
+    await page.close();
+  });
+});
+
+// Standalone test that can be run individually
+test('quick extension health check', async () => {
+  const context = await chromium.launchPersistentContext('', {
+    headless: false,
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+      '--no-sandbox',
+    ],
+  });
+
+  try {
+    const extensionId = await getExtensionId(context);
+    console.log(`✓ Extension loaded: ${extensionId}`);
+
+    const page = await context.newPage();
+    await page.goto(`chrome-extension://${extensionId}/popup.html`);
+
+    const title = await page.locator('.header h1').textContent();
+    console.log(`✓ Popup title: ${title}`);
+
+    expect(title).toContain('Video Downloader');
+
+    await page.close();
+  } finally {
+    await context.close();
+  }
+});

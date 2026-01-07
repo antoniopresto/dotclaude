@@ -1,0 +1,128 @@
+/**
+ * TypeBox abstraction layer.
+ * This is the ONLY file that should import from 'typebox' directly.
+ */
+
+import { Static, TSchema, Type } from 'typebox';
+import { Compile } from 'typebox/compile';
+import { Value } from 'typebox/value';
+
+/** Custom kind identifier for Date type (TypeBox 1.x uses ~kind property) */
+const CUSTOM_DATE_KIND = 'CustomDate';
+
+/**
+ * FIX-006: Cache for compiled validators.
+ * WeakMap allows garbage collection of unused schemas.
+ */
+const compiledValidatorCache = new WeakMap<
+  TSchema,
+  ReturnType<typeof Compile>
+>();
+
+/**
+ * FIX-006: Get or create a compiled validator for a schema.
+ * Compiled validators are 10-100x faster than Value.Check interpreter.
+ */
+function getCompiledValidator(schema: TSchema): ReturnType<typeof Compile> {
+  let validator = compiledValidatorCache.get(schema);
+  if (!validator) {
+    validator = Compile(schema);
+    compiledValidatorCache.set(schema, validator);
+  }
+  return validator;
+}
+
+/**
+ * Check if a schema is our custom Date type.
+ */
+function isCustomDateSchema(schema: TSchema): boolean {
+  return (schema as any)['~customKind'] === CUSTOM_DATE_KIND;
+}
+
+/**
+ * Validate a value as a Date object.
+ */
+function isValidDate(value: unknown): value is Date {
+  return value instanceof Date && !isNaN(value.getTime());
+}
+
+/**
+ * Creates a TypeBox schema for validating Date objects.
+ */
+export function createDateType(): TSchema {
+  return Type.Unsafe<Date>({ '~customKind': CUSTOM_DATE_KIND });
+}
+
+/**
+ * Infers the TypeScript type from a TypeBox schema.
+ */
+export type TypeBoxInfer<T extends TSchema> = Static<T>;
+
+/**
+ * Result of createBaseType - contains the schema and validation utilities.
+ */
+export type BaseType<T extends TSchema> = {
+  /** The raw TypeBox schema */
+  schema: T;
+  /** Check if a value matches the schema */
+  check(value: unknown): value is Static<T>;
+  /** Parse and validate a value, throws on failure */
+  parse(value: unknown): Static<T>;
+  /** Get validation errors for a value */
+  errors(value: unknown): string[];
+  /** Decode a value (applies transforms) */
+  decode(value: unknown): Static<T>;
+};
+
+/**
+ * Creates a wrapped TypeBox type with validation utilities.
+ * Similar to Zod's API but using TypeBox under the hood.
+ * FIX-006: Uses compiled validators for 10-100x faster validation.
+ */
+export function createBaseType<T extends TSchema>(schema: T): BaseType<T> {
+  const isDateSchema = isCustomDateSchema(schema);
+
+  // FIX-006: Get compiled validator (cached)
+  const compiledValidator = isDateSchema ? null : getCompiledValidator(schema);
+
+  return {
+    schema,
+    check(value: unknown): value is Static<T> {
+      if (isDateSchema) {
+        return isValidDate(value);
+      }
+      // FIX-006: Use compiled validator instead of interpreter
+      return compiledValidator!.Check(value);
+    },
+    parse(value: unknown): Static<T> {
+      if (isDateSchema) {
+        if (isValidDate(value)) {
+          return value as Static<T>;
+        }
+        throw new TypeError('Expected a valid Date object');
+      }
+      // FIX-006: Use compiled validator
+      if (compiledValidator!.Check(value)) {
+        return Value.Decode(schema, value);
+      }
+      const errors = [...Value.Errors(schema, value)];
+      throw new TypeError(errors.map(e => e.message).join(', '));
+    },
+    errors(value: unknown): string[] {
+      if (isDateSchema) {
+        return isValidDate(value) ? [] : ['Expected a valid Date object'];
+      }
+      return [...Value.Errors(schema, value)].map(e => e.message);
+    },
+    decode(value: unknown): Static<T> {
+      if (isDateSchema) {
+        return value as Static<T>;
+      }
+      return Value.Decode(schema, value);
+    },
+  };
+}
+
+// Re-export Type builder for internal schema construction
+export { Type };
+export type { TSchema };

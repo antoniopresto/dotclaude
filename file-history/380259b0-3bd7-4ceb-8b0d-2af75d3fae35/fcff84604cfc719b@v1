@@ -1,0 +1,528 @@
+/**
+ * ExecutionLayer Component
+ *
+ * The most detailed view showing individual task cards with full information.
+ * Designed for daily/hourly operational planning.
+ *
+ * LOD: Execution (> 3.0x zoom)
+ */
+
+import React, { useMemo, useState, useCallback } from 'react';
+import { Card, Tag, Intent, ProgressBar, Icon } from '@blueprintjs/core';
+import type { Task, Train } from '../../data/mock-generator';
+import { MAINTENANCE_TYPE_MAP, TIME_RANGE } from '../../data/mock-config';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+export interface ExecutionLayerProps {
+  /** Task data */
+  tasks: Task[];
+  /** Train data for row labels */
+  trains: Train[];
+  /** Width of the viewport */
+  width: number;
+  /** Height of the viewport */
+  height: number;
+  /** Camera X position (pan) - days from start */
+  cameraX?: number;
+  /** Camera Y position (pan) - train index */
+  cameraY?: number;
+  /** Zoom level */
+  zoom?: number;
+  /** Opacity for crossfade transitions */
+  opacity?: number;
+  /** Callback when a task is clicked */
+  onTaskClick?: (task: Task) => void;
+  /** Callback when a task is hovered */
+  onTaskHover?: (task: Task | null) => void;
+  /** Currently selected task ID */
+  selectedTaskId?: string | null;
+  /** Show dependency lines */
+  showDependencies?: boolean;
+  /** Show resource indicators */
+  showResources?: boolean;
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const PX_PER_HOUR = 12;
+const PX_PER_DAY = PX_PER_HOUR * 24;
+const ROW_HEIGHT = 80;
+const TASK_HEIGHT = 60;
+const TASK_MARGIN = 10;
+const HEADER_HEIGHT = 50;
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+function daysBetween(start: Date, end: Date): number {
+  return Math.floor((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function formatDate(date: Date): string {
+  return date.toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  });
+}
+
+function formatTime(hours: number): string {
+  const h = Math.floor(hours);
+  const m = Math.round((hours - h) * 60);
+  return `${h}h ${m > 0 ? `${m}m` : ''}`.trim();
+}
+
+function getStatusIntent(status: Task['status']): Intent {
+  switch (status) {
+    case 'completed':
+      return Intent.SUCCESS;
+    case 'in-progress':
+      return Intent.PRIMARY;
+    case 'overdue':
+      return Intent.DANGER;
+    default:
+      return Intent.NONE;
+  }
+}
+
+function getStatusProgress(status: Task['status']): number {
+  switch (status) {
+    case 'completed':
+      return 1;
+    case 'in-progress':
+      return 0.5;
+    case 'overdue':
+      return 0.8;
+    default:
+      return 0;
+  }
+}
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+export const ExecutionLayer: React.FC<ExecutionLayerProps> = ({
+  tasks,
+  trains,
+  width,
+  height,
+  cameraX = 0,
+  cameraY = 0,
+  zoom = 1,
+  opacity = 1,
+  onTaskClick,
+  onTaskHover,
+  selectedTaskId,
+  showDependencies = true,
+  showResources = true,
+}) => {
+  const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
+
+  // Calculate visible area
+  const visibleDays = width / (PX_PER_DAY * zoom);
+  const visibleTrains = (height - HEADER_HEIGHT) / (ROW_HEIGHT * zoom);
+
+  // Filter tasks to visible area
+  const visibleTasks = useMemo(() => {
+    const startDay = cameraX;
+    const endDay = cameraX + visibleDays;
+    const startTrain = Math.floor(cameraY);
+    const endTrain = Math.ceil(cameraY + visibleTrains);
+
+    return tasks.filter((task) => {
+      const taskStartDay = daysBetween(TIME_RANGE.start, task.startDate);
+      const taskEndDay = daysBetween(TIME_RANGE.start, task.endDate);
+      const trainIndex = task.trainIndex;
+
+      return (
+        taskEndDay >= startDay &&
+        taskStartDay <= endDay &&
+        trainIndex >= startTrain &&
+        trainIndex <= endTrain
+      );
+    });
+  }, [tasks, cameraX, cameraY, visibleDays, visibleTrains]);
+
+  // Calculate task positions
+  const taskPositions = useMemo(() => {
+    return visibleTasks.map((task) => {
+      const startDay = daysBetween(TIME_RANGE.start, task.startDate);
+      const duration = daysBetween(task.startDate, task.endDate);
+
+      const x = (startDay - cameraX) * PX_PER_DAY * zoom;
+      const y = HEADER_HEIGHT + (task.trainIndex - cameraY) * ROW_HEIGHT * zoom;
+      const w = Math.max(duration * PX_PER_DAY * zoom, 100); // Minimum width for readability
+      const h = TASK_HEIGHT * zoom;
+
+      return { task, x, y, w, h };
+    });
+  }, [visibleTasks, cameraX, cameraY, zoom]);
+
+  // Generate hour markers
+  const hourMarkers = useMemo(() => {
+    const markers: { x: number; label: string; isMajor: boolean }[] = [];
+    const startDay = Math.floor(cameraX);
+    const endDay = Math.ceil(cameraX + visibleDays) + 1;
+
+    for (let day = startDay; day <= endDay; day++) {
+      const date = new Date(TIME_RANGE.start);
+      date.setDate(date.getDate() + day);
+
+      for (let hour = 0; hour < 24; hour += 6) {
+        const x = ((day - cameraX) * 24 + hour) * PX_PER_HOUR * zoom;
+        if (x >= -50 && x <= width + 50) {
+          markers.push({
+            x,
+            label:
+              hour === 0
+                ? date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+                : `${hour}:00`,
+            isMajor: hour === 0,
+          });
+        }
+      }
+    }
+
+    return markers;
+  }, [cameraX, visibleDays, zoom, width]);
+
+  // Generate train row backgrounds
+  const trainRows = useMemo(() => {
+    const rows: { y: number; train: Train; index: number }[] = [];
+    const startTrain = Math.floor(cameraY);
+    const endTrain = Math.ceil(cameraY + visibleTrains) + 1;
+
+    for (let i = startTrain; i <= Math.min(endTrain, trains.length - 1); i++) {
+      if (i >= 0 && trains[i]) {
+        rows.push({
+          y: HEADER_HEIGHT + (i - cameraY) * ROW_HEIGHT * zoom,
+          train: trains[i],
+          index: i,
+        });
+      }
+    }
+
+    return rows;
+  }, [trains, cameraY, visibleTrains, zoom]);
+
+  const handleTaskClick = useCallback(
+    (task: Task) => {
+      onTaskClick?.(task);
+    },
+    [onTaskClick]
+  );
+
+  const handleTaskHover = useCallback(
+    (task: Task | null) => {
+      setHoveredTaskId(task?.id ?? null);
+      onTaskHover?.(task);
+    },
+    [onTaskHover]
+  );
+
+  return (
+    <div
+      style={{
+        width,
+        height,
+        position: 'relative',
+        overflow: 'hidden',
+        background: '#f8fafc',
+        opacity,
+      }}
+    >
+      {/* Time header */}
+      <div
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          height: HEADER_HEIGHT,
+          background: 'white',
+          borderBottom: '1px solid #e2e8f0',
+          zIndex: 10,
+        }}
+      >
+        {hourMarkers.map((marker, i) => (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              left: marker.x,
+              top: 0,
+              height: HEADER_HEIGHT,
+              borderLeft: marker.isMajor ? '2px solid #94a3b8' : '1px solid #e2e8f0',
+              paddingLeft: 4,
+              fontSize: marker.isMajor ? 12 : 10,
+              fontWeight: marker.isMajor ? 600 : 400,
+              color: marker.isMajor ? '#1e293b' : '#64748b',
+              display: 'flex',
+              alignItems: 'center',
+            }}
+          >
+            {marker.label}
+          </div>
+        ))}
+      </div>
+
+      {/* Train sidebar */}
+      <div
+        style={{
+          position: 'absolute',
+          top: HEADER_HEIGHT,
+          left: 0,
+          width: 100,
+          bottom: 0,
+          background: 'white',
+          borderRight: '1px solid #e2e8f0',
+          zIndex: 10,
+          overflow: 'hidden',
+        }}
+      >
+        {trainRows.map(({ y, train, index }) => (
+          <div
+            key={train.id}
+            style={{
+              position: 'absolute',
+              top: y - HEADER_HEIGHT,
+              left: 0,
+              right: 0,
+              height: ROW_HEIGHT * zoom,
+              borderBottom: '1px solid #f1f5f9',
+              padding: '8px',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+            }}
+          >
+            <div style={{ fontWeight: 600, fontSize: 11 }}>{train.name}</div>
+            <Tag
+              minimal
+              style={{ fontSize: 9, marginTop: 2 }}
+              intent={train.fleetId === 'kinki' ? Intent.SUCCESS : Intent.PRIMARY}
+            >
+              {train.fleetId === 'kinki' ? 'KNK' : 'ALT'}
+            </Tag>
+          </div>
+        ))}
+      </div>
+
+      {/* Train rows background */}
+      <div
+        style={{
+          position: 'absolute',
+          top: HEADER_HEIGHT,
+          left: 100,
+          right: 0,
+          bottom: 0,
+          overflow: 'hidden',
+        }}
+      >
+        {trainRows.map(({ y, index }) => (
+          <div
+            key={index}
+            style={{
+              position: 'absolute',
+              top: y - HEADER_HEIGHT,
+              left: 0,
+              right: 0,
+              height: ROW_HEIGHT * zoom,
+              background: index % 2 === 0 ? '#ffffff' : '#f8fafc',
+              borderBottom: '1px solid #f1f5f9',
+            }}
+          />
+        ))}
+
+        {/* Vertical grid lines */}
+        {hourMarkers.map((marker, i) => (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              left: marker.x - 100,
+              top: 0,
+              bottom: 0,
+              borderLeft: marker.isMajor ? '1px solid #e2e8f0' : '1px dashed #f1f5f9',
+            }}
+          />
+        ))}
+
+        {/* Task cards */}
+        {taskPositions.map(({ task, x, y, w, h }) => {
+          const mt = MAINTENANCE_TYPE_MAP.get(task.type);
+          const isSelected = task.id === selectedTaskId;
+          const isHovered = task.id === hoveredTaskId;
+
+          return (
+            <Card
+              key={task.id}
+              interactive
+              elevation={isSelected ? 3 : isHovered ? 2 : 1}
+              onClick={() => handleTaskClick(task)}
+              onMouseEnter={() => handleTaskHover(task)}
+              onMouseLeave={() => handleTaskHover(null)}
+              style={{
+                position: 'absolute',
+                left: x - 100 + TASK_MARGIN,
+                top: y - HEADER_HEIGHT + TASK_MARGIN,
+                width: Math.max(w - TASK_MARGIN * 2, 100),
+                height: h - TASK_MARGIN * 2,
+                padding: 8,
+                overflow: 'hidden',
+                borderLeft: `4px solid ${mt?.color ?? '#94a3b8'}`,
+                borderColor: isSelected ? '#3b82f6' : task.hasConflict ? '#ef4444' : undefined,
+                borderWidth: isSelected || task.hasConflict ? 2 : undefined,
+                background: isHovered ? '#f0f9ff' : 'white',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              {/* Task header */}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'flex-start',
+                  marginBottom: 4,
+                }}
+              >
+                <div style={{ fontSize: 11, fontWeight: 600, color: '#1e293b' }}>
+                  {task.name}
+                </div>
+                <Tag
+                  minimal
+                  intent={getStatusIntent(task.status)}
+                  style={{ fontSize: 9, flexShrink: 0 }}
+                >
+                  {task.status}
+                </Tag>
+              </div>
+
+              {/* Task details */}
+              <div style={{ fontSize: 10, color: '#64748b', marginBottom: 4 }}>
+                {formatDate(task.startDate)} - {formatDate(task.endDate)}
+              </div>
+
+              {/* Progress bar */}
+              <ProgressBar
+                value={getStatusProgress(task.status)}
+                intent={getStatusIntent(task.status)}
+                stripes={task.status === 'in-progress'}
+                animate={task.status === 'in-progress'}
+                style={{ height: 4, marginBottom: 4 }}
+              />
+
+              {/* Resource indicators */}
+              {showResources && (
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    fontSize: 9,
+                    color: '#64748b',
+                    marginTop: 4,
+                  }}
+                >
+                  <span>
+                    <Icon icon="time" size={10} /> {task.durationHours}h
+                  </span>
+                  <span>
+                    <Icon icon="person" size={10} /> {task.manHours}mh
+                  </span>
+                  {task.pitId && (
+                    <span>
+                      <Icon icon="grid" size={10} /> Pit {task.pitId}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Conflict indicator */}
+              {task.hasConflict && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 4,
+                    right: 4,
+                    color: '#ef4444',
+                  }}
+                >
+                  <Icon icon="warning-sign" size={14} />
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* View info */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 16,
+          right: 16,
+          background: 'white',
+          padding: '8px 12px',
+          borderRadius: 8,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+          fontSize: 11,
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Execution View</div>
+        <div>Visible: {visibleTasks.length} tasks</div>
+        <div>
+          Zoom: {zoom.toFixed(1)}x ({(zoom * 100).toFixed(0)}%)
+        </div>
+        <div>
+          Time: {PX_PER_HOUR * zoom}px/hour
+        </div>
+      </div>
+
+      {/* Legend */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 16,
+          left: 116,
+          background: 'white',
+          padding: '8px 12px',
+          borderRadius: 8,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+          fontSize: 10,
+          display: 'flex',
+          gap: 12,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <Tag minimal intent={Intent.NONE}>
+            scheduled
+          </Tag>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <Tag minimal intent={Intent.PRIMARY}>
+            in-progress
+          </Tag>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <Tag minimal intent={Intent.SUCCESS}>
+            completed
+          </Tag>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <Tag minimal intent={Intent.DANGER}>
+            overdue
+          </Tag>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ExecutionLayer;

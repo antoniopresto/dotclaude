@@ -1,0 +1,335 @@
+# HQ - Harness Orchestrator & Dashboard
+
+## Vision
+
+**HQ** (Headquarters) is a native desktop application that provides a visual dashboard for managing AI agent development sessions. It enables developers to orchestrate, monitor, and control multiple Claude Code sessions across different projects without using a terminal.
+
+## Core Philosophy
+
+> "A Single Pane of Glass for AI-Assisted Development"
+
+HQ transforms the way developers interact with long-running AI agents by providing:
+- **Visual Kanban boards** for feature tracking
+- **Real-time logs** from all running processes
+- **PTY-based process control** with full interactivity
+- **Multi-project management** via tabs
+- **Harness state visualization**
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         HQ Desktop App                               │
+│                    (Tauri + React 19 + PatternFly 6)                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────────────┐ │
+│  │   Tab Bar      │  │   Kanban View   │  │   Logs Panel           │ │
+│  │   (Projects)   │  │   (Features)    │  │   (Real-time PTY)      │ │
+│  └────────────────┘  └────────────────┘  └────────────────────────┘ │
+│                                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                       State Management Layer                         │
+│                  (@zazcart/toolkit state-machine)                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                       Rust Backend (Tauri)                           │
+│                                                                      │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
+│  │ PTY Controller  │  │ File Watcher    │  │ IPC Commands        │  │
+│  │ (portable-pty)  │  │ (notify crate)  │  │ (Tauri invoke)      │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
+│                                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                     External Processes                               │
+│                                                                      │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
+│  │ Claude Code #1  │  │ Claude Code #2  │  │ Other Processes     │  │
+│  │ (Project A)     │  │ (Project B)     │  │ (servers, tests)    │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Technology Stack
+
+| Layer | Technology | Version | Purpose |
+|-------|------------|---------|---------|
+| **Desktop Runtime** | Tauri | 2.x | Native app shell, Rust backend |
+| **Frontend** | React | 19.x | UI framework |
+| **UI Components** | PatternFly | 6.x | Enterprise UI (chat, terminal, logs) |
+| **State Management** | @zazcart/toolkit | file:/usr/local/packages/toolkit | State machine + schema validation |
+| **PTY Emulation** | portable-pty (Rust) | latest | Process spawning and control |
+| **File Watching** | notify (Rust) | latest | Real-time harness file changes |
+| **IPC** | Tauri Commands | - | Frontend ↔ Backend communication |
+
+### Why PatternFly 6?
+
+PatternFly provides ready-made components for our use cases:
+- **Chat/AI components** - For agent communication UI
+- **Log viewer** - Real-time log display with ANSI support
+- **Terminal** - Embedded terminal views
+- **Tabs** - Multi-project navigation
+- **Cards/Panels** - Kanban board layout
+- **Dark theme** - Built-in dark mode support
+
+---
+
+## Feature Specifications
+
+### F001: Multi-Project Tab Management
+
+**Description:** Open and manage multiple projects simultaneously via tabs.
+
+**UI Elements:**
+- Tab bar at top (PatternFly Tabs)
+- New tab button (+)
+- Close tab button (X)
+- Tab context menu (rename, close others, close all)
+
+**Behavior:**
+- Each tab represents a project directory
+- Tab title shows project name (from package.json or folder name)
+- Active tab is highlighted
+- Tabs are reorderable via drag-and-drop
+
+### F002: Kanban Board View
+
+**Description:** Visual kanban board for feature tracking within a project.
+
+**Columns:**
+```
+BACKLOG → TODO → DOING → REVIEW → QA → DONE
+```
+
+**Card Structure:**
+- Feature ID (e.g., F001)
+- Title
+- Description (truncated)
+- Status badge
+- Priority indicator
+- Click to expand details
+
+**Data Source:**
+- Reads from `.harness/features.json`
+- Auto-updates when file changes (via file watcher)
+- Status mapped to columns:
+  - `passes: false` + not started → BACKLOG
+  - `passes: false` + priority → TODO
+  - `passes: false` + in_progress → DOING
+  - `passes: false` + needs_review → REVIEW
+  - `passes: false` + testing → QA
+  - `passes: true` → DONE
+
+### F003: Real-Time Log Panel
+
+**Description:** Live output from running processes (Claude Code, servers, etc.)
+
+**Features:**
+- PatternFly LogViewer component
+- ANSI color support
+- Timestamp prefix
+- Process filter
+- Search within logs
+- Clear button
+- Auto-scroll toggle
+
+**Technical:**
+- PTY streams → Tauri events → React state
+- Max 10,000 lines per process (ring buffer)
+
+### F004: PTY Process Controller
+
+**Description:** Spawn, control, and interact with shell processes.
+
+**Capabilities:**
+- Start new process (e.g., `claude` command)
+- Send keystrokes (including Ctrl+C, Ctrl+D)
+- Resize PTY on window resize
+- Kill process
+- Restart process
+
+**Rust Implementation:**
+```rust
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+fn spawn_process(cmd: &str, cols: u16, rows: u16) -> Result<PtyPair> {
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize { rows, cols, .. })?;
+    let cmd = CommandBuilder::new(cmd);
+    pair.slave.spawn_command(cmd)?;
+    Ok(pair)
+}
+```
+
+### F005: Harness State Visualization
+
+**Description:** Display current harness state visually.
+
+**Components:**
+- Progress summary card
+  - Features completed / total
+  - Current session info
+  - Last commit
+- Active feature highlight
+- Session timeline (from progress.txt)
+
+### F006: Project Selector Dialog
+
+**Description:** Open new project from file system.
+
+**UI:**
+- PatternFly Modal
+- Recent projects list
+- Browse button (native file picker via Tauri)
+- Validate project (check for .harness folder)
+
+### F007: Settings Panel
+
+**Description:** Configure HQ preferences.
+
+**Settings:**
+- Theme (light/dark/system)
+- Log buffer size
+- Auto-start Claude Code
+- Default shell
+- Font size
+
+---
+
+## State Schema (using @zazcart/toolkit)
+
+```typescript
+import { Type, Static } from 'typebox';
+import { createStore } from '@zazcart/toolkit';
+
+// Project Schema
+const ProjectSchema = Type.Object({
+  id: Type.String(),
+  path: Type.String(),
+  name: Type.String(),
+  harness: Type.Optional(Type.Object({
+    progressFile: Type.String(),
+    featuresFile: Type.String(),
+  })),
+});
+
+// Feature Schema (from harness)
+const FeatureSchema = Type.Object({
+  id: Type.String(),
+  description: Type.String(),
+  category: Type.String(),
+  passes: Type.Boolean(),
+  steps: Type.Array(Type.String()),
+});
+
+// Process Schema
+const ProcessSchema = Type.Object({
+  id: Type.String(),
+  projectId: Type.String(),
+  command: Type.String(),
+  status: Type.Union([
+    Type.Literal('running'),
+    Type.Literal('stopped'),
+    Type.Literal('error'),
+  ]),
+  pid: Type.Optional(Type.Number()),
+});
+
+// App State
+const AppStateSchema = Type.Object({
+  activeTab: Type.String(),
+  theme: Type.Union([
+    Type.Literal('light'),
+    Type.Literal('dark'),
+    Type.Literal('system'),
+  ]),
+  projects: Type.Record(Type.String(), ProjectSchema),
+  projectOrder: Type.Array(Type.String()),
+  features: Type.Record(Type.String(), Type.Array(FeatureSchema)),
+  processes: Type.Record(Type.String(), ProcessSchema),
+});
+
+type AppState = Static<typeof AppStateSchema>;
+```
+
+---
+
+## Tauri Commands (IPC)
+
+```typescript
+// Frontend → Backend commands
+interface TauriCommands {
+  'project:open': (path: string) => Promise<Project>;
+  'project:close': (id: string) => Promise<void>;
+  'pty:spawn': (projectId: string, cmd: string) => Promise<string>;
+  'pty:write': (processId: string, data: string) => Promise<void>;
+  'pty:resize': (processId: string, cols: number, rows: number) => Promise<void>;
+  'pty:kill': (processId: string) => Promise<void>;
+  'harness:read_features': (path: string) => Promise<Feature[]>;
+  'harness:watch': (projectPath: string) => Promise<void>;
+  'fs:select_directory': () => Promise<string | null>;
+}
+
+// Backend → Frontend events
+interface TauriEvents {
+  'pty:output': { processId: string; data: string };
+  'pty:exit': { processId: string; code: number };
+  'harness:changed': { projectPath: string; file: string };
+}
+```
+
+---
+
+## Directory Structure
+
+```
+~/antonio/HQ/
+├── .claude/
+│   ├── settings.json
+│   └── hooks/
+├── .harness/
+│   ├── progress.txt
+│   └── features.json
+├── docs/
+│   └── HQ_SPEC.md
+├── src/
+│   ├── main.tsx
+│   ├── App.tsx
+│   ├── components/
+│   ├── state/
+│   ├── lib/
+│   └── views/
+├── src-tauri/
+│   ├── Cargo.toml
+│   ├── tauri.conf.json
+│   └── src/
+├── package.json
+├── vite.config.ts
+├── CLAUDE.md
+└── README.md
+```
+
+---
+
+## References
+
+- [Anthropic: Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- [PatternFly 6 Documentation](https://www.patternfly.org/)
+- [Tauri 2.0 Documentation](https://v2.tauri.app/)
+- [portable-pty (Rust)](https://docs.rs/portable-pty)
+
+---
+
+## Success Metrics
+
+| Metric | Target |
+|--------|--------|
+| App startup time | < 2s |
+| Log rendering latency | < 16ms (60fps) |
+| PTY input latency | < 50ms |
+| Memory usage (10 projects) | < 200MB |
+| Binary size | < 30MB |

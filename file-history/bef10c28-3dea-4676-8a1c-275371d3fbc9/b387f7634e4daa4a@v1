@@ -1,0 +1,693 @@
+/**
+ * POC: Gesture Recognizer with @use-gesture/react
+ *
+ * Demonstrates touch and mouse gesture handling for the canvas:
+ * 1. Pan (drag to move viewport)
+ * 2. Pinch (pinch-to-zoom on touch devices)
+ * 3. Wheel (scroll to zoom)
+ * 4. Momentum (inertia after release)
+ *
+ * This POC validates gesture handling before integrating with deck.gl/XState.
+ */
+
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import type { Meta, StoryObj } from '@storybook/react';
+import { useGesture } from '@use-gesture/react';
+import { Card, Tag, Intent, Divider, Switch, Slider } from '@blueprintjs/core';
+
+import { COLORS, ANIMATION } from '../../data/mock-config';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+interface ViewportState {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+interface MomentumState {
+  vx: number;
+  vy: number;
+  active: boolean;
+}
+
+interface GestureConfig {
+  enableMomentum: boolean;
+  enablePinch: boolean;
+  zoomSensitivity: number;
+  momentumFriction: number;
+  minZoom: number;
+  maxZoom: number;
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const DEFAULT_CONFIG: GestureConfig = {
+  enableMomentum: true,
+  enablePinch: true,
+  zoomSensitivity: 0.002,
+  momentumFriction: 0.95,
+  minZoom: 0.1,
+  maxZoom: 10,
+};
+
+const GRID_SIZE = 50;
+const WORLD_SIZE = 2000;
+
+// =============================================================================
+// UTILITIES
+// =============================================================================
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+// =============================================================================
+// GRID VISUALIZATION COMPONENT
+// =============================================================================
+
+interface GridProps {
+  viewport: ViewportState;
+  width: number;
+  height: number;
+}
+
+function Grid({ viewport, width, height }: GridProps) {
+  const { x, y, zoom } = viewport;
+
+  // Calculate visible grid range
+  const scaledGridSize = GRID_SIZE * zoom;
+  const offsetX = (x * zoom) % scaledGridSize;
+  const offsetY = (y * zoom) % scaledGridSize;
+
+  // Generate grid lines
+  const verticalLines: number[] = [];
+  const horizontalLines: number[] = [];
+
+  for (let i = -1; i <= Math.ceil(width / scaledGridSize) + 1; i++) {
+    verticalLines.push(offsetX + i * scaledGridSize);
+  }
+
+  for (let i = -1; i <= Math.ceil(height / scaledGridSize) + 1; i++) {
+    horizontalLines.push(offsetY + i * scaledGridSize);
+  }
+
+  return (
+    <svg
+      width={width}
+      height={height}
+      style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }}
+    >
+      {/* Grid lines */}
+      {verticalLines.map((lineX, i) => (
+        <line
+          key={`v-${i}`}
+          x1={lineX}
+          y1={0}
+          x2={lineX}
+          y2={height}
+          stroke={COLORS.border.default}
+          strokeWidth={1}
+        />
+      ))}
+      {horizontalLines.map((lineY, i) => (
+        <line
+          key={`h-${i}`}
+          x1={0}
+          y1={lineY}
+          x2={width}
+          y2={lineY}
+          stroke={COLORS.border.default}
+          strokeWidth={1}
+        />
+      ))}
+
+      {/* Origin marker */}
+      <circle
+        cx={x * zoom + width / 2}
+        cy={y * zoom + height / 2}
+        r={8}
+        fill={COLORS.status.info}
+        opacity={0.8}
+      />
+
+      {/* Viewport center crosshair */}
+      <line
+        x1={width / 2 - 20}
+        y1={height / 2}
+        x2={width / 2 + 20}
+        y2={height / 2}
+        stroke={COLORS.today}
+        strokeWidth={2}
+      />
+      <line
+        x1={width / 2}
+        y1={height / 2 - 20}
+        x2={width / 2}
+        y2={height / 2 + 20}
+        stroke={COLORS.today}
+        strokeWidth={2}
+      />
+    </svg>
+  );
+}
+
+// =============================================================================
+// INFO PANEL
+// =============================================================================
+
+interface InfoPanelProps {
+  viewport: ViewportState;
+  momentum: MomentumState;
+  gesture: string;
+}
+
+function InfoPanel({ viewport, momentum, gesture }: InfoPanelProps) {
+  return (
+    <Card style={{ position: 'absolute', top: 10, left: 10, padding: '8px 12px', zIndex: 100 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Viewport State</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '4px 16px', fontSize: 11 }}>
+        <span style={{ color: COLORS.text.secondary }}>Pan X:</span>
+        <strong>{viewport.x.toFixed(1)}</strong>
+        <span style={{ color: COLORS.text.secondary }}>Pan Y:</span>
+        <strong>{viewport.y.toFixed(1)}</strong>
+        <span style={{ color: COLORS.text.secondary }}>Zoom:</span>
+        <Tag intent={Intent.PRIMARY} minimal>{viewport.zoom.toFixed(2)}x</Tag>
+      </div>
+      <Divider style={{ margin: '8px 0' }} />
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>Gesture</div>
+      <Tag intent={gesture !== 'idle' ? Intent.SUCCESS : Intent.NONE}>
+        {gesture}
+      </Tag>
+      {momentum.active && (
+        <>
+          <Divider style={{ margin: '8px 0' }} />
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>Momentum</div>
+          <div style={{ fontSize: 10, color: COLORS.text.secondary }}>
+            vx: {momentum.vx.toFixed(1)}, vy: {momentum.vy.toFixed(1)}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+// =============================================================================
+// CONFIG PANEL
+// =============================================================================
+
+interface ConfigPanelProps {
+  config: GestureConfig;
+  onConfigChange: (config: GestureConfig) => void;
+  onReset: () => void;
+}
+
+function ConfigPanel({ config, onConfigChange, onReset }: ConfigPanelProps) {
+  return (
+    <Card style={{ position: 'absolute', top: 10, right: 10, padding: '8px 12px', zIndex: 100, width: 200 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Configuration</div>
+
+      <div style={{ marginBottom: 8 }}>
+        <Switch
+          checked={config.enableMomentum}
+          onChange={(e) =>
+            onConfigChange({ ...config, enableMomentum: (e.target as HTMLInputElement).checked })
+          }
+          label="Momentum"
+          style={{ fontSize: 11 }}
+        />
+      </div>
+
+      <div style={{ marginBottom: 8 }}>
+        <Switch
+          checked={config.enablePinch}
+          onChange={(e) =>
+            onConfigChange({ ...config, enablePinch: (e.target as HTMLInputElement).checked })
+          }
+          label="Pinch to Zoom"
+          style={{ fontSize: 11 }}
+        />
+      </div>
+
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 10, color: COLORS.text.secondary, marginBottom: 4 }}>
+          Zoom Sensitivity: {config.zoomSensitivity.toFixed(3)}
+        </div>
+        <Slider
+          min={0.001}
+          max={0.01}
+          stepSize={0.001}
+          value={config.zoomSensitivity}
+          onChange={(value) => onConfigChange({ ...config, zoomSensitivity: value })}
+          labelRenderer={false}
+        />
+      </div>
+
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 10, color: COLORS.text.secondary, marginBottom: 4 }}>
+          Friction: {config.momentumFriction.toFixed(2)}
+        </div>
+        <Slider
+          min={0.8}
+          max={0.99}
+          stepSize={0.01}
+          value={config.momentumFriction}
+          onChange={(value) => onConfigChange({ ...config, momentumFriction: value })}
+          labelRenderer={false}
+        />
+      </div>
+
+      <Divider style={{ margin: '8px 0' }} />
+
+      <button
+        onClick={onReset}
+        style={{
+          width: '100%',
+          padding: '4px 8px',
+          fontSize: 11,
+          cursor: 'pointer',
+          background: COLORS.bg.tertiary,
+          border: `1px solid ${COLORS.border.default}`,
+          borderRadius: 4,
+        }}
+      >
+        Reset Viewport
+      </button>
+    </Card>
+  );
+}
+
+// =============================================================================
+// INSTRUCTIONS
+// =============================================================================
+
+function Instructions() {
+  return (
+    <Card style={{ position: 'absolute', bottom: 10, left: 10, padding: '8px 12px', zIndex: 100 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>Instructions</div>
+      <div style={{ fontSize: 10, color: COLORS.text.secondary }}>
+        <div><strong>Drag</strong> - Pan viewport</div>
+        <div><strong>Scroll</strong> - Zoom in/out</div>
+        <div><strong>Pinch</strong> - Zoom (touch devices)</div>
+        <div><strong>Release</strong> - Momentum continues</div>
+      </div>
+    </Card>
+  );
+}
+
+// =============================================================================
+// MAIN COMPONENT
+// =============================================================================
+
+function GestureRecognizerDemo() {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+
+  // Viewport state
+  const [viewport, setViewport] = useState<ViewportState>({ x: 0, y: 0, zoom: 1 });
+
+  // Momentum state
+  const [momentum, setMomentum] = useState<MomentumState>({ vx: 0, vy: 0, active: false });
+  const momentumRef = useRef<MomentumState>({ vx: 0, vy: 0, active: false });
+  const animationFrameRef = useRef<number | null>(null);
+
+  // Current gesture
+  const [currentGesture, setCurrentGesture] = useState<string>('idle');
+
+  // Config
+  const [config, setConfig] = useState<GestureConfig>(DEFAULT_CONFIG);
+
+  // Handle resize
+  useEffect(() => {
+    const updateDimensions = () => {
+      if (containerRef.current) {
+        setDimensions({
+          width: containerRef.current.clientWidth,
+          height: containerRef.current.clientHeight,
+        });
+      }
+    };
+
+    updateDimensions();
+    window.addEventListener('resize', updateDimensions);
+    return () => window.removeEventListener('resize', updateDimensions);
+  }, []);
+
+  // Momentum animation loop
+  useEffect(() => {
+    const animate = () => {
+      const m = momentumRef.current;
+      if (m.active && (Math.abs(m.vx) > 0.1 || Math.abs(m.vy) > 0.1)) {
+        setViewport((prev) => ({
+          ...prev,
+          x: prev.x + m.vx,
+          y: prev.y + m.vy,
+        }));
+
+        // Apply friction
+        m.vx *= config.momentumFriction;
+        m.vy *= config.momentumFriction;
+        setMomentum({ ...m });
+
+        animationFrameRef.current = requestAnimationFrame(animate);
+      } else {
+        m.active = false;
+        setMomentum({ ...m });
+      }
+    };
+
+    if (momentumRef.current.active) {
+      animationFrameRef.current = requestAnimationFrame(animate);
+    }
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [config.momentumFriction]);
+
+  // Reset handler
+  const handleReset = useCallback(() => {
+    setViewport({ x: 0, y: 0, zoom: 1 });
+    momentumRef.current = { vx: 0, vy: 0, active: false };
+    setMomentum({ vx: 0, vy: 0, active: false });
+  }, []);
+
+  // Gesture bindings
+  const bind = useGesture(
+    {
+      onDrag: ({ movement: [mx, my], velocity: [vx, vy], down, memo }) => {
+        // Stop momentum when starting new drag
+        if (down) {
+          momentumRef.current.active = false;
+          setCurrentGesture('dragging');
+        }
+
+        // Store initial position on first drag frame
+        const initial = memo ?? { x: viewport.x, y: viewport.y };
+
+        // Update viewport position
+        setViewport((prev) => ({
+          ...prev,
+          x: initial.x + mx / prev.zoom,
+          y: initial.y + my / prev.zoom,
+        }));
+
+        // On release, start momentum if enabled
+        if (!down) {
+          setCurrentGesture('idle');
+
+          if (config.enableMomentum && (Math.abs(vx) > 0.5 || Math.abs(vy) > 0.5)) {
+            momentumRef.current = {
+              vx: vx * 10 / viewport.zoom,
+              vy: vy * 10 / viewport.zoom,
+              active: true,
+            };
+            setMomentum(momentumRef.current);
+          }
+        }
+
+        return initial;
+      },
+
+      onPinch: ({ offset: [scale], origin: [ox, oy], down }) => {
+        if (!config.enablePinch) return;
+
+        setCurrentGesture(down ? 'pinching' : 'idle');
+
+        // Clamp zoom
+        const newZoom = clamp(scale, config.minZoom, config.maxZoom);
+
+        setViewport((prev) => ({
+          ...prev,
+          zoom: newZoom,
+        }));
+      },
+
+      onWheel: ({ delta: [, dy], event }) => {
+        event.preventDefault();
+
+        setCurrentGesture('wheeling');
+
+        // Calculate zoom delta
+        const zoomDelta = -dy * config.zoomSensitivity;
+
+        setViewport((prev) => {
+          const newZoom = clamp(prev.zoom * (1 + zoomDelta), config.minZoom, config.maxZoom);
+          return { ...prev, zoom: newZoom };
+        });
+
+        // Reset gesture state after short delay
+        setTimeout(() => setCurrentGesture('idle'), 100);
+      },
+    },
+    {
+      drag: {
+        filterTaps: true,
+      },
+      pinch: {
+        scaleBounds: { min: config.minZoom, max: config.maxZoom },
+      },
+      wheel: {
+        preventDefault: true,
+      },
+    }
+  );
+
+  return (
+    <div
+      ref={containerRef}
+      {...bind()}
+      style={{
+        width: '100%',
+        height: '100vh',
+        position: 'relative',
+        background: COLORS.bg.secondary,
+        overflow: 'hidden',
+        cursor: currentGesture === 'dragging' ? 'grabbing' : 'grab',
+        touchAction: 'none', // Prevent browser gestures
+      }}
+    >
+      {/* Grid visualization */}
+      <Grid viewport={viewport} width={dimensions.width} height={dimensions.height} />
+
+      {/* UI overlays */}
+      <InfoPanel viewport={viewport} momentum={momentum} gesture={currentGesture} />
+      <ConfigPanel config={config} onConfigChange={setConfig} onReset={handleReset} />
+      <Instructions />
+    </div>
+  );
+}
+
+// =============================================================================
+// STORYBOOK CONFIG
+// =============================================================================
+
+const meta: Meta<typeof GestureRecognizerDemo> = {
+  title: '01-POCs/Interaction/Gesture Recognizer',
+  component: GestureRecognizerDemo,
+  parameters: {
+    layout: 'fullscreen',
+    docs: {
+      description: {
+        component: `
+## Gesture Recognizer POC
+
+This POC demonstrates touch and mouse gesture handling using \`@use-gesture/react\`.
+
+### Supported Gestures:
+- **Pan (Drag)** - Move the viewport by dragging
+- **Wheel** - Zoom in/out with mouse wheel
+- **Pinch** - Pinch-to-zoom on touch devices
+- **Momentum** - Inertia continues after release
+
+### Configurable Options:
+- Enable/disable momentum
+- Enable/disable pinch zoom
+- Zoom sensitivity
+- Momentum friction
+
+### Integration:
+This gesture system will be integrated with:
+- XState viewport machine for state management
+- deck.gl for rendering
+- Semantic zoom transitions
+        `,
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof GestureRecognizerDemo>;
+
+export const Default: Story = {};
+
+export const NoMomentum: Story = {
+  render: () => {
+    const [viewport, setViewport] = useState<ViewportState>({ x: 0, y: 0, zoom: 1 });
+    const containerRef = useRef<HTMLDivElement>(null);
+    const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+
+    useEffect(() => {
+      const updateDimensions = () => {
+        if (containerRef.current) {
+          setDimensions({
+            width: containerRef.current.clientWidth,
+            height: containerRef.current.clientHeight,
+          });
+        }
+      };
+      updateDimensions();
+      window.addEventListener('resize', updateDimensions);
+      return () => window.removeEventListener('resize', updateDimensions);
+    }, []);
+
+    const bind = useGesture({
+      onDrag: ({ movement: [mx, my], memo }) => {
+        const initial = memo ?? { x: viewport.x, y: viewport.y };
+        setViewport((prev) => ({
+          ...prev,
+          x: initial.x + mx / prev.zoom,
+          y: initial.y + my / prev.zoom,
+        }));
+        return initial;
+      },
+      onWheel: ({ delta: [, dy], event }) => {
+        event.preventDefault();
+        setViewport((prev) => ({
+          ...prev,
+          zoom: clamp(prev.zoom * (1 - dy * 0.002), 0.1, 10),
+        }));
+      },
+    });
+
+    return (
+      <div
+        ref={containerRef}
+        {...bind()}
+        style={{
+          width: '100%',
+          height: '100vh',
+          position: 'relative',
+          background: COLORS.bg.secondary,
+          overflow: 'hidden',
+          cursor: 'grab',
+          touchAction: 'none',
+        }}
+      >
+        <Grid viewport={viewport} width={dimensions.width} height={dimensions.height} />
+        <Card style={{ position: 'absolute', top: 10, left: 10, padding: 8 }}>
+          <Tag intent={Intent.WARNING}>No Momentum Mode</Tag>
+          <div style={{ fontSize: 10, marginTop: 4, color: COLORS.text.secondary }}>
+            Pan stops immediately on release
+          </div>
+        </Card>
+      </div>
+    );
+  },
+};
+
+export const HighFriction: Story = {
+  render: () => {
+    const [viewport, setViewport] = useState<ViewportState>({ x: 0, y: 0, zoom: 1 });
+    const momentumRef = useRef<MomentumState>({ vx: 0, vy: 0, active: false });
+    const [momentum, setMomentum] = useState<MomentumState>({ vx: 0, vy: 0, active: false });
+    const containerRef = useRef<HTMLDivElement>(null);
+    const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+
+    const friction = 0.85; // High friction = quick stop
+
+    useEffect(() => {
+      const updateDimensions = () => {
+        if (containerRef.current) {
+          setDimensions({
+            width: containerRef.current.clientWidth,
+            height: containerRef.current.clientHeight,
+          });
+        }
+      };
+      updateDimensions();
+      window.addEventListener('resize', updateDimensions);
+      return () => window.removeEventListener('resize', updateDimensions);
+    }, []);
+
+    useEffect(() => {
+      let animationFrame: number;
+      const animate = () => {
+        const m = momentumRef.current;
+        if (m.active && (Math.abs(m.vx) > 0.1 || Math.abs(m.vy) > 0.1)) {
+          setViewport((prev) => ({
+            ...prev,
+            x: prev.x + m.vx,
+            y: prev.y + m.vy,
+          }));
+          m.vx *= friction;
+          m.vy *= friction;
+          setMomentum({ ...m });
+          animationFrame = requestAnimationFrame(animate);
+        } else {
+          m.active = false;
+          setMomentum({ ...m });
+        }
+      };
+      if (momentumRef.current.active) {
+        animationFrame = requestAnimationFrame(animate);
+      }
+      return () => cancelAnimationFrame(animationFrame);
+    }, [momentum.active]);
+
+    const bind = useGesture({
+      onDrag: ({ movement: [mx, my], velocity: [vx, vy], down, memo }) => {
+        if (down) momentumRef.current.active = false;
+        const initial = memo ?? { x: viewport.x, y: viewport.y };
+        setViewport((prev) => ({
+          ...prev,
+          x: initial.x + mx / prev.zoom,
+          y: initial.y + my / prev.zoom,
+        }));
+        if (!down && (Math.abs(vx) > 0.5 || Math.abs(vy) > 0.5)) {
+          momentumRef.current = { vx: vx * 10 / viewport.zoom, vy: vy * 10 / viewport.zoom, active: true };
+          setMomentum(momentumRef.current);
+        }
+        return initial;
+      },
+      onWheel: ({ delta: [, dy], event }) => {
+        event.preventDefault();
+        setViewport((prev) => ({
+          ...prev,
+          zoom: clamp(prev.zoom * (1 - dy * 0.002), 0.1, 10),
+        }));
+      },
+    });
+
+    return (
+      <div
+        ref={containerRef}
+        {...bind()}
+        style={{
+          width: '100%',
+          height: '100vh',
+          position: 'relative',
+          background: COLORS.bg.secondary,
+          overflow: 'hidden',
+          cursor: 'grab',
+          touchAction: 'none',
+        }}
+      >
+        <Grid viewport={viewport} width={dimensions.width} height={dimensions.height} />
+        <Card style={{ position: 'absolute', top: 10, left: 10, padding: 8 }}>
+          <Tag intent={Intent.PRIMARY}>High Friction (0.85)</Tag>
+          <div style={{ fontSize: 10, marginTop: 4, color: COLORS.text.secondary }}>
+            Momentum decays quickly
+          </div>
+        </Card>
+      </div>
+    );
+  },
+};

@@ -1,0 +1,449 @@
+     1→# UX Specification: Infinite Canvas for Railway Maintenance Planning
+     2→
+     3→## 1. Vision
+     4→
+     5→**"Single Pane of Glass"** — A continuous, zoomable timeline that unifies 12-year strategic planning down to daily operations without page reloads or tab navigation.
+     6→
+     7→**Core Metaphor:** Google Earth for time. Pan through years, zoom into days. Data transforms semantically at each level.
+     8→
+     9→---
+    10→
+    11→## 2. Architecture Overview
+    12→
+    13→```
+    14→┌────────────────────────────────────────────────────────────────┐
+    15→│                      React Application                          │
+    16→├────────────────────────────────────────────────────────────────┤
+    17→│  ┌──────────────┐  ┌────────────────┐  ┌───────────────────┐  │
+    18→│  │ Viewport     │  │ @use-gesture   │  │ @zazcart/tools      │  │
+    19→│  │ State        │◄─┤ Input Handler  │◄─┤ State Machine     │  │
+    20→│  └──────────────┘  └────────────────┘  └───────────────────┘  │
+    21→├────────────────────────────────────────────────────────────────┤
+    22→│                     LOD Decision Layer                          │
+    23→│       zoom < 0.5 → MACRO  │  0.5-2.0 → MESO  │  > 2.0 → MICRO  │
+    24→├─────────────────┬─────────────────┬────────────────────────────┤
+    25→│   HeatmapLayer  │  ScatterplotLayer │  PolygonLayer + HTML    │
+    26→│   (aggregated)  │  (instanced)      │  (detailed cards)       │
+    27→├────────────────────────────────────────────────────────────────┤
+    28→│              RBush Spatial Index (60,000+ tasks)               │
+    29→├────────────────────────────────────────────────────────────────┤
+    30→│         deck.gl OrthographicView + WebGL2 Renderer             │
+    31→└────────────────────────────────────────────────────────────────┘
+    32→```
+    33→
+    34→### Tech Stack
+    35→
+    36→| Layer     | Technology                     | Purpose                           |
+    37→|-----------|--------------------------------|-----------------------------------|
+    38→| Rendering | **deck.gl** + OrthographicView | WebGL2 canvas with GPU instancing |
+    39→| Input     | **@use-gesture/react**         | Cross-platform pan/zoom/pinch     |
+    40→| Spatial   | **RBush**                      | O(log n) viewport culling         |
+    41→| State     | **@zazcart/tools**               | Reactive state machine            |
+    42→| UI        | **BlueprintJS 6**              | Navbar, cards, controls           |
+    43→
+    44→---
+    45→
+    46→## 3. Coordinate System
+    47→
+    48→The canvas uses a 2D orthographic coordinate system:
+    49→
+    50→| Axis  | Represents  | Unit             | Example             |
+    51→|-------|-------------|------------------|---------------------|
+    52→| **X** | Time        | Days since epoch | Day 0 = Jan 1, 2024 |
+    53→| **Y** | Train index | Row number       | Train 0-49          |
+    54→
+    55→```typescript
+    56→// World coordinates
+    57→const PX_PER_DAY = 10;    // 1 day = 10 pixels
+    58→const PX_PER_TRAIN = 24;  // 1 train row = 24 pixels
+    59→
+    60→// Convert screen to world
+    61→function screenToWorld(screenX: number, screenY: number, viewport: Viewport) {
+    62→  return {
+    63→    day: (screenX - viewport.x) / (PX_PER_DAY * viewport.zoom),
+    64→    trainIndex: (screenY - viewport.y) / (PX_PER_TRAIN * viewport.zoom)
+    65→  };
+    66→}
+    67→```
+    68→
+    69→---
+    70→
+    71→## 4. Semantic Zoom (LOD Layers)
+    72→
+    73→### 4.1 Level of Detail Thresholds
+    74→
+    75→| LOD       | Zoom Range  | Time Visible | Visualization                 |
+    76→|-----------|-------------|--------------|-------------------------------|
+    77→| **MACRO** | < 0.5x      | 10-20 years  | Aggregated heatmap            |
+    78→| **MESO**  | 0.5x - 2.0x | 2-5 years    | Task blocks (DNA pattern)     |
+    79→| **MICRO** | > 2.0x      | 4-8 weeks    | Detailed cards + dependencies |
+    80→
+    81→### 4.2 Layer Implementation
+    82→
+    83→```typescript
+    84→// deck.gl CompositeLayer with LOD switching
+    85→class MaintenanceLayer extends CompositeLayer {
+    86→  renderLayers() {
+    87→    const { zoom } = this.context.viewport;
+    88→
+    89→    return [
+    90→      new HeatmapLayer({
+    91→        id: 'macro',
+    92→        visible: zoom < 0.5,
+    93→        data: this.props.aggregatedData,
+    94→        getPosition: d => [d.dayCenter, d.trainCenter],
+    95→        getWeight: d => d.taskCount,
+    96→        colorRange: HEATMAP_COLORS  // Yellow → Orange → Red
+    97→      }),
+    98→
+    99→      new ScatterplotLayer({
+   100→        id: 'meso',
+   101→        visible: zoom >= 0.5 && zoom < 2.0,
+   102→        data: this.props.tasks,
+   103→        getPosition: d => [d.startDay * PX_PER_DAY, d.trainIndex * PX_PER_TRAIN],
+   104→        getRadius: d => d.duration * PX_PER_DAY / 2,
+   105→        getFillColor: d => TASK_COLORS[d.type]
+   106→      }),
+   107→
+   108→      new PolygonLayer({
+   109→        id: 'micro',
+   110→        visible: zoom >= 2.0,
+   111→        data: this.props.visibleTasks,
+   112→        getPolygon: d => getTaskPolygon(d),
+   113→        getFillColor: d => TASK_COLORS[d.type],
+   114→        pickable: true
+   115→      })
+   116→    ];
+   117→  }
+   118→}
+   119→```
+   120→
+   121→### 4.3 Crossfade Transitions
+   122→
+   123→To avoid jarring "pop-in" when switching LOD levels, both layers render simultaneously during transition with opacity crossfade:
+   124→
+   125→```typescript
+   126→const TRANSITION_WIDTH = 0.1; // Zoom units
+   127→
+   128→function calculateOpacity(zoom: number, threshold: number, direction: 'in' | 'out') {
+   129→  const t = (zoom - threshold) / TRANSITION_WIDTH;
+   130→  const clamped = Math.max(0, Math.min(1, t));
+   131→  return direction === 'in' ? clamped : 1 - clamped;
+   132→}
+   133→
+   134→// At zoom 0.45: MACRO 100%, MESO 0%
+   135→// At zoom 0.50: MACRO 50%, MESO 50%
+   136→// At zoom 0.55: MACRO 0%, MESO 100%
+   137→```
+   138→
+   139→---
+   140→
+   141→## 5. Viewport Culling
+   142→
+   143→### 5.1 RBush Spatial Index
+   144→
+   145→Never render off-screen elements. Use R-tree for O(log n) queries:
+   146→
+   147→```typescript
+   148→import RBush from 'rbush';
+   149→
+   150→const spatialIndex = new RBush<TaskItem>();
+   151→
+   152→// Bulk load on data change
+   153→spatialIndex.load(tasks.map(task => ({
+   154→  minX: task.startDay * PX_PER_DAY,
+   155→  minY: task.trainIndex * PX_PER_TRAIN,
+   156→  maxX: (task.startDay + task.duration) * PX_PER_DAY,
+   157→  maxY: (task.trainIndex + 1) * PX_PER_TRAIN,
+   158→  task
+   159→})));
+   160→
+   161→// Query visible tasks with overscan margin
+   162→const visible = spatialIndex.search({
+   163→  minX: viewport.left - OVERSCAN,
+   164→  minY: viewport.top - OVERSCAN,
+   165→  maxX: viewport.right + OVERSCAN,
+   166→  maxY: viewport.bottom + OVERSCAN
+   167→});
+   168→```
+   169→
+   170→### 5.2 Performance Targets
+   171→
+   172→| Metric         | Target  | Rationale                   |
+   173→|----------------|---------|-----------------------------|
+   174→| Viewport query | < 5ms   | 1000 results from 60K items |
+   175→| Frame time     | < 16ms  | 60fps constant              |
+   176→| LOD transition | < 100ms | No perceptible delay        |
+   177→| Memory         | < 100MB | Mobile device support       |
+   178→
+   179→---
+   180→
+   181→## 6. Input Handling
+   182→
+   183→### 6.1 Cross-Platform Normalization
+   184→
+   185→Using `@use-gesture/react` for consistent behavior across devices:
+   186→
+   187→```typescript
+   188→const bind = useGesture({
+   189→  onPinch: ({ offset: [scale], origin: [ox, oy] }) => {
+   190→    zoomAtPoint(scale, ox, oy);
+   191→  },
+   192→  onWheel: ({ delta: [dx, dy], ctrlKey }) => {
+   193→    if (ctrlKey) return; // Handled by onPinch
+   194→    pan(-dx, -dy);
+   195→  },
+   196→  onDrag: ({ delta: [dx, dy], velocity }) => {
+   197→    pan(dx, dy);
+   198→    if (velocity > 0.5) startMomentum(velocity);
+   199→  }
+   200→}, {
+   201→  target: canvasRef,
+   202→  eventOptions: { passive: false }
+   203→});
+   204→```
+   205→
+   206→### 6.2 Gesture Mapping
+   207→
+   208→| Input             | Device         | Action              |
+   209→|-------------------|----------------|---------------------|
+   210→| Drag              | All            | Pan canvas          |
+   211→| Scroll wheel      | Mouse          | Zoom at cursor      |
+   212→| Two-finger scroll | Trackpad       | Pan canvas          |
+   213→| Pinch             | Trackpad/Touch | Zoom at center      |
+   214→| Ctrl+Scroll       | All            | Horizontal pan      |
+   215→| Shift+Scroll      | All            | Vertical pan        |
+   216→| Double-click      | All            | Zoom in 2x at point |
+   217→
+   218→### 6.3 Momentum Physics
+   219→
+   220→```typescript
+   221→const FRICTION = 0.93;
+   222→const MIN_VELOCITY = 0.5;
+   223→
+   224→function startMomentum(initialVelocity: Vector2) {
+   225→  let velocity = initialVelocity;
+   226→
+   227→  function animate() {
+   228→    velocity = velocity.multiply(FRICTION);
+   229→    pan(velocity.x, velocity.y);
+   230→
+   231→    if (velocity.magnitude() > MIN_VELOCITY) {
+   232→      requestAnimationFrame(animate);
+   233→    }
+   234→  }
+   235→
+   236→  requestAnimationFrame(animate);
+   237→}
+   238→```
+   239→
+   240→---
+   241→
+   242→## 7. Visual Design
+   243→
+   244→### 7.1 Color Palette
+   245→
+   246→| Element           | Color      | Hex       |
+   247→|-------------------|------------|-----------|
+   248→| Background        | Zinc 100   | `#f4f4f5` |
+   249→| Task: Maintenance | Blue 700   | `#1d4ed8` |
+   250→| Task: Overhaul    | Amber 500  | `#f59e0b` |
+   251→| Task: Inspection  | Gray 500   | `#6b7280` |
+   252→| Conflict          | Red 500    | `#ef4444` |
+   253→| Selection         | Cyan 500   | `#06b6d4` |
+   254→| Focus             | Violet 500 | `#8b5cf6` |
+   255→
+   256→### 7.2 Heatmap Gradient (MACRO)
+   257→
+   258→```typescript
+   259→import { interpolateYlOrRd } from 'd3-scale-chromatic';
+   260→
+   261→// Low density → High density
+   262→// Yellow (#fff3c4) → Orange (#fb923c) → Red (#dc2626)
+   263→const getHeatmapColor = (density: number) => {
+   264→  return interpolateYlOrRd(density); // 0.0 to 1.0
+   265→};
+   266→```
+   267→
+   268→### 7.3 Typography
+   269→
+   270→| Element        | Font              | Size          |
+   271→|----------------|-------------------|---------------|
+   272→| Task labels    | System sans-serif | 11px          |
+   273→| Timeline dates | System sans-serif | 12px semibold |
+   274→| Train IDs      | Monospace         | 12px          |
+   275→| Tooltips       | System sans-serif | 13px          |
+   276→
+   277→---
+   278→
+   279→## 8. Layout Structure
+   280→
+   281→```
+   282→┌─────────────────────────────────────────────────────────────────┐
+   283→│  NAVBAR                           [Zoom: 1.00x] [MESO] [Reset]  │
+   284→├────────────┬────────────────────────────────────────────────────┤
+   285→│            │  TIMELINE HEADER (adaptive date labels)            │
+   286→│  SIDEBAR   ├────────────────────────────────────────────────────┤
+   287→│            │                                                     │
+   288→│  Train     │              deck.gl DeckGL                        │
+   289→│  IDs       │                                                     │
+   290→│  (synced   │     ┌─────────────────────────────────────┐        │
+   291→│   scroll)  │     │  [MACRO] [MESO] [MICRO] Layers      │        │
+   292→│            │     └─────────────────────────────────────┘        │
+   293→│            │                                                     │
+   294→│            │                          [+]  Zoom                  │
+   295→│            │  [MINIMAP]               [-]  Controls              │
+   296→└────────────┴────────────────────────────────────────────────────┘
+   297→```
+   298→
+   299→### Component Responsibilities
+   300→
+   301→| Component     | Technology              | Function                                   |
+   302→|---------------|-------------------------|--------------------------------------------|
+   303→| Navbar        | BlueprintJS             | Zoom level, LOD badge, reset               |
+   304→| Sidebar       | BlueprintJS Card        | Train list, synced with viewport Y         |
+   305→| Timeline      | Custom React            | Adaptive date labels (day/week/month/year) |
+   306→| Canvas        | deck.gl DeckGL          | WebGL rendering                            |
+   307→| Minimap       | SVG                     | Bird's eye navigation                      |
+   308→| Zoom Controls | BlueprintJS ButtonGroup | +/- zoom buttons                           |
+   309→
+   310→---
+   311→
+   312→## 9. Interaction States
+   313→
+   314→### 9.1 Task States
+   315→
+   316→| State    | Visual          | Trigger           |
+   317→|----------|-----------------|-------------------|
+   318→| Normal   | Base color      | Default           |
+   319→| Hover    | Brightness +30% | Mouse over        |
+   320→| Selected | Cyan border     | Click             |
+   321→| Focused  | Violet ring     | Tab navigation    |
+   322→| Conflict | Red background  | hasConflict: true |
+   323→
+   324→### 9.2 Selection Flow
+   325→
+   326→```
+   327→Hover (instant) → Click (select) → Details Panel (slide in)
+   328→                                 → Escape (deselect)
+   329→```
+   330→
+   331→### 9.3 Keyboard Navigation
+   332→
+   333→| Key         | Action              |
+   334→|-------------|---------------------|
+   335→| Tab         | Focus next task     |
+   336→| Shift+Tab   | Focus previous task |
+   337→| Enter/Space | Select focused task |
+   338→| Arrow keys  | Pan viewport        |
+   339→| +/-         | Zoom in/out         |
+   340→| Escape      | Clear selection     |
+   341→| Home        | Reset view          |
+   342→
+   343→---
+   344→
+   345→## 10. Accessibility
+   346→
+   347→### 10.1 ARIA Implementation
+   348→
+   349→```tsx
+   350→<div
+   351→  role="application"
+   352→  aria-label="Maintenance planning canvas. Currently showing MESO view at 100% zoom."
+   353→  aria-roledescription="Interactive timeline canvas"
+   354→>
+   355→  <DeckGL ... />
+   356→
+   357→  {/* Live region for announcements */}
+   358→  <div role="status" aria-live="polite" className="sr-only">
+   359→    {announcement}
+   360→  </div>
+   361→</div>
+   362→```
+   363→
+   364→### 10.2 Announcements
+   365→
+   366→| Event       | Announcement                                                                |
+   367→|-------------|-----------------------------------------------------------------------------|
+   368→| LOD change  | "View changed to Strategic heatmap / Tactical blocks / Operational details" |
+   369→| Zoom change | "75 percent zoom" (debounced)                                               |
+   370→| Task focus  | "Maintenance task, Train 15, Day 45, 3 days duration"                       |
+   371→| Selection   | "Task selected. Press Escape to deselect."                                  |
+   372→
+   373→---
+   374→
+   375→## 11. Data Flow
+   376→
+   377→### 11.1 Task Entity
+   378→
+   379→```typescript
+   380→interface Task {
+   381→  id: string;
+   382→  trainId: string;
+   383→  startDate: string;      // ISO 8601
+   384→  endDate: string;
+   385→  type: 'maintenance' | 'overhaul' | 'inspection';
+   386→  hasConflict: boolean;
+   387→}
+   388→
+   389→interface TaskRender {
+   390→  id: string;
+   391→  trainIndex: number;     // Y position
+   392→  startDay: number;       // X position (days since epoch)
+   393→  duration: number;       // Width in days
+   394→  color: [number, number, number, number]; // RGBA
+   395→  hasConflict: boolean;
+   396→}
+   397→```
+   398→
+   399→### 11.2 Viewport State
+   400→
+   401→```typescript
+   402→interface ViewportState {
+   403→  x: number;              // Camera X (world units)
+   404→  y: number;              // Camera Y (world units)
+   405→  zoom: number;           // 0.1 to 5.0
+   406→  lod: 'MACRO' | 'MESO' | 'MICRO';
+   407→}
+   408→```
+   409→
+   410→---
+   411→
+   412→## 12. Performance Checklist
+   413→
+   414→- [x] deck.gl with GPU instancing (automatic)
+   415→- [x] RBush spatial index for O(log n) culling
+   416→- [x] Viewport culling with overscan margin
+   417→- [x] LOD-based data reduction
+   418→- [x] Memoized layer props
+   419→- [x] Throttled zoom events (60fps max)
+   420→- [x] Crossfade transitions (no pop-in)
+   421→- [ ] Web Worker for heavy calculations (future)
+   422→- [ ] Progressive loading for large datasets (future)
+   423→
+   424→---
+   425→
+   426→## 13. Browser Support
+   427→
+   428→| Browser        | Support | Notes                |
+   429→|----------------|---------|----------------------|
+   430→| Chrome 90+     | Full    | Primary target       |
+   431→| Safari 15+     | Full    | GestureEvent support |
+   432→| Firefox 90+    | Full    | WebGL2 required      |
+   433→| Edge 90+       | Full    | Chromium-based       |
+   434→| Mobile Safari  | Partial | Touch gestures only  |
+   435→| Chrome Android | Partial | Touch gestures only  |
+   436→
+   437→---
+   438→
+   439→## 14. References
+   440→
+   441→- [deck.gl Documentation](https://deck.gl/docs)
+   442→- [OrthographicView API](https://deck.gl/docs/api-reference/core/orthographic-view)
+   443→- [@use-gesture/react](https://use-gesture.netlify.app/)
+   444→- [RBush Spatial Index](https://github.com/mourner/rbush)
+   445→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

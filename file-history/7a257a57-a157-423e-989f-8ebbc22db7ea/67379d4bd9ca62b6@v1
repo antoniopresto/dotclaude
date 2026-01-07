@@ -1,0 +1,249 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { LogViewer, LogViewerSearch } from '@patternfly/react-log-viewer';
+import {
+  Button,
+  Toolbar,
+  ToolbarContent,
+  ToolbarItem,
+  ToolbarGroup,
+  MenuToggle,
+  MenuToggleElement,
+  Select,
+  SelectOption,
+  Checkbox,
+  Tooltip,
+  Label,
+} from '@patternfly/react-core';
+import {
+  OutlinedPlayCircleIcon,
+  PauseIcon,
+  TrashIcon,
+  DownloadIcon,
+} from '@patternfly/react-icons';
+
+export interface LogEntry {
+  timestamp: number;
+  processId: string;
+  processName: string;
+  message: string;
+  level: 'info' | 'warn' | 'error' | 'debug';
+}
+
+interface LogPanelProps {
+  logs: LogEntry[];
+  processes: { id: string; name: string }[];
+  onClear?: () => void;
+  height?: number | string;
+}
+
+// ANSI colors are handled natively by LogViewer component
+
+// Format log entry with timestamp and process name
+function formatLogEntry(entry: LogEntry): string {
+  const date = new Date(entry.timestamp);
+  const time = date.toLocaleTimeString('en-US', {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  const timestamp = `${time}.${ms}`;
+
+  // Color prefix based on log level
+  const levelColors: Record<string, string> = {
+    error: '\x1b[91m',
+    warn: '\x1b[93m',
+    info: '\x1b[97m',
+    debug: '\x1b[90m',
+  };
+
+  const levelColor = levelColors[entry.level] || '';
+  const reset = '\x1b[0m';
+
+  return `${levelColor}[${timestamp}] [${entry.processName}] ${entry.message}${reset}`;
+}
+
+export function LogPanel({
+  logs,
+  processes,
+  onClear,
+  height = 400,
+}: LogPanelProps) {
+  const [isAutoScroll, setIsAutoScroll] = useState(true);
+  const [selectedProcessId, setSelectedProcessId] = useState<string>('all');
+  const [isProcessSelectOpen, setIsProcessSelectOpen] = useState(false);
+  const [isTextWrapped, setIsTextWrapped] = useState(false);
+  const logViewerRef = useRef<{ scrollToBottom: () => void }>(null);
+
+  // Filter logs by selected process
+  const filteredLogs = selectedProcessId === 'all'
+    ? logs
+    : logs.filter((log) => log.processId === selectedProcessId);
+
+  // Convert logs to formatted strings
+  const logData = filteredLogs.map(formatLogEntry);
+
+  // Auto-scroll to bottom when new logs arrive
+  useEffect(() => {
+    if (isAutoScroll && logViewerRef.current) {
+      logViewerRef.current.scrollToBottom();
+    }
+  }, [logData.length, isAutoScroll]);
+
+  // Handle scroll events to detect manual scrolling
+  const handleScroll = useCallback(
+    ({
+      scrollOffsetToBottom,
+      scrollUpdateWasRequested,
+    }: {
+      scrollDirection: 'forward' | 'backward';
+      scrollOffset: number;
+      scrollOffsetToBottom: number;
+      scrollUpdateWasRequested: boolean;
+    }) => {
+      // If user scrolled manually (not programmatic) and not at bottom, disable auto-scroll
+      if (!scrollUpdateWasRequested && scrollOffsetToBottom > 50) {
+        setIsAutoScroll(false);
+      }
+    },
+    []
+  );
+
+  const handleProcessSelect = useCallback(
+    (_event: React.MouseEvent<Element, MouseEvent> | undefined, value: string | number | undefined) => {
+      setSelectedProcessId(value as string);
+      setIsProcessSelectOpen(false);
+    },
+    []
+  );
+
+  const handleClear = useCallback(() => {
+    onClear?.();
+  }, [onClear]);
+
+  const handleDownload = useCallback(() => {
+    const content = logData.join('\n');
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `logs-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [logData]);
+
+  const processToggle = (toggleRef: React.Ref<MenuToggleElement>) => (
+    <MenuToggle
+      ref={toggleRef}
+      onClick={() => setIsProcessSelectOpen(!isProcessSelectOpen)}
+      isExpanded={isProcessSelectOpen}
+      style={{ minWidth: '150px' }}
+    >
+      {selectedProcessId === 'all'
+        ? 'All Processes'
+        : processes.find((p) => p.id === selectedProcessId)?.name || selectedProcessId}
+    </MenuToggle>
+  );
+
+  // Toolbar component
+  const toolbar = (
+    <Toolbar>
+      <ToolbarContent>
+        <ToolbarGroup variant="filter-group">
+          <ToolbarItem>
+            <Select
+              aria-label="Filter by process"
+              isOpen={isProcessSelectOpen}
+              selected={selectedProcessId}
+              onSelect={handleProcessSelect}
+              onOpenChange={setIsProcessSelectOpen}
+              toggle={processToggle}
+            >
+              <SelectOption value="all">
+                All Processes
+                <Badge isRead style={{ marginLeft: '8px' }}>
+                  {logs.length}
+                </Badge>
+              </SelectOption>
+              {processes.map((process) => (
+                <SelectOption key={process.id} value={process.id}>
+                  {process.name}
+                  <Badge isRead style={{ marginLeft: '8px' }}>
+                    {logs.filter((l) => l.processId === process.id).length}
+                  </Badge>
+                </SelectOption>
+              ))}
+            </Select>
+          </ToolbarItem>
+          <ToolbarItem>
+            <LogViewerSearch placeholder="Search logs..." minSearchChars={2} />
+          </ToolbarItem>
+        </ToolbarGroup>
+
+        <ToolbarGroup variant="action-group-plain">
+          <ToolbarItem>
+            <Checkbox
+              label="Wrap text"
+              id="wrap-text-checkbox"
+              isChecked={isTextWrapped}
+              onChange={(_, checked) => setIsTextWrapped(checked)}
+            />
+          </ToolbarItem>
+          <ToolbarItem>
+            <Tooltip content={isAutoScroll ? 'Pause auto-scroll' : 'Resume auto-scroll'}>
+              <Button
+                variant={isAutoScroll ? 'primary' : 'secondary'}
+                aria-label={isAutoScroll ? 'Pause auto-scroll' : 'Resume auto-scroll'}
+                onClick={() => setIsAutoScroll(!isAutoScroll)}
+                icon={isAutoScroll ? <PauseIcon /> : <OutlinedPlayCircleIcon />}
+              />
+            </Tooltip>
+          </ToolbarItem>
+          <ToolbarItem>
+            <Tooltip content="Download logs">
+              <Button
+                variant="secondary"
+                aria-label="Download logs"
+                onClick={handleDownload}
+                icon={<DownloadIcon />}
+              />
+            </Tooltip>
+          </ToolbarItem>
+          <ToolbarItem>
+            <Tooltip content="Clear logs">
+              <Button
+                variant="danger"
+                aria-label="Clear logs"
+                onClick={handleClear}
+                icon={<TrashIcon />}
+                isDisabled={!onClear}
+              />
+            </Tooltip>
+          </ToolbarItem>
+        </ToolbarGroup>
+      </ToolbarContent>
+    </Toolbar>
+  );
+
+  return (
+    <div
+      style={{
+        border: '1px solid var(--pf-t--global--border--color--default)',
+        borderRadius: 'var(--pf-t--global--border--radius--small)',
+        overflow: 'hidden',
+      }}
+    >
+      <LogViewer
+        innerRef={logViewerRef}
+        data={logData}
+        theme="dark"
+        height={height}
+        hasLineNumbers
+        isTextWrapped={isTextWrapped}
+        toolbar={toolbar}
+        onScroll={handleScroll}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,272 @@
+import { useRef, useEffect, useState, useCallback } from 'react';
+import Box from '@mui/material/Box';
+import Typography from '@mui/material/Typography';
+import { Application, Graphics, Text, TextStyle } from 'pixi.js';
+import { Viewport } from 'pixi-viewport';
+
+/**
+ * StressTestCanvas - Dedicated component for 60fps validation with 50k rectangles.
+ *
+ * Features:
+ * - Renders configurable number of rectangles
+ * - Real-time FPS counter
+ * - pixi-viewport for pan/zoom testing
+ * - Performance metrics display
+ */
+
+export interface StressTestCanvasProps {
+  /** Number of rectangles to render */
+  rectCount?: number;
+  /** Show FPS counter */
+  showFps?: boolean;
+}
+
+/** Color palette for rectangles */
+const COLORS = [
+  0x4ecdc4, 0xff6b6b, 0x45b7d1, 0xfeca57, 0xff9ff3,
+  0x54a0ff, 0x5f27cd, 0x00d2d3, 0xf368e0, 0x10ac84,
+];
+
+export function StressTestCanvas({ rectCount = 50000, showFps = true }: StressTestCanvasProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const appRef = useRef<Application | null>(null);
+  const [fps, setFps] = useState(0);
+  const [avgFps, setAvgFps] = useState(0);
+  const [minFps, setMinFps] = useState(60);
+  const [renderTime, setRenderTime] = useState(0);
+  const [isReady, setIsReady] = useState(false);
+
+  const initApp = useCallback(async () => {
+    const container = containerRef.current;
+    if (!container || appRef.current) return;
+
+    const rect = container.getBoundingClientRect();
+    const width = rect.width || 800;
+    const height = rect.height || 600;
+
+    // Create PixiJS Application
+    const app = new Application();
+    await app.init({
+      background: 0x1a1a2e,
+      width,
+      height,
+      antialias: false, // Disable for max performance
+      resolution: window.devicePixelRatio || 1,
+      autoDensity: true,
+      powerPreference: 'high-performance',
+    });
+
+    container.appendChild(app.canvas);
+    app.canvas.style.width = '100%';
+    app.canvas.style.height = '100%';
+    app.canvas.style.display = 'block';
+
+    appRef.current = app;
+
+    // Create viewport
+    const viewport = new Viewport({
+      screenWidth: width,
+      screenHeight: height,
+      worldWidth: 200000,
+      worldHeight: 15000,
+      events: app.renderer.events,
+      passiveWheel: false,
+    });
+
+    viewport
+      .drag({ mouseButtons: 'left' })
+      .pinch()
+      .wheel({ smooth: 3, percent: 0.1 })
+      .decelerate({ friction: 0.92 })
+      .clampZoom({ minScale: 0.01, maxScale: 10 });
+
+    app.stage.addChild(viewport);
+
+    // Generate rectangles using batch Graphics
+    const graphics = new Graphics();
+    viewport.addChild(graphics);
+
+    console.log(`[StressTest] Generating ${rectCount} rectangles...`);
+    const startGen = performance.now();
+
+    // Seeded random for consistency
+    let seed = 12345;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+
+    // Draw rectangles in batches for better performance
+    const worldWidth = 200000;
+    const worldHeight = 15000;
+
+    for (let i = 0; i < rectCount; i++) {
+      const x = random() * (worldWidth - 100);
+      const y = random() * (worldHeight - 40);
+      const w = 60 + random() * 40;
+      const h = 25 + random() * 15;
+      const color = COLORS[Math.floor(random() * COLORS.length)];
+
+      graphics.rect(x, y, w, h);
+      graphics.fill({ color, alpha: 0.85 });
+    }
+
+    const genTime = performance.now() - startGen;
+    console.log(`[StressTest] Generated ${rectCount} rectangles in ${genTime.toFixed(0)}ms`);
+
+    // Add FPS counter text (fixed position on stage, not viewport)
+    if (showFps) {
+      const fpsStyle = new TextStyle({
+        fontFamily: 'monospace',
+        fontSize: 14,
+        fill: 0x00ff00,
+        stroke: { color: 0x000000, width: 2 },
+      });
+
+      const fpsText = new Text({ text: 'FPS: --', style: fpsStyle });
+      fpsText.x = 10;
+      fpsText.y = 10;
+      fpsText.label = 'fps-counter';
+      app.stage.addChild(fpsText);
+
+      // FPS tracking
+      const fpsHistory: number[] = [];
+      let lastTime = performance.now();
+      let frameCount = 0;
+      let minFpsVal = 60;
+
+      app.ticker.add(() => {
+        frameCount++;
+        const now = performance.now();
+        const delta = now - lastTime;
+
+        if (delta >= 500) {
+          const currentFps = Math.round((frameCount / delta) * 1000);
+          fpsHistory.push(currentFps);
+          if (fpsHistory.length > 20) fpsHistory.shift();
+
+          const avg = Math.round(fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length);
+          minFpsVal = Math.min(minFpsVal, currentFps);
+
+          fpsText.text = `FPS: ${currentFps} | AVG: ${avg} | MIN: ${minFpsVal}`;
+
+          setFps(currentFps);
+          setAvgFps(avg);
+          setMinFps(minFpsVal);
+          setRenderTime(app.ticker.deltaMS);
+
+          lastTime = now;
+          frameCount = 0;
+        }
+      });
+    }
+
+    setIsReady(true);
+    console.log('[StressTest] Ready');
+  }, [rectCount, showFps]);
+
+  useEffect(() => {
+    initApp();
+
+    return () => {
+      if (appRef.current) {
+        appRef.current.destroy(true, { children: true });
+        appRef.current = null;
+      }
+    };
+  }, [initApp]);
+
+  // Handle resize
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const observer = new ResizeObserver(() => {
+      const app = appRef.current;
+      if (!app) return;
+
+      const rect = container.getBoundingClientRect();
+      app.renderer.resize(rect.width, rect.height);
+
+      // Resize viewport
+      const viewport = app.stage.children.find(c => c instanceof Viewport) as Viewport | undefined;
+      if (viewport) {
+        viewport.resize(rect.width, rect.height);
+      }
+    });
+
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <Box sx={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
+      {/* Stats Header */}
+      <Box
+        sx={{
+          p: 1.5,
+          bgcolor: 'background.paper',
+          borderBottom: 1,
+          borderColor: 'divider',
+          display: 'flex',
+          gap: 3,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
+        <Typography variant="subtitle1" fontWeight="bold">
+          60fps Stress Test
+        </Typography>
+        <Box sx={{ display: 'flex', gap: 2 }}>
+          <Typography variant="body2" color="text.secondary">
+            Rectangles: <strong>{rectCount.toLocaleString()}</strong>
+          </Typography>
+          {isReady && (
+            <>
+              <Typography
+                variant="body2"
+                sx={{ color: fps >= 55 ? 'success.main' : fps >= 30 ? 'warning.main' : 'error.main' }}
+              >
+                FPS: <strong>{fps}</strong>
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Avg: <strong>{avgFps}</strong>
+              </Typography>
+              <Typography
+                variant="body2"
+                sx={{ color: minFps >= 55 ? 'success.main' : minFps >= 30 ? 'warning.main' : 'error.main' }}
+              >
+                Min: <strong>{minFps}</strong>
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Frame: <strong>{renderTime.toFixed(1)}ms</strong>
+              </Typography>
+            </>
+          )}
+        </Box>
+      </Box>
+
+      {/* Instructions */}
+      <Box sx={{ px: 1.5, py: 0.5, bgcolor: 'grey.900' }}>
+        <Typography variant="caption" color="text.secondary">
+          Pan: drag | Zoom: wheel/pinch | Target: constant 60fps during navigation
+        </Typography>
+      </Box>
+
+      {/* Canvas Container */}
+      <Box
+        ref={containerRef}
+        sx={{
+          flex: 1,
+          position: 'relative',
+          overflow: 'hidden',
+          touchAction: 'none',
+          cursor: 'grab',
+          '&:active': { cursor: 'grabbing' },
+        }}
+      />
+    </Box>
+  );
+}
+
+export default StressTestCanvas;

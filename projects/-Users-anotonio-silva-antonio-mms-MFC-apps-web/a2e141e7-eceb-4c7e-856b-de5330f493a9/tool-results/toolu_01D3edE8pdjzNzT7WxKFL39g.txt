@@ -1,0 +1,311 @@
+     1→'use client';
+     2→
+     3→import React, { useEffect, useState, useCallback } from 'react';
+     4→import {
+     5→  servicesApi,
+     6→  allocationsApi,
+     7→  Service,
+     8→  Recommendation,
+     9→} from '@/lib/api';
+    10→
+    11→interface AllocationPanelProps {
+    12→  onAllocationComplete?: () => void;
+    13→}
+    14→
+    15→/**
+    16→ * Allocation Panel Component
+    17→ *
+    18→ * Main component for train-to-service allocation:
+    19→ * - Lists pending services
+    20→ * - Generates recommendations
+    21→ * - Displays justifications
+    22→ * - Confirms allocations
+    23→ */
+    24→export function AllocationPanel({ onAllocationComplete }: AllocationPanelProps) {
+    25→  const [services, setServices] = useState<Service[]>([]);
+    26→  const [selectedService, setSelectedService] = useState<Service | null>(null);
+    27→  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+    28→  const [loading, setLoading] = useState(true);
+    29→  const [recommending, setRecommending] = useState(false);
+    30→  const [allocating, setAllocating] = useState<string | null>(null);
+    31→  const [error, setError] = useState<string | null>(null);
+    32→  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+    33→  const [selectedDate, setSelectedDate] = useState(
+    34→    new Date().toISOString().split('T')[0]
+    35→  );
+    36→  const [isFallback, setIsFallback] = useState(false);
+    37→  const [solverTime, setSolverTime] = useState(0);
+    38→
+    39→  const fetchServices = useCallback(async () => {
+    40→    setLoading(true);
+    41→    setError(null);
+    42→    const { data, error } = await servicesApi.getPending(selectedDate);
+    43→
+    44→    if (error) {
+    45→      setError(error);
+    46→    } else if (data) {
+    47→      setServices(data.services);
+    48→    }
+    49→    setLoading(false);
+    50→  }, [selectedDate]);
+    51→
+    52→  useEffect(() => {
+    53→    fetchServices();
+    54→  }, [fetchServices]);
+    55→
+    56→  const handleSelectService = (service: Service) => {
+    57→    setSelectedService(service);
+    58→    setRecommendations([]);
+    59→    setSuccessMessage(null);
+    60→  };
+    61→
+    62→  const handleGetRecommendations = async () => {
+    63→    if (!selectedService) return;
+    64→
+    65→    setRecommending(true);
+    66→    setError(null);
+    67→
+    68→    const { data, error } = await allocationsApi.recommend(
+    69→      selectedService.id,
+    70→      selectedDate
+    71→    );
+    72→
+    73→    if (error) {
+    74→      setError(error);
+    75→    } else if (data) {
+    76→      setRecommendations(data.recommendations);
+    77→      setIsFallback(data.fallback || false);
+    78→      setSolverTime(data.solverTimeMs);
+    79→    }
+    80→    setRecommending(false);
+    81→  };
+    82→
+    83→  const handleAllocate = async (rec: Recommendation) => {
+    84→    if (!selectedService) return;
+    85→
+    86→    setAllocating(rec.trainId);
+    87→    setError(null);
+    88→
+    89→    const { data, error } = await allocationsApi.create(
+    90→      selectedService.id,
+    91→      rec.trainId,
+    92→      selectedDate,
+    93→      rec.score,
+    94→      rec.justifications
+    95→    );
+    96→
+    97→    if (error) {
+    98→      setError(error);
+    99→    } else if (data) {
+   100→      setSuccessMessage(
+   101→        `Train ${rec.train_id} assigned to ${selectedService.serviceCode}`
+   102→      );
+   103→      // Remove allocated service from list
+   104→      setServices((prev) =>
+   105→        prev.filter((s) => s.id !== selectedService.id)
+   106→      );
+   107→      setSelectedService(null);
+   108→      setRecommendations([]);
+   109→      onAllocationComplete?.();
+   110→    }
+   111→    setAllocating(null);
+   112→  };
+   113→
+   114→  const formatTime = (time: string | undefined) => {
+   115→    if (!time) return '--:--';
+   116→    return time.substring(0, 5);
+   117→  };
+   118→
+   119→  return (
+   120→    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+   121→      {/* Left Panel - Pending Services */}
+   122→      <div className="bg-panel rounded-lg overflow-hidden border border-border">
+   123→        <div className="p-4 border-b border-border bg-elevated">
+   124→          <div className="flex items-center justify-between">
+   125→            <h2 className="text-lg font-semibold text-text-primary">
+   126→              Pending Services
+   127→            </h2>
+   128→            <input
+   129→              type="date"
+   130→              value={selectedDate}
+   131→              onChange={(e) => setSelectedDate(e.target.value)}
+   132→              className="px-3 py-1 border border-border bg-elevated text-text-primary rounded text-sm"
+   133→            />
+   134→          </div>
+   135→          <p className="mt-1 text-sm text-text-muted">
+   136→            {services.length} services awaiting allocation
+   137→          </p>
+   138→        </div>
+   139→
+   140→        {loading ? (
+   141→          <div className="p-8 text-center">
+   142→            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-500 mx-auto"></div>
+   143→            <p className="mt-2 text-text-muted">Loading services...</p>
+   144→          </div>
+   145→        ) : services.length === 0 ? (
+   146→          <div className="p-8 text-center text-text-muted">
+   147→            No pending services for {selectedDate}
+   148→          </div>
+   149→        ) : (
+   150→          <div className="divide-y divide-border max-h-[500px] overflow-y-auto">
+   151→            {services.map((service) => (
+   152→              <div
+   153→                key={service.id}
+   154→                className={`p-4 cursor-pointer transition-colors ${
+   155→                  selectedService?.id === service.id
+   156→                    ? 'bg-primary-600/20 border-l-4 border-primary-500'
+   157→                    : 'hover:bg-hover'
+   158→                }`}
+   159→                onClick={() => handleSelectService(service)}
+   160→              >
+   161→                <div className="flex items-center justify-between">
+   162→                  <span className="font-mono font-semibold text-text-primary">
+   163→                    {service.serviceCode}
+   164→                  </span>
+   165→                  <span className="text-sm text-text-muted">
+   166→                    {formatTime(service.departureTime)}
+   167→                  </span>
+   168→                </div>
+   169→                <div className="mt-1 text-sm text-text-secondary">
+   170→                  {service.origin} → {service.destination}
+   171→                </div>
+   172→                <div className="mt-1 flex items-center gap-4 text-xs text-text-muted">
+   173→                  <span>{service.distanceKm} km</span>
+   174→                  <span className="capitalize">{service.serviceType}</span>
+   175→                </div>
+   176→              </div>
+   177→            ))}
+   178→          </div>
+   179→        )}
+   180→      </div>
+   181→
+   182→      {/* Right Panel - Recommendations */}
+   183→      <div className="bg-panel rounded-lg overflow-hidden border border-border">
+   184→        <div className="p-4 border-b border-border bg-elevated">
+   185→          <h2 className="text-lg font-semibold text-text-primary">
+   186→            Train Recommendations
+   187→          </h2>
+   188→          {selectedService && (
+   189→            <p className="mt-1 text-sm text-text-secondary">
+   190→              For {selectedService.serviceCode}: {selectedService.origin} →{' '}
+   191→              {selectedService.destination}
+   192→            </p>
+   193→          )}
+   194→        </div>
+   195→
+   196→        {/* Success Message */}
+   197→        {successMessage && (
+   198→          <div className="p-4 bg-maint-pm1/10 border-b border-maint-pm1/30">
+   199→            <div className="flex items-center">
+   200→              <svg className="w-5 h-5 text-maint-pm1 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+   201→                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+   202→              </svg>
+   203→              <span className="text-maint-pm1">{successMessage}</span>
+   204→            </div>
+   205→          </div>
+   206→        )}
+   207→
+   208→        {/* Error Message */}
+   209→        {error && (
+   210→          <div className="p-4 bg-red-900/20 border-b border-red-800">
+   211→            <p className="text-red-400">{error}</p>
+   212→          </div>
+   213→        )}
+   214→
+   215→        {!selectedService ? (
+   216→          <div className="p-8 text-center text-text-muted">
+   217→            Select a service to get train recommendations
+   218→          </div>
+   219→        ) : recommendations.length === 0 ? (
+   220→          <div className="p-8 text-center">
+   221→            <button
+   222→              onClick={handleGetRecommendations}
+   223→              disabled={recommending}
+   224→              className="px-6 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+   225→            >
+   226→              {recommending ? (
+   227→                <span className="flex items-center">
+   228→                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+   229→                  Analyzing...
+   230→                </span>
+   231→              ) : (
+   232→                'Get Recommendations'
+   233→              )}
+   234→            </button>
+   235→            <p className="mt-2 text-sm text-text-muted">
+   236→              AI-powered recommendations based on km balancing
+   237→            </p>
+   238→          </div>
+   239→        ) : (
+   240→          <div>
+   241→            {/* Solver Info */}
+   242→            {isFallback && (
+   243→              <div className="p-3 bg-amber-500/10 border-b border-amber-500/30">
+   244→                <p className="text-sm text-amber-400">
+   245→                  Using fallback ranking (solver unavailable)
+   246→                </p>
+   247→              </div>
+   248→            )}
+   249→            {solverTime > 0 && (
+   250→              <div className="p-2 bg-elevated border-b border-border text-xs text-text-muted text-right">
+   251→                Solver time: {solverTime}ms
+   252→              </div>
+   253→            )}
+   254→
+   255→            {/* Recommendations List */}
+   256→            <div className="divide-y divide-border">
+   257→              {recommendations.map((rec, idx) => (
+   258→                <div key={rec.trainId} className="p-4">
+   259→                  <div className="flex items-center justify-between">
+   260→                    <div>
+   261→                      <span className="font-mono font-semibold text-text-primary">
+   262→                        {rec.train_id}
+   263→                      </span>
+   264→                      <span className="ml-2 px-2 py-0.5 text-xs rounded bg-primary-600/20 text-primary-400">
+   265→                        Score: {rec.score}
+   266→                      </span>
+   267→                      {idx === 0 && (
+   268→                        <span className="ml-2 px-2 py-0.5 text-xs rounded bg-maint-pm1/20 text-maint-pm1">
+   269→                          Best Match
+   270→                        </span>
+   271→                      )}
+   272→                    </div>
+   273→                    <button
+   274→                      onClick={() => handleAllocate(rec)}
+   275→                      disabled={allocating !== null}
+   276→                      className="px-4 py-2 bg-maint-pm1 text-white rounded hover:bg-maint-pm1/80 disabled:opacity-50 disabled:cursor-not-allowed text-sm transition-colors"
+   277→                    >
+   278→                      {allocating === rec.trainId ? 'Assigning...' : 'Assign'}
+   279→                    </button>
+   280→                  </div>
+   281→
+   282→                  <div className="mt-2 text-sm text-text-secondary">
+   283→                    Dead running: {rec.deadRunningKm} km
+   284→                  </div>
+   285→
+   286→                  {/* Justifications */}
+   287→                  <div className="mt-3 space-y-1">
+   288→                    {rec.justifications.map((j, jIdx) => (
+   289→                      <div
+   290→                        key={jIdx}
+   291→                        className="flex items-start text-sm text-text-secondary"
+   292→                      >
+   293→                        <span className="text-maint-pm1 mr-2">✓</span>
+   294→                        <span>{j}</span>
+   295→                      </div>
+   296→                    ))}
+   297→                  </div>
+   298→                </div>
+   299→              ))}
+   300→            </div>
+   301→          </div>
+   302→        )}
+   303→      </div>
+   304→    </div>
+   305→  );
+   306→}
+   307→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

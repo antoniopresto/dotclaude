@@ -1,0 +1,195 @@
+     1→"""
+     2→MMS Solver - Database Client
+     3→
+     4→Async PostgreSQL client using asyncpg for efficient database operations.
+     5→"""
+     6→
+     7→import os
+     8→import asyncpg
+     9→from typing import Optional
+    10→from datetime import date
+    11→
+    12→# Database connection settings
+    13→DATABASE_URL = os.getenv(
+    14→    "DATABASE_URL",
+    15→    "postgresql://mms:mms@localhost:5432/mms"
+    16→)
+    17→
+    18→
+    19→class DatabaseClient:
+    20→    """Async PostgreSQL client for solver queries."""
+    21→
+    22→    def __init__(self):
+    23→        self.pool: Optional[asyncpg.Pool] = None
+    24→
+    25→    async def connect(self):
+    26→        """Initialize connection pool."""
+    27→        if self.pool is None:
+    28→            self.pool = await asyncpg.create_pool(
+    29→                DATABASE_URL,
+    30→                min_size=2,
+    31→                max_size=10,
+    32→                command_timeout=30
+    33→            )
+    34→
+    35→    async def close(self):
+    36→        """Close connection pool."""
+    37→        if self.pool:
+    38→            await self.pool.close()
+    39→            self.pool = None
+    40→
+    41→    async def get_available_trains(self, allocation_date: date) -> list[dict]:
+    42→        """
+    43→        Get all trains available for allocation on a given date.
+    44→
+    45→        Returns trains that are:
+    46→        - Fitness status = 'fit'
+    47→        - Not already allocated to another service on that date
+    48→        - Not under maintenance on that date
+    49→        """
+    50→        query = """
+    51→            SELECT
+    52→                t.id,
+    53→                t.train_id,
+    54→                t.fleet_id,
+    55→                t.base_depot_id,
+    56→                t.current_km,
+    57→                t.target_km,
+    58→                t.fitness_status,
+    59→                t.next_maintenance_km,
+    60→                t.latitude,
+    61→                t.longitude,
+    62→                d.name as depot_name,
+    63→                d.code as depot_code,
+    64→                d.latitude as depot_lat,
+    65→                d.longitude as depot_lon,
+    66→                f.name as fleet_name,
+    67→                f.pm1_interval_km,
+    68→                f.pm2_interval_km,
+    69→                f.hm_interval_km
+    70→            FROM trains t
+    71→            LEFT JOIN depots d ON t.base_depot_id = d.id
+    72→            LEFT JOIN fleets f ON t.fleet_id = f.id
+    73→            WHERE t.fitness_status = 'fit'
+    74→            AND NOT EXISTS (
+    75→                SELECT 1 FROM allocations a
+    76→                WHERE a.train_id = t.id
+    77→                AND a.allocation_date = $1
+    78→                AND a.status != 'cancelled'
+    79→            )
+    80→            AND NOT EXISTS (
+    81→                SELECT 1 FROM maintenance_schedules m
+    82→                WHERE m.train_id = t.id
+    83→                AND $1 BETWEEN m.scheduled_date
+    84→                    AND m.scheduled_date + (m.duration_days - 1) * interval '1 day'
+    85→                AND m.status = 'scheduled'
+    86→            )
+    87→            ORDER BY t.train_id
+    88→        """
+    89→        async with self.pool.acquire() as conn:
+    90→            rows = await conn.fetch(query, allocation_date)
+    91→            return [dict(row) for row in rows]
+    92→
+    93→    async def get_service(self, service_id: str) -> Optional[dict]:
+    94→        """Get service details by UUID."""
+    95→        query = """
+    96→            SELECT
+    97→                id,
+    98→                service_code,
+    99→                origin,
+   100→                destination,
+   101→                distance_km,
+   102→                departure_time,
+   103→                arrival_time,
+   104→                service_type
+   105→            FROM services
+   106→            WHERE id = $1
+   107→        """
+   108→        async with self.pool.acquire() as conn:
+   109→            row = await conn.fetchrow(query, service_id)
+   110→            return dict(row) if row else None
+   111→
+   112→    async def get_fleet_average_km(self, fleet_id: str) -> float:
+   113→        """Get average km for trains in a fleet."""
+   114→        query = """
+   115→            SELECT AVG(current_km)::float as avg_km
+   116→            FROM trains
+   117→            WHERE fleet_id = $1
+   118→            AND fitness_status = 'fit'
+   119→        """
+   120→        async with self.pool.acquire() as conn:
+   121→            result = await conn.fetchval(query, fleet_id)
+   122→            return result or 0.0
+   123→
+   124→    async def get_depot_by_name(self, name: str) -> Optional[dict]:
+   125→        """Find depot by name (partial match)."""
+   126→        query = """
+   127→            SELECT id, name, code, latitude, longitude
+   128→            FROM depots
+   129→            WHERE LOWER(name) LIKE LOWER($1)
+   130→            LIMIT 1
+   131→        """
+   132→        async with self.pool.acquire() as conn:
+   133→            row = await conn.fetchrow(query, f"%{name}%")
+   134→            return dict(row) if row else None
+   135→
+   136→    async def get_upcoming_maintenance(self, train_id: str, days_ahead: int = 7) -> list[dict]:
+   137→        """Get scheduled maintenance for a train in the next N days."""
+   138→        query = """
+   139→            SELECT
+   140→                m.id,
+   141→                m.maintenance_type,
+   142→                m.scheduled_date,
+   143→                m.duration_days,
+   144→                d.name as depot_name,
+   145→                d.code as depot_code
+   146→            FROM maintenance_schedules m
+   147→            JOIN depots d ON m.depot_id = d.id
+   148→            WHERE m.train_id = $1
+   149→            AND m.scheduled_date BETWEEN CURRENT_DATE AND CURRENT_DATE + $2 * interval '1 day'
+   150→            AND m.status = 'scheduled'
+   151→            ORDER BY m.scheduled_date
+   152→        """
+   153→        async with self.pool.acquire() as conn:
+   154→            rows = await conn.fetch(query, train_id, days_ahead)
+   155→            return [dict(row) for row in rows]
+   156→
+   157→    async def get_train_allocations_count(self, train_id: str, days_back: int = 7) -> int:
+   158→        """Count recent allocations for a train."""
+   159→        query = """
+   160→            SELECT COUNT(*)
+   161→            FROM allocations
+   162→            WHERE train_id = $1
+   163→            AND allocation_date >= CURRENT_DATE - $2 * interval '1 day'
+   164→            AND status != 'cancelled'
+   165→        """
+   166→        async with self.pool.acquire() as conn:
+   167→            return await conn.fetchval(query, train_id, days_back)
+   168→
+   169→    async def get_all_trains_km(self) -> list[dict]:
+   170→        """Get current km for all trains (for simulation)."""
+   171→        query = """
+   172→            SELECT
+   173→                t.id,
+   174→                t.train_id,
+   175→                t.current_km,
+   176→                t.target_km,
+   177→                t.fleet_id,
+   178→                f.name as fleet_name
+   179→            FROM trains t
+   180→            LEFT JOIN fleets f ON t.fleet_id = f.id
+   181→            WHERE t.fitness_status = 'fit'
+   182→            ORDER BY t.train_id
+   183→        """
+   184→        async with self.pool.acquire() as conn:
+   185→            rows = await conn.fetch(query)
+   186→            return [dict(row) for row in rows]
+   187→
+   188→
+   189→# Singleton instance
+   190→db = DatabaseClient()
+   191→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

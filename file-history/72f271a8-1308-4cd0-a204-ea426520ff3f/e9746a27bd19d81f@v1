@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+/**
+ * Harness Orchestrator CLI
+ *
+ * Command-line interface for the harness orchestrator.
+ */
+
+import { Command } from 'commander';
+import chalk from 'chalk';
+import ora from 'ora';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import { DependencyGraph } from '../graph/DependencyGraph.js';
+import { CriticalPath } from '../graph/CriticalPath.js';
+import { StateManager } from '../state/StateManager.js';
+import { AIManager } from '../ai/AIManager.js';
+import type { HarnessConfig } from '../types.js';
+
+const program = new Command();
+
+program
+  .name('harness-orchestrator')
+  .description('AI Project Manager for harness task orchestration')
+  .version('0.1.0');
+
+// Analyze command
+program
+  .command('analyze <features-path>')
+  .description('Analyze dependency graph and show execution plan')
+  .action((featuresPath: string) => {
+    const resolvedPath = resolve(featuresPath);
+    const content = readFileSync(resolvedPath, 'utf-8');
+    const config: HarnessConfig = JSON.parse(content);
+
+    const graph = new DependencyGraph(config);
+    const criticalPath = new CriticalPath(graph);
+
+    console.log(chalk.bold('\n📊 Dependency Analysis\n'));
+
+    // Check for cycles
+    const cycle = graph.detectCycles();
+    if (cycle) {
+      console.log(chalk.red('❌ Cycle detected:'), cycle.join(' → '));
+      process.exit(1);
+    }
+    console.log(chalk.green('✓ No cycles detected\n'));
+
+    // Show features by status
+    const pending = graph.getPendingFeatures();
+    const completed = graph.getAllFeatures().filter((f) => f.passes);
+
+    console.log(chalk.bold('Status:'));
+    console.log(`  Completed: ${chalk.green(completed.length)}`);
+    console.log(`  Pending: ${chalk.yellow(pending.length)}`);
+    console.log();
+
+    // Show ready tasks
+    const ready = graph.getReadyTasks();
+    console.log(chalk.bold('Ready to run (parallelizable):'));
+    if (ready.length === 0) {
+      console.log(chalk.dim('  None'));
+    } else {
+      for (const f of ready) {
+        const priority = criticalPath.getPriorityScore(f.id);
+        const onCritical = criticalPath.getCriticalPath().includes(f.id);
+        const critical = onCritical ? chalk.red(' [CRITICAL]') : '';
+        console.log(`  ${chalk.cyan(f.id)}: ${f.description}${critical} (priority: ${priority})`);
+      }
+    }
+    console.log();
+
+    // Show critical path
+    const path = criticalPath.getCriticalPath();
+    console.log(chalk.bold('Critical Path:'));
+    console.log(`  ${path.map((id) => chalk.red(id)).join(' → ')}`);
+    console.log();
+
+    // Show execution order
+    const order = graph.topologicalSort();
+    console.log(chalk.bold('Topological Order:'));
+    console.log(`  ${order.map((id) => graph.getFeature(id)?.passes ? chalk.green(id) : chalk.yellow(id)).join(' → ')}`);
+  });
+
+// Status command
+program
+  .command('status <features-path>')
+  .description('Show current progress status')
+  .action((featuresPath: string) => {
+    const resolvedPath = resolve(featuresPath);
+    const stateManager = new StateManager(resolvedPath);
+    const aiManager = new AIManager();
+
+    const config = stateManager.load();
+    const progress = stateManager.getProgress();
+
+    console.log(chalk.bold('\n📈 Harness Status\n'));
+    console.log(`Project: ${chalk.cyan(config.project)}`);
+    console.log(`Version: ${config.version}`);
+    console.log(`Last Updated: ${config.lastUpdated}`);
+    console.log();
+
+    // Progress bar
+    const pct = Math.round((progress.completed / progress.total) * 100);
+    const filled = Math.round(pct / 5);
+    const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+    console.log(`Progress: [${bar}] ${pct}%`);
+    console.log(`  ${chalk.green(progress.completed)} completed / ${chalk.yellow(progress.pending)} pending`);
+    console.log();
+
+    // Features list
+    console.log(chalk.bold('Features:'));
+    for (const f of config.features) {
+      const status = f.passes ? chalk.green('✓') : chalk.yellow('○');
+      const blockedBy = f.blockedBy
+        ? chalk.dim(` (blocked by: ${Array.isArray(f.blockedBy) ? f.blockedBy.join(', ') : f.blockedBy})`)
+        : '';
+      console.log(`  ${status} ${f.id}: ${f.description}${blockedBy}`);
+    }
+
+    // AI summary
+    console.log('\n' + aiManager.generateProgressSummary(config.features));
+  });
+
+// Orchestrate command (placeholder - will be implemented in O006)
+program
+  .command('orchestrate <features-path>')
+  .description('Run full orchestration with parallel agents')
+  .option('-n, --max-agents <number>', 'Maximum concurrent agents', '3')
+  .option('-m, --model <model>', 'Default model (haiku, sonnet, opus)', 'sonnet')
+  .option('--dry-run', 'Show plan without executing')
+  .action(async (featuresPath: string, options) => {
+    const spinner = ora('Loading harness configuration...').start();
+
+    try {
+      const resolvedPath = resolve(featuresPath);
+      const stateManager = new StateManager(resolvedPath);
+      const config = stateManager.load();
+
+      spinner.succeed('Configuration loaded');
+
+      if (options.dryRun) {
+        console.log(chalk.yellow('\n🔍 Dry Run Mode\n'));
+        console.log('Would orchestrate with:');
+        console.log(`  Max agents: ${options.maxAgents}`);
+        console.log(`  Model: ${options.model}`);
+        console.log(`  Features: ${config.features.filter((f) => !f.passes).length} pending`);
+        return;
+      }
+
+      console.log(chalk.red('\n⚠️  Full orchestration not yet implemented'));
+      console.log('See feature O006 for implementation.');
+      console.log('\nUse --dry-run to see the execution plan.');
+    } catch (error) {
+      spinner.fail('Failed to load configuration');
+      console.error(error);
+      process.exit(1);
+    }
+  });
+
+program.parse();

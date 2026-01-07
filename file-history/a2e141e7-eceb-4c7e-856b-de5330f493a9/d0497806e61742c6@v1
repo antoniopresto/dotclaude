@@ -1,0 +1,301 @@
+'use client';
+
+import React, { useEffect, useState, useCallback } from 'react';
+import {
+  Card,
+  Elevation,
+  Button,
+  Spinner,
+  Callout,
+  Intent,
+  Tag,
+  Icon,
+  InputGroup,
+} from '@blueprintjs/core';
+import {
+  servicesApi,
+  allocationsApi,
+  Service,
+  Recommendation,
+} from '@/lib/api';
+
+interface AllocationPanelProps {
+  onAllocationComplete?: () => void;
+}
+
+/**
+ * Allocation Panel Component
+ *
+ * Main component for train-to-service allocation:
+ * - Lists pending services
+ * - Generates recommendations
+ * - Displays justifications
+ * - Confirms allocations
+ */
+export function AllocationPanel({ onAllocationComplete }: AllocationPanelProps) {
+  const [services, setServices] = useState<Service[]>([]);
+  const [selectedService, setSelectedService] = useState<Service | null>(null);
+  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [recommending, setRecommending] = useState(false);
+  const [allocating, setAllocating] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [selectedDate, setSelectedDate] = useState(
+    new Date().toISOString().split('T')[0]
+  );
+  const [isFallback, setIsFallback] = useState(false);
+  const [solverTime, setSolverTime] = useState(0);
+
+  const fetchServices = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const { data, error } = await servicesApi.getPending(selectedDate);
+
+    if (error) {
+      setError(error);
+    } else if (data) {
+      setServices(data.services);
+    }
+    setLoading(false);
+  }, [selectedDate]);
+
+  useEffect(() => {
+    fetchServices();
+  }, [fetchServices]);
+
+  const handleSelectService = (service: Service) => {
+    setSelectedService(service);
+    setRecommendations([]);
+    setSuccessMessage(null);
+  };
+
+  const handleGetRecommendations = async () => {
+    if (!selectedService) return;
+
+    setRecommending(true);
+    setError(null);
+
+    const { data, error } = await allocationsApi.recommend(
+      selectedService.id,
+      selectedDate
+    );
+
+    if (error) {
+      setError(error);
+    } else if (data) {
+      setRecommendations(data.recommendations);
+      setIsFallback(data.fallback || false);
+      setSolverTime(data.solverTimeMs);
+    }
+    setRecommending(false);
+  };
+
+  const handleAllocate = async (rec: Recommendation) => {
+    if (!selectedService) return;
+
+    setAllocating(rec.trainId);
+    setError(null);
+
+    const { data, error } = await allocationsApi.create(
+      selectedService.id,
+      rec.trainId,
+      selectedDate,
+      rec.score,
+      rec.justifications
+    );
+
+    if (error) {
+      setError(error);
+    } else if (data) {
+      setSuccessMessage(
+        `Train ${rec.train_id} assigned to ${selectedService.serviceCode}`
+      );
+      // Remove allocated service from list
+      setServices((prev) =>
+        prev.filter((s) => s.id !== selectedService.id)
+      );
+      setSelectedService(null);
+      setRecommendations([]);
+      onAllocationComplete?.();
+    }
+    setAllocating(null);
+  };
+
+  const formatTime = (time: string | undefined) => {
+    if (!time) return '--:--';
+    return time.substring(0, 5);
+  };
+
+  return (
+    <div className="mms-grid-2">
+      {/* Left Panel - Pending Services */}
+      <Card elevation={Elevation.ONE} style={{ padding: 0, overflow: 'hidden' }}>
+        <div style={{ padding: 16, borderBottom: '1px solid #e1e8ed', backgroundColor: '#f5f8fa' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Pending Services</h2>
+            <InputGroup
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              style={{ width: 140 }}
+            />
+          </div>
+          <p style={{ margin: '8px 0 0', fontSize: 14, color: '#5c7080' }}>
+            {services.length} services awaiting allocation
+          </p>
+        </div>
+
+        {loading ? (
+          <div style={{ padding: 32, textAlign: 'center' }}>
+            <Spinner size={32} />
+            <p style={{ marginTop: 8, color: '#5c7080' }}>Loading services...</p>
+          </div>
+        ) : services.length === 0 ? (
+          <div style={{ padding: 32, textAlign: 'center', color: '#5c7080' }}>
+            No pending services for {selectedDate}
+          </div>
+        ) : (
+          <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+            {services.map((service) => (
+              <div
+                key={service.id}
+                style={{
+                  padding: 16,
+                  cursor: 'pointer',
+                  borderBottom: '1px solid #e1e8ed',
+                  backgroundColor: selectedService?.id === service.id ? '#e1e8ed' : 'transparent',
+                  borderLeft: selectedService?.id === service.id ? '4px solid #2563eb' : '4px solid transparent',
+                }}
+                onClick={() => handleSelectService(service)}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span className="train-id" style={{ fontWeight: 600 }}>
+                    {service.serviceCode}
+                  </span>
+                  <span style={{ fontSize: 14, color: '#5c7080' }}>
+                    {formatTime(service.departureTime)}
+                  </span>
+                </div>
+                <div style={{ marginTop: 4, fontSize: 14, color: '#5c7080' }}>
+                  {service.origin} → {service.destination}
+                </div>
+                <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 16 }}>
+                  <Tag minimal>{service.distanceKm} km</Tag>
+                  <Tag minimal intent={Intent.NONE}>{service.serviceType}</Tag>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* Right Panel - Recommendations */}
+      <Card elevation={Elevation.ONE} style={{ padding: 0, overflow: 'hidden' }}>
+        <div style={{ padding: 16, borderBottom: '1px solid #e1e8ed', backgroundColor: '#f5f8fa' }}>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Train Recommendations</h2>
+          {selectedService && (
+            <p style={{ margin: '8px 0 0', fontSize: 14, color: '#5c7080' }}>
+              For {selectedService.serviceCode}: {selectedService.origin} → {selectedService.destination}
+            </p>
+          )}
+        </div>
+
+        {/* Success Message */}
+        {successMessage && (
+          <Callout intent={Intent.SUCCESS} icon="tick-circle" style={{ margin: 16 }}>
+            {successMessage}
+          </Callout>
+        )}
+
+        {/* Error Message */}
+        {error && (
+          <Callout intent={Intent.DANGER} style={{ margin: 16 }}>
+            {error}
+          </Callout>
+        )}
+
+        {!selectedService ? (
+          <div style={{ padding: 32, textAlign: 'center', color: '#5c7080' }}>
+            Select a service to get train recommendations
+          </div>
+        ) : recommendations.length === 0 ? (
+          <div style={{ padding: 32, textAlign: 'center' }}>
+            <Button
+              onClick={handleGetRecommendations}
+              disabled={recommending}
+              intent={Intent.PRIMARY}
+              large
+              icon={recommending ? undefined : 'lightbulb'}
+              loading={recommending}
+            >
+              {recommending ? 'Analyzing...' : 'Get Recommendations'}
+            </Button>
+            <p style={{ marginTop: 8, fontSize: 14, color: '#5c7080' }}>
+              AI-powered recommendations based on km balancing
+            </p>
+          </div>
+        ) : (
+          <div>
+            {/* Solver Info */}
+            {isFallback && (
+              <Callout intent={Intent.WARNING} icon="warning-sign" style={{ margin: 16 }}>
+                Using fallback ranking (solver unavailable)
+              </Callout>
+            )}
+            {solverTime > 0 && (
+              <div style={{ padding: 8, backgroundColor: '#f5f8fa', borderBottom: '1px solid #e1e8ed', fontSize: 12, color: '#5c7080', textAlign: 'right' }}>
+                Solver time: {solverTime}ms
+              </div>
+            )}
+
+            {/* Recommendations List */}
+            <div>
+              {recommendations.map((rec, idx) => (
+                <div key={rec.trainId} style={{ padding: 16, borderBottom: '1px solid #e1e8ed' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span className="train-id" style={{ fontWeight: 600 }}>
+                        {rec.train_id}
+                      </span>
+                      <Tag intent={Intent.PRIMARY} minimal>Score: {rec.score}</Tag>
+                      {idx === 0 && (
+                        <Tag intent={Intent.SUCCESS}>Best Match</Tag>
+                      )}
+                    </div>
+                    <Button
+                      onClick={() => handleAllocate(rec)}
+                      disabled={allocating !== null}
+                      intent={Intent.SUCCESS}
+                      loading={allocating === rec.trainId}
+                      small
+                    >
+                      Assign
+                    </Button>
+                  </div>
+
+                  <div style={{ marginTop: 8, fontSize: 14, color: '#5c7080' }}>
+                    Dead running: {rec.deadRunningKm} km
+                  </div>
+
+                  {/* Justifications */}
+                  <div style={{ marginTop: 12 }}>
+                    {rec.justifications.map((j, jIdx) => (
+                      <div
+                        key={jIdx}
+                        style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 14, color: '#5c7080', marginTop: 4 }}
+                      >
+                        <Icon icon="tick" intent={Intent.SUCCESS} size={14} />
+                        <span>{j}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}

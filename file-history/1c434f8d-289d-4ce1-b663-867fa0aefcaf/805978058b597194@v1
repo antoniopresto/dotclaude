@@ -1,0 +1,188 @@
+import _get from 'lodash/get';
+import _isPlainObject from 'lodash/isPlainObject';
+import { LRUCache } from 'lru-cache';
+
+import { InvariantError } from '../helpers/error-utils';
+import { ms } from '../helpers/ms';
+import type { AnyFunction, Writable } from '../helpers/type-utils';
+
+import type {
+  InferType,
+  ObjectTypeProperties,
+  TypeDefinition,
+  TypeDefinitionString,
+  Type as TypeWrapper,
+} from './infer-type';
+import { createBaseType, createDateType, type TSchema, Type } from './lib/type';
+
+export function createType<const Definition extends TypeDefinition>(
+  definition: Definition,
+): TypeWrapper<Definition, InferType<Definition>> {
+  if (typeof definition === 'string') {
+    let schema = createType.cache.get(definition);
+    if (!schema) {
+      schema = _createType(definition);
+      createType.cache.set(definition, schema);
+    }
+    return schema as unknown as TypeWrapper<Definition, InferType<Definition>>;
+  }
+  return _createType(definition) as unknown as TypeWrapper<Definition, InferType<Definition>>;
+}
+
+/** @internal Schema compilation cache - 1h TTL since schemas rarely change at runtime */
+createType.cache = new LRUCache({
+  max: 2000,
+  ttl: ms('1h'),
+});
+
+export function createModel<const Schema extends ObjectTypeProperties>(
+  properties: Schema,
+): TypeWrapper<{ properties: Writable<Schema> }, InferType<{ properties: Writable<Schema> }>> {
+  return createType({ properties }) as never;
+}
+
+function toTypeBox<T extends TypeDefinition>(type: T): TSchema {
+  if (typeof type === 'string') {
+    if (type.endsWith('?')) {
+      const slice = type.slice(0, -1) as TypeDefinitionString;
+      return Type.Optional(toTypeBox(slice));
+    }
+    if (type.endsWith('[]')) {
+      const slice = type.slice(0, -2) as TypeDefinitionString;
+      return Type.Array(toTypeBox(slice));
+    }
+  }
+
+  if (type === 'string') {
+    return Type.String();
+  }
+
+  if (type === 'number') {
+    return Type.Number();
+  }
+
+  if (type === 'boolean') {
+    return Type.Boolean();
+  }
+
+  if (type === 'date') {
+    return createDateType();
+  }
+
+  if (type === 'null') {
+    return Type.Null();
+  }
+
+  if (type === 'undefined') {
+    return Type.Undefined();
+  }
+
+  if (type === 'function') {
+    return Type.Unsafe<AnyFunction>({ type: 'function' });
+  }
+
+  if (type === 'object') {
+    // Generic object that accepts any properties
+    return Type.Record(Type.String(), Type.Unknown());
+  }
+
+  if (type === 'unknown') {
+    return Type.Unknown();
+  }
+
+  if (type === 'any') {
+    return Type.Any();
+  }
+
+  if (type && typeof type === 'object') {
+    // Handle already processed types (have ~typebox property with actual schema)
+    if ('~typebox' in type && type['~typebox'] && typeof type['~typebox'] === 'object') {
+      return type['~typebox'] as TSchema;
+    }
+
+    if ('properties' in type) {
+      const shape: Record<string, TSchema> = {};
+      Object.entries(type.properties).forEach(([k, v]) => {
+        shape[k] = toTypeBox(v);
+      });
+      return Type.Object(shape);
+    }
+
+    if ('enum' in type && Array.isArray(type.enum)) {
+      const items = (type.enum as string[]).map((item) => Type.Literal(item));
+      return Type.Union(items);
+    }
+
+    if ('items' in type) {
+      return Type.Array(toTypeBox(type.items as TypeDefinition));
+    }
+
+    if ('union' in type) {
+      const items = (type.union as TypeDefinition[]).map((item) => toTypeBox(item));
+      return Type.Union(items);
+    }
+
+    if ('record' in type) {
+      const recordValue = toTypeBox(type.record as TypeDefinition);
+      return Type.Record(Type.String(), recordValue);
+    }
+  }
+
+  throw new InvariantError(`Invalid type definition`, createType, type);
+}
+
+function _createType<const Definition extends TypeDefinition>(
+  definition: Definition,
+): TypeWrapper<Definition, InferType<Definition>> {
+  const typeBoxSchema = toTypeBox(definition);
+  const baseType = createBaseType(typeBoxSchema);
+
+  let listType: TypeWrapper<any> | null = null;
+
+  function list() {
+    if (!listType) {
+      listType = createType({ items: definition }) as never;
+    }
+    return listType;
+  }
+
+  function parse(value: any, path?: string) {
+    if (path) {
+      const valueAtPath = _get(value, path);
+      if (!_isPlainObject(valueAtPath)) {
+        throw new InvariantError(`Expected value at ${path} to be an object.`, parse);
+      }
+      value = valueAtPath;
+    }
+
+    try {
+      return baseType.parse(value);
+    } catch (e: any) {
+      throw new InvariantError(e.message, parse);
+    }
+  }
+
+  function parseList(value: any, path?: string) {
+    if (path) {
+      const valueAtPath = _get(value, path);
+      if (!Array.isArray(valueAtPath)) {
+        throw new InvariantError(`Expected value at ${path} to be an array.`, parseList);
+      }
+      value = valueAtPath;
+    }
+
+    return list().parse(value);
+  }
+
+  function isValid(value: unknown): value is any {
+    return baseType.check(value);
+  }
+
+  return {
+    '~typebox': typeBoxSchema,
+    list,
+    parse,
+    parseList,
+    isValid,
+  } as unknown as TypeWrapper<any, any>;
+}

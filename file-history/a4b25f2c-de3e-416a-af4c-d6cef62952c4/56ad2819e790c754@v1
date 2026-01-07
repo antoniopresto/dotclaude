@@ -1,0 +1,408 @@
+//! Screenshot CRUD operations (F015).
+//!
+//! This module provides Create, Read, Update, Delete operations for test screenshots.
+//! Screenshots store metadata for visual test images with optional task/step associations.
+
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
+
+use super::types::TestScreenshot;
+use super::DbResult;
+
+/// Default page size for list operations.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+// =============================================================================
+// CREATE
+// =============================================================================
+
+/// Create a new screenshot record.
+pub fn create_screenshot(conn: &Connection, screenshot: &TestScreenshot) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO test_screenshots (id, task_id, step_id, file_name, caption, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+        params![
+            screenshot.id,
+            screenshot.task_id,
+            screenshot.step_id,
+            screenshot.file_name,
+            screenshot.caption,
+            screenshot.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add a screenshot (alias for create_screenshot).
+pub fn add_screenshot(conn: &Connection, screenshot: &TestScreenshot) -> DbResult<()> {
+    create_screenshot(conn, screenshot)
+}
+
+// =============================================================================
+// READ
+// =============================================================================
+
+/// Get a screenshot by ID.
+pub fn get_screenshot(conn: &Connection, id: &str) -> DbResult<Option<TestScreenshot>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT id, task_id, step_id, file_name, caption, created_at
+            FROM test_screenshots
+            WHERE id = ?1
+            "#,
+            [id],
+            |row| row_to_screenshot(row),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// List all screenshots, ordered by creation date (newest first).
+pub fn list_screenshots(conn: &Connection, limit: Option<usize>) -> DbResult<Vec<TestScreenshot>> {
+    let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, task_id, step_id, file_name, caption, created_at
+        FROM test_screenshots
+        ORDER BY created_at DESC
+        LIMIT ?1
+        "#,
+    )?;
+
+    let rows = stmt.query_map([limit as i64], |row| row_to_screenshot(row))?;
+
+    let mut screenshots = Vec::new();
+    for row in rows {
+        screenshots.push(row?);
+    }
+
+    Ok(screenshots)
+}
+
+/// List screenshots for a specific task.
+pub fn list_screenshots_for_task(
+    conn: &Connection,
+    task_id: &str,
+    limit: Option<usize>,
+) -> DbResult<Vec<TestScreenshot>> {
+    let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, task_id, step_id, file_name, caption, created_at
+        FROM test_screenshots
+        WHERE task_id = ?1
+        ORDER BY created_at DESC
+        LIMIT ?2
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![task_id, limit as i64], |row| row_to_screenshot(row))?;
+
+    let mut screenshots = Vec::new();
+    for row in rows {
+        screenshots.push(row?);
+    }
+
+    Ok(screenshots)
+}
+
+/// Count total screenshots.
+pub fn count_screenshots(conn: &Connection) -> DbResult<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM test_screenshots",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Count screenshots for a specific task.
+pub fn count_screenshots_for_task(conn: &Connection, task_id: &str) -> DbResult<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM test_screenshots WHERE task_id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+// =============================================================================
+// UPDATE
+// =============================================================================
+
+/// Update screenshot caption.
+pub fn update_screenshot_caption(
+    conn: &Connection,
+    id: &str,
+    caption: Option<&str>,
+) -> DbResult<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE test_screenshots SET caption = ?1 WHERE id = ?2",
+        params![caption, id],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+/// Update screenshot task association.
+pub fn update_screenshot_task(
+    conn: &Connection,
+    id: &str,
+    task_id: Option<&str>,
+) -> DbResult<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE test_screenshots SET task_id = ?1 WHERE id = ?2",
+        params![task_id, id],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+// =============================================================================
+// DELETE
+// =============================================================================
+
+/// Delete a screenshot by ID.
+pub fn delete_screenshot(conn: &Connection, id: &str) -> DbResult<bool> {
+    let rows_affected = conn.execute("DELETE FROM test_screenshots WHERE id = ?1", [id])?;
+    Ok(rows_affected > 0)
+}
+
+/// Delete all screenshots for a task.
+pub fn delete_screenshots_for_task(conn: &Connection, task_id: &str) -> DbResult<usize> {
+    let rows_affected = conn.execute(
+        "DELETE FROM test_screenshots WHERE task_id = ?1",
+        [task_id],
+    )?;
+    Ok(rows_affected)
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn row_to_screenshot(row: &rusqlite::Row) -> rusqlite::Result<TestScreenshot> {
+    let created_at_str: String = row.get(5)?;
+
+    Ok(TestScreenshot {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        step_id: row.get(2)?,
+        file_name: row.get(3)?,
+        caption: row.get(4)?,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::connection::open_in_memory;
+
+    fn create_test_screenshot(file_name: &str) -> TestScreenshot {
+        TestScreenshot::new(file_name)
+    }
+
+    // -------------------------------------------------------------------------
+    // Create tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_create_screenshot() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let screenshot = create_test_screenshot("test-001.png");
+
+        create_screenshot(&conn, &screenshot).expect("Failed to create screenshot");
+
+        let retrieved = get_screenshot(&conn, &screenshot.id).expect("Failed to get screenshot");
+        assert!(retrieved.is_some());
+
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.file_name, "test-001.png");
+        assert!(retrieved.task_id.is_none());
+        assert!(retrieved.caption.is_none());
+    }
+
+    #[test]
+    fn test_create_screenshot_with_all_fields() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let screenshot = create_test_screenshot("test-002.png")
+            .with_task_id("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .with_step_id("task#01ARZ3NDEKTSV4RRFFQ69G5FAV#01BSZ3NDEKTSV4RRFFQ69G5FBV")
+            .with_caption("Login form rendered");
+
+        create_screenshot(&conn, &screenshot).expect("Failed to create screenshot");
+
+        let retrieved = get_screenshot(&conn, &screenshot.id).expect("Failed to get").unwrap();
+        assert_eq!(retrieved.task_id, Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()));
+        assert_eq!(retrieved.caption, Some("Login form rendered".to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Read tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_screenshot_not_found() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let result = get_screenshot(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("Query failed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_screenshots_empty() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let result = list_screenshots(&conn, None).expect("Failed to list screenshots");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_list_screenshots_ordered_by_date() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        for i in 0..5 {
+            let screenshot = create_test_screenshot(&format!("test-{:03}.png", i));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            create_screenshot(&conn, &screenshot).expect("Failed to create");
+        }
+
+        let result = list_screenshots(&conn, None).expect("Failed to list");
+        assert_eq!(result.len(), 5);
+        // Newest first
+        assert!(result[0].created_at >= result[1].created_at);
+    }
+
+    #[test]
+    fn test_list_screenshots_for_task() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        // Create screenshots for different tasks
+        for i in 0..3 {
+            let screenshot = create_test_screenshot(&format!("task1-{}.png", i))
+                .with_task_id(task_id);
+            create_screenshot(&conn, &screenshot).expect("Failed to create");
+        }
+
+        for i in 0..2 {
+            let screenshot = create_test_screenshot(&format!("task2-{}.png", i))
+                .with_task_id("01BSZ3NDEKTSV4RRFFQ69G5FBV");
+            create_screenshot(&conn, &screenshot).expect("Failed to create");
+        }
+
+        let result = list_screenshots_for_task(&conn, task_id, None).expect("Failed to list");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_count_screenshots() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+
+        for i in 0..5 {
+            let screenshot = create_test_screenshot(&format!("test-{}.png", i));
+            create_screenshot(&conn, &screenshot).expect("Failed to create");
+        }
+
+        let count = count_screenshots(&conn).expect("Failed to count");
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_count_screenshots_for_task() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        for i in 0..3 {
+            let screenshot = create_test_screenshot(&format!("test-{}.png", i))
+                .with_task_id(task_id);
+            create_screenshot(&conn, &screenshot).expect("Failed to create");
+        }
+
+        let count = count_screenshots_for_task(&conn, task_id).expect("Failed to count");
+        assert_eq!(count, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Update tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_update_screenshot_caption() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let screenshot = create_test_screenshot("test.png");
+        create_screenshot(&conn, &screenshot).expect("Failed to create");
+
+        let updated = update_screenshot_caption(&conn, &screenshot.id, Some("New caption"))
+            .expect("Update failed");
+        assert!(updated);
+
+        let retrieved = get_screenshot(&conn, &screenshot.id).expect("Get failed").unwrap();
+        assert_eq!(retrieved.caption, Some("New caption".to_string()));
+    }
+
+    #[test]
+    fn test_update_screenshot_task() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let screenshot = create_test_screenshot("test.png");
+        create_screenshot(&conn, &screenshot).expect("Failed to create");
+
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let updated = update_screenshot_task(&conn, &screenshot.id, Some(task_id))
+            .expect("Update failed");
+        assert!(updated);
+
+        let retrieved = get_screenshot(&conn, &screenshot.id).expect("Get failed").unwrap();
+        assert_eq!(retrieved.task_id, Some(task_id.to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Delete tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_screenshot() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let screenshot = create_test_screenshot("test.png");
+        create_screenshot(&conn, &screenshot).expect("Failed to create");
+
+        let deleted = delete_screenshot(&conn, &screenshot.id).expect("Delete failed");
+        assert!(deleted);
+
+        let retrieved = get_screenshot(&conn, &screenshot.id).expect("Get failed");
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_delete_screenshot_not_found() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let deleted = delete_screenshot(&conn, "01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("Delete should not error");
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn test_delete_screenshots_for_task() {
+        let conn = open_in_memory().expect("Failed to open in-memory db");
+        let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        for i in 0..3 {
+            let screenshot = create_test_screenshot(&format!("test-{}.png", i))
+                .with_task_id(task_id);
+            create_screenshot(&conn, &screenshot).expect("Failed to create");
+        }
+
+        let deleted = delete_screenshots_for_task(&conn, task_id).expect("Delete failed");
+        assert_eq!(deleted, 3);
+
+        let count = count_screenshots_for_task(&conn, task_id).expect("Count failed");
+        assert_eq!(count, 0);
+    }
+}

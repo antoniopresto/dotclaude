@@ -1,0 +1,508 @@
+/**
+ * XState Viewport Machine POC
+ *
+ * Demonstrates the viewport state machine with visual state transitions.
+ * Shows zoom, pan, LOD changes with real-time state inspection.
+ */
+
+import React, { useRef, useMemo, useCallback } from 'react';
+import type { Meta, StoryObj } from '@storybook/react';
+import { useMachine } from '@xstate/react';
+import { Card, Tag, Intent, Button, ButtonGroup, Divider } from '@blueprintjs/core';
+import { viewportMachine } from '../../machines/viewport.machine';
+import { LOD_THRESHOLDS, COLORS, TIME_RANGE, TOTAL_TRAINS } from '../../data/mock-config';
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+interface ViewportVisualizerProps {
+  showStateInspector?: boolean;
+}
+
+function ViewportVisualizer({ showStateInspector = true }: ViewportVisualizerProps) {
+  const [snapshot, send] = useMachine(viewportMachine);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const animationFrameRef = useRef<number | null>(null);
+
+  const context = snapshot.context;
+  const stateName = snapshot.value as string;
+
+  // Animation loop for momentum/animation states
+  const tick = useCallback(() => {
+    const timestamp = performance.now();
+
+    if (stateName === 'momentum') {
+      send({ type: 'MOMENTUM_TICK', timestamp });
+    } else if (stateName === 'animating') {
+      send({ type: 'ANIMATION_TICK', timestamp });
+    }
+
+    animationFrameRef.current = requestAnimationFrame(tick);
+  }, [send, stateName]);
+
+  // Start/stop animation loop based on state
+  React.useEffect(() => {
+    if (stateName === 'momentum' || stateName === 'animating') {
+      animationFrameRef.current = requestAnimationFrame(tick);
+    }
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [stateName, tick]);
+
+  // Handle wheel for zoom
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    e.preventDefault();
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    // Convert screen coords to world coords (simplified)
+    const centerX = (e.clientX - rect.left) / rect.width * TIME_RANGE.days;
+    const centerY = (e.clientY - rect.top) / rect.height * TOTAL_TRAINS;
+
+    send({ type: 'ZOOM', delta: e.deltaY, centerX, centerY });
+  }, [send]);
+
+  // Handle pointer for pan
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    send({ type: 'PAN_START', pointerX: e.clientX, pointerY: e.clientY });
+  }, [send]);
+
+  const handlePointerMove = useCallback((e: React.PointerEvent) => {
+    if (stateName === 'panning') {
+      send({ type: 'PAN_MOVE', pointerX: e.clientX, pointerY: e.clientY });
+    }
+  }, [send, stateName]);
+
+  const handlePointerUp = useCallback(() => {
+    if (stateName === 'panning') {
+      send({ type: 'PAN_END' });
+    }
+  }, [send, stateName]);
+
+  // Handle double-click for zoom
+  const handleDoubleClick = useCallback((e: React.MouseEvent) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const x = (e.clientX - rect.left) / rect.width * TIME_RANGE.days;
+    const y = (e.clientY - rect.top) / rect.height * TOTAL_TRAINS;
+
+    send({ type: 'DOUBLE_TAP', x, y });
+  }, [send]);
+
+  // LOD indicator colors
+  const lodIntent = useMemo((): Intent => {
+    switch (context.lod) {
+      case 'strategic': return Intent.PRIMARY;
+      case 'tactical': return Intent.SUCCESS;
+      case 'operational': return Intent.WARNING;
+      case 'execution': return Intent.DANGER;
+    }
+  }, [context.lod]);
+
+  // State indicator colors
+  const stateIntent = useMemo((): Intent => {
+    switch (stateName) {
+      case 'idle': return Intent.NONE;
+      case 'panning': return Intent.PRIMARY;
+      case 'pinching': return Intent.SUCCESS;
+      case 'momentum': return Intent.WARNING;
+      case 'animating': return Intent.DANGER;
+      default: return Intent.NONE;
+    }
+  }, [stateName]);
+
+  // Viewport preview
+  const viewportPreviewStyle = useMemo(() => {
+    const scale = 1 / context.zoom;
+    const translateX = -context.panX / TIME_RANGE.days * 100;
+    const translateY = -context.panY / TOTAL_TRAINS * 100;
+    return {
+      transform: `translate(${translateX}%, ${translateY}%) scale(${scale})`,
+      transformOrigin: 'top left',
+    };
+  }, [context.zoom, context.panX, context.panY]);
+
+  return (
+    <div style={{ display: 'flex', gap: '16px', height: '100%', minHeight: '600px' }}>
+      {/* Canvas Area */}
+      <Card
+        style={{
+          flex: 2,
+          display: 'flex',
+          flexDirection: 'column',
+          padding: 0,
+          overflow: 'hidden',
+        }}
+      >
+        {/* Header */}
+        <div
+          style={{
+            padding: '12px 16px',
+            borderBottom: `1px solid ${COLORS.border.default}`,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px',
+          }}
+        >
+          <Tag intent={stateIntent} large>
+            State: {stateName.toUpperCase()}
+          </Tag>
+          <Tag intent={lodIntent} large>
+            LOD: {context.lod.toUpperCase()}
+          </Tag>
+          <Tag minimal large>
+            Zoom: {(context.zoom * 100).toFixed(0)}%
+          </Tag>
+          <div style={{ flex: 1 }} />
+          <ButtonGroup>
+            <Button
+              icon="zoom-in"
+              onClick={() => send({ type: 'ZOOM_TO', zoom: context.zoom * 1.5, animate: true })}
+            />
+            <Button
+              icon="zoom-out"
+              onClick={() => send({ type: 'ZOOM_TO', zoom: context.zoom / 1.5, animate: true })}
+            />
+            <Button icon="home" onClick={() => send({ type: 'RESET' })} />
+            <Button icon="calendar" onClick={() => send({ type: 'JUMP_TO_TODAY' })}>
+              Today
+            </Button>
+          </ButtonGroup>
+        </div>
+
+        {/* Canvas */}
+        <div
+          ref={containerRef}
+          style={{
+            flex: 1,
+            position: 'relative',
+            cursor: stateName === 'panning' ? 'grabbing' : 'grab',
+            background: COLORS.bg.secondary,
+            overflow: 'hidden',
+          }}
+          onWheel={handleWheel}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerLeave={handlePointerUp}
+          onDoubleClick={handleDoubleClick}
+        >
+          {/* Viewport visualization */}
+          <div
+            style={{
+              position: 'absolute',
+              top: '10%',
+              left: '10%',
+              width: '80%',
+              height: '80%',
+              background: COLORS.bg.primary,
+              border: `2px solid ${COLORS.border.strong}`,
+              borderRadius: '8px',
+              ...viewportPreviewStyle,
+            }}
+          >
+            {/* Grid */}
+            <svg width="100%" height="100%" style={{ position: 'absolute' }}>
+              {/* Vertical lines (time) */}
+              {Array.from({ length: 13 }, (_, i) => (
+                <line
+                  key={`v-${i}`}
+                  x1={`${(i / 12) * 100}%`}
+                  y1="0"
+                  x2={`${(i / 12) * 100}%`}
+                  y2="100%"
+                  stroke={COLORS.border.default}
+                  strokeWidth={i === 0 || i === 12 ? 2 : 1}
+                />
+              ))}
+              {/* Horizontal lines (trains) */}
+              {Array.from({ length: 5 }, (_, i) => (
+                <line
+                  key={`h-${i}`}
+                  x1="0"
+                  y1={`${(i / 4) * 100}%`}
+                  x2="100%"
+                  y2={`${(i / 4) * 100}%`}
+                  stroke={COLORS.border.default}
+                  strokeWidth={i === 0 || i === 4 ? 2 : 1}
+                />
+              ))}
+              {/* LOD-specific visualization */}
+              {context.lod === 'strategic' && (
+                <rect
+                  x="10%"
+                  y="20%"
+                  width="80%"
+                  height="60%"
+                  fill={COLORS.heatmap.medium}
+                  opacity={0.5}
+                />
+              )}
+              {context.lod === 'tactical' && (
+                <>
+                  {Array.from({ length: 12 }, (_, i) => (
+                    <rect
+                      key={i}
+                      x={`${10 + i * 6.5}%`}
+                      y={`${30 + Math.random() * 20}%`}
+                      width="5%"
+                      height={`${20 + Math.random() * 30}%`}
+                      fill={COLORS.status.info}
+                      opacity={0.7}
+                    />
+                  ))}
+                </>
+              )}
+              {(context.lod === 'operational' || context.lod === 'execution') && (
+                <>
+                  {Array.from({ length: 8 }, (_, i) => (
+                    <rect
+                      key={i}
+                      x={`${15 + i * 10}%`}
+                      y={`${25 + i * 5}%`}
+                      width={`${5 + Math.random() * 10}%`}
+                      height="8%"
+                      fill={['#60a5fa', '#a78bfa', '#f472b6', '#fb923c'][i % 4]}
+                      rx="4"
+                    />
+                  ))}
+                </>
+              )}
+            </svg>
+
+            {/* LOD label */}
+            <div
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                fontSize: '24px',
+                fontWeight: 'bold',
+                color: COLORS.text.muted,
+                opacity: 0.5,
+              }}
+            >
+              {context.lod.toUpperCase()} VIEW
+            </div>
+          </div>
+
+          {/* Zoom level indicator */}
+          <div
+            style={{
+              position: 'absolute',
+              bottom: '16px',
+              right: '16px',
+              background: COLORS.bg.primary,
+              padding: '8px 16px',
+              borderRadius: '4px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+              fontSize: '14px',
+              fontFamily: 'monospace',
+            }}
+          >
+            {context.zoom.toFixed(2)}x
+          </div>
+
+          {/* LOD thresholds indicator */}
+          <div
+            style={{
+              position: 'absolute',
+              bottom: '16px',
+              left: '16px',
+              background: COLORS.bg.primary,
+              padding: '8px 12px',
+              borderRadius: '4px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+              fontSize: '12px',
+            }}
+          >
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <span
+                style={{
+                  width: '8px',
+                  height: '8px',
+                  borderRadius: '50%',
+                  background: context.lod === 'strategic' ? COLORS.status.info : COLORS.border.default,
+                }}
+              />
+              <span>&lt;{LOD_THRESHOLDS.strategic}x Strategic</span>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '4px' }}>
+              <span
+                style={{
+                  width: '8px',
+                  height: '8px',
+                  borderRadius: '50%',
+                  background: context.lod === 'tactical' ? COLORS.status.healthy : COLORS.border.default,
+                }}
+              />
+              <span>&lt;{LOD_THRESHOLDS.tactical}x Tactical</span>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '4px' }}>
+              <span
+                style={{
+                  width: '8px',
+                  height: '8px',
+                  borderRadius: '50%',
+                  background: context.lod === 'operational' ? COLORS.status.warning : COLORS.border.default,
+                }}
+              />
+              <span>&lt;{LOD_THRESHOLDS.operational}x Operational</span>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '4px' }}>
+              <span
+                style={{
+                  width: '8px',
+                  height: '8px',
+                  borderRadius: '50%',
+                  background: context.lod === 'execution' ? COLORS.status.critical : COLORS.border.default,
+                }}
+              />
+              <span>≥{LOD_THRESHOLDS.operational}x Execution</span>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      {/* State Inspector */}
+      {showStateInspector && (
+        <Card style={{ flex: 1, overflow: 'auto' }}>
+          <h3 style={{ marginTop: 0 }}>State Inspector</h3>
+          <Divider />
+
+          <h4>Current State</h4>
+          <Tag intent={stateIntent} large fill>
+            {stateName}
+          </Tag>
+
+          <h4 style={{ marginTop: '16px' }}>Context</h4>
+          <div style={{ fontFamily: 'monospace', fontSize: '12px' }}>
+            <ContextValue label="zoom" value={context.zoom.toFixed(4)} />
+            <ContextValue label="panX" value={context.panX.toFixed(2)} />
+            <ContextValue label="panY" value={context.panY.toFixed(2)} />
+            <Divider />
+            <ContextValue label="lod" value={context.lod} />
+            <ContextValue label="prevLod" value={context.prevLod ?? 'null'} />
+            <ContextValue
+              label="lodTransition"
+              value={`${(context.lodTransitionProgress * 100).toFixed(0)}%`}
+            />
+            <Divider />
+            <ContextValue label="velocityX" value={context.velocityX.toFixed(2)} />
+            <ContextValue label="velocityY" value={context.velocityY.toFixed(2)} />
+            <Divider />
+            <ContextValue label="isPinching" value={context.isPinching.toString()} />
+            <ContextValue label="animating" value={(stateName === 'animating').toString()} />
+          </div>
+
+          <h4 style={{ marginTop: '16px' }}>Quick Actions</h4>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <Button
+              fill
+              onClick={() => send({ type: 'ZOOM_TO', zoom: 0.2, animate: true })}
+            >
+              Strategic (0.2x)
+            </Button>
+            <Button
+              fill
+              onClick={() => send({ type: 'ZOOM_TO', zoom: 0.5, animate: true })}
+            >
+              Tactical (0.5x)
+            </Button>
+            <Button
+              fill
+              onClick={() => send({ type: 'ZOOM_TO', zoom: 1.5, animate: true })}
+            >
+              Operational (1.5x)
+            </Button>
+            <Button
+              fill
+              onClick={() => send({ type: 'ZOOM_TO', zoom: 4.0, animate: true })}
+            >
+              Execution (4x)
+            </Button>
+            <Divider />
+            <Button
+              fill
+              intent={Intent.PRIMARY}
+              onClick={() => send({ type: 'JUMP_TO_TRAIN', trainIndex: 64 })}
+            >
+              Jump to Train #64
+            </Button>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function ContextValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+      <span style={{ color: COLORS.text.secondary }}>{label}:</span>
+      <span style={{ fontWeight: 'bold' }}>{value}</span>
+    </div>
+  );
+}
+
+// =============================================================================
+// STORY CONFIGURATION
+// =============================================================================
+
+const meta: Meta<typeof ViewportVisualizer> = {
+  title: '01-POCs/State/XStateViewport',
+  component: ViewportVisualizer,
+  parameters: {
+    layout: 'fullscreen',
+    docs: {
+      description: {
+        component: `
+## XState Viewport Machine
+
+This POC demonstrates the viewport state machine for the MMS Fractal Canvas.
+
+### States
+- **idle**: Ready for user input
+- **panning**: User is dragging to pan
+- **pinching**: User is pinch-zooming (touch)
+- **momentum**: Inertial panning after release
+- **animating**: Smooth transition to target position/zoom
+
+### LOD Levels
+- **Strategic** (zoom < 0.3x): 10-12 year heatmap view
+- **Tactical** (0.3x - 1.0x): 1-3 year workload bars
+- **Operational** (1.0x - 3.0x): 1-6 month Gantt view
+- **Execution** (> 3.0x): 1-4 week detailed tasks
+
+### Interactions
+- **Scroll**: Zoom in/out centered on cursor
+- **Drag**: Pan the viewport
+- **Double-click**: Zoom 2x at click position
+- **Buttons**: Zoom controls, reset, jump to today
+        `,
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof ViewportVisualizer>;
+
+export const Default: Story = {
+  args: {
+    showStateInspector: true,
+  },
+};
+
+export const WithoutInspector: Story = {
+  args: {
+    showStateInspector: false,
+  },
+};

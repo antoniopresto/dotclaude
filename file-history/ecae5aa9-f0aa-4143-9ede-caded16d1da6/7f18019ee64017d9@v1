@@ -1,0 +1,293 @@
+/**
+ * MicroLayer - Detailed task card visualization
+ *
+ * Renders detailed task cards with labels at zoom > 2.0x (MICRO LOD level).
+ *
+ * Features:
+ * - Task cards as 3D meshes (consistent with MesoLayer)
+ * - HTML labels overlaid on wider tasks
+ * - Grid lines for days (vertical) and trains (horizontal)
+ * - Conflict indicators with red glow
+ * - Only renders visible tasks for performance
+ */
+
+import { useMemo, useRef, useEffect } from 'react';
+import { InstancedMesh, Object3D, Color } from 'three';
+import { Html } from '@react-three/drei';
+import { useThree } from '@react-three/fiber';
+import type { TaskRender } from '../../data/types';
+import { DEFAULT_VIEW_CONFIG } from '../../data/types';
+
+interface MicroLayerProps {
+  tasks: TaskRender[];
+  trainCount: number;
+}
+
+const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+
+// Task card dimensions
+const CARD_PADDING = 2;
+const CARD_HEIGHT = pxPerTrain - CARD_PADDING * 2 - 2; // Slightly smaller for grid visibility
+
+// Color mappings (matching MesoLayer)
+const COLORS: Record<string, string> = {
+  blue: '#3b82f6',
+  orange: '#f59e0b',
+  gray: '#9ca3af',
+};
+const CONFLICT_COLOR = '#ef4444';
+
+// Grid colors
+const GRID_COLOR_MAJOR = '#d1d5db'; // Gray-300
+const GRID_COLOR_MINOR = '#e5e7eb'; // Gray-200
+
+// Row background colors
+const ROW_BG_EVEN = '#ffffff';
+const ROW_BG_ODD = '#f8fafc';
+
+/**
+ * Task cards using InstancedMesh (same pattern as MesoLayer)
+ */
+function TaskCards({ tasks }: { tasks: TaskRender[] }) {
+  const meshRef = useRef<InstancedMesh>(null);
+  const tempObject = useMemo(() => new Object3D(), []);
+
+  useEffect(() => {
+    if (!meshRef.current || tasks.length === 0) return;
+
+    const mesh = meshRef.current;
+
+    tasks.forEach((task, i) => {
+      const width = task.duration * pxPerDay - CARD_PADDING * 2;
+      const height = CARD_HEIGHT;
+      const x = task.startDay * pxPerDay + width / 2 + CARD_PADDING;
+      const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+      const z = task.hasConflict ? 0.1 : 0;
+
+      tempObject.position.set(x, y, z);
+      tempObject.scale.set(width, height, 1);
+      tempObject.updateMatrix();
+      mesh.setMatrixAt(i, tempObject.matrix);
+
+      const color = task.hasConflict
+        ? new Color(CONFLICT_COLOR)
+        : new Color(COLORS[task.color]);
+      mesh.setColorAt(i, color);
+    });
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) {
+      mesh.instanceColor.needsUpdate = true;
+    }
+  }, [tasks, tempObject]);
+
+  if (tasks.length === 0) return null;
+
+  return (
+    <instancedMesh ref={meshRef} args={[undefined, undefined, tasks.length]}>
+      <planeGeometry args={[1, 1]} />
+      <meshBasicMaterial toneMapped={false} />
+    </instancedMesh>
+  );
+}
+
+/**
+ * Conflict glow effects (behind task cards)
+ */
+function ConflictGlows({ tasks }: { tasks: TaskRender[] }) {
+  const conflictTasks = useMemo(() => tasks.filter((t) => t.hasConflict), [tasks]);
+  const meshRef = useRef<InstancedMesh>(null);
+  const tempObject = useMemo(() => new Object3D(), []);
+
+  useEffect(() => {
+    if (!meshRef.current || conflictTasks.length === 0) return;
+
+    const mesh = meshRef.current;
+
+    conflictTasks.forEach((task, i) => {
+      const width = task.duration * pxPerDay + 4;
+      const height = CARD_HEIGHT + 4;
+      const x = task.startDay * pxPerDay + (task.duration * pxPerDay) / 2;
+      const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+      const z = -0.05;
+
+      tempObject.position.set(x, y, z);
+      tempObject.scale.set(width, height, 1);
+      tempObject.updateMatrix();
+      mesh.setMatrixAt(i, tempObject.matrix);
+    });
+
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [conflictTasks, tempObject]);
+
+  if (conflictTasks.length === 0) return null;
+
+  return (
+    <instancedMesh ref={meshRef} args={[undefined, undefined, conflictTasks.length]}>
+      <planeGeometry args={[1, 1]} />
+      <meshBasicMaterial color={CONFLICT_COLOR} transparent opacity={0.3} />
+    </instancedMesh>
+  );
+}
+
+/**
+ * HTML labels for tasks (only on wider tasks)
+ */
+function TaskLabels({ tasks }: { tasks: TaskRender[] }) {
+  const { camera } = useThree();
+  const zoom = (camera as any).zoom || 1;
+
+  // Only show labels on tasks wide enough (> 40 screen pixels)
+  const labeledTasks = useMemo(() => {
+    const minWidthForLabel = 40 / zoom; // Convert screen pixels to world pixels
+    return tasks.filter((t) => t.duration * pxPerDay > minWidthForLabel);
+  }, [tasks, zoom]);
+
+  return (
+    <>
+      {labeledTasks.map((task) => {
+        const width = task.duration * pxPerDay;
+        const x = task.startDay * pxPerDay + width / 2;
+        const y = -task.trainIndex * pxPerTrain - pxPerTrain / 2;
+        const label = task.type.charAt(0).toUpperCase() + task.type.slice(1);
+
+        return (
+          <Html
+            key={task.id}
+            position={[x, y, 0.2]}
+            center
+            style={{ pointerEvents: 'none' }}
+          >
+            <div
+              style={{
+                color: 'white',
+                fontSize: '10px',
+                fontFamily: 'system-ui, sans-serif',
+                fontWeight: 600,
+                textShadow: '0 1px 2px rgba(0,0,0,0.3)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {label}
+            </div>
+          </Html>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * Grid lines for MICRO view
+ */
+function GridLines({
+  totalDays,
+  trainCount,
+}: {
+  totalDays: number;
+  trainCount: number;
+}) {
+  const totalWidth = totalDays * pxPerDay;
+  const totalHeight = trainCount * pxPerTrain;
+
+  // Week markers (every 7 days) - only render reasonable amount
+  const weekLines = useMemo(() => {
+    const lines = [];
+    for (let day = 0; day <= totalDays; day += 7) {
+      lines.push(day);
+    }
+    return lines.slice(0, 200); // Limit for performance
+  }, [totalDays]);
+
+  return (
+    <group>
+      {/* Horizontal lines (train boundaries) */}
+      {Array.from({ length: trainCount + 1 }, (_, i) => (
+        <mesh
+          key={`h-${i}`}
+          position={[totalWidth / 2, -i * pxPerTrain, -0.05]}
+        >
+          <planeGeometry args={[totalWidth, 1]} />
+          <meshBasicMaterial color={GRID_COLOR_MAJOR} transparent opacity={0.5} />
+        </mesh>
+      ))}
+
+      {/* Vertical lines (week boundaries) */}
+      {weekLines.map((day) => (
+        <mesh
+          key={`v-${day}`}
+          position={[day * pxPerDay, -totalHeight / 2, -0.05]}
+        >
+          <planeGeometry args={[1, totalHeight]} />
+          <meshBasicMaterial
+            color={day % 30 === 0 ? GRID_COLOR_MAJOR : GRID_COLOR_MINOR}
+            transparent
+            opacity={day % 30 === 0 ? 0.5 : 0.3}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+/**
+ * Row backgrounds
+ */
+function RowBackgrounds({
+  trainCount,
+  totalDays,
+}: {
+  trainCount: number;
+  totalDays: number;
+}) {
+  const totalWidth = totalDays * pxPerDay;
+
+  return (
+    <group>
+      {Array.from({ length: trainCount }, (_, i) => (
+        <mesh
+          key={`row-${i}`}
+          position={[totalWidth / 2, -i * pxPerTrain - pxPerTrain / 2, -0.1]}
+        >
+          <planeGeometry args={[totalWidth, pxPerTrain]} />
+          <meshBasicMaterial
+            color={i % 2 === 0 ? ROW_BG_EVEN : ROW_BG_ODD}
+            transparent
+            opacity={0.5}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+/**
+ * MicroLayer Component
+ */
+export function MicroLayer({ tasks, trainCount }: MicroLayerProps) {
+  // Calculate total days
+  const totalDays = useMemo(() => {
+    if (tasks.length === 0) return 365 * 10;
+    const maxDay = Math.max(...tasks.map((t) => t.startDay + t.duration));
+    return Math.max(maxDay + 30, 365 * 10);
+  }, [tasks]);
+
+  return (
+    <group>
+      {/* Row backgrounds */}
+      <RowBackgrounds trainCount={trainCount} totalDays={totalDays} />
+
+      {/* Grid lines */}
+      <GridLines totalDays={totalDays} trainCount={trainCount} />
+
+      {/* Conflict glow effects */}
+      <ConflictGlows tasks={tasks} />
+
+      {/* Task cards */}
+      <TaskCards tasks={tasks} />
+
+      {/* Task labels (HTML overlay) */}
+      <TaskLabels tasks={tasks} />
+    </group>
+  );
+}

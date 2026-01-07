@@ -1,0 +1,250 @@
+//! File watcher module for .harness directory changes (F008)
+//!
+//! Watches the .harness directory (specifically harness.db) for changes
+//! and emits Tauri events to notify the frontend.
+
+use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter};
+
+/// Event payload for harness file changes
+#[derive(Clone, serde::Serialize)]
+pub struct HarnessChangeEvent {
+    /// The project path being watched
+    pub project_path: String,
+    /// Type of change: "db", "config", or "unknown"
+    pub change_type: String,
+    /// The file that changed (relative to .harness/)
+    pub file: String,
+}
+
+/// Manages file watchers for multiple projects
+pub struct WatcherManager {
+    /// Map of project_path -> watcher handle (stored as thread join handle)
+    watchers: Mutex<HashMap<String, std::thread::JoinHandle<()>>>,
+    /// Shutdown signals for each watcher
+    shutdown_signals: Mutex<HashMap<String, Arc<Mutex<bool>>>>,
+}
+
+impl WatcherManager {
+    pub fn new() -> Self {
+        Self {
+            watchers: Mutex::new(HashMap::new()),
+            shutdown_signals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Start watching a project's .harness directory
+    pub fn start_watching(&self, app: AppHandle, project_path: String) -> Result<(), String> {
+        let harness_dir = PathBuf::from(&project_path).join(".harness");
+
+        if !harness_dir.exists() {
+            return Err(format!(
+                "No .harness directory found at: {}",
+                harness_dir.display()
+            ));
+        }
+
+        // Check if already watching
+        {
+            let watchers = self.watchers.lock();
+            if watchers.contains_key(&project_path) {
+                return Ok(()); // Already watching, no-op
+            }
+        }
+
+        // Create shutdown signal
+        let shutdown_signal = Arc::new(Mutex::new(false));
+        let shutdown_signal_clone = shutdown_signal.clone();
+
+        let project_path_clone = project_path.clone();
+        let harness_dir_clone = harness_dir.clone();
+
+        // Spawn watcher thread
+        let handle = std::thread::spawn(move || {
+            // Create debouncer with 500ms delay
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            let mut debouncer = match new_debouncer(Duration::from_millis(500), tx) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Failed to create debouncer: {}", e);
+                    return;
+                }
+            };
+
+            // Watch the .harness directory
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(&harness_dir_clone, notify::RecursiveMode::NonRecursive)
+            {
+                eprintln!("Failed to watch directory: {}", e);
+                return;
+            }
+
+            println!(
+                "🔍 Watching .harness directory: {}",
+                harness_dir_clone.display()
+            );
+
+            // Event loop
+            loop {
+                // Check for shutdown signal
+                if *shutdown_signal_clone.lock() {
+                    println!("🛑 Stopping watcher for: {}", project_path_clone);
+                    break;
+                }
+
+                // Check for file changes with timeout
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(events)) => {
+                        for event in events {
+                            if event.kind == DebouncedEventKind::Any {
+                                let file_name = event
+                                    .path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+
+                                let change_type = if file_name.ends_with(".db")
+                                    || file_name.ends_with(".db-wal")
+                                    || file_name.ends_with(".db-shm")
+                                {
+                                    "db"
+                                } else if file_name.ends_with(".json") {
+                                    "config"
+                                } else {
+                                    "unknown"
+                                };
+
+                                let payload = HarnessChangeEvent {
+                                    project_path: project_path_clone.clone(),
+                                    change_type: change_type.to_string(),
+                                    file: file_name,
+                                };
+
+                                // Emit event to frontend
+                                if let Err(e) = app.emit("harness-change", payload) {
+                                    eprintln!("Failed to emit harness-change event: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("Watch error: {:?}", e);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // No events, continue polling
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        println!("Watcher channel disconnected");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Store handle and shutdown signal
+        {
+            let mut watchers = self.watchers.lock();
+            watchers.insert(project_path.clone(), handle);
+        }
+        {
+            let mut signals = self.shutdown_signals.lock();
+            signals.insert(project_path, shutdown_signal);
+        }
+
+        Ok(())
+    }
+
+    /// Stop watching a project
+    pub fn stop_watching(&self, project_path: &str) -> Result<(), String> {
+        // Signal shutdown
+        {
+            let signals = self.shutdown_signals.lock();
+            if let Some(signal) = signals.get(project_path) {
+                *signal.lock() = true;
+            }
+        }
+
+        // Wait for thread to finish and remove
+        let handle = {
+            let mut watchers = self.watchers.lock();
+            watchers.remove(project_path)
+        };
+
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+
+        // Clean up signal
+        {
+            let mut signals = self.shutdown_signals.lock();
+            signals.remove(project_path);
+        }
+
+        Ok(())
+    }
+
+    /// Get list of watched projects
+    pub fn list_watching(&self) -> Vec<String> {
+        let watchers = self.watchers.lock();
+        watchers.keys().cloned().collect()
+    }
+}
+
+impl Default for WatcherManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Tauri commands
+
+/// Start watching a project's .harness directory for changes
+#[tauri::command]
+pub fn harness_watch_start(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<WatcherManager>>,
+    project_path: String,
+) -> Result<(), String> {
+    state.start_watching(app, project_path)
+}
+
+/// Stop watching a project
+#[tauri::command]
+pub fn harness_watch_stop(
+    state: tauri::State<'_, Arc<WatcherManager>>,
+    project_path: String,
+) -> Result<(), String> {
+    state.stop_watching(&project_path)
+}
+
+/// List all watched projects
+#[tauri::command]
+pub fn harness_watch_list(state: tauri::State<'_, Arc<WatcherManager>>) -> Vec<String> {
+    state.list_watching()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_watcher_manager_new() {
+        let manager = WatcherManager::new();
+        assert!(manager.list_watching().is_empty());
+    }
+
+    #[test]
+    fn test_stop_watching_not_started() {
+        let manager = WatcherManager::new();
+        // Should not error even if not watching
+        assert!(manager.stop_watching("/nonexistent").is_ok());
+    }
+}

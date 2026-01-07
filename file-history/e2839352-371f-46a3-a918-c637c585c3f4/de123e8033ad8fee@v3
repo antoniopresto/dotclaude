@@ -1,0 +1,84 @@
+#!/bin/bash
+# cascade-rules.sh - Collect and enforce __*.md rules from hierarchy
+#
+# This hook:
+# 1. Gets target path from JSON stdin (tool_input.file_path)
+# 2. Collects all __*.md files from path to project root
+# 3. Outputs rules to be injected into context
+# 4. Blocks if violation detected (exit 2)
+
+# Project root
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+
+# Read JSON from stdin and extract file_path
+STDIN_JSON=$(cat)
+TARGET_PATH=$(echo "$STDIN_JSON" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
+
+# Debug log
+echo "=== CASCADE RULES $(date) ===" >> /tmp/cascade-rules-debug.log
+echo "TARGET_PATH: ${TARGET_PATH:-EMPTY}" >> /tmp/cascade-rules-debug.log
+
+# If no target path, allow action
+if [[ -z "$TARGET_PATH" ]]; then
+    exit 0
+fi
+
+# Function to collect rules from hierarchy
+collect_rules() {
+    local target_dir="$1"
+    local rules=""
+
+    # Normalize path - if it's a file, get its directory
+    if [[ -f "$target_dir" ]]; then
+        target_dir=$(dirname "$target_dir")
+    fi
+
+    # Walk up the directory tree until we exit PROJECT_ROOT
+    local current_dir="$target_dir"
+    while [[ "$current_dir" == "$PROJECT_ROOT"* ]] && [[ "$current_dir" != "/" ]]; do
+        # Find __*.md files in current directory
+        for rule_file in "$current_dir"/__*.md; do
+            if [[ -f "$rule_file" ]]; then
+                rules="$rules\n--- Rules from: $rule_file ---\n$(cat "$rule_file")\n"
+            fi
+        done
+
+        # Move up one level
+        current_dir=$(dirname "$current_dir")
+    done
+
+    echo -e "$rules"
+}
+
+# Function to check for .forbidden extension (RULE-TEST-001)
+check_forbidden_extension() {
+    local path="$1"
+    if [[ "$path" == *.forbidden ]]; then
+        echo "❌ RULE VIOLATION: RULE-TEST-001" >&2
+        echo "   Attempted to create .forbidden file: $path" >&2
+        echo "   Action BLOCKED" >&2
+        echo "BLOCKED: .forbidden file" >> /tmp/cascade-rules-debug.log
+        exit 2
+    fi
+}
+
+# === ENFORCEMENT ===
+
+# Check RULE-TEST-001: No .forbidden files
+check_forbidden_extension "$TARGET_PATH"
+
+# Collect and output rules (for context injection)
+RULES=$(collect_rules "$TARGET_PATH")
+
+if [[ -n "$RULES" ]]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔒 CASCADE RULES ACTIVE for: $TARGET_PATH"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "$RULES"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+fi
+
+echo "ALLOWED: $TARGET_PATH" >> /tmp/cascade-rules-debug.log
+
+# Allow action to proceed
+exit 0

@@ -1,0 +1,489 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { AgentHookContext, AgentHooks, AgentConfig } from '../types/agent';
+import { defineAgent } from '../types/agent';
+
+/**
+ * Creates a mock hook context for testing
+ */
+function createMockContext(overrides: Partial<AgentHookContext> = {}): AgentHookContext {
+  return {
+    tool: 'Write',
+    input: { file_path: '/test/path.ts', content: 'test content' },
+    projectRoot: '/project',
+    filePath: '/test/path.ts',
+    block: vi.fn(),
+    warn: vi.fn(),
+    inject: vi.fn(),
+    ...overrides,
+  };
+}
+
+/**
+ * Simulates hook execution from agentrc-runner.ts
+ */
+async function executeHook(
+  hooks: AgentHooks,
+  hookName: keyof AgentHooks,
+  ctx: AgentHookContext
+): Promise<{ blocked: boolean; blockMessage: string; injected: string[]; warnings: string[] }> {
+  const hook = hooks[hookName];
+  if (!hook) {
+    return { blocked: false, blockMessage: '', injected: [], warnings: [] };
+  }
+
+  let blocked = false;
+  let blockMessage = '';
+  const injected: string[] = [];
+  const warnings: string[] = [];
+
+  const hookCtx: AgentHookContext = {
+    ...ctx,
+    block: (msg: string) => {
+      blocked = true;
+      blockMessage = msg;
+    },
+    warn: (msg: string) => {
+      warnings.push(msg);
+    },
+    inject: (content: string) => {
+      injected.push(content);
+    },
+  };
+
+  await hook(hookCtx);
+
+  return { blocked, blockMessage, injected, warnings };
+}
+
+describe('Hook Execution', () => {
+  describe('PreToolUse hook', () => {
+    it('should execute PreToolUse hook', async () => {
+      const hookFn = vi.fn();
+      const hooks: AgentHooks = { PreToolUse: hookFn };
+      const ctx = createMockContext();
+
+      await executeHook(hooks, 'PreToolUse', ctx);
+
+      expect(hookFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('should receive correct context', async () => {
+      let receivedCtx: AgentHookContext | undefined;
+
+      const hooks: AgentHooks = {
+        PreToolUse: (ctx) => {
+          receivedCtx = ctx;
+        },
+      };
+
+      const ctx = createMockContext({
+        tool: 'Edit',
+        filePath: '/specific/path.ts',
+      });
+
+      await executeHook(hooks, 'PreToolUse', ctx);
+
+      expect(receivedCtx?.tool).toBe('Edit');
+      expect(receivedCtx?.filePath).toBe('/specific/path.ts');
+    });
+
+    it('should be able to block action', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: ({ block }) => {
+          block('Blocked by hook');
+        },
+      };
+
+      const result = await executeHook(hooks, 'PreToolUse', createMockContext());
+
+      expect(result.blocked).toBe(true);
+      expect(result.blockMessage).toBe('Blocked by hook');
+    });
+
+    it('should be able to inject content', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: ({ inject }) => {
+          inject('Line 1');
+          inject('Line 2');
+        },
+      };
+
+      const result = await executeHook(hooks, 'PreToolUse', createMockContext());
+
+      expect(result.injected).toEqual(['Line 1', 'Line 2']);
+    });
+
+    it('should be able to warn', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: ({ warn }) => {
+          warn('Warning 1');
+          warn('Warning 2');
+        },
+      };
+
+      const result = await executeHook(hooks, 'PreToolUse', createMockContext());
+
+      expect(result.warnings).toEqual(['Warning 1', 'Warning 2']);
+    });
+
+    it('should handle async hooks', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: async ({ inject }) => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          inject('Async content');
+        },
+      };
+
+      const result = await executeHook(hooks, 'PreToolUse', createMockContext());
+
+      expect(result.injected).toEqual(['Async content']);
+    });
+
+    it('should allow conditional blocking', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: ({ tool, filePath, block }) => {
+          if (tool === 'Write' && filePath.endsWith('.env')) {
+            block('Cannot write to .env files');
+          }
+        },
+      };
+
+      const envResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/.env' })
+      );
+      expect(envResult.blocked).toBe(true);
+
+      const tsResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/file.ts' })
+      );
+      expect(tsResult.blocked).toBe(false);
+    });
+  });
+
+  describe('PostToolUse hook', () => {
+    it('should execute PostToolUse hook', async () => {
+      const hookFn = vi.fn();
+      const hooks: AgentHooks = { PostToolUse: hookFn };
+
+      await executeHook(hooks, 'PostToolUse', createMockContext());
+
+      expect(hookFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('should have access to tool result in input', async () => {
+      let receivedInput: Record<string, unknown> | undefined;
+
+      const hooks: AgentHooks = {
+        PostToolUse: (ctx) => {
+          receivedInput = ctx.input;
+        },
+      };
+
+      const ctx = createMockContext({
+        input: {
+          file_path: '/test/path.ts',
+          content: 'new content',
+          result: 'success',
+        },
+      });
+
+      await executeHook(hooks, 'PostToolUse', ctx);
+
+      expect(receivedInput?.result).toBe('success');
+    });
+  });
+
+  describe('SessionStart hook', () => {
+    it('should execute SessionStart hook', async () => {
+      const hookFn = vi.fn();
+      const hooks: AgentHooks = { SessionStart: hookFn };
+
+      await executeHook(hooks, 'SessionStart', createMockContext());
+
+      expect(hookFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('should inject welcome banner', async () => {
+      const hooks: AgentHooks = {
+        SessionStart: ({ inject }) => {
+          inject('═══════════════════════════════');
+          inject('       AgentRC Active          ');
+          inject('═══════════════════════════════');
+        },
+      };
+
+      const result = await executeHook(hooks, 'SessionStart', createMockContext());
+
+      expect(result.injected).toHaveLength(3);
+      expect(result.injected[1]).toContain('AgentRC Active');
+    });
+  });
+
+  describe('SessionEnd hook', () => {
+    it('should execute SessionEnd hook', async () => {
+      const hookFn = vi.fn();
+      const hooks: AgentHooks = { SessionEnd: hookFn };
+
+      await executeHook(hooks, 'SessionEnd', createMockContext());
+
+      expect(hookFn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('multiple hooks', () => {
+    it('should handle config with multiple hooks', async () => {
+      const preToolUseFn = vi.fn();
+      const postToolUseFn = vi.fn();
+      const sessionStartFn = vi.fn();
+
+      const hooks: AgentHooks = {
+        PreToolUse: preToolUseFn,
+        PostToolUse: postToolUseFn,
+        SessionStart: sessionStartFn,
+      };
+
+      await executeHook(hooks, 'PreToolUse', createMockContext());
+      await executeHook(hooks, 'PostToolUse', createMockContext());
+      await executeHook(hooks, 'SessionStart', createMockContext());
+
+      expect(preToolUseFn).toHaveBeenCalledTimes(1);
+      expect(postToolUseFn).toHaveBeenCalledTimes(1);
+      expect(sessionStartFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not execute undefined hooks', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: vi.fn(),
+        // PostToolUse not defined
+      };
+
+      const result = await executeHook(hooks, 'PostToolUse', createMockContext());
+
+      expect(result.blocked).toBe(false);
+      expect(result.injected).toEqual([]);
+    });
+  });
+
+  describe('hook error handling', () => {
+    it('should handle sync errors gracefully', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: () => {
+          throw new Error('Hook error');
+        },
+      };
+
+      // In real runner, errors are caught and logged
+      await expect(executeHook(hooks, 'PreToolUse', createMockContext())).rejects.toThrow(
+        'Hook error'
+      );
+    });
+
+    it('should handle async errors gracefully', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: async () => {
+          await Promise.resolve();
+          throw new Error('Async hook error');
+        },
+      };
+
+      await expect(executeHook(hooks, 'PreToolUse', createMockContext())).rejects.toThrow(
+        'Async hook error'
+      );
+    });
+  });
+
+  describe('real-world hook scenarios', () => {
+    it('should implement logging hook', async () => {
+      const logs: string[] = [];
+
+      const hooks: AgentHooks = {
+        PreToolUse: ({ tool, filePath, inject }) => {
+          const timestamp = new Date().toISOString();
+          const logEntry = `[${timestamp}] ${tool}: ${filePath}`;
+          logs.push(logEntry);
+          inject(`📝 Logged: ${tool} on ${filePath}`);
+        },
+      };
+
+      await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ tool: 'Write', filePath: '/src/file.ts' })
+      );
+
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain('Write');
+      expect(logs[0]).toContain('/src/file.ts');
+    });
+
+    it('should implement conditional injection', async () => {
+      const hooks: AgentHooks = {
+        PreToolUse: ({ filePath, inject }) => {
+          if (filePath.includes('/tests/')) {
+            inject('⚠️ Modifying test file - ensure tests still pass');
+          }
+          if (filePath.includes('/config/')) {
+            inject('⚠️ Config change - verify in all environments');
+          }
+        },
+      };
+
+      const testResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/tests/unit.test.ts' })
+      );
+      expect(testResult.injected[0]).toContain('test file');
+
+      const configResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/config/app.json' })
+      );
+      expect(configResult.injected[0]).toContain('Config change');
+
+      const srcResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/src/file.ts' })
+      );
+      expect(srcResult.injected).toHaveLength(0);
+    });
+
+    it('should implement permission-based blocking', async () => {
+      const userPermissions = {
+        canWriteEnv: false,
+        canWriteConfig: true,
+        canWriteSrc: true,
+      };
+
+      const hooks: AgentHooks = {
+        PreToolUse: ({ filePath, block }) => {
+          if (filePath.includes('.env') && !userPermissions.canWriteEnv) {
+            block('No permission to modify env files');
+          }
+          if (filePath.includes('/config/') && !userPermissions.canWriteConfig) {
+            block('No permission to modify config files');
+          }
+        },
+      };
+
+      const envResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/.env' })
+      );
+      expect(envResult.blocked).toBe(true);
+
+      const configResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/config/app.json' })
+      );
+      expect(configResult.blocked).toBe(false);
+    });
+
+    it('should implement project context banner', async () => {
+      const projectInfo = {
+        name: 'my-project',
+        version: '1.0.0',
+        rulesEnabled: true,
+      };
+
+      const hooks: AgentHooks = {
+        SessionStart: ({ inject }) => {
+          inject('╔════════════════════════════════════╗');
+          inject(`║ Project: ${projectInfo.name.padEnd(24)} ║`);
+          inject(`║ Version: ${projectInfo.version.padEnd(24)} ║`);
+          inject(`║ Rules: ${(projectInfo.rulesEnabled ? 'Enabled' : 'Disabled').padEnd(26)} ║`);
+          inject('╚════════════════════════════════════╝');
+        },
+      };
+
+      const result = await executeHook(hooks, 'SessionStart', createMockContext());
+
+      expect(result.injected).toHaveLength(5);
+      expect(result.injected.join('\n')).toContain('my-project');
+      expect(result.injected.join('\n')).toContain('1.0.0');
+    });
+
+    it('should implement file type validation', async () => {
+      const allowedExtensions = ['.ts', '.tsx', '.js', '.jsx', '.json', '.md'];
+
+      const hooks: AgentHooks = {
+        PreToolUse: ({ filePath, tool, block, warn }) => {
+          if (tool !== 'Write') return;
+
+          const ext = '.' + filePath.split('.').pop();
+          const isAllowed = allowedExtensions.some((allowed) => filePath.endsWith(allowed));
+
+          if (!isAllowed) {
+            if (filePath.endsWith('.exe') || filePath.endsWith('.sh')) {
+              block(`Cannot create executable files: ${ext}`);
+            } else {
+              warn(`Unusual file extension: ${ext}`);
+            }
+          }
+        },
+      };
+
+      const exeResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/script.exe', tool: 'Write' })
+      );
+      expect(exeResult.blocked).toBe(true);
+
+      const imgResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/image.png', tool: 'Write' })
+      );
+      expect(imgResult.blocked).toBe(false);
+      expect(imgResult.warnings).toHaveLength(1);
+
+      const tsResult = await executeHook(
+        hooks,
+        'PreToolUse',
+        createMockContext({ filePath: '/project/file.ts', tool: 'Write' })
+      );
+      expect(tsResult.blocked).toBe(false);
+      expect(tsResult.warnings).toHaveLength(0);
+    });
+  });
+
+  describe('defineAgent integration', () => {
+    it('should work with defineAgent hooks', async () => {
+      const config = defineAgent({
+        hooks: {
+          PreToolUse: ({ inject }) => {
+            inject('From defineAgent');
+          },
+        },
+      });
+
+      const result = await executeHook(config.hooks!, 'PreToolUse', createMockContext());
+
+      expect(result.injected).toContain('From defineAgent');
+    });
+
+    it('should handle async hooks from defineAgent', async () => {
+      const config = defineAgent({
+        hooks: {
+          PreToolUse: async ({ inject }) => {
+            await Promise.resolve();
+            inject('Async from defineAgent');
+          },
+        },
+      });
+
+      const result = await executeHook(config.hooks!, 'PreToolUse', createMockContext());
+
+      expect(result.injected).toContain('Async from defineAgent');
+    });
+  });
+});

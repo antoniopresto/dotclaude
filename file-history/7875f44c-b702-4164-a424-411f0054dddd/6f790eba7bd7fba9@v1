@@ -1,0 +1,310 @@
+import seedrandom from 'seedrandom';
+import { BlockType, type BlockTypeValue } from '../../engine/store/simulationStore';
+
+/**
+ * Maintenance type definitions matching DEMO_DATA.md
+ */
+export const MAINTENANCE_TYPES = {
+  A: {
+    id: 'A',
+    level: 'A' as const,
+    name: 'A-Check',
+    intervalKm: 10_000,
+    toleranceKm: 2_000,
+    durationHours: 4,
+    manHours: 8,
+    requiredTracks: 1,
+    estimatedCost: 2_500,
+    blockType: BlockType.PM,
+  },
+  B: {
+    id: 'B',
+    level: 'B' as const,
+    name: 'B-Check',
+    intervalKm: 50_000,
+    toleranceKm: 5_000,
+    durationHours: 16,
+    manHours: 32,
+    requiredTracks: 1,
+    estimatedCost: 8_500,
+    blockType: BlockType.INSPECTION,
+  },
+  C: {
+    id: 'C',
+    level: 'C' as const,
+    name: 'C-Check',
+    intervalKm: 200_000,
+    toleranceKm: 20_000,
+    durationHours: 72,
+    manHours: 160,
+    requiredTracks: 1,
+    estimatedCost: 45_000,
+    blockType: BlockType.INSPECTION,
+  },
+  D: {
+    id: 'D',
+    level: 'D' as const,
+    name: 'D-Overhaul',
+    intervalKm: 800_000,
+    toleranceKm: 50_000,
+    durationHours: 480,
+    manHours: 1_200,
+    requiredTracks: 2,
+    estimatedCost: 180_000,
+    blockType: BlockType.OVERHAUL,
+  },
+} as const;
+
+/**
+ * Depot definitions matching DEMO_DATA.md
+ */
+export const DEPOTS = {
+  RED: {
+    id: 'depot-red',
+    name: 'Al Rashidiya',
+    trackCount: 5,
+    weeklyManHours: 2_800,
+    assetTypes: ['ALSTOM'],
+  },
+  GREEN: {
+    id: 'depot-green',
+    name: 'Jebel Ali',
+    trackCount: 4,
+    weeklyManHours: 2_400,
+    assetTypes: ['KINKI'],
+  },
+} as const;
+
+export interface Train {
+  id: string;
+  index: number;
+  type: 'ALSTOM' | 'KINKI';
+  carsCount: number;
+  baseMileageKm: number;
+  avgDailyMileageKm: number;
+  depot: typeof DEPOTS.RED | typeof DEPOTS.GREEN;
+}
+
+export interface ScheduleBlock {
+  index: number;
+  trainIndex: number;
+  startTime: number;
+  endTime: number;
+  type: BlockTypeValue;
+  trackId: number;
+  maintenanceLevel: 'A' | 'B' | 'C' | 'D';
+}
+
+export interface GeneratedScenario {
+  trains: Train[];
+  blocks: ScheduleBlock[];
+  timelineStart: number;
+  timelineEnd: number;
+}
+
+const MS_PER_HOUR = 3600_000;
+const MS_PER_DAY = 24 * MS_PER_HOUR;
+const DAYS_PER_YEAR = 365;
+
+/**
+ * Deterministic scenario generator using seeded random.
+ * Guarantees reproducible scenarios for debugging and testing.
+ */
+export class ScenarioGenerator {
+  private rng: () => number;
+  private seed: string;
+
+  constructor(seed: string = 'default-scenario') {
+    this.seed = seed;
+    this.rng = seedrandom(seed);
+  }
+
+  /** Generate a random number in range [min, max) */
+  private random(min: number, max: number): number {
+    return min + this.rng() * (max - min);
+  }
+
+  /** Generate a random integer in range [min, max] */
+  private randomInt(min: number, max: number): number {
+    return Math.floor(this.random(min, max + 1));
+  }
+
+  /** Generate the full fleet (128 trains) */
+  generateFleet(): Train[] {
+    const trains: Train[] = [];
+
+    // Alstom fleet: 79 trains (Red Line)
+    for (let i = 1; i <= 79; i++) {
+      const id = `ALT-${String(i).padStart(3, '0')}`;
+      trains.push({
+        id,
+        index: trains.length,
+        type: 'ALSTOM',
+        carsCount: 5,
+        baseMileageKm: this.randomInt(450_000, 800_000),
+        avgDailyMileageKm: this.randomInt(420, 475),
+        depot: DEPOTS.RED,
+      });
+    }
+
+    // Kinki Sharyo fleet: 49 trains (Green Line)
+    for (let i = 1; i <= 49; i++) {
+      const id = `KNK-${String(i).padStart(3, '0')}`;
+      trains.push({
+        id,
+        index: trains.length,
+        type: 'KINKI',
+        carsCount: 5,
+        baseMileageKm: this.randomInt(320_000, 600_000),
+        avgDailyMileageKm: this.randomInt(400, 454),
+        depot: DEPOTS.GREEN,
+      });
+    }
+
+    return trains;
+  }
+
+  /**
+   * Generate maintenance schedule for a given period.
+   * Uses mileage-based intervals to schedule predictive maintenance.
+   */
+  generateSchedule(
+    trains: Train[],
+    startDate: Date,
+    years: number = 12
+  ): ScheduleBlock[] {
+    const blocks: ScheduleBlock[] = [];
+    const startTime = startDate.getTime();
+    const endTime = startTime + years * DAYS_PER_YEAR * MS_PER_DAY;
+
+    for (const train of trains) {
+      // Track last maintenance for each level
+      const lastMaintenance: Record<string, number> = {
+        A: train.baseMileageKm,
+        B: train.baseMileageKm,
+        C: train.baseMileageKm,
+        D: train.baseMileageKm,
+      };
+
+      // Track last maintenance time to avoid overlaps
+      let lastMaintenanceEnd = startTime;
+
+      // Calculate daily mileage increment
+      const dailyKm = train.avgDailyMileageKm;
+      const kmPerMs = dailyKm / MS_PER_DAY;
+
+      // Iterate through time and schedule maintenance
+      let currentTime = startTime;
+      let currentMileage = train.baseMileageKm;
+
+      while (currentTime < endTime) {
+        // Check each maintenance level (highest priority first: D, C, B, A)
+        const levels: Array<'D' | 'C' | 'B' | 'A'> = ['D', 'C', 'B', 'A'];
+        let scheduled = false;
+
+        for (const level of levels) {
+          const mType = MAINTENANCE_TYPES[level];
+          const kmSinceLast = currentMileage - lastMaintenance[level];
+
+          // Schedule if we've exceeded the interval (with some tolerance)
+          if (kmSinceLast >= mType.intervalKm - mType.toleranceKm) {
+            // Add some randomness to the exact timing
+            const jitter = this.random(-mType.toleranceKm * 0.5, mType.toleranceKm * 0.5);
+            const scheduledKm = lastMaintenance[level] + mType.intervalKm + jitter;
+            const scheduledTime = startTime + (scheduledKm - train.baseMileageKm) / kmPerMs;
+
+            // Ensure we don't schedule in the past or overlap
+            const blockStart = Math.max(scheduledTime, lastMaintenanceEnd + MS_PER_HOUR);
+
+            if (blockStart < endTime) {
+              const blockEnd = blockStart + mType.durationHours * MS_PER_HOUR;
+
+              // Assign a track (simple round-robin within depot)
+              const trackId = blocks.length % train.depot.trackCount;
+
+              blocks.push({
+                index: blocks.length,
+                trainIndex: train.index,
+                startTime: blockStart,
+                endTime: blockEnd,
+                type: mType.blockType,
+                trackId,
+                maintenanceLevel: level,
+              });
+
+              // Update last maintenance record
+              lastMaintenance[level] = currentMileage;
+
+              // Also reset lower-level maintenance counters (D resets C, B, A etc.)
+              if (level === 'D') {
+                lastMaintenance.C = currentMileage;
+                lastMaintenance.B = currentMileage;
+                lastMaintenance.A = currentMileage;
+              } else if (level === 'C') {
+                lastMaintenance.B = currentMileage;
+                lastMaintenance.A = currentMileage;
+              } else if (level === 'B') {
+                lastMaintenance.A = currentMileage;
+              }
+
+              lastMaintenanceEnd = blockEnd;
+              scheduled = true;
+              break; // Only schedule one maintenance per time window
+            }
+          }
+        }
+
+        // Advance time (faster if no maintenance was scheduled)
+        const advanceMs = scheduled ? MS_PER_DAY : MS_PER_DAY * 7;
+        currentTime += advanceMs;
+        currentMileage += kmPerMs * advanceMs;
+      }
+    }
+
+    // Sort blocks by start time for efficient rendering
+    blocks.sort((a, b) => a.startTime - b.startTime);
+
+    // Re-index after sorting
+    blocks.forEach((block, i) => {
+      block.index = i;
+    });
+
+    return blocks;
+  }
+
+  /**
+   * Generate a complete scenario with fleet and schedule.
+   */
+  generateScenario(years: number = 12): GeneratedScenario {
+    // Reset RNG for reproducibility
+    this.rng = seedrandom(this.seed);
+
+    const startDate = new Date('2024-01-01T00:00:00Z');
+    const trains = this.generateFleet();
+    const blocks = this.generateSchedule(trains, startDate, years);
+
+    return {
+      trains,
+      blocks,
+      timelineStart: startDate.getTime(),
+      timelineEnd: startDate.getTime() + years * DAYS_PER_YEAR * MS_PER_DAY,
+    };
+  }
+}
+
+/**
+ * Pre-configured scenarios for testing different edge cases.
+ */
+export const SCENARIOS = {
+  /** Standard 12-year scenario with typical load */
+  standard: () => new ScenarioGenerator('scenario-standard-2024'),
+
+  /** Heavy load scenario with more overlapping maintenance */
+  heavyLoad: () => new ScenarioGenerator('scenario-heavy-load-stress'),
+
+  /** Edge case with many D-overhauls clustered */
+  clusteredOverhauls: () => new ScenarioGenerator('scenario-clustered-overhauls'),
+
+  /** Minimal scenario for unit testing */
+  minimal: () => new ScenarioGenerator('scenario-minimal-test'),
+} as const;

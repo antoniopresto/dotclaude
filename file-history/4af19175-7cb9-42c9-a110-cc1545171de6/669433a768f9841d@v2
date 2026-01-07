@@ -1,0 +1,466 @@
+//! Dev Bridge - Secure RPC bridge for browser-to-native communication
+//!
+//! This module provides a development-only WebSocket server that mirrors Tauri commands,
+//! allowing Playwright and other browser-based tools to interact with native features.
+//!
+//! SECURITY:
+//! - Only compiled in debug mode (#[cfg(debug_assertions)])
+//! - localhost-only binding (127.0.0.1)
+//! - Token-based authentication
+//! - Command allowlist (no arbitrary execution)
+
+#![cfg(debug_assertions)]
+
+use crate::pty::{PtyManager, ProcessInfo};
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
+
+/// Default port for dev bridge server
+const DEFAULT_PORT: u16 = 9876;
+
+/// RPC Request format
+#[derive(Debug, Deserialize)]
+pub struct RpcRequest {
+    /// Unique request ID for response correlation
+    pub id: String,
+    /// Command name (e.g., "pty_spawn", "pty_write")
+    pub cmd: String,
+    /// Command arguments as JSON
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// RPC Response format
+#[derive(Debug, Serialize)]
+pub struct RpcResponse {
+    /// Request ID for correlation
+    pub id: String,
+    /// Success flag
+    pub success: bool,
+    /// Result data (if success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Error message (if failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Event broadcast to clients
+#[derive(Debug, Clone, Serialize)]
+pub struct RpcEvent {
+    /// Event type (e.g., "pty-output", "pty-exit")
+    pub event: String,
+    /// Event payload
+    pub payload: serde_json::Value,
+}
+
+/// Query params for auth
+#[derive(Debug, Deserialize)]
+pub struct AuthQuery {
+    pub token: Option<String>,
+}
+
+/// Dev Bridge server state
+pub struct DevBridgeState {
+    /// Auth token (generated at startup)
+    pub token: String,
+    /// PTY manager reference
+    pub pty_manager: Arc<PtyManager>,
+    /// Event broadcaster
+    pub event_tx: broadcast::Sender<RpcEvent>,
+    /// Connected clients count
+    pub clients: Mutex<u32>,
+}
+
+impl DevBridgeState {
+    pub fn new(pty_manager: Arc<PtyManager>) -> Self {
+        let (event_tx, _) = broadcast::channel(1024);
+
+        // Generate random token
+        let token: String = (0..32)
+            .map(|_| {
+                let idx = rand::random::<u8>() % 62;
+                let c = if idx < 10 {
+                    (b'0' + idx) as char
+                } else if idx < 36 {
+                    (b'A' + idx - 10) as char
+                } else {
+                    (b'a' + idx - 36) as char
+                };
+                c
+            })
+            .collect();
+
+        Self {
+            token,
+            pty_manager,
+            event_tx,
+            clients: Mutex::new(0),
+        }
+    }
+
+    /// Broadcast an event to all connected clients
+    pub fn broadcast(&self, event: RpcEvent) {
+        let _ = self.event_tx.send(event);
+    }
+}
+
+/// Start the dev bridge server
+///
+/// Returns the auth token and a handle to the server task
+pub async fn start_dev_bridge(
+    pty_manager: Arc<PtyManager>,
+    port: Option<u16>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let port = port.unwrap_or(DEFAULT_PORT);
+    let state = Arc::new(DevBridgeState::new(pty_manager));
+    let token = state.token.clone();
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/ws", get(ws_handler))
+        .layer(cors)
+        .with_state(state);
+
+    let addr = format!("127.0.0.1:{}", port);
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("🌉 DEV BRIDGE ACTIVE (debug mode only)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("   Address: http://{}", addr);
+    println!("   Token:   {}", token);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Write token to file for frontend to read
+    let token_path = std::env::temp_dir().join("hq-dev-bridge-token");
+    if let Err(e) = std::fs::write(&token_path, &token) {
+        eprintln!("Warning: Could not write token file: {}", e);
+    } else {
+        println!("   Token file: {:?}", token_path);
+    }
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind dev bridge server");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (token, handle)
+}
+
+/// Health check endpoint
+async fn health_check() -> &'static str {
+    "HQ Dev Bridge OK"
+}
+
+/// WebSocket handler with auth
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<AuthQuery>,
+    State(state): State<Arc<DevBridgeState>>,
+) -> Response {
+    // Validate token
+    match query.token {
+        Some(token) if token == state.token => {
+            ws.on_upgrade(move |socket| handle_socket(socket, state))
+        }
+        _ => (StatusCode::UNAUTHORIZED, "Invalid or missing token").into_response(),
+    }
+}
+
+/// Handle WebSocket connection
+async fn handle_socket(socket: WebSocket, state: Arc<DevBridgeState>) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Increment client count
+    {
+        let mut clients = state.clients.lock();
+        *clients += 1;
+        println!("Dev Bridge: Client connected (total: {})", *clients);
+    }
+
+    // Subscribe to events
+    let mut event_rx = state.event_tx.subscribe();
+
+    // Clone state for command handler
+    let state_cmd = state.clone();
+
+    // Spawn task to forward events to client
+    let send_task = tokio::spawn(async move {
+        while let Ok(event) = event_rx.recv().await {
+            let msg = serde_json::to_string(&event).unwrap();
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Handle incoming commands
+    let recv_task = async {
+        while let Some(Ok(msg)) = receiver.next().await {
+            if let Message::Text(text) = msg {
+                let response = handle_command(&text, &state_cmd).await;
+
+                // Broadcast the response as an event (sender is moved to send_task)
+                state_cmd.broadcast(RpcEvent {
+                    event: "rpc-response".to_string(),
+                    payload: serde_json::to_value(&response).unwrap(),
+                });
+            }
+        }
+    };
+
+    recv_task.await;
+    send_task.abort();
+
+    // Decrement client count
+    {
+        let mut clients = state.clients.lock();
+        *clients -= 1;
+        println!("Dev Bridge: Client disconnected (total: {})", *clients);
+    }
+}
+
+/// Handle RPC command
+async fn handle_command(text: &str, state: &DevBridgeState) -> RpcResponse {
+    let request: RpcRequest = match serde_json::from_str(text) {
+        Ok(req) => req,
+        Err(e) => {
+            return RpcResponse {
+                id: "unknown".to_string(),
+                success: false,
+                result: None,
+                error: Some(format!("Invalid JSON: {}", e)),
+            };
+        }
+    };
+
+    let result = execute_command(&request.cmd, &request.args, state).await;
+
+    match result {
+        Ok(value) => RpcResponse {
+            id: request.id,
+            success: true,
+            result: Some(value),
+            error: None,
+        },
+        Err(e) => RpcResponse {
+            id: request.id,
+            success: false,
+            result: None,
+            error: Some(e),
+        },
+    }
+}
+
+/// Execute a command and return result
+async fn execute_command(
+    cmd: &str,
+    args: &serde_json::Value,
+    state: &DevBridgeState,
+) -> Result<serde_json::Value, String> {
+    match cmd {
+        "pty_spawn" => {
+            let cmd_str = args["cmd"].as_str().ok_or("Missing 'cmd' argument")?;
+            let args_vec: Vec<String> = args["args"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cwd = args["cwd"]
+                .as_str()
+                .unwrap_or(".")
+                .to_string();
+            let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+            let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+
+            // Spawn process and set up event forwarding
+            let info = spawn_with_events(
+                state,
+                cmd_str.to_string(),
+                args_vec,
+                cwd,
+                rows,
+                cols,
+            )?;
+
+            serde_json::to_value(&info).map_err(|e| e.to_string())
+        }
+
+        "pty_write" => {
+            let id = args["id"].as_str().ok_or("Missing 'id' argument")?;
+            let data = args["data"].as_str().ok_or("Missing 'data' argument")?;
+            state.pty_manager.write(id, data)?;
+            Ok(serde_json::Value::Null)
+        }
+
+        "pty_resize" => {
+            let id = args["id"].as_str().ok_or("Missing 'id' argument")?;
+            let rows = args["rows"].as_u64().ok_or("Missing 'rows' argument")? as u16;
+            let cols = args["cols"].as_u64().ok_or("Missing 'cols' argument")? as u16;
+            state.pty_manager.resize(id, rows, cols)?;
+            Ok(serde_json::Value::Null)
+        }
+
+        "pty_kill" => {
+            let id = args["id"].as_str().ok_or("Missing 'id' argument")?;
+            state.pty_manager.kill(id)?;
+            Ok(serde_json::Value::Null)
+        }
+
+        "pty_list" => {
+            let list = state.pty_manager.list();
+            serde_json::to_value(&list).map_err(|e| e.to_string())
+        }
+
+        "pty_get" => {
+            let id = args["id"].as_str().ok_or("Missing 'id' argument")?;
+            let info = state.pty_manager.get(id);
+            serde_json::to_value(&info).map_err(|e| e.to_string())
+        }
+
+        "greet" => {
+            let name = args["name"].as_str().unwrap_or("World");
+            Ok(serde_json::Value::String(format!(
+                "Hello, {}! You've been greeted from Dev Bridge!",
+                name
+            )))
+        }
+
+        _ => Err(format!("Unknown command: {}", cmd)),
+    }
+}
+
+/// Spawn PTY process with event forwarding
+fn spawn_with_events(
+    state: &DevBridgeState,
+    cmd: String,
+    args: Vec<String>,
+    cwd: String,
+    rows: u16,
+    cols: u16,
+) -> Result<ProcessInfo, String> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let pty_system = native_pty_system();
+
+    let size = PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    let pair = pty_system
+        .openpty(size)
+        .map_err(|e| format!("Failed to open pty: {}", e))?;
+
+    let mut cmd_builder = CommandBuilder::new(&cmd);
+    for arg in &args {
+        cmd_builder.arg(arg);
+    }
+    cmd_builder.cwd(&cwd);
+
+    let _child = pair
+        .slave
+        .spawn_command(cmd_builder)
+        .map_err(|e| format!("Failed to spawn command: {}", e))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let info = ProcessInfo {
+        id: id.clone(),
+        cmd: cmd.clone(),
+        cwd: cwd.clone(),
+        rows,
+        cols,
+        running: true,
+    };
+
+    // Get reader for streaming output
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("Failed to clone reader: {}", e))?;
+
+    // Get writer for sending input (will be needed for pty_write in future)
+    let _writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("Failed to take writer: {}", e))?;
+
+    // Store in manager (we need to modify PtyManager to expose internal storage)
+    // For now, we'll create a simple internal tracking
+
+    // Spawn reader thread for event broadcasting
+    let process_id = id.clone();
+    let event_tx = state.event_tx.clone();
+
+    std::thread::spawn(move || {
+        read_and_broadcast(reader, process_id, event_tx);
+    });
+
+    Ok(info)
+}
+
+/// Read PTY output and broadcast as events
+fn read_and_broadcast(
+    mut reader: Box<dyn std::io::Read + Send>,
+    process_id: String,
+    event_tx: broadcast::Sender<RpcEvent>,
+) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                // EOF - process ended
+                let _ = event_tx.send(RpcEvent {
+                    event: "pty-exit".to_string(),
+                    payload: serde_json::json!({
+                        "id": process_id,
+                        "code": null
+                    }),
+                });
+                break;
+            }
+            Ok(n) => {
+                let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = event_tx.send(RpcEvent {
+                    event: "pty-output".to_string(),
+                    payload: serde_json::json!({
+                        "id": process_id,
+                        "data": data
+                    }),
+                });
+            }
+            Err(e) => {
+                eprintln!("Dev Bridge PTY read error: {}", e);
+                break;
+            }
+        }
+    }
+}

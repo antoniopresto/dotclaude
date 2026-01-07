@@ -1,0 +1,174 @@
+import { NavigationProp, useIsFocused, useNavigation } from '@react-navigation/native';
+import React, { FC, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { connect } from 'react-redux';
+
+import { useFocusEffect } from '@react-navigation/native';
+import { useScreenViewTracking } from '../../hooks/tracking';
+import { PointsActions } from '../../redux/ducks/points';
+import { rescueActions, RescuePayload } from '../../redux/ducks/rescue';
+
+import { bindActionCreators, Dispatch } from 'redux';
+import { AppReducers } from '../../redux/reducers/Models';
+import { PropsRootStack } from '../../routes/Models';
+import { useInvoiceCashbackPermission } from '../../services/invoiceCashbackPermission/hooks';
+import theme from '../../styles/theme';
+import { InvoiceCashbackProps } from './models';
+import InvoiceCashbackSummaryView from './view';
+
+const InvoiceCashbackSummary: FC<InvoiceCashbackProps> = ({
+  route,
+  pointsReducer,
+  rescueReducer,
+  rescueRequest,
+  rescueClear,
+}) => {
+  useScreenViewTracking({ route, title: 'Cashback na fatura' });
+  const navigation = useNavigation<NavigationProp<PropsRootStack>>();
+  const isFocused = useIsFocused();
+  const { hasRedeemed, markAsRedeemed } = useInvoiceCashbackPermission();
+  const alreadyMarkedRef = useRef(false);
+
+  const [hasAttemptedRescue, setHasAttemptedRescue] = useState(false);
+
+  useLayoutEffect(() => {
+    if (isFocused) {
+      setHasAttemptedRescue(false);
+      rescueClear();
+    }
+  }, [isFocused, rescueClear]);
+
+  useFocusEffect(
+    React.useCallback(() => {
+      setHasAttemptedRescue(false);
+      rescueClear();
+      return undefined;
+    }, [rescueClear])
+  );
+
+  const conversionFactor = pointsReducer.conversionFactor;
+  const pointsPrice = (pointsReducer.points || 0) * conversionFactor;
+
+  const handleGoBack = () => {
+    setHasAttemptedRescue(false);
+    rescueClear();
+    navigation.goBack();
+  };
+
+  const invoiceList = (pts: number, _price: number): any[] => {
+    const whiteShape = theme.colors.LIGHT_BASE_01;
+    const fintechColor = theme.colors.SECONDARY_COLOR_02;
+    const finalPrice = pts * conversionFactor;
+    const formattedPrice = new Intl.NumberFormat('pt-BR', {
+      style: 'currency',
+      currency: 'BRL',
+    }).format(finalPrice);
+
+    return [
+      {
+        type: 'default',
+        icon: 'icon-switch-vertical',
+        iconColor: fintechColor,
+        iconColorShape: whiteShape,
+        description: `Cada ${pts.toLocaleString('pt-br')} pontos valem ${formattedPrice} no cashback`,
+      },
+      {
+        type: 'default',
+        icon: 'icon-calendar',
+        iconColor: fintechColor,
+        iconColorShape: whiteShape,
+        description: 'Você define quanto cashback quer aplicar na sua fatura aberta',
+      },
+      {
+        type: 'default',
+        icon: 'icon-payment-invoice',
+        iconColor: fintechColor,
+        iconColorShape: whiteShape,
+        description: 'Se o valor for maior que o da fatura, a diferença será aplicada nas próximas',
+      },
+      {
+        type: 'default',
+        icon: 'icon-clock',
+        iconColor: fintechColor,
+        iconColorShape: whiteShape,
+        description: 'O cashback acontece em até 72h',
+      },
+    ];
+  };
+
+  const pointsSelected = route?.params?.pointsSelected ?? 0;
+  const reaisSelected = route?.params?.reaisSelected ?? 0;
+  const productCode = route?.params?.productCode;
+  const campaingId = route?.params?.campaingId;
+
+  const onConfirmRescue = () => {
+    setHasAttemptedRescue(true);
+    const payload: RescuePayload = {
+      value: pointsSelected,
+      campaignId: campaingId,
+      productCode: productCode,
+      description: 'Cashback resgatado',
+    };
+    rescueRequest({ payload });
+  };
+
+  const onExitResult = () => {
+    setHasAttemptedRescue(false);
+    rescueClear();
+    navigation.navigate('RewardProgram');
+  };
+
+  const isRescueLoading = rescueReducer?.isLoading;
+  const isRescueFailed = rescueReducer?.isError;
+  const isRescueConcluded = !isRescueFailed && !!rescueReducer?.status;
+
+  const showResult = isFocused && hasAttemptedRescue && (isRescueConcluded || isRescueFailed);
+
+  useEffect(() => {
+    if (
+      showResult &&
+      isRescueConcluded &&
+      !alreadyMarkedRef.current &&
+      hasRedeemed !== true
+    ) {
+      alreadyMarkedRef.current = true;
+      markAsRedeemed().catch(() => {});
+    }
+  }, [showResult, isRescueConcluded, hasRedeemed, markAsRedeemed]);
+
+  return (
+    <InvoiceCashbackSummaryView
+      handleGoBack={handleGoBack}
+      cashbackInvoiceList={invoiceList}
+      pts={pointsReducer.points || 0}
+      handleContinue={() => {}}
+      price={pointsPrice}
+      conversionFactor={conversionFactor}
+      pointsSelected={pointsSelected}
+      reaisSelected={reaisSelected}
+      onConfirmRescue={onConfirmRescue}
+      onExitResult={onExitResult}
+      isRescueLoading={isRescueLoading}
+      isRescueConcluded={isRescueConcluded}
+      isRescueFailed={isRescueFailed}
+      showResult={showResult}
+    />
+  );
+};
+
+export const mapStateToProps = ({ pointsReducer, rescueReducer }: AppReducers) => ({
+  pointsReducer,
+  rescueReducer,
+});
+
+export const mapDispatchToProps = (dispatch: Dispatch) => {
+  return bindActionCreators(
+    {
+      ...PointsActions,
+      rescueRequest: rescueActions.rescueRequest,
+      rescueClear: rescueActions.rescueClear,
+    },
+    dispatch
+  );
+};
+
+export default connect(mapStateToProps, mapDispatchToProps)(InvoiceCashbackSummary);

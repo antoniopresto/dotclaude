@@ -1,0 +1,160 @@
+# Optimal tech stack for ZUI railway maintenance dashboard
+
+Building a semantic Zoomable User Interface for fleet maintenance planning with **300 trains over 10 years** demands a carefully orchestrated combination of canvas rendering, intelligent state management, and optimized data loading. The recommended stack centers on **PixiJS + react-zoom-pan-pinch** for ZUI, **@zazcart/toolkit state-machine + TanStack Query** for state, **Elysia.js** for the Bun backend, and **Apache ECharts + Bryntum Gantt** for visualizations—a combination that handles million-datapoint scales while maintaining 60fps interactions.
+
+## Canvas-based ZUI with semantic zoom delivers the performance edge
+
+The core architectural decision is adopting a **hybrid Canvas + React approach** rather than pure DOM-based rendering. At your data scale (~1M+ potential data points across 300 trains × 10 years × daily granularity), Canvas rendering becomes essential for maintaining smooth zoom and pan interactions.
+
+**PixiJS** emerges as the top choice for the ZUI foundation, offering **WebGL-accelerated rendering** capable of handling 1M+ elements at 60fps. Its React wrapper `@pixi/react` provides declarative component patterns while leveraging hardware acceleration. Konva.js serves as an excellent alternative when richer event handling is needed (drag, hover, click on individual elements), with better built-in interactivity at the cost of roughly 40% lower raw performance.
+
+For zoom/pan gesture handling, combine **@use-gesture/react** (low-level pinch/wheel control) with **react-zoom-pan-pinch** (DOM content wrapper). Together they support touch, trackpad, and mouse wheel interactions with consistent behavior. The semantic zoom pattern maps scale thresholds to content granularity:
+
+```typescript
+const useSemanticZoomLevel = (scale: number): ZoomLevel => {
+  if (scale < 0.1) return 'decade';      // 10-year strategic
+  if (scale < 0.25) return 'annual';
+  if (scale < 0.5) return 'quarterly';
+  if (scale < 1) return 'monthly';
+  if (scale < 2) return 'weekly';
+  return 'daily';                        // Tactical planning
+};
+```
+
+Level-of-detail (LOD) rendering then switches component implementations based on zoom level—showing aggregated year summaries when zoomed out, detailed task views when zoomed in. This pattern, inspired by React Flow's contextual zoom, prevents rendering millions of elements at any given moment.
+
+## Visualization libraries must handle enterprise scale
+
+**Gantt charts** represent the most complex visualization requirement. **Bryntum Gantt** (commercial, ~$450+) leads for enterprise features: virtual scrolling for 10K+ tasks, dependency management, critical path analysis, and async scheduling engine. For budget-conscious projects, **SVAR React Gantt** (GPLv3, free) launched in November 2024 as a compelling native React alternative with built-in big data optimization.
+
+For **calendars and timeline views**, FullCalendar with the Premium license provides the resource timeline view essential for train scheduling, backed by **19K GitHub stars** and virtual scrolling support. React-big-calendar serves as a solid open-source alternative for simpler calendar needs.
+
+**Apache ECharts** dominates the charting space for this use case—it handles **1M+ data points via WebGL rendering**, supports TypedArrays for memory optimization, and includes built-in heatmap, calendar heatmap, and custom series for Gantt-like visualizations. The library excels at data-heavy dashboards through incremental rendering and canvas optimization.
+
+| Visualization Type | Primary Recommendation | Bundle Impact |
+|--------------------|----------------------|---------------|
+| Gantt Charts | Bryntum Gantt (enterprise) / SVAR (OSS) | Large (vendor) |
+| Calendar/Timeline | FullCalendar Premium | Medium |
+| Charts/Heatmaps | Apache ECharts | Medium (tree-shakeable) |
+| Custom Viz | Visx (low-level D3 primitives) | Small (modular) |
+
+## State architecture for scenario comparison requires normalized design
+
+Managing multiple simulation scenarios with undo/redo capabilities calls for **@zazcart/toolkit state-machine + TanStack Query**—a combination that cleanly separates client state (scenarios, UI) from server cache (API data). This architectural boundary prevents common pitfalls of duplicating server data in client stores.
+
+The **@zazcart/toolkit state-machine** provides a lightweight, type-safe state management solution with built-in support for slices, caching, and React hooks. It offers predictable state transitions, memoized selectors, and a clean API without providers. For 300 trains × 10 years, **state normalization using the byId/allIds pattern** is essential:
+
+```typescript
+interface NormalizedPlanningState {
+  trains: { byId: Record<string, Train>; allIds: string[] };
+  yearPlans: { byId: Record<string, YearPlan>; allIds: string[] };
+  maintenanceEvents: { byId: Record<string, Event>; allIds: string[] };
+}
+
+interface ScenarioStore {
+  scenarios: Record<string, NormalizedPlanningState>;
+  activeScenarioId: string;
+  comparisonScenarioIds: string[];  // Side-by-side comparison
+}
+```
+
+This structure enables **O(1) entity lookups** versus O(n) array searches, selective updates without deep cloning, and independent state history per scenario. The toolkit's cache mechanism integrates seamlessly, allowing selective state tracking (excluding UI state from history).
+
+TanStack Query handles server synchronization with built-in optimistic updates and rollback. Configure `staleTime: Infinity` for simulation results (which don't change) and aggressive caching via IndexedDB for offline scenario access.
+
+## Elysia.js provides the optimal Bun backend framework
+
+**Elysia.js** stands out among Bun HTTP frameworks for its exceptional TypeScript developer experience and schema-first design. It uses **TypeBox by default**, which generates JSON Schema-compatible output—enabling you to define schemas once and use them for both API validation and MongoDB collection validators. The framework auto-generates OpenAPI documentation with a single line.
+
+Performance benchmarks place Elysia at the top tier for Bun, with **7x WebSocket throughput** compared to Node.js + ws library thanks to Bun's uWebSockets foundation. End-to-end type safety flows from route definition through validation to handler, similar to tRPC.
+
+For CPU-intensive simulations, Bun's native **Worker API** with the worker pool pattern handles heavy optimization:
+
+```typescript
+class SimulationWorkerPool {
+  private workers: Worker[] = [];
+  
+  constructor(poolSize = navigator.hardwareConcurrency || 4) {
+    for (let i = 0; i < poolSize; i++) {
+      const worker = new Worker('./simulation-worker.ts', { smol: true });
+      this.workers.push(worker);
+    }
+  }
+}
+```
+
+The `smol: true` option reduces memory footprint for multiple workers. Note that Worker termination is marked experimental—implement pool reuse rather than per-request spawning.
+
+MongoDB's official Node.js driver works natively with Bun. Configure collections with JSON Schema validators matching your TypeBox API schemas:
+
+```typescript
+await db.createCollection('trains', {
+  validator: { $jsonSchema: TrainJsonSchema },
+  validationLevel: 'strict',
+  validationAction: 'error'
+});
+```
+
+## Performance optimization through layered caching and virtualization
+
+**TanStack Virtual** leads React virtualization for your 2D Gantt requirements, supporting dual virtualizers (horizontal time columns + vertical train rows) with 60fps scrolling regardless of dataset size. Its headless architecture provides complete control over markup while handling dynamic sizing via ResizeObserver.
+
+The **Canvas vs SVG decision** follows clear thresholds: use SVG for <1,000 elements needing individual interactivity; Canvas for 1,000-10,000 elements; WebGL (PixiJS) for >10,000. Your ZUI dashboard benefits from a **hybrid approach**: Canvas base layer for thousands of Gantt bars and heatmap cells, SVG interaction layer for tooltips and drag handles, switching between layers based on zoom level.
+
+Data aggregation must be **pre-computed server-side** at each granularity level:
+
+| Zoom Level | Aggregation | Records per Train |
+|------------|-------------|-------------------|
+| Decade | Yearly | 10 |
+| Annual | Monthly | 120 |
+| Quarterly | Weekly | 520 |
+| Daily | Individual | 3,650 |
+
+Combine zoom-level-based fetching with viewport-based loading—only fetch visible time range plus buffer, using TanStack Query with keys like `['maintenance', aggregationLevel, timeRange]`.
+
+For optimization algorithms, **glpk.js** (WebAssembly port of GLPK) handles large mixed-integer programming problems server-side, while **YALPS** (~15KB) provides 2x faster performance for quick client-side what-if scenarios under 100 variables.
+
+## Complete architecture and production considerations
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ZUI Container Layer                         │
+│       (react-zoom-pan-pinch + @use-gesture/react)               │
+├─────────────────────────────────────────────────────────────────┤
+│            Semantic Zoom Manager (useSemanticZoomLevel)          │
+├────────────────┬────────────────┬───────────────────────────────┤
+│  Gantt View    │  Calendar View │    Analytics View              │
+│  (Bryntum +    │  (FullCalendar)│    (Apache ECharts)           │
+│   PixiJS)      │                │                                │
+├────────────────┴────────────────┴───────────────────────────────┤
+│    State Layer (@zazcart/toolkit state-machine + TanStack Query)    │
+├─────────────────────────────────────────────────────────────────┤
+│  Cache: React Query (in-memory) → IndexedDB (persistent)        │
+├─────────────────────────────────────────────────────────────────┤
+│                   Elysia.js API Server (Bun)                     │
+│        WebSocket pub/sub │ Worker Pool (glpk.js)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                   MongoDB (JSON Schema validation)               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Bun production readiness** as of December 2024 is solid for Linux deployments. Windows remains experimental. Deploy behind nginx for additional reliability, implement graceful shutdown, and maintain Node.js-portable code as a fallback—Elysia and Hono both work on Node.js.
+
+## Recommended technology summary
+
+| Layer | Technology | Justification |
+|-------|-----------|---------------|
+| **ZUI Engine** | PixiJS + react-zoom-pan-pinch | WebGL performance, React integration |
+| **Gantt** | Bryntum (enterprise) / SVAR (OSS) | Virtual scrolling, dependencies |
+| **Charts** | Apache ECharts | 1M+ points, WebGL, heatmaps |
+| **Calendar** | FullCalendar Premium | Resource timeline, virtual scroll |
+| **State** | @zazcart/toolkit state-machine | Lightweight, type-safe, normalized |
+| **Server Cache** | TanStack Query | Optimistic updates, caching |
+| **Virtualization** | TanStack Virtual | Headless, 2D grid support |
+| **Backend** | Elysia.js | TypeBox schemas, WebSocket, TypeScript DX |
+| **Workers** | Bun Worker + Comlink | Native TS, smol mode, pool pattern |
+| **Optimization** | glpk.js (server) / YALPS (client) | LP/MIP solving, lightweight client |
+| **Database** | MongoDB + JSON Schema | Native validation, no ORM needed |
+| **Persistence** | IndexedDB (idb-keyval) | Large scenario caching |
+
+This stack prioritizes **TypeScript-first development**, canvas-based performance for ZUI, and clear separation between client and server state—enabling instant client-side feedback for scenario exploration while offloading heavy optimization to Bun workers. The @zazcart/toolkit state-machine provides a unified, type-safe approach to state management with built-in React integration via hooks.

@@ -1,0 +1,278 @@
+# @mms/harness-orchestrator
+
+AI Project Manager that orchestrates multiple Claude agents to complete harness tasks in parallel.
+
+## Installation
+
+```bash
+# From the monorepo root
+bun add @mms/harness-orchestrator --filter=<your-package>
+
+# Or link locally during development
+cd packages/harness-orchestrator && bun link
+cd ../harness-dashboard && bun link @mms/harness-orchestrator
+```
+
+## CLI Usage
+
+After installation, the `harness` command is available (also aliased as `h`):
+
+```bash
+# Full command
+harness <command>
+
+# Short alias
+h <command>
+
+# Or run directly without installing
+node packages/harness-orchestrator/dist/cli/index.js <command>
+```
+
+### Commands
+
+#### `analyze <features-path>`
+
+Analyze dependency graph and show execution plan.
+
+```bash
+harness analyze features.json
+# or
+h analyze features.json
+```
+
+Output:
+- Cycle detection (would cause deadlock)
+- Ready tasks that can run in parallel
+- Critical path (longest dependency chain)
+- Topological execution order
+
+#### `status <features-path>`
+
+Show current progress status.
+
+```bash
+harness status features.json
+```
+
+Output:
+- Project info and progress bar
+- All features with blocked-by dependencies
+- AI-generated summary by category
+
+#### `orchestrate <features-path>`
+
+Run full orchestration with parallel agents.
+
+```bash
+# Dry run (show plan without executing)
+harness orchestrate features.json --dry-run
+
+# Run with default settings (3 agents, sonnet model)
+harness orchestrate features.json
+
+# Custom settings
+harness orchestrate features.json \
+  --max-agents 5 \
+  --model opus \
+  --timeout 900000 \
+  --dashboard
+```
+
+Options:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-n, --max-agents` | 3 | Maximum concurrent agents |
+| `-m, --model` | sonnet | Model: haiku, sonnet, opus |
+| `--timeout` | 600000 | Timeout per task (ms) |
+| `-d, --dashboard` | false | Enable real-time dashboard |
+| `--no-costs` | false | Disable cost estimates |
+| `--dry-run` | false | Show plan only |
+
+#### `verify <features-path>`
+
+Verify feature completion and git status.
+
+```bash
+# Verify all completed features
+harness verify features.json --all
+
+# Verify specific feature
+harness verify features.json -f D001
+```
+
+Options:
+| Option | Description |
+|--------|-------------|
+| `-f, --feature <id>` | Verify specific feature |
+| `--all` | Verify all completed features |
+
+#### `rollback <features-path>`
+
+Rollback a feature to incomplete state.
+
+```bash
+harness rollback features.json -f D001
+```
+
+Options:
+| Option | Description |
+|--------|-------------|
+| `-f, --feature <id>` | Feature ID to rollback (required) |
+| `--delete-remote` | Also delete remote branch |
+
+#### `branches <features-path>`
+
+List and manage feature branches.
+
+```bash
+# List all feature branches
+harness branches features.json
+
+# Cleanup merged branches
+harness branches features.json --cleanup
+```
+
+Options:
+| Option | Description |
+|--------|-------------|
+| `--cleanup` | Delete merged feature branches |
+
+#### `dashboard <features-path>`
+
+Show standalone dashboard (static view).
+
+```bash
+harness dashboard features.json
+```
+
+## features.json Format
+
+The orchestrator expects a `features.json` with this structure:
+
+```json
+{
+  "project": "My Project",
+  "version": "0.1.0",
+  "description": "Project description",
+  "lastUpdated": "2025-12-16",
+  "features": [
+    {
+      "id": "F001",
+      "category": "setup",
+      "description": "Initialize project",
+      "steps": [
+        "Step 1",
+        "Step 2"
+      ],
+      "passes": false,
+      "blockedBy": null,
+      "notes": "Optional notes"
+    },
+    {
+      "id": "F002",
+      "category": "core",
+      "description": "Implement feature X",
+      "steps": ["..."],
+      "passes": false,
+      "blockedBy": "F001"
+    },
+    {
+      "id": "F003",
+      "category": "core",
+      "description": "Implement feature Y",
+      "steps": ["..."],
+      "passes": false,
+      "blockedBy": ["F001", "F002"]
+    }
+  ]
+}
+```
+
+### Field Reference
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Unique feature identifier |
+| `category` | string | Yes | Feature category for grouping |
+| `description` | string | Yes | What the feature does |
+| `steps` | string[] | Yes | Implementation steps |
+| `passes` | boolean | Yes | Whether feature is complete |
+| `blockedBy` | string \| string[] \| null | Yes | Dependencies |
+| `notes` | string | No | Additional notes |
+
+## Programmatic API
+
+```typescript
+import {
+  DependencyGraph,
+  CriticalPath,
+  TaskScheduler,
+  AgentPool,
+  StateManager,
+  Orchestrator,
+  Dashboard,
+  Verifier,
+  GitManager,
+} from '@mms/harness-orchestrator';
+
+// Analyze dependencies
+const config = JSON.parse(fs.readFileSync('features.json', 'utf-8'));
+const graph = new DependencyGraph(config);
+
+// Get ready tasks
+const ready = graph.getReadyTasks();
+console.log('Can run in parallel:', ready.map(f => f.id));
+
+// Calculate critical path
+const criticalPath = new CriticalPath(graph);
+console.log('Critical path:', criticalPath.getCriticalPath());
+
+// Run orchestration
+const orchestrator = new Orchestrator('features.json', {
+  maxAgents: 3,
+  model: 'sonnet',
+  timeout: 600000,
+});
+
+orchestrator.on('taskSucceeded', ({ taskId }) => {
+  console.log(`✓ ${taskId} completed`);
+});
+
+const result = await orchestrator.run();
+console.log(`Completed: ${result.completed}, Failed: ${result.failed}`);
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CLI (commander.js)                        │
+├─────────────────────────────────────────────────────────────┤
+│  analyze │ status │ orchestrate │ dashboard │ verify │ ...  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   Orchestrator  │  │    Dashboard    │  │    Verifier     │
+│  (coordination) │  │  (terminal UI)  │  │  (git + checks) │
+└────────┬────────┘  └─────────────────┘  └────────┬────────┘
+         │                                          │
+    ┌────┴────┐                               ┌────┴────┐
+    │         │                               │         │
+    ▼         ▼                               ▼         ▼
+┌─────────┐ ┌──────────┐               ┌───────────┐ ┌───────┐
+│Scheduler│ │AgentPool │               │GitManager │ │State  │
+└─────────┘ └──────────┘               └───────────┘ └───────┘
+    │         │
+    ▼         ▼
+┌───────────────────┐
+│  DependencyGraph  │
+│  + CriticalPath   │
+└───────────────────┘
+```
+
+## License
+
+MIT

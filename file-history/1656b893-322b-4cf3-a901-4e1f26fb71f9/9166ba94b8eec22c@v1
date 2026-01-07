@@ -1,0 +1,596 @@
+---
+title: Deployment Guide
+category: implementation
+difficulty: intermediate
+tags: [deployment, docker, kubernetes, cloud, devops]
+related_docs: [01-tech-stack, 03-api-design]
+summary: Deployment patterns for fleet maintenance scheduling systems including Docker, Kubernetes, and cloud platforms.
+version: 1.0
+last_updated: 2025-12-07
+---
+
+# Deployment Guide
+
+This document covers deployment strategies for fleet maintenance scheduling systems, from development to production.
+
+## Deployment Architecture
+
+### Production Topology
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                             CDN (CloudFront/Cloudflare)                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Load Balancer (ALB/nginx)                       │
+└─────────────────────────────────────────────────────────────────────────┘
+          │                         │                         │
+          ▼                         ▼                         ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│    API Pod 1    │      │    API Pod 2    │      │    API Pod 3    │
+│   (Bun + Hono)  │      │   (Bun + Hono)  │      │   (Bun + Hono)  │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+          │                         │                         │
+          └─────────────────────────┼─────────────────────────┘
+                                    │
+          ┌─────────────────────────┼─────────────────────────┐
+          │                         │                         │
+          ▼                         ▼                         ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│  Solver Worker  │      │  Solver Worker  │      │  Solver Worker  │
+│    (Python)     │      │    (Python)     │      │    (Python)     │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+                                    │
+┌───────────────────────────────────────────────────────────────────────┐
+│                          Data Layer                                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                │
+│  │  PostgreSQL  │  │    Redis     │  │      S3      │                │
+│  │  (Primary)   │  │   Cluster    │  │    Bucket    │                │
+│  └──────────────┘  └──────────────┘  └──────────────┘                │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+## Docker Configuration
+
+### API Dockerfile
+
+```dockerfile
+# Dockerfile.api
+FROM oven/bun:1.1 AS base
+WORKDIR /app
+
+# Install dependencies
+FROM base AS deps
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile --production
+
+# Build
+FROM base AS builder
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile
+COPY . .
+RUN bun run build
+
+# Production image
+FROM base AS runner
+ENV NODE_ENV=production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 bunjs
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json ./
+
+USER bunjs
+
+EXPOSE 3000
+
+CMD ["bun", "run", "dist/index.js"]
+```
+
+### Solver Dockerfile
+
+```dockerfile
+# Dockerfile.solver
+FROM python:3.12-slim AS base
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY solver/ ./solver/
+
+# Non-root user
+RUN useradd -m -u 1001 solver
+USER solver
+
+CMD ["python", "-m", "solver.worker"]
+```
+
+### Docker Compose (Development)
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/mms
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: development
+    volumes:
+      - ./apps/api/src:/app/src:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  solver:
+    build:
+      context: .
+      dockerfile: Dockerfile.solver
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/mms
+    depends_on:
+      - redis
+      - db
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3000
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mms
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
+```
+
+## Kubernetes Deployment
+
+### API Deployment
+
+```yaml
+# k8s/api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mms-api
+  labels:
+    app: mms-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mms-api
+  template:
+    metadata:
+      labels:
+        app: mms-api
+    spec:
+      containers:
+        - name: api
+          image: your-registry/mms-api:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mms-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mms-secrets
+                  key: redis-url
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mms-api
+spec:
+  selector:
+    app: mms-api
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: ClusterIP
+```
+
+### Solver Worker Deployment
+
+```yaml
+# k8s/solver-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mms-solver
+  labels:
+    app: mms-solver
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mms-solver
+  template:
+    metadata:
+      labels:
+        app: mms-solver
+    spec:
+      containers:
+        - name: solver
+          image: your-registry/mms-solver:latest
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mms-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mms-secrets
+                  key: redis-url
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+```
+
+### Horizontal Pod Autoscaler
+
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mms-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mms-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+## Cloud Platform Deployment
+
+### AWS with ECS/Fargate
+
+```typescript
+// infrastructure/aws-cdk/stack.ts
+import * as cdk from 'aws-cdk-lib';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as rds from 'aws-cdk-lib/aws-rds';
+
+export class MMSStack extends cdk.Stack {
+  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // VPC
+    const vpc = new ec2.Vpc(this, 'MmsVpc', {
+      maxAzs: 2
+    });
+
+    // ECS Cluster
+    const cluster = new ecs.Cluster(this, 'MmsCluster', {
+      vpc,
+      containerInsights: true
+    });
+
+    // RDS PostgreSQL
+    const database = new rds.DatabaseInstance(this, 'MmsDatabase', {
+      engine: rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.VER_16
+      }),
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T3,
+        ec2.InstanceSize.MEDIUM
+      ),
+      vpc,
+      databaseName: 'mms'
+    });
+
+    // API Service
+    const apiService = new ecs.FargateService(this, 'MmsApiService', {
+      cluster,
+      taskDefinition: this.createApiTaskDefinition(),
+      desiredCount: 2
+    });
+
+    // Solver Service
+    const solverService = new ecs.FargateService(this, 'MmsSolverService', {
+      cluster,
+      taskDefinition: this.createSolverTaskDefinition(),
+      desiredCount: 2
+    });
+  }
+}
+```
+
+### Environment Configuration
+
+```typescript
+// config/env.ts
+import { z } from 'zod';
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'staging', 'production']),
+  PORT: z.coerce.number().default(3000),
+
+  // Database
+  DATABASE_URL: z.string().url(),
+  DATABASE_POOL_SIZE: z.coerce.number().default(10),
+
+  // Redis
+  REDIS_URL: z.string().url(),
+
+  // Auth
+  JWT_SECRET: z.string().min(32),
+  JWT_EXPIRY: z.string().default('24h'),
+
+  // External APIs
+  EAM_API_URL: z.string().url().optional(),
+  EAM_API_KEY: z.string().optional(),
+
+  // Observability
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  SENTRY_DSN: z.string().url().optional()
+});
+
+export const env = envSchema.parse(process.env);
+```
+
+## CI/CD Pipeline
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - run: bun install
+      - run: bun test
+      - run: bun run lint
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.api
+          push: true
+          tags: ghcr.io/${{ github.repository }}/api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Kubernetes
+        uses: azure/k8s-deploy@v4
+        with:
+          manifests: |
+            k8s/api-deployment.yaml
+            k8s/solver-deployment.yaml
+          images: |
+            ghcr.io/${{ github.repository }}/api:${{ github.sha }}
+```
+
+## Monitoring and Observability
+
+### Structured Logging
+
+```typescript
+// lib/logger.ts
+import pino from 'pino';
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  transport: process.env.NODE_ENV === 'development'
+    ? { target: 'pino-pretty' }
+    : undefined,
+  formatters: {
+    level: (label) => ({ level: label })
+  }
+});
+```
+
+### Health Check Endpoint
+
+```typescript
+// routes/health.ts
+app.get('/health', async (c) => {
+  const checks = {
+    database: await checkDatabase(),
+    redis: await checkRedis(),
+    solver: await checkSolverQueue()
+  };
+
+  const healthy = Object.values(checks).every(c => c.status === 'healthy');
+
+  return c.json({
+    status: healthy ? 'healthy' : 'unhealthy',
+    timestamp: new Date().toISOString(),
+    checks
+  }, healthy ? 200 : 503);
+});
+```
+
+### Prometheus Metrics
+
+```typescript
+// middleware/metrics.ts
+import { Registry, Counter, Histogram } from 'prom-client';
+
+const registry = new Registry();
+
+export const httpRequestsTotal = new Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'path', 'status'],
+  registers: [registry]
+});
+
+export const httpRequestDuration = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request duration',
+  labelNames: ['method', 'path'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
+  registers: [registry]
+});
+```
+
+## Database Migrations
+
+```bash
+# Run migrations
+bun run db:migrate
+
+# Generate migration
+bun run db:generate
+
+# Push schema (development)
+bun run db:push
+```
+
+```json
+// package.json scripts
+{
+  "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio"
+  }
+}
+```
+
+## Backup and Recovery
+
+```bash
+# PostgreSQL backup script
+#!/bin/bash
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="mms_backup_${TIMESTAMP}.sql.gz"
+
+pg_dump $DATABASE_URL | gzip > $BACKUP_FILE
+aws s3 cp $BACKUP_FILE s3://mms-backups/
+
+# Keep only last 30 days
+find /backups -name "*.sql.gz" -mtime +30 -delete
+```
+
+## Next Steps
+
+With deployment configured:
+
+- Explore `06-FEATURES/` for feature implementation
+- Study `07-CASE-STUDIES/` for production examples
+- Review monitoring and alerting setup

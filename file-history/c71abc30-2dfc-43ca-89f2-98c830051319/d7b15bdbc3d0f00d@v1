@@ -1,0 +1,253 @@
+"""PHAROS LangGraph Workflow Definition.
+
+This module defines the main StateGraph that orchestrates the 4 agents:
+1. PRODUCT_DESIGN - Defines WHAT (spec, wording, visual rules)
+2. SENIOR_ENGINEER - Defines HOW and implements
+3. THE_AUDITOR - Verifies (visual, performance, QA)
+4. ORCHESTRATOR - Coordinates and decides routing
+"""
+
+from typing import Literal
+from datetime import datetime
+
+from langgraph.graph import StateGraph, END
+
+from .state import PharosState
+from .checkpointer import get_checkpointer
+
+import sys
+sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
+
+
+# === Node Functions ===
+# These will be replaced with actual agent implementations
+
+def orchestrator_node(state: PharosState) -> PharosState:
+    """ORCHESTRATOR: Analyzes state and prepares for next agent."""
+    from src.agents.orchestrator import run_orchestrator
+    return run_orchestrator(state)
+
+
+def product_design_node(state: PharosState) -> PharosState:
+    """PRODUCT_DESIGN: Generates spec, wording, visual rules."""
+    from src.agents.product_design import run_product_design
+    return run_product_design(state)
+
+
+def senior_engineer_node(state: PharosState) -> PharosState:
+    """SENIOR_ENGINEER: Implements the feature."""
+    from src.agents.senior_engineer import run_senior_engineer
+    return run_senior_engineer(state)
+
+
+def the_auditor_node(state: PharosState) -> PharosState:
+    """THE_AUDITOR: Verifies visual, performance, QA."""
+    from src.agents.the_auditor import run_the_auditor
+    return run_the_auditor(state)
+
+
+# === Routing Functions ===
+
+def route_after_orchestrator(state: PharosState) -> Literal["product_design", "senior_engineer", "the_auditor", "end"]:
+    """Route based on current status after orchestrator analysis."""
+    status = state.get("status", "draft")
+
+    if status in ("draft", "spec_pending"):
+        return "product_design"
+    elif status in ("spec_ready", "in_progress"):
+        return "senior_engineer"
+    elif status == "review_pending":
+        return "the_auditor"
+    elif status in ("approved", "merged"):
+        return "end"
+    elif status == "rejected":
+        # Check retry count
+        if state.get("retry_count", 0) < state.get("max_retries", 3):
+            return "senior_engineer"  # Go back to engineer to fix
+        else:
+            return "end"  # Max retries exceeded
+    else:
+        return "end"
+
+
+def route_after_product_design(state: PharosState) -> Literal["senior_engineer", "orchestrator"]:
+    """Route after product design completes."""
+    if state.get("spec_approved", False):
+        return "senior_engineer"
+    else:
+        return "orchestrator"  # Needs revision
+
+
+def route_after_engineer(state: PharosState) -> Literal["the_auditor", "orchestrator"]:
+    """Route after engineer completes."""
+    if state.get("code_complete", False):
+        return "the_auditor"
+    else:
+        return "orchestrator"  # Needs help
+
+
+def route_after_auditor(state: PharosState) -> Literal["orchestrator", "end"]:
+    """Route after auditor completes."""
+    audit = state.get("audit", {})
+
+    if audit.get("overall_passed", False):
+        # All checks passed - update status and finish
+        return "end"
+    else:
+        # Failed audit - go back to orchestrator for routing
+        return "orchestrator"
+
+
+# === Graph Construction ===
+
+def create_workflow() -> StateGraph:
+    """Create the PHAROS workflow graph.
+
+    Graph Structure:
+    ```
+    START
+      │
+      ▼
+    ORCHESTRATOR ──────────────────┐
+      │                            │
+      ├─► PRODUCT_DESIGN           │
+      │     │                      │
+      │     ├─► SENIOR_ENGINEER    │
+      │     │     │                │
+      │     │     ▼                │
+      │     │   THE_AUDITOR ───────┤
+      │     │     │                │
+      │     │     ├─► END (approved)
+      │     │     │                │
+      │     │     └─► ORCHESTRATOR (rejected, retry)
+      │     │                      │
+      │     └─► ORCHESTRATOR (spec needs work)
+      │                            │
+      └─► END (approved/max_retries)
+    ```
+    """
+    # Create the graph
+    workflow = StateGraph(PharosState)
+
+    # Add nodes
+    workflow.add_node("orchestrator", orchestrator_node)
+    workflow.add_node("product_design", product_design_node)
+    workflow.add_node("senior_engineer", senior_engineer_node)
+    workflow.add_node("the_auditor", the_auditor_node)
+
+    # Set entry point
+    workflow.set_entry_point("orchestrator")
+
+    # Add conditional edges
+    workflow.add_conditional_edges(
+        "orchestrator",
+        route_after_orchestrator,
+        {
+            "product_design": "product_design",
+            "senior_engineer": "senior_engineer",
+            "the_auditor": "the_auditor",
+            "end": END,
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "product_design",
+        route_after_product_design,
+        {
+            "senior_engineer": "senior_engineer",
+            "orchestrator": "orchestrator",
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "senior_engineer",
+        route_after_engineer,
+        {
+            "the_auditor": "the_auditor",
+            "orchestrator": "orchestrator",
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "the_auditor",
+        route_after_auditor,
+        {
+            "orchestrator": "orchestrator",
+            "end": END,
+        }
+    )
+
+    return workflow
+
+
+def compile_workflow():
+    """Compile the workflow with MongoDB checkpointing."""
+    workflow = create_workflow()
+    checkpointer = get_checkpointer()
+    return workflow.compile(checkpointer=checkpointer)
+
+
+async def run_ticket(
+    ticket_id: str,
+    title: str,
+    description: str,
+    feature_id: str | None = None,
+) -> PharosState:
+    """Run the PHAROS workflow for a ticket.
+
+    Args:
+        ticket_id: Unique ticket identifier
+        title: Ticket title
+        description: Ticket description
+        feature_id: Optional reference to features.json
+
+    Returns:
+        Final state after workflow completion
+    """
+    from .state import create_initial_state
+
+    # Create initial state
+    initial_state = create_initial_state(
+        ticket_id=ticket_id,
+        title=title,
+        description=description,
+        feature_id=feature_id,
+    )
+
+    # Compile and run
+    app = compile_workflow()
+
+    config = {
+        "configurable": {
+            "thread_id": ticket_id,
+        }
+    }
+
+    # Run the graph
+    final_state = None
+    async for state in app.astream(initial_state, config):
+        final_state = state
+        # Log progress
+        current_agent = state.get("current_agent", "unknown")
+        status = state.get("status", "unknown")
+        print(f"[{ticket_id}] Agent: {current_agent}, Status: {status}")
+
+    return final_state
+
+
+def resume_ticket(ticket_id: str) -> PharosState | None:
+    """Resume a ticket from its last checkpoint.
+
+    Args:
+        ticket_id: The ticket ID to resume
+
+    Returns:
+        The resumed state, or None if no checkpoint found
+    """
+    checkpointer = get_checkpointer()
+    config = {"configurable": {"thread_id": ticket_id}}
+
+    checkpoint = checkpointer.get(config)
+    if checkpoint:
+        return checkpoint.get("channel_values", {})
+    return None

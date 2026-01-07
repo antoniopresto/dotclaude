@@ -1,0 +1,292 @@
+import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  Button,
+  Card,
+  CardBody,
+  CardTitle,
+  TextInput,
+  Label,
+  Flex,
+  FlexItem,
+  Alert,
+  Stack,
+  StackItem,
+  Content,
+  Split,
+  SplitItem,
+} from "@patternfly/react-core";
+import { PlayIcon, StopIcon, TerminalIcon } from "@patternfly/react-icons";
+import { LogViewer } from "@patternfly/react-log-viewer";
+import {
+  isBackendAvailable,
+  ptySpawn,
+  ptyWrite,
+  ptyKill,
+  onPtyOutput,
+  onPtyExit,
+  ProcessInfo,
+} from "../lib/rpc";
+
+type UnlistenFn = () => void;
+
+interface TerminalPanelProps {
+  height?: number;
+  defaultCwd?: string;
+}
+
+export function TerminalPanel({
+  height = 300,
+  defaultCwd,
+}: TerminalPanelProps) {
+  const [processInfo, setProcessInfo] = useState<ProcessInfo | null>(null);
+  const [output, setOutput] = useState<string[]>([]);
+  const [input, setInput] = useState("");
+  const [status, setStatus] = useState<"idle" | "running" | "stopped">("idle");
+  const [backendAvailable, setBackendAvailable] = useState(false);
+  const [isChecking, setIsChecking] = useState(true);
+  const unlistenRef = useRef<UnlistenFn[]>([]);
+
+  useEffect(() => {
+    const checkBackend = async () => {
+      setIsChecking(true);
+      const available = await isBackendAvailable();
+      setBackendAvailable(available);
+      setIsChecking(false);
+    };
+
+    checkBackend();
+    const interval = setInterval(checkBackend, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!processInfo || !backendAvailable) return;
+
+    const setupListeners = async () => {
+      const unlistenOutput = await onPtyOutput((payload) => {
+        if (payload.id === processInfo.id) {
+          setOutput((prev) => [...prev, payload.data]);
+        }
+      });
+
+      const unlistenExit = await onPtyExit((payload) => {
+        if (payload.id === processInfo.id) {
+          setStatus("stopped");
+          setOutput((prev) => [
+            ...prev,
+            `\n[Process exited with code: ${payload.code ?? "unknown"}]\n`,
+          ]);
+        }
+      });
+
+      unlistenRef.current = [unlistenOutput, unlistenExit];
+    };
+
+    setupListeners();
+
+    return () => {
+      unlistenRef.current.forEach((unlisten) => unlisten());
+      unlistenRef.current = [];
+    };
+  }, [processInfo, backendAvailable]);
+
+  const handleSpawn = useCallback(async () => {
+    if (!backendAvailable) {
+      setOutput([
+        "Backend server not available. Please start the server first.",
+      ]);
+      return;
+    }
+
+    try {
+      const shell = navigator.userAgent.includes("Mac")
+        ? "/bin/zsh"
+        : "/bin/bash";
+      const cwd = defaultCwd || "~";
+
+      const info = await ptySpawn(shell, [], cwd, 24, 80);
+
+      setProcessInfo(info);
+      setOutput([
+        `[Shell started: ${info.cmd}]\n`,
+        `[Mode: Web Backend]\n`,
+      ]);
+      setStatus("running");
+    } catch (error) {
+      setOutput((prev) => [...prev, `[Error: ${error}]\n`]);
+    }
+  }, [defaultCwd, backendAvailable]);
+
+  const handleKill = useCallback(async () => {
+    if (!processInfo || !backendAvailable) return;
+
+    try {
+      await ptyKill(processInfo.id);
+      setStatus("stopped");
+    } catch (error) {
+      setOutput((prev) => [...prev, `[Kill error: ${error}]\n`]);
+    }
+  }, [processInfo, backendAvailable]);
+
+  const handleSend = useCallback(async () => {
+    if (!processInfo || !input.trim() || !backendAvailable) return;
+
+    try {
+      await ptyWrite(processInfo.id, input + "\n");
+      setInput("");
+    } catch (error) {
+      setOutput((prev) => [
+        ...prev,
+        `[Write error: ${error}]\n`,
+      ]);
+    }
+  }, [processInfo, input, backendAvailable]);
+
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent) => {
+      if (event.key === "Enter") {
+        handleSend();
+      }
+    },
+    [handleSend]
+  );
+
+  const logData = output.join("");
+
+  return (
+    <Card>
+      <CardTitle>
+        <Split hasGutter>
+          <SplitItem>
+            <Flex alignItems={{ default: "alignItemsCenter" }} spaceItems={{ default: "spaceItemsSm" }}>
+              <FlexItem><TerminalIcon /></FlexItem>
+              <FlexItem>Terminal (PTY)</FlexItem>
+            </Flex>
+          </SplitItem>
+          <SplitItem>
+            <Label color={backendAvailable ? "green" : "grey"}>
+              {isChecking ? "Checking..." : backendAvailable ? "Connected" : "Disconnected"}
+            </Label>
+          </SplitItem>
+          <SplitItem>
+            <Label
+              color={
+                status === "running"
+                  ? "green"
+                  : status === "stopped"
+                    ? "red"
+                    : "grey"
+              }
+            >
+              {status}
+            </Label>
+          </SplitItem>
+        </Split>
+      </CardTitle>
+      <CardBody>
+        <Stack hasGutter>
+          {/* Warning when no backend available */}
+          {!backendAvailable && !isChecking && (
+            <StackItem>
+              <Alert
+                variant="warning"
+                title="Backend Not Available"
+                isInline
+              >
+                PTY requires the backend server. Start it with:
+                <br />
+                <code>bun run server/index.ts</code>
+              </Alert>
+            </StackItem>
+          )}
+
+          {/* Connected info */}
+          {backendAvailable && (
+            <StackItem>
+              <Alert
+                variant="info"
+                title="Backend Connected"
+                isInline
+              >
+                Connected to web backend. PTY output is streamed over WebSocket.
+              </Alert>
+            </StackItem>
+          )}
+
+          {/* Output area using LogViewer */}
+          <StackItem>
+            {output.length > 0 ? (
+              <LogViewer
+                data={logData}
+                height={height}
+                isTextWrapped
+                hasLineNumbers={false}
+              />
+            ) : (
+              <Content component="p">
+                {backendAvailable
+                  ? 'Click "Start Shell" to spawn a PTY process...'
+                  : "Backend not available. Start the server first."}
+              </Content>
+            )}
+          </StackItem>
+
+          {/* Controls */}
+          <StackItem>
+            <Flex spaceItems={{ default: "spaceItemsSm" }}>
+              {status !== "running" ? (
+                <FlexItem>
+                  <Button
+                    variant="primary"
+                    onClick={handleSpawn}
+                    icon={<PlayIcon />}
+                    isDisabled={!backendAvailable}
+                  >
+                    Start Shell
+                  </Button>
+                </FlexItem>
+              ) : (
+                <>
+                  <FlexItem grow={{ default: "grow" }}>
+                    <TextInput
+                      value={input}
+                      onChange={(_e, val) => setInput(val)}
+                      onKeyDown={handleKeyDown}
+                      placeholder="Type command and press Enter..."
+                      aria-label="Command input"
+                    />
+                  </FlexItem>
+                  <FlexItem>
+                    <Button variant="secondary" onClick={handleSend}>
+                      Send
+                    </Button>
+                  </FlexItem>
+                  <FlexItem>
+                    <Button
+                      variant="danger"
+                      onClick={handleKill}
+                      icon={<StopIcon />}
+                    >
+                      Kill
+                    </Button>
+                  </FlexItem>
+                </>
+              )}
+            </Flex>
+          </StackItem>
+
+          {/* Process info */}
+          {processInfo && (
+            <StackItem>
+              <Content component="small">
+                <strong>Process ID:</strong> {processInfo.id} |{" "}
+                <strong>Size:</strong> {processInfo.cols}x{processInfo.rows} |{" "}
+                <strong>CWD:</strong> {processInfo.cwd}
+              </Content>
+            </StackItem>
+          )}
+        </Stack>
+      </CardBody>
+    </Card>
+  );
+}

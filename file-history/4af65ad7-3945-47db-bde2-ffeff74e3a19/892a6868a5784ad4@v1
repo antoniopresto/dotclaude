@@ -1,0 +1,189 @@
+/**
+ * RBushSpatialIndex - O(log n) spatial queries using R-tree
+ *
+ * DECK-COMPLETE-003: Implements efficient viewport culling for 60k+ tasks.
+ *
+ * Features:
+ * - Bulk load on startup (optimized tree construction)
+ * - Viewport queries with overscan margin
+ * - Returns task IDs for efficient layer filtering
+ *
+ * @see https://github.com/mourner/rbush
+ */
+
+import RBush from 'rbush';
+import type { TaskRender } from '../../data/types';
+import { DEFAULT_VIEW_CONFIG } from '../../data/types';
+
+const { pxPerDay, pxPerTrain } = DEFAULT_VIEW_CONFIG;
+
+// ─────────────────────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────────────────────
+
+/** RBush item with task ID and bounding box */
+interface SpatialItem {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  id: string;
+}
+
+/** Viewport bounds for queries */
+export interface ViewportBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+// ─────────────────────────────────────────────────────────────
+// SPATIAL INDEX CLASS
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * RBush-based spatial index for O(log n) viewport queries
+ */
+export class RBushSpatialIndex {
+  private tree: RBush<SpatialItem>;
+  private taskMap: Map<string, TaskRender>;
+
+  constructor() {
+    this.tree = new RBush<SpatialItem>();
+    this.taskMap = new Map();
+  }
+
+  /**
+   * Bulk load tasks into the spatial index
+   * Should be called once when data is loaded
+   *
+   * @param tasks - Array of tasks to index
+   */
+  bulkLoad(tasks: TaskRender[]): void {
+    // Clear existing data
+    this.tree.clear();
+    this.taskMap.clear();
+
+    // Convert tasks to spatial items
+    const items: SpatialItem[] = tasks.map((task) => {
+      // Store task in map for later retrieval
+      this.taskMap.set(task.id, task);
+
+      // Calculate bounding box in world coordinates
+      // X: startDay * pxPerDay
+      // Y: -trainIndex * pxPerTrain (negative because Y goes down)
+      const x = task.startDay * pxPerDay;
+      const y = -task.trainIndex * pxPerTrain;
+      const width = task.duration * pxPerDay;
+      const height = pxPerTrain;
+
+      return {
+        minX: x,
+        minY: y - height, // Y is negative, so minY is lower
+        maxX: x + width,
+        maxY: y,
+        id: task.id,
+      };
+    });
+
+    // Bulk load for optimized tree construction
+    this.tree.load(items);
+  }
+
+  /**
+   * Query tasks visible in the given viewport
+   *
+   * @param bounds - Viewport bounds in world coordinates
+   * @param overscan - Extra margin around viewport (default 100px)
+   * @returns Array of task IDs in the viewport
+   */
+  queryViewport(bounds: ViewportBounds, overscan: number = 100): string[] {
+    // Expand bounds by overscan to prevent pop-in
+    const query = {
+      minX: bounds.minX - overscan,
+      minY: bounds.minY - overscan,
+      maxX: bounds.maxX + overscan,
+      maxY: bounds.maxY + overscan,
+    };
+
+    // Query the R-tree
+    const results = this.tree.search(query);
+
+    // Return task IDs
+    return results.map((item) => item.id);
+  }
+
+  /**
+   * Get tasks by their IDs
+   *
+   * @param ids - Array of task IDs
+   * @returns Array of TaskRender objects
+   */
+  getTasksByIds(ids: string[]): TaskRender[] {
+    const tasks: TaskRender[] = [];
+    for (const id of ids) {
+      const task = this.taskMap.get(id);
+      if (task) {
+        tasks.push(task);
+      }
+    }
+    return tasks;
+  }
+
+  /**
+   * Get visible tasks for the viewport
+   * Combines queryViewport and getTasksByIds
+   *
+   * @param bounds - Viewport bounds in world coordinates
+   * @param overscan - Extra margin around viewport (default 100px)
+   * @returns Array of TaskRender objects in the viewport
+   */
+  getVisibleTasks(bounds: ViewportBounds, overscan: number = 100): TaskRender[] {
+    const ids = this.queryViewport(bounds, overscan);
+    return this.getTasksByIds(ids);
+  }
+
+  /**
+   * Get all tasks (for when spatial filtering is not needed)
+   */
+  getAllTasks(): TaskRender[] {
+    return Array.from(this.taskMap.values());
+  }
+
+  /**
+   * Get task count
+   */
+  get size(): number {
+    return this.taskMap.size;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SINGLETON INSTANCE
+// ─────────────────────────────────────────────────────────────
+
+/** Global spatial index instance */
+let spatialIndexInstance: RBushSpatialIndex | null = null;
+
+/**
+ * Get or create the spatial index singleton
+ */
+export function getSpatialIndex(): RBushSpatialIndex {
+  if (!spatialIndexInstance) {
+    spatialIndexInstance = new RBushSpatialIndex();
+  }
+  return spatialIndexInstance;
+}
+
+/**
+ * Initialize the spatial index with tasks
+ * Should be called once when the app loads data
+ */
+export function initializeSpatialIndex(tasks: TaskRender[]): RBushSpatialIndex {
+  const index = getSpatialIndex();
+  index.bulkLoad(tasks);
+  return index;
+}
+
+export default RBushSpatialIndex;

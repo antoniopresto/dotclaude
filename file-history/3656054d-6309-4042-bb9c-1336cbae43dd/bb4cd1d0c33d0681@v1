@@ -1,0 +1,450 @@
+/**
+ * BasicChecker: Programmatic Harness Validation
+ *
+ * Performs structural validation of a harness project without requiring AI.
+ * Checks that all required files exist and have valid content.
+ */
+
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+
+export interface CheckResult {
+  name: string;
+  passed: boolean;
+  message: string;
+  severity: 'error' | 'warning' | 'info';
+  fix?: string;
+}
+
+export interface BasicCheckerOptions {
+  /** Verbose output */
+  verbose?: boolean;
+}
+
+export class BasicChecker {
+  private projectPath: string;
+  private options: BasicCheckerOptions;
+
+  constructor(projectPath: string, options: BasicCheckerOptions = {}) {
+    this.projectPath = resolve(projectPath);
+    this.options = options;
+  }
+
+  /**
+   * Run all basic checks and return results
+   */
+  async runAllChecks(): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+
+    results.push(this.checkFeaturesJson());
+    results.push(this.checkProgressFile());
+    results.push(this.checkClaudeMd());
+    results.push(this.checkInitSh());
+    results.push(this.checkHooksDir());
+    results.push(this.checkGitRepo());
+    results.push(this.checkHarnessKb());
+
+    return results;
+  }
+
+  /**
+   * Check if features.json exists and is valid
+   */
+  checkFeaturesJson(): CheckResult {
+    const featuresPath = join(this.projectPath, 'features.json');
+
+    if (!existsSync(featuresPath)) {
+      return {
+        name: 'features.json',
+        passed: false,
+        message: 'features.json not found',
+        severity: 'error',
+        fix: 'Run "harness init" to create a harness structure',
+      };
+    }
+
+    try {
+      const content = readFileSync(featuresPath, 'utf-8');
+      const data = JSON.parse(content);
+
+      // Validate required fields
+      const errors: string[] = [];
+
+      if (!data.project || typeof data.project !== 'string') {
+        errors.push('missing or invalid "project" field');
+      }
+
+      if (!Array.isArray(data.features)) {
+        errors.push('missing or invalid "features" array');
+      } else {
+        // Validate each feature
+        for (let i = 0; i < data.features.length; i++) {
+          const f = data.features[i];
+          if (!f.id) errors.push(`feature[${i}] missing "id"`);
+          if (!f.description) errors.push(`feature[${i}] missing "description"`);
+          if (typeof f.passes !== 'boolean') errors.push(`feature[${i}] missing "passes" boolean`);
+          // blockedBy is optional, but if present should be string or array
+          if (f.blockedBy !== null && f.blockedBy !== undefined) {
+            if (typeof f.blockedBy !== 'string' && !Array.isArray(f.blockedBy)) {
+              errors.push(`feature[${i}] "blockedBy" should be string, array, or null`);
+            }
+          }
+        }
+      }
+
+      if (errors.length > 0) {
+        return {
+          name: 'features.json',
+          passed: false,
+          message: `Invalid structure: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? ` (+${errors.length - 3} more)` : ''}`,
+          severity: 'error',
+          fix: 'Fix the structure issues in features.json',
+        };
+      }
+
+      const completed = data.features.filter((f: { passes: boolean }) => f.passes).length;
+      const total = data.features.length;
+
+      return {
+        name: 'features.json',
+        passed: true,
+        message: `Valid with ${total} features (${completed} completed)`,
+        severity: 'info',
+      };
+    } catch (error: any) {
+      return {
+        name: 'features.json',
+        passed: false,
+        message: `Invalid JSON: ${error.message}`,
+        severity: 'error',
+        fix: 'Fix JSON syntax errors in features.json',
+      };
+    }
+  }
+
+  /**
+   * Check if progress file exists (claude-progress.txt or progress.txt)
+   */
+  checkProgressFile(): CheckResult {
+    const claudeProgressPath = join(this.projectPath, 'claude-progress.txt');
+    const progressPath = join(this.projectPath, 'progress.txt');
+
+    const claudeExists = existsSync(claudeProgressPath);
+    const progressExists = existsSync(progressPath);
+
+    if (!claudeExists && !progressExists) {
+      return {
+        name: 'Progress file',
+        passed: false,
+        message: 'No progress file found (claude-progress.txt or progress.txt)',
+        severity: 'error',
+        fix: 'Run "harness init" or "harness session" to create progress file',
+      };
+    }
+
+    const filePath = claudeExists ? claudeProgressPath : progressPath;
+    const fileName = claudeExists ? 'claude-progress.txt' : 'progress.txt';
+
+    try {
+      const content = readFileSync(filePath, 'utf-8');
+
+      // Count sessions (## Session N pattern)
+      const sessionMatches = content.match(/## Session \d+/g);
+      const sessionCount = sessionMatches ? sessionMatches.length : 0;
+
+      if (sessionCount === 0) {
+        return {
+          name: 'Progress file',
+          passed: true,
+          message: `${fileName} exists but no sessions logged yet`,
+          severity: 'warning',
+          fix: 'Add session entries using "harness session"',
+        };
+      }
+
+      return {
+        name: 'Progress file',
+        passed: true,
+        message: `${fileName} has ${sessionCount} session(s)`,
+        severity: 'info',
+      };
+    } catch (error: any) {
+      return {
+        name: 'Progress file',
+        passed: false,
+        message: `Error reading progress file: ${error.message}`,
+        severity: 'error',
+      };
+    }
+  }
+
+  /**
+   * Check if CLAUDE.md exists and contains required keywords
+   */
+  checkClaudeMd(): CheckResult {
+    const claudeMdPath = join(this.projectPath, 'CLAUDE.md');
+
+    if (!existsSync(claudeMdPath)) {
+      return {
+        name: 'CLAUDE.md',
+        passed: false,
+        message: 'CLAUDE.md not found',
+        severity: 'error',
+        fix: 'Run "harness init" to create CLAUDE.md with AI instructions',
+      };
+    }
+
+    try {
+      const content = readFileSync(claudeMdPath, 'utf-8').toLowerCase();
+
+      // Check for essential keywords
+      const requiredKeywords = ['harness', 'progress', 'features'];
+      const missingKeywords = requiredKeywords.filter(kw => !content.includes(kw));
+
+      if (missingKeywords.length > 0) {
+        return {
+          name: 'CLAUDE.md',
+          passed: true,
+          message: `CLAUDE.md exists but may be incomplete (missing: ${missingKeywords.join(', ')})`,
+          severity: 'warning',
+          fix: 'Ensure CLAUDE.md documents the harness protocol',
+        };
+      }
+
+      return {
+        name: 'CLAUDE.md',
+        passed: true,
+        message: 'CLAUDE.md exists with harness protocol documentation',
+        severity: 'info',
+      };
+    } catch (error: any) {
+      return {
+        name: 'CLAUDE.md',
+        passed: false,
+        message: `Error reading CLAUDE.md: ${error.message}`,
+        severity: 'error',
+      };
+    }
+  }
+
+  /**
+   * Check if init.sh exists (warning if missing, not error)
+   */
+  checkInitSh(): CheckResult {
+    const initShPath = join(this.projectPath, 'init.sh');
+
+    if (!existsSync(initShPath)) {
+      return {
+        name: 'init.sh',
+        passed: true,
+        message: 'init.sh not found (optional but recommended)',
+        severity: 'warning',
+        fix: 'Create init.sh to set up development environment',
+      };
+    }
+
+    try {
+      const stats = statSync(initShPath);
+      const isExecutable = (stats.mode & parseInt('111', 8)) !== 0;
+
+      if (!isExecutable) {
+        return {
+          name: 'init.sh',
+          passed: true,
+          message: 'init.sh exists but is not executable',
+          severity: 'warning',
+          fix: 'Run: chmod +x init.sh',
+        };
+      }
+
+      return {
+        name: 'init.sh',
+        passed: true,
+        message: 'init.sh exists and is executable',
+        severity: 'info',
+      };
+    } catch (error: any) {
+      return {
+        name: 'init.sh',
+        passed: false,
+        message: `Error checking init.sh: ${error.message}`,
+        severity: 'error',
+      };
+    }
+  }
+
+  /**
+   * Check if .claude/hooks/ directory exists with hook files
+   */
+  checkHooksDir(): CheckResult {
+    const claudeDir = join(this.projectPath, '.claude');
+    const hooksDir = join(claudeDir, 'hooks');
+    const settingsPath = join(claudeDir, 'settings.json');
+
+    // Check .claude directory
+    if (!existsSync(claudeDir)) {
+      return {
+        name: 'Hooks directory',
+        passed: false,
+        message: '.claude/ directory not found',
+        severity: 'error',
+        fix: 'Run "harness init" to create hooks structure',
+      };
+    }
+
+    // Check .claude/settings.json
+    const settingsExists = existsSync(settingsPath);
+
+    // Check hooks directory
+    if (!existsSync(hooksDir)) {
+      return {
+        name: 'Hooks directory',
+        passed: false,
+        message: '.claude/hooks/ directory not found',
+        severity: 'error',
+        fix: 'Run "harness init" to create hooks',
+      };
+    }
+
+    try {
+      const files = readdirSync(hooksDir);
+      const hookFiles = files.filter(f => f.endsWith('.sh') || f.endsWith('.py'));
+
+      if (hookFiles.length === 0) {
+        return {
+          name: 'Hooks directory',
+          passed: true,
+          message: '.claude/hooks/ exists but has no hook files',
+          severity: 'warning',
+          fix: 'Add hook scripts (.sh or .py) to .claude/hooks/',
+        };
+      }
+
+      const settingsNote = settingsExists ? '' : ' (settings.json missing)';
+
+      return {
+        name: 'Hooks directory',
+        passed: true,
+        message: `${hookFiles.length} hook file(s) found${settingsNote}`,
+        severity: settingsExists ? 'info' : 'warning',
+        fix: settingsExists ? undefined : 'Create .claude/settings.json to configure hooks',
+      };
+    } catch (error: any) {
+      return {
+        name: 'Hooks directory',
+        passed: false,
+        message: `Error reading hooks: ${error.message}`,
+        severity: 'error',
+      };
+    }
+  }
+
+  /**
+   * Check if .git directory exists
+   */
+  checkGitRepo(): CheckResult {
+    const gitDir = join(this.projectPath, '.git');
+
+    if (!existsSync(gitDir)) {
+      return {
+        name: 'Git repository',
+        passed: false,
+        message: '.git/ directory not found - not a git repository',
+        severity: 'error',
+        fix: 'Run: git init',
+      };
+    }
+
+    return {
+      name: 'Git repository',
+      passed: true,
+      message: 'Git repository initialized',
+      severity: 'info',
+    };
+  }
+
+  /**
+   * Check if .harness/kb/ knowledge base exists (info only)
+   */
+  checkHarnessKb(): CheckResult {
+    const harnessDir = join(this.projectPath, '.harness');
+    const kbDir = join(harnessDir, 'kb');
+
+    if (!existsSync(harnessDir)) {
+      return {
+        name: 'Knowledge base',
+        passed: true,
+        message: '.harness/ directory not found (optional for AI checks)',
+        severity: 'info',
+        fix: 'Run "harness doctor --setup-kb" to create knowledge base',
+      };
+    }
+
+    if (!existsSync(kbDir)) {
+      return {
+        name: 'Knowledge base',
+        passed: true,
+        message: '.harness/kb/ not found (required for AI validation)',
+        severity: 'info',
+        fix: 'Run "harness doctor --setup-kb" to create knowledge base',
+      };
+    }
+
+    try {
+      const files = readdirSync(kbDir);
+      const xmlFiles = files.filter(f => f.endsWith('.xml'));
+      const manifestExists = files.includes('manifest.json');
+
+      if (xmlFiles.length === 0) {
+        return {
+          name: 'Knowledge base',
+          passed: true,
+          message: '.harness/kb/ exists but has no knowledge files',
+          severity: 'info',
+          fix: 'Run "harness doctor --setup-kb" to populate knowledge base',
+        };
+      }
+
+      return {
+        name: 'Knowledge base',
+        passed: true,
+        message: `${xmlFiles.length} knowledge file(s)${manifestExists ? '' : ' (missing manifest.json)'}`,
+        severity: 'info',
+      };
+    } catch (error: any) {
+      return {
+        name: 'Knowledge base',
+        passed: true,
+        message: `Error reading knowledge base: ${error.message}`,
+        severity: 'info',
+      };
+    }
+  }
+
+  /**
+   * Get a summary of all check results
+   */
+  static summarize(results: CheckResult[]): {
+    total: number;
+    passed: number;
+    failed: number;
+    errors: number;
+    warnings: number;
+    healthy: boolean;
+  } {
+    const total = results.length;
+    const passed = results.filter(r => r.passed).length;
+    const failed = results.filter(r => !r.passed).length;
+    const errors = results.filter(r => r.severity === 'error' && !r.passed).length;
+    const warnings = results.filter(r => r.severity === 'warning').length;
+
+    return {
+      total,
+      passed,
+      failed,
+      errors,
+      warnings,
+      healthy: errors === 0,
+    };
+  }
+}

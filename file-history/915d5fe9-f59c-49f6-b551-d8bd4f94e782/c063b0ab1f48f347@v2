@@ -1,0 +1,208 @@
+import { Merge, RenameKeys } from '../../helpers/type-utils';
+
+// common types
+import {
+  AnyMachineSlice,
+  CombineSlicesContext,
+  CombineSlicesState,
+  MachineMetadata,
+  MachineMiddleware,
+  MachineSelectors,
+  MachineSlices,
+  MachineState,
+  MachineUserID,
+  SliceContext,
+  SliceToActionCreators,
+  SliceToActionTypes,
+  StringTypes,
+  UnknownAction,
+  WithMetadataParam,
+  WithSelectorsState,
+} from './commons';
+
+// slice types
+import { FlatRecordRecords } from '../../helpers/object-utils';
+import { Cache } from '../cache';
+import { Store } from '../store';
+import { MachineHook, MachineUseSelector } from './hooks';
+import { AnyAction } from './slice';
+
+export type PartialContext<Context = SliceContext> = Omit<
+  Partial<Context>,
+  'userID'
+> & {
+  userID: MachineUserID;
+};
+
+/**
+ * Represents the final, read-only state machine definition.
+ */
+export type StateMachine<
+  Slices extends MachineSlices,
+  BaseState extends CombineSlicesState<Slices>,
+  Selectors extends MachineSelectors<BaseState>,
+  Context extends CombineSlicesContext<Slices>,
+  ID extends string,
+  State = WithSelectorsState<BaseState, Selectors>,
+> = WithAliases<
+  ID,
+  {
+    /** The unique identifier of the state machine. */
+    ID: ID;
+    /** A React hook to access and interact with the machine's state and actions. */
+    useMachine: MachineHook<Slices, Selectors>;
+    /** A React hook to access the machine's state. */
+    useSelector: MachineUseSelector<State>;
+    /** The root reducer function created from slices. */
+    reducer(state: BaseState | undefined, action: UnknownAction): State;
+    /** Subscribe */
+    subscribe: Store.Subscription<State>;
+    /** Get current machine state */
+    getState(): WithUserID<State>;
+    /** Dispatch actions  **/
+    dispatch(action: AnyAction): void;
+    getContext(): Context;
+    /** The global runtime context available to all slices. */
+    provideContext(context: PartialContext<Context>): void;
+    /** A nested object containing all action creators, organized by slice. */
+    actions: {
+      -readonly [K in keyof Slices]: SliceToActionCreators<Slices[K]>;
+    };
+    /** A nested object containing all action type strings, organized by slice. */
+    actionTypes: {
+      -readonly [K in keyof Slices]: SliceToActionTypes<ID, Slices[K]>;
+    };
+    /** The initial state. */
+    getInitialState(): State;
+    /** A list of information generated from slices and available for adapters. */
+    mappedSlices: MachineSliceInfo[];
+    /** The used configuration */
+    config: MachineConfig<Slices, BaseState, Selectors, Context, ID>;
+    /** Reset machine initial state **/
+    reset(): never;
+    /**
+     * Cache invalidations or null.
+     * May contain information about the stale data picked from cache to be updated.
+     * May be null if there is no cache invalidations.
+     * **/
+    invalidations: Cache.StateInvalidationsReport | null;
+  }
+>;
+
+export type CreateMachine = <
+  const Slices extends MachineSlices,
+  const Selectors extends MachineSelectors<CombineSlicesState<Slices>>,
+  const State extends CombineSlicesState<Slices>,
+  const Context extends CombineSlicesContext<Slices>,
+  const ID extends string,
+>(
+  config: MachineConfig<Slices, State, Selectors, Context, ID>,
+) => StateMachine<Slices, State, Selectors, Context, ID>;
+
+export type MachineSliceInfo<
+  Key extends string = StringTypes.SliceKey,
+  Slice extends AnyMachineSlice = AnyMachineSlice,
+  ID extends string = string,
+> = {
+  sliceKey: Key;
+  slice: Slice;
+  actionPrefix: `@${ID}/${Slice['id']}` | (string & {});
+};
+
+// Add dynamically generated fields for a given machine
+export type WithAliases<
+  ID extends string,
+  Machine extends {
+    actionTypes: {};
+    actions: {};
+  },
+> = Machine &
+  RenameKeys<
+    Merge<
+      Machine,
+      {
+        actionTypes: FlatRecordRecords<ID, Machine['actionTypes']>;
+        actions: FlatRecordRecords<ID, Machine['actions']>;
+      }
+    >,
+    | `reducer as ${ID}Reducer`
+    | `actionTypes as ${ID}ActionTypes`
+    | `actions as ${ID}Actions`
+    | `useMachine as use${Capitalize<ID>}`
+    | `useSelector as use${Capitalize<ID>}Selector`
+  >;
+
+export type MachineStoreMiddlewareAPI<State = MachineState> = {
+  getState(): State;
+  dispatch(action: any): any;
+};
+
+export type WithUserID<ContextBase> = ContextBase & {
+  userID: MachineUserID;
+};
+
+/**
+ * Defines the main configuration object for a state machine.
+ */
+export type MachineConfig<
+  Slices extends { [K: string]: AnyMachineSlice },
+  State,
+  Selectors extends MachineSelectors<State>,
+  Context extends CombineSlicesContext<Slices>,
+  ID extends string,
+> = {
+  /** A unique identifier for the entire state machine. */
+  id: ID;
+  /** Optional overrides for the initial state of slices, e.g., for hydration. */
+  initial?: WithMetadataParam<Partial<State>>;
+  /** Optional overrides for the runtime context available to all slices. */
+  context?: PartialContext<Context>;
+  /** A record of all slices that compose the machine's state. */
+  slices: Slices;
+  /** A record of selector functions to compute derived state. */
+  selectors?: Selectors;
+  /** Middleware api to customize machine **/
+  middleware?: MachineMiddleware[];
+  /** App Session ID. Defaults to the value of GLOBAL_APP_SESSION_ID **/
+  sessionID?: string;
+  /**
+   * FIX-004/FIX-011: Whether to track metadata on each dispatch.
+   * Set to false for high-frequency machines (game loops, 60fps updates)
+   * to avoid GC thrashing from object allocation. Default: true
+   */
+  trackMetadata?: boolean;
+};
+
+/**
+ * Represents the structure of action
+ */
+export type MachineAction<ActionPayload extends any = unknown> = {
+  type: string;
+  payload?: ActionPayload;
+};
+
+export const METADATA_FIELD_NAME = `~metadata`;
+
+export type METADATA_FIELD_NAME = typeof METADATA_FIELD_NAME;
+
+export type RuntimeActionCreator = ((
+  payload: unknown,
+  context: unknown,
+) => MachineAction) & {
+  type: StringTypes.ActionType;
+  info: MachineSliceInfo;
+  sliceReducerName: StringTypes.SliceReducerName;
+};
+
+export type UpsertMetadataOperation = {
+  override: Partial<MachineMetadata>;
+  state: MachineState;
+} & (
+  | {
+      op: 'create';
+    }
+  | {
+      op: 'update';
+      originActionType: string;
+    }
+);

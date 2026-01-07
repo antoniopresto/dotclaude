@@ -1,0 +1,417 @@
+# WebGL Performance Patterns for High-Density Planning Systems
+
+Reference for building CAD/Google Earth-style applications in the browser with 50k+ objects.
+
+Source: Expert patterns for systems like Figma, Google Maps, professional CAD tools.
+
+---
+
+## 1. GPU Data Patterns
+
+### Data Textures (State as Texture)
+
+**What:** Encode object state (color, status, conflict) in a `DataTexture` instead of CPU loops.
+
+**Why:** Updating 50k object colors via CPU = 50k operations. Uploading a 256x256 texture = 1 operation.
+
+**How:**
+```javascript
+// Create texture once
+const data = new Uint8Array(width * height * 4); // RGBA
+const texture = new DataTexture(data, width, height, RGBAFormat);
+
+// Update state (CPU)
+data[index * 4 + 0] = red;
+data[index * 4 + 1] = green;
+texture.needsUpdate = true;
+
+// Read in shader (GPU)
+vec4 state = texture2D(uStateTexture, vec2(instanceId / width, 0.0));
+```
+
+**Trigger:** When you have >1000 objects that need state updates per frame.
+
+**Already in project:** MacroLayer heatmap uses this pattern.
+
+---
+
+### Struct of Arrays (SoA) vs Array of Structs (AoS)
+
+**What:** Store data in parallel typed arrays instead of object arrays.
+
+**Why:**
+- Cache-friendly memory access
+- Direct upload to GPU buffers
+- No GC pressure from object allocation
+
+**Example:**
+```javascript
+// AoS (bad for GPU)
+const tasks = [{ id: 1, x: 10, y: 20 }, { id: 2, x: 15, y: 25 }];
+
+// SoA (GPU-friendly)
+const ids = new Uint32Array([1, 2]);
+const positions = new Float32Array([10, 20, 15, 25]); // x1,y1,x2,y2
+```
+
+**Trigger:** When JSON parsing or array operations become bottleneck (profile first).
+
+**Note:** Adds complexity. Only use when measured performance requires it.
+
+---
+
+## 2. Picking & Interaction
+
+### Math-Based Picking (O(1) vs Raycaster O(N))
+
+**What:** For grid-based layouts (Gantt, timeline), calculate hit directly from mouse position.
+
+**Why:** Three.js Raycaster checks every object. Math is instant.
+
+**How:**
+```javascript
+// For time-based grid
+const day = Math.floor((mouseX / zoom) + offsetX) / DAY_WIDTH;
+const train = Math.floor((mouseY / zoom) + offsetY) / ROW_HEIGHT;
+const taskId = lookupGrid[train][day]; // O(1)
+```
+
+**Trigger:** When hover/click feels sluggish with many objects.
+
+**Already in project:** MesoLayer uses Spatial Hash Grid for this.
+
+---
+
+### Spatial Hash Grid
+
+**What:** Divide space into cells, store object references per cell.
+
+**How:**
+```javascript
+const cellSize = 50; // pixels
+const grid = new Map();
+
+function addToGrid(obj) {
+  const key = `${Math.floor(obj.x / cellSize)}_${Math.floor(obj.y / cellSize)}`;
+  if (!grid.has(key)) grid.set(key, []);
+  grid.get(key).push(obj);
+}
+
+function queryPoint(x, y) {
+  const key = `${Math.floor(x / cellSize)}_${Math.floor(y / cellSize)}`;
+  return grid.get(key) || [];
+}
+```
+
+**Trigger:** When you need fast spatial queries (hover detection, collision).
+
+---
+
+### Pointer Events Layering
+
+**What:** Control which layer receives mouse events.
+
+**Why:** HTML overlays steal events from canvas underneath.
+
+**How:**
+```css
+.overlay-container { pointer-events: none; }
+.overlay-container .clickable-card { pointer-events: auto; }
+```
+
+**Trigger:** When clicks don't reach the canvas, or tooltips block interaction.
+
+---
+
+## 3. LOD (Level of Detail) Transitions
+
+### Hysteresis (Dead Zone)
+
+**What:** Use different thresholds for entering vs leaving a LOD level.
+
+**Why:** Without it, user zooming near threshold causes flickering.
+
+**How:**
+```javascript
+// Bad: flickers at exactly 0.5
+const lod = zoom > 0.5 ? 'meso' : 'macro';
+
+// Good: stable transition
+let currentLod = 'macro';
+if (currentLod === 'macro' && zoom > 0.55) currentLod = 'meso';
+if (currentLod === 'meso' && zoom < 0.45) currentLod = 'macro';
+```
+
+**Trigger:** Implement from the start when building LOD systems.
+
+---
+
+### Opacity Crossfade
+
+**What:** Fade between LOD layers instead of hard switch.
+
+**How:**
+```javascript
+const t = smoothstep(0.45, 0.55, zoom);
+macroLayer.opacity = 1 - t;
+mesoLayer.opacity = t;
+```
+
+**Trigger:** When LOD transitions feel jarring.
+
+---
+
+## 4. React + WebGL Performance
+
+### React-Free Zone
+
+**What:** Bypass React for 60fps operations.
+
+**Why:** useState triggers re-render. At 60fps = 60 re-renders/second = death.
+
+**How:**
+```javascript
+// Bad: React re-renders 60x/sec
+const [position, setPosition] = useState({ x: 0, y: 0 });
+useFrame(() => setPosition({ x: mouse.x, y: mouse.y }));
+
+// Good: Direct mutation, no re-render
+const positionRef = useRef({ x: 0, y: 0 });
+useFrame(() => {
+  positionRef.current.x = mouse.x;
+  mesh.current.position.x = positionRef.current.x;
+});
+```
+
+**Trigger:** Any animation or continuous interaction (drag, pan, zoom, hover highlight).
+
+---
+
+### Object Pooling (GC Avoidance)
+
+**What:** Reuse objects instead of creating new ones in hot paths.
+
+**Why:** `new Vector3()` in useFrame = 60 allocations/sec = GC stutters.
+
+**How:**
+```javascript
+// Bad: creates garbage
+useFrame(() => {
+  const temp = new Vector3(x, y, z);
+  mesh.position.copy(temp);
+});
+
+// Good: reuse
+const temp = useMemo(() => new Vector3(), []);
+useFrame(() => {
+  temp.set(x, y, z);
+  mesh.position.copy(temp);
+});
+```
+
+**Trigger:** Any code inside useFrame, event handlers, or animation loops.
+
+---
+
+## 5. Numerical Precision
+
+### Local Coordinates
+
+**What:** Subtract a global offset from large numbers before sending to GPU.
+
+**Why:** Float32 has ~7 digits precision. Unix timestamp (1700000000000) overflows.
+
+**How:**
+```javascript
+const EPOCH = new Date('2024-01-01').getTime();
+
+// CPU: convert to local
+const localTime = (task.timestamp - EPOCH) / MS_PER_DAY; // small number
+
+// Send to shader
+uniforms.uTime.value = localTime;
+```
+
+**Trigger:** When objects wobble or disappear at high zoom. When using timestamps in shaders.
+
+---
+
+### Z-Fighting Prevention
+
+**What:** Add micro-offset to Z position for overlapping planes.
+
+**Why:** Same Z + depth buffer = flickering.
+
+**How:**
+```javascript
+// In 2D orthographic view
+mesh.position.z = layerIndex * 0.001;
+// or
+mesh.renderOrder = layerIndex;
+```
+
+**Trigger:** When overlapping elements flicker.
+
+---
+
+## 6. Loading & Data
+
+### Progressive Loading
+
+**What:** Load visible data first, fetch more on demand.
+
+**Why:** 10 years of detailed data = huge payload. User sees 1 month at a time.
+
+**Pattern:**
+```
+1. Load viewport + buffer (current view ± 20%)
+2. On pan/zoom, fetch missing chunks
+3. Macro view = aggregated data (small)
+4. Micro view = detailed data (load on demand)
+```
+
+**Trigger:** When initial load is slow or payload > 1MB.
+
+---
+
+### Virtualización Lógica
+
+**What:** Only process visible data range, not entire dataset.
+
+**How:**
+```javascript
+const visibleStart = Math.floor(cameraX / DAY_WIDTH);
+const visibleEnd = Math.ceil((cameraX + viewportWidth) / DAY_WIDTH);
+
+// Only iterate visible range
+for (let i = visibleStart; i < visibleEnd; i++) {
+  renderTask(tasks[i]);
+}
+```
+
+**Trigger:** When you have 10+ years of data but show weeks at a time.
+
+---
+
+## 7. Debugging Tools
+
+### stats.gl
+
+**What:** Performance monitor showing FPS, draw calls, triangles, GPU memory.
+
+**Why:** stats.js only shows FPS. You need to know WHY it's slow.
+
+**Install:** `npm install stats.gl`
+
+---
+
+### Spector.js
+
+**What:** Chrome extension that captures WebGL frames.
+
+**Why:** Shows exactly what GPU drew, shader by shader. Essential for "why is this invisible?" bugs.
+
+**Install:** Chrome Web Store → Spector.js
+
+---
+
+### Leva
+
+**What:** Runtime GUI for tweaking values.
+
+**Why:** Change colors, thresholds, sizes without code reload.
+
+**Use:** During development, expose magic numbers as Leva controls.
+
+---
+
+### Debug Render Mode
+
+**What:** Alternate coloring that shows render cost or instance index.
+
+**Why:** Visually identifies objects being rendered that shouldn't be (offscreen, hidden).
+
+**How:**
+```javascript
+// Toggle with Alt+D
+if (debugMode) {
+  color = instanceIndex / totalInstances; // gradient by index
+  // or
+  color = isOffscreen ? RED : GREEN;
+}
+```
+
+**Trigger:** When FPS is low but you don't know what's causing it.
+
+---
+
+## 8. UX Patterns
+
+### Ghost Drag
+
+**What:** Show semi-transparent copy during drag, keep original in place.
+
+**Why:** User sees immediate feedback + can cancel safely.
+
+**Trigger:** When implementing drag-and-drop for task rescheduling.
+
+---
+
+### Scroll Sync (Canvas as Source)
+
+**What:** WebGL camera position drives HTML sidebar scroll, not vice versa.
+
+**Why:** Canvas animation is smoother. HTML following canvas = smooth. Canvas following HTML = janky.
+
+**How:**
+```javascript
+// In animation loop
+sidebarElement.style.transform = `translateY(${-cameraY * PX_PER_TRAIN}px)`;
+```
+
+**Already in project:** Implemented in TrainList.tsx
+
+---
+
+## 9. Shader Patterns
+
+### Shader Warm-up
+
+**What:** Force shader compilation before user interaction.
+
+**Why:** First render with new shader = compilation jank (freeze).
+
+**How:**
+```javascript
+// Before showing UI
+renderer.compile(scene, camera);
+// or render one invisible frame
+```
+
+**Trigger:** When first interaction causes visible freeze.
+
+---
+
+### Discard vs Alpha
+
+**What:** In fragment shader, `discard` vs `alpha = 0.0`.
+
+**Why:** `discard` removes from depth buffer (good for holes). Alpha keeps in buffer.
+
+**Trigger:** When transparent objects behave unexpectedly with depth.
+
+---
+
+## Quick Reference: When to Apply
+
+| Symptom | Pattern to Apply |
+|---------|------------------|
+| Slow state updates (color changes) | Data Textures |
+| Slow hover/click detection | Math Picking / Spatial Hash |
+| LOD transition flickers | Hysteresis + Crossfade |
+| Animation stutters | React-Free Zone + Object Pooling |
+| Objects wobble at high zoom | Local Coordinates |
+| Overlapping elements flicker | Z-Fighting prevention |
+| Initial load slow | Progressive Loading |
+| FPS low, unknown cause | Debug Render Mode + stats.gl |
+| Clicks not reaching canvas | Pointer Events layering |

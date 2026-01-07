@@ -1,0 +1,213 @@
+/**
+ * useCulledInstances - Hook for viewport-based instance culling
+ *
+ * This hook optimizes InstancedMesh rendering by:
+ * 1. Querying a spatial index for visible items
+ * 2. Reordering instances so visible ones are at the front
+ * 3. Returning the visible count to set on mesh.count
+ *
+ * The key insight is that Three.js InstancedMesh renders instances
+ * 0 to mesh.count-1. By placing visible instances at the front
+ * and setting count to the visible count, we skip hidden instances.
+ *
+ * Performance characteristics:
+ * - Query: O(log n) with R-tree, O(n) with SimpleSpatialIndex
+ * - Reorder: O(visible) - only moves pointers, not data
+ * - Memory: O(n) for the lookup map
+ *
+ * Usage in MesoLayer:
+ * ```tsx
+ * const { visibleTasks, visibleCount } = useCulledInstances(tasks, viewportBounds, spatialIndex);
+ * // Use visibleTasks for matrix/color setup
+ * // Set mesh.count = visibleCount
+ * ```
+ *
+ * @see PERF-002 Phase 2
+ */
+
+import { useMemo, useRef } from 'react';
+import type { TaskRender } from '../data/types';
+import type { ViewportBounds, ISpatialIndex } from '../spatial';
+
+/**
+ * Result of culling operation
+ */
+export interface CulledInstancesResult {
+  /**
+   * Tasks reordered with visible tasks at the front.
+   * The first `visibleCount` items are visible.
+   */
+  orderedTasks: TaskRender[];
+
+  /**
+   * Number of visible tasks (set this as mesh.count)
+   */
+  visibleCount: number;
+
+  /**
+   * Map from task ID to its index in orderedTasks.
+   * Useful for hover/selection highlighting.
+   */
+  taskIndexMap: Map<string, number>;
+
+  /**
+   * Set of visible task IDs for quick lookup
+   */
+  visibleIds: Set<string>;
+}
+
+/**
+ * Hook for viewport-based instance culling.
+ *
+ * @param tasks - All tasks to potentially render
+ * @param viewportBounds - Current viewport in world coordinates (null = show all)
+ * @param spatialIndex - Spatial index to query (null = no culling)
+ * @param padding - Extra padding around viewport (world units)
+ * @returns Culled and reordered tasks with visibility info
+ */
+export function useCulledInstances(
+  tasks: TaskRender[],
+  viewportBounds: ViewportBounds | null,
+  spatialIndex: ISpatialIndex | null,
+  padding: number = 50
+): CulledInstancesResult {
+  // Keep track of previous visible set for stable reordering
+  const previousVisibleRef = useRef<Set<string>>(new Set());
+
+  return useMemo(() => {
+    // If no bounds or no index, show all tasks in original order
+    if (!viewportBounds || !spatialIndex) {
+      const taskIndexMap = new Map<string, number>();
+      tasks.forEach((task, i) => taskIndexMap.set(task.id, i));
+
+      return {
+        orderedTasks: tasks,
+        visibleCount: tasks.length,
+        taskIndexMap,
+        visibleIds: new Set(tasks.map((t) => t.id)),
+      };
+    }
+
+    // Expand viewport bounds by padding
+    const paddedBounds: ViewportBounds = {
+      minX: viewportBounds.minX - padding,
+      maxX: viewportBounds.maxX + padding,
+      minY: viewportBounds.minY - padding,
+      maxY: viewportBounds.maxY + padding,
+    };
+
+    // Query spatial index for visible task IDs
+    const visibleIds = new Set(spatialIndex.queryViewport(paddedBounds));
+
+    // If all visible, return original order
+    if (visibleIds.size === tasks.length) {
+      const taskIndexMap = new Map<string, number>();
+      tasks.forEach((task, i) => taskIndexMap.set(task.id, i));
+
+      return {
+        orderedTasks: tasks,
+        visibleCount: tasks.length,
+        taskIndexMap,
+        visibleIds,
+      };
+    }
+
+    // Partition tasks: visible first, then hidden
+    const visible: TaskRender[] = [];
+    const hidden: TaskRender[] = [];
+
+    for (const task of tasks) {
+      if (visibleIds.has(task.id)) {
+        visible.push(task);
+      } else {
+        hidden.push(task);
+      }
+    }
+
+    // Combine: visible tasks at front
+    const orderedTasks = [...visible, ...hidden];
+
+    // Build index map
+    const taskIndexMap = new Map<string, number>();
+    orderedTasks.forEach((task, i) => taskIndexMap.set(task.id, i));
+
+    // Update previous visible set
+    previousVisibleRef.current = visibleIds;
+
+    return {
+      orderedTasks,
+      visibleCount: visible.length,
+      taskIndexMap,
+      visibleIds,
+    };
+  }, [tasks, viewportBounds, spatialIndex, padding]);
+}
+
+/**
+ * Helper to calculate viewport bounds from camera state.
+ *
+ * @param cameraX - Camera X position (center)
+ * @param cameraY - Camera Y position (center)
+ * @param zoom - Current zoom level
+ * @param canvasWidth - Canvas width in pixels
+ * @param canvasHeight - Canvas height in pixels
+ * @returns ViewportBounds in world coordinates
+ */
+export function calculateViewportBounds(
+  cameraX: number,
+  cameraY: number,
+  zoom: number,
+  canvasWidth: number,
+  canvasHeight: number
+): ViewportBounds {
+  // Half viewport dimensions in world units
+  const halfWidth = canvasWidth / 2 / zoom;
+  const halfHeight = canvasHeight / 2 / zoom;
+
+  return {
+    minX: cameraX - halfWidth,
+    maxX: cameraX + halfWidth,
+    minY: cameraY - halfHeight,
+    maxY: cameraY + halfHeight,
+  };
+}
+
+/**
+ * Create a stable reference to viewport bounds that only changes
+ * when the bounds actually change significantly.
+ *
+ * This prevents unnecessary re-queries when camera moves slightly.
+ *
+ * @param bounds - Current bounds
+ * @param threshold - Minimum change to trigger update (world units)
+ */
+export function useStableViewportBounds(
+  bounds: ViewportBounds | null,
+  threshold: number = 10
+): ViewportBounds | null {
+  const stableRef = useRef<ViewportBounds | null>(null);
+
+  return useMemo(() => {
+    if (!bounds) {
+      stableRef.current = null;
+      return null;
+    }
+
+    const prev = stableRef.current;
+    if (!prev) {
+      stableRef.current = bounds;
+      return bounds;
+    }
+
+    // Check if bounds changed significantly
+    const deltaX = Math.abs(bounds.minX - prev.minX) + Math.abs(bounds.maxX - prev.maxX);
+    const deltaY = Math.abs(bounds.minY - prev.minY) + Math.abs(bounds.maxY - prev.maxY);
+
+    if (deltaX > threshold || deltaY > threshold) {
+      stableRef.current = bounds;
+      return bounds;
+    }
+
+    return prev;
+  }, [bounds, threshold]);
+}

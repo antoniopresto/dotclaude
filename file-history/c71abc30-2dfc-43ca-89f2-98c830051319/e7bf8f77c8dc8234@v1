@@ -1,0 +1,311 @@
+"""PHAROS CLI - Command Line Interface.
+
+Usage:
+    pharos ticket create "Title" "Description"
+    pharos ticket process TKT-2025-0001
+    pharos ticket status TKT-2025-0001
+    pharos ticket list
+    pharos db init
+    pharos db status
+"""
+
+import asyncio
+from datetime import datetime
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich import print as rprint
+
+import sys
+sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
+
+app = typer.Typer(
+    name="pharos",
+    help="PHAROS Multi-Agent Quality Framework",
+    add_completion=False,
+)
+
+console = Console()
+
+
+# === Ticket Commands ===
+
+ticket_app = typer.Typer(help="Ticket management commands")
+app.add_typer(ticket_app, name="ticket")
+
+
+@ticket_app.command("create")
+def ticket_create(
+    title: str = typer.Argument(..., help="Ticket title"),
+    description: str = typer.Argument(..., help="Ticket description"),
+    feature_id: Optional[str] = typer.Option(None, "--feature", "-f", help="Feature ID from features.json"),
+):
+    """Create a new ticket."""
+    from src.db import TicketRepository, Ticket, TicketStatus
+
+    ticket_id = TicketRepository.get_next_ticket_id()
+
+    ticket = Ticket(
+        ticket_id=ticket_id,
+        feature_id=feature_id,
+        title=title,
+        description=description,
+        status=TicketStatus.DRAFT,
+    )
+
+    TicketRepository.create(ticket)
+
+    rprint(Panel(
+        f"[green]Ticket created successfully![/green]\n\n"
+        f"[bold]ID:[/bold] {ticket_id}\n"
+        f"[bold]Title:[/bold] {title}\n"
+        f"[bold]Status:[/bold] {ticket.status.value}",
+        title="New Ticket",
+    ))
+
+    rprint(f"\nRun [bold cyan]pharos ticket process {ticket_id}[/bold cyan] to start the workflow.")
+
+
+@ticket_app.command("process")
+def ticket_process(
+    ticket_id: str = typer.Argument(..., help="Ticket ID to process"),
+):
+    """Process a ticket through the PHAROS workflow."""
+    from src.db import TicketRepository
+    from src.graph.workflow import run_ticket
+    from src.graph.state import create_initial_state
+
+    # Get ticket from database
+    ticket = TicketRepository.get(ticket_id)
+
+    if not ticket:
+        rprint(f"[red]Error:[/red] Ticket {ticket_id} not found")
+        raise typer.Exit(1)
+
+    rprint(Panel(
+        f"[bold]Processing ticket:[/bold] {ticket_id}\n"
+        f"[bold]Title:[/bold] {ticket.title}\n"
+        f"[bold]Current Status:[/bold] {ticket.status.value}",
+        title="PHAROS Workflow",
+    ))
+
+    rprint("\n[yellow]Starting workflow...[/yellow]\n")
+
+    # Run the workflow
+    try:
+        final_state = asyncio.run(run_ticket(
+            ticket_id=ticket.ticket_id,
+            title=ticket.title,
+            description=ticket.description,
+            feature_id=ticket.feature_id,
+        ))
+
+        # Update ticket in database
+        ticket.status = final_state.get("status", ticket.status)
+        ticket.visual_spec = final_state.get("visual_spec")
+        ticket.technical_spec = final_state.get("technical_spec")
+        ticket.audit_result = final_state.get("audit")
+        TicketRepository.update(ticket)
+
+        # Show result
+        if final_state.get("approved"):
+            rprint(Panel(
+                f"[green bold]APPROVED[/green bold]\n\n"
+                f"Ticket {ticket_id} has passed all quality gates.",
+                title="Workflow Complete",
+                border_style="green",
+            ))
+        else:
+            rejection_reasons = final_state.get("rejection_reasons", [])
+            reasons_text = "\n".join(f"- {r}" for r in rejection_reasons)
+            rprint(Panel(
+                f"[red bold]REJECTED[/red bold]\n\n"
+                f"Ticket {ticket_id} failed quality gates:\n{reasons_text}",
+                title="Workflow Complete",
+                border_style="red",
+            ))
+
+    except Exception as e:
+        rprint(f"[red]Error during workflow:[/red] {str(e)}")
+        raise typer.Exit(1)
+
+
+@ticket_app.command("status")
+def ticket_status(
+    ticket_id: str = typer.Argument(..., help="Ticket ID"),
+):
+    """Show ticket status and details."""
+    from src.db import TicketRepository
+
+    ticket = TicketRepository.get(ticket_id)
+
+    if not ticket:
+        rprint(f"[red]Error:[/red] Ticket {ticket_id} not found")
+        raise typer.Exit(1)
+
+    # Status color
+    status_colors = {
+        "draft": "white",
+        "spec_pending": "yellow",
+        "spec_ready": "cyan",
+        "in_progress": "blue",
+        "review_pending": "magenta",
+        "approved": "green",
+        "rejected": "red",
+        "merged": "green",
+    }
+    color = status_colors.get(ticket.status.value, "white")
+
+    # Build details
+    details = [
+        f"[bold]ID:[/bold] {ticket.ticket_id}",
+        f"[bold]Title:[/bold] {ticket.title}",
+        f"[bold]Status:[/bold] [{color}]{ticket.status.value}[/{color}]",
+        f"[bold]Created:[/bold] {ticket.created_at}",
+        f"[bold]Updated:[/bold] {ticket.updated_at}",
+    ]
+
+    if ticket.feature_id:
+        details.append(f"[bold]Feature:[/bold] {ticket.feature_id}")
+
+    if ticket.retry_count > 0:
+        details.append(f"[bold]Retries:[/bold] {ticket.retry_count}/{ticket.max_retries}")
+
+    rprint(Panel("\n".join(details), title=f"Ticket {ticket_id}"))
+
+    # Gates table
+    if ticket.gates:
+        table = Table(title="Quality Gates")
+        table.add_column("Gate", style="cyan")
+        table.add_column("Status")
+        table.add_column("Feedback")
+
+        for gate_name, gate in ticket.gates.items():
+            status = gate.status.value if hasattr(gate.status, 'value') else str(gate.status)
+            gate_color = "green" if status == "approved" else "red" if status == "rejected" else "yellow"
+            table.add_row(
+                gate_name,
+                f"[{gate_color}]{status}[/{gate_color}]",
+                (gate.feedback or "")[:50],
+            )
+
+        rprint(table)
+
+
+@ticket_app.command("list")
+def ticket_list(
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by status"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max tickets to show"),
+):
+    """List tickets."""
+    from src.db import TicketRepository, TicketStatus
+
+    if status:
+        try:
+            status_enum = TicketStatus(status)
+            tickets = TicketRepository.list_by_status(status_enum, limit=limit)
+        except ValueError:
+            rprint(f"[red]Invalid status:[/red] {status}")
+            rprint(f"Valid statuses: {', '.join(s.value for s in TicketStatus)}")
+            raise typer.Exit(1)
+    else:
+        # Get all by listing each status
+        tickets = []
+        for s in TicketStatus:
+            tickets.extend(TicketRepository.list_by_status(s, limit=limit))
+        tickets = sorted(tickets, key=lambda t: t.created_at, reverse=True)[:limit]
+
+    if not tickets:
+        rprint("[yellow]No tickets found.[/yellow]")
+        return
+
+    table = Table(title="Tickets")
+    table.add_column("ID", style="cyan")
+    table.add_column("Title")
+    table.add_column("Status")
+    table.add_column("Created")
+
+    status_colors = {
+        "draft": "white",
+        "spec_pending": "yellow",
+        "spec_ready": "cyan",
+        "in_progress": "blue",
+        "review_pending": "magenta",
+        "approved": "green",
+        "rejected": "red",
+        "merged": "green",
+    }
+
+    for ticket in tickets:
+        status_val = ticket.status.value if hasattr(ticket.status, 'value') else str(ticket.status)
+        color = status_colors.get(status_val, "white")
+        created = ticket.created_at.strftime("%Y-%m-%d %H:%M") if isinstance(ticket.created_at, datetime) else str(ticket.created_at)[:16]
+
+        table.add_row(
+            ticket.ticket_id,
+            ticket.title[:40],
+            f"[{color}]{status_val}[/{color}]",
+            created,
+        )
+
+    rprint(table)
+
+
+# === Database Commands ===
+
+db_app = typer.Typer(help="Database management commands")
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("init")
+def db_init():
+    """Initialize database with indexes."""
+    from src.db.mongo import init_database
+
+    rprint("[yellow]Initializing database...[/yellow]")
+    init_database()
+    rprint("[green]Database initialized successfully![/green]")
+
+
+@db_app.command("status")
+def db_status():
+    """Check database connection status."""
+    from src.db.mongo import check_connection
+
+    result = check_connection()
+
+    if result["status"] == "connected":
+        rprint(Panel(
+            f"[green]Connected[/green]\n\n"
+            f"[bold]Database:[/bold] {result['database']}\n"
+            f"[bold]Collections:[/bold] {', '.join(result['collections']) or 'none'}",
+            title="MongoDB Status",
+        ))
+    else:
+        rprint(Panel(
+            f"[red]Error[/red]\n\n{result.get('error', 'Unknown error')}",
+            title="MongoDB Status",
+            border_style="red",
+        ))
+
+
+# === Main Entry Point ===
+
+@app.callback()
+def main():
+    """PHAROS - Multi-Agent Quality Framework.
+
+    A LangGraph-based system with 4 specialized agents:
+    - PRODUCT_DESIGN: Defines WHAT (spec, wording, visual rules)
+    - SENIOR_ENGINEER: Defines HOW and implements
+    - THE_AUDITOR: Verifies (visual, performance, QA)
+    - ORCHESTRATOR: Coordinates and routes
+    """
+    pass
+
+
+if __name__ == "__main__":
+    app()

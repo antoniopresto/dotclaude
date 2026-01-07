@@ -1,0 +1,313 @@
+use parking_lot::Mutex;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::thread;
+use tauri::{AppHandle, Emitter, Runtime};
+use uuid::Uuid;
+
+/// Process info returned to frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub id: String,
+    pub cmd: String,
+    pub cwd: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub running: bool,
+}
+
+/// Output event emitted to frontend
+#[derive(Debug, Clone, Serialize)]
+pub struct PtyOutput {
+    pub id: String,
+    pub data: String,
+}
+
+/// Exit event emitted to frontend
+#[derive(Debug, Clone, Serialize)]
+pub struct PtyExit {
+    pub id: String,
+    pub code: Option<i32>,
+}
+
+/// Internal process state
+struct PtyProcess {
+    info: ProcessInfo,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+/// Global PTY manager
+pub struct PtyManager {
+    processes: Mutex<HashMap<String, PtyProcess>>,
+}
+
+impl Default for PtyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PtyManager {
+    pub fn new() -> Self {
+        Self {
+            processes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Spawn a new PTY process
+    pub fn spawn<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        cmd: String,
+        args: Vec<String>,
+        cwd: String,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ProcessInfo, String> {
+        let pty_system = native_pty_system();
+
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        let pair = pty_system
+            .openpty(size)
+            .map_err(|e| format!("Failed to open pty: {}", e))?;
+
+        let mut cmd_builder = CommandBuilder::new(&cmd);
+        for arg in &args {
+            cmd_builder.arg(arg);
+        }
+        cmd_builder.cwd(&cwd);
+
+        let child = pair
+            .slave
+            .spawn_command(cmd_builder)
+            .map_err(|e| format!("Failed to spawn command: {}", e))?;
+
+        let id = Uuid::new_v4().to_string();
+
+        let info = ProcessInfo {
+            id: id.clone(),
+            cmd: cmd.clone(),
+            cwd: cwd.clone(),
+            rows,
+            cols,
+            running: true,
+        };
+
+        // Get reader for streaming output
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| format!("Failed to clone reader: {}", e))?;
+
+        // Get writer for sending input
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| format!("Failed to take writer: {}", e))?;
+
+        // Store process
+        let process = PtyProcess {
+            info: info.clone(),
+            writer,
+            master: pair.master,
+            child,
+        };
+        self.processes.lock().insert(id.clone(), process);
+
+        // Spawn reader thread
+        let process_id = id.clone();
+        let app_handle = app.clone();
+        thread::spawn(move || {
+            Self::read_output(reader, process_id, app_handle);
+        });
+
+        Ok(info)
+    }
+
+    /// Read PTY output and emit events
+    fn read_output<R: Runtime>(
+        mut reader: Box<dyn Read + Send>,
+        process_id: String,
+        app: AppHandle<R>,
+    ) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    // EOF - process ended
+                    let _ = app.emit(
+                        "pty-exit",
+                        PtyExit {
+                            id: process_id.clone(),
+                            code: None,
+                        },
+                    );
+                    break;
+                }
+                Ok(n) => {
+                    // Convert to string (lossy for binary data)
+                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = app.emit(
+                        "pty-output",
+                        PtyOutput {
+                            id: process_id.clone(),
+                            data,
+                        },
+                    );
+                }
+                Err(e) => {
+                    eprintln!("PTY read error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Write data to PTY (send keystrokes)
+    pub fn write(&self, id: &str, data: &str) -> Result<(), String> {
+        let mut processes = self.processes.lock();
+        let process = processes
+            .get_mut(id)
+            .ok_or_else(|| format!("Process not found: {}", id))?;
+
+        process
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|e| format!("Write error: {}", e))?;
+
+        process
+            .writer
+            .flush()
+            .map_err(|e| format!("Flush error: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Resize PTY terminal
+    pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), String> {
+        let mut processes = self.processes.lock();
+        let process = processes
+            .get_mut(id)
+            .ok_or_else(|| format!("Process not found: {}", id))?;
+
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        process
+            .master
+            .resize(size)
+            .map_err(|e| format!("Resize error: {}", e))?;
+
+        process.info.rows = rows;
+        process.info.cols = cols;
+
+        Ok(())
+    }
+
+    /// Kill a PTY process
+    pub fn kill(&self, id: &str) -> Result<(), String> {
+        let mut processes = self.processes.lock();
+        let process = processes
+            .get_mut(id)
+            .ok_or_else(|| format!("Process not found: {}", id))?;
+
+        process
+            .child
+            .kill()
+            .map_err(|e| format!("Kill error: {}", e))?;
+
+        process.info.running = false;
+
+        Ok(())
+    }
+
+    /// Get process info
+    pub fn get(&self, id: &str) -> Option<ProcessInfo> {
+        self.processes.lock().get(id).map(|p| p.info.clone())
+    }
+
+    /// List all processes
+    pub fn list(&self) -> Vec<ProcessInfo> {
+        self.processes
+            .lock()
+            .values()
+            .map(|p| p.info.clone())
+            .collect()
+    }
+
+    /// Remove a terminated process
+    #[allow(dead_code)]
+    pub fn remove(&self, id: &str) -> Option<ProcessInfo> {
+        self.processes.lock().remove(id).map(|p| p.info)
+    }
+}
+
+// Tauri commands
+
+#[tauri::command]
+pub async fn pty_spawn<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, Arc<PtyManager>>,
+    cmd: String,
+    args: Vec<String>,
+    cwd: String,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<ProcessInfo, String> {
+    state.spawn(&app, cmd, args, cwd, rows.unwrap_or(24), cols.unwrap_or(80))
+}
+
+#[tauri::command]
+pub async fn pty_write(
+    state: tauri::State<'_, Arc<PtyManager>>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
+    state.write(&id, &data)
+}
+
+#[tauri::command]
+pub async fn pty_resize(
+    state: tauri::State<'_, Arc<PtyManager>>,
+    id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    state.resize(&id, rows, cols)
+}
+
+#[tauri::command]
+pub async fn pty_kill(
+    state: tauri::State<'_, Arc<PtyManager>>,
+    id: String,
+) -> Result<(), String> {
+    state.kill(&id)
+}
+
+#[tauri::command]
+pub async fn pty_list(state: tauri::State<'_, Arc<PtyManager>>) -> Result<Vec<ProcessInfo>, String> {
+    Ok(state.list())
+}
+
+#[tauri::command]
+pub async fn pty_get(
+    state: tauri::State<'_, Arc<PtyManager>>,
+    id: String,
+) -> Result<Option<ProcessInfo>, String> {
+    Ok(state.get(&id))
+}

@@ -1,0 +1,261 @@
+import { getViewportState, viewportStore } from '../store/viewportStore';
+
+/**
+ * Virtual Scroller with physics-based inertia and momentum.
+ *
+ * Replaces native DOM scrolling to overcome browser coordinate limits (~33M pixels).
+ * Provides smooth 60fps scrolling with momentum decay.
+ */
+
+interface ScrollerState {
+  /** Is the user currently dragging? */
+  isDragging: boolean;
+  /** Last pointer position during drag */
+  lastPointerX: number;
+  lastPointerY: number;
+  /** Current velocity (pixels per ms) */
+  velocityX: number;
+  velocityY: number;
+  /** Animation frame ID */
+  rafId: number | null;
+  /** Last frame timestamp */
+  lastFrameTime: number;
+}
+
+const state: ScrollerState = {
+  isDragging: false,
+  lastPointerX: 0,
+  lastPointerY: 0,
+  velocityX: 0,
+  velocityY: 0,
+  rafId: null,
+  lastFrameTime: 0,
+};
+
+/** Friction coefficient (velocity multiplier per frame at 60fps) */
+const FRICTION = 0.95;
+
+/** Minimum velocity before stopping (px/ms) */
+const MIN_VELOCITY = 0.001;
+
+/** Zoom sensitivity (scale change per wheel delta) */
+const ZOOM_SENSITIVITY = 0.001;
+
+/** Pan sensitivity for touch/mouse */
+const PAN_SENSITIVITY = 1.0;
+
+/**
+ * Handle wheel events for zooming and panning.
+ */
+export function handleWheel(event: WheelEvent): void {
+  event.preventDefault();
+
+  if (event.ctrlKey || event.metaKey) {
+    // Zoom with Ctrl/Cmd + wheel
+    const zoomFactor = 1 - event.deltaY * ZOOM_SENSITIVITY;
+    const rect = (event.target as HTMLElement).getBoundingClientRect();
+    const centerX = event.clientX - rect.left;
+    const centerY = event.clientY - rect.top;
+    viewportStore.getState().zoom(zoomFactor, centerX, centerY);
+  } else {
+    // Pan with regular wheel
+    viewportStore.getState().pan(-event.deltaX * PAN_SENSITIVITY, -event.deltaY * PAN_SENSITIVITY);
+  }
+}
+
+/**
+ * Start drag operation.
+ */
+export function handlePointerDown(event: PointerEvent): void {
+  state.isDragging = true;
+  state.lastPointerX = event.clientX;
+  state.lastPointerY = event.clientY;
+  state.velocityX = 0;
+  state.velocityY = 0;
+
+  // Stop any ongoing momentum animation
+  if (state.rafId !== null) {
+    cancelAnimationFrame(state.rafId);
+    state.rafId = null;
+  }
+
+  // Capture pointer for reliable tracking
+  (event.target as HTMLElement).setPointerCapture(event.pointerId);
+}
+
+/**
+ * Handle drag movement.
+ */
+export function handlePointerMove(event: PointerEvent): void {
+  if (!state.isDragging) return;
+
+  const deltaX = event.clientX - state.lastPointerX;
+  const deltaY = event.clientY - state.lastPointerY;
+
+  // Apply pan immediately
+  viewportStore.getState().pan(deltaX, deltaY);
+
+  // Calculate velocity for momentum
+  const now = performance.now();
+  const dt = now - state.lastFrameTime;
+  if (dt > 0) {
+    // Smooth velocity calculation (exponential moving average)
+    const alpha = 0.3;
+    state.velocityX = alpha * (deltaX / dt) + (1 - alpha) * state.velocityX;
+    state.velocityY = alpha * (deltaY / dt) + (1 - alpha) * state.velocityY;
+  }
+
+  state.lastPointerX = event.clientX;
+  state.lastPointerY = event.clientY;
+  state.lastFrameTime = now;
+}
+
+/**
+ * End drag and start momentum scrolling.
+ */
+export function handlePointerUp(event: PointerEvent): void {
+  if (!state.isDragging) return;
+
+  state.isDragging = false;
+  (event.target as HTMLElement).releasePointerCapture(event.pointerId);
+
+  // Start momentum animation if velocity is significant
+  if (Math.abs(state.velocityX) > MIN_VELOCITY || Math.abs(state.velocityY) > MIN_VELOCITY) {
+    state.lastFrameTime = performance.now();
+    startMomentum();
+  }
+}
+
+/**
+ * Momentum animation loop.
+ */
+function startMomentum(): void {
+  function tick(now: number): void {
+    const dt = now - state.lastFrameTime;
+    state.lastFrameTime = now;
+
+    // Apply velocity
+    const dx = state.velocityX * dt;
+    const dy = state.velocityY * dt;
+    viewportStore.getState().pan(dx, dy);
+
+    // Apply friction (frame-rate independent)
+    const frictionFactor = Math.pow(FRICTION, dt / 16.67);
+    state.velocityX *= frictionFactor;
+    state.velocityY *= frictionFactor;
+
+    // Continue animation if velocity is significant
+    if (Math.abs(state.velocityX) > MIN_VELOCITY || Math.abs(state.velocityY) > MIN_VELOCITY) {
+      state.rafId = requestAnimationFrame(tick);
+    } else {
+      state.rafId = null;
+      state.velocityX = 0;
+      state.velocityY = 0;
+    }
+  }
+
+  state.rafId = requestAnimationFrame(tick);
+}
+
+/**
+ * Programmatic scroll to a specific time with animation.
+ */
+export function scrollToTime(targetTime: number, durationMs: number = 500): void {
+  const viewport = getViewportState();
+  const { originTime, scale, offsetX, width } = viewport;
+
+  // Calculate target offset to center the time in viewport
+  const targetX = (targetTime - originTime) * scale;
+  const targetOffsetX = width / 2 - targetX;
+  const startOffsetX = offsetX;
+  const deltaOffset = targetOffsetX - startOffsetX;
+
+  const startTime = performance.now();
+
+  function animate(now: number): void {
+    const elapsed = now - startTime;
+    const progress = Math.min(1, elapsed / durationMs);
+
+    // Ease out cubic
+    const eased = 1 - Math.pow(1 - progress, 3);
+
+    const newOffset = startOffsetX + deltaOffset * eased;
+    viewportStore.getState().setOffset(newOffset, viewport.offsetY);
+
+    if (progress < 1) {
+      requestAnimationFrame(animate);
+    }
+  }
+
+  requestAnimationFrame(animate);
+}
+
+/**
+ * Programmatic zoom to a specific scale centered on a point.
+ */
+export function zoomToScale(
+  targetScale: number,
+  centerX: number,
+  centerY: number,
+  durationMs: number = 300
+): void {
+  const startScale = getViewportState().scale;
+  const startTime = performance.now();
+
+  function animate(now: number): void {
+    const elapsed = now - startTime;
+    const progress = Math.min(1, elapsed / durationMs);
+
+    // Ease out cubic
+    const eased = 1 - Math.pow(1 - progress, 3);
+
+    // Interpolate scale logarithmically for smoother zoom
+    const logStart = Math.log(startScale);
+    const logTarget = Math.log(targetScale);
+    const newScale = Math.exp(logStart + (logTarget - logStart) * eased);
+
+    const factor = newScale / getViewportState().scale;
+    viewportStore.getState().zoom(factor, centerX, centerY);
+
+    if (progress < 1) {
+      requestAnimationFrame(animate);
+    }
+  }
+
+  requestAnimationFrame(animate);
+}
+
+/**
+ * Attach all event listeners to a container element.
+ */
+export function attachScrollerEvents(container: HTMLElement): () => void {
+  container.addEventListener('wheel', handleWheel, { passive: false });
+  container.addEventListener('pointerdown', handlePointerDown);
+  container.addEventListener('pointermove', handlePointerMove);
+  container.addEventListener('pointerup', handlePointerUp);
+  container.addEventListener('pointercancel', handlePointerUp);
+
+  // Prevent context menu on long press
+  container.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // Return cleanup function
+  return () => {
+    container.removeEventListener('wheel', handleWheel);
+    container.removeEventListener('pointerdown', handlePointerDown);
+    container.removeEventListener('pointermove', handlePointerMove);
+    container.removeEventListener('pointerup', handlePointerUp);
+    container.removeEventListener('pointercancel', handlePointerUp);
+
+    if (state.rafId !== null) {
+      cancelAnimationFrame(state.rafId);
+      state.rafId = null;
+    }
+  };
+}
+
+/**
+ * Get current scroll state for debugging.
+ */
+export function getScrollerState(): Readonly<ScrollerState> {
+  return { ...state };
+}

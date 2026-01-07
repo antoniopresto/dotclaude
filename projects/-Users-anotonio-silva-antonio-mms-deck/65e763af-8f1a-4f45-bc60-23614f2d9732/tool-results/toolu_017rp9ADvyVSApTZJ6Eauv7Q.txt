@@ -1,0 +1,621 @@
+     1→# Viewport Culling & Massive Data Rendering Research
+     2→
+     3→> Research document for MMS Canvas optimization
+     4→> Last updated: 2025-12-17
+     5→
+     6→## Executive Summary
+     7→
+     8→This document consolidates research on best practices for rendering massive datasets in WebGL, with specific focus on:
+     9→
+    10→1. **Viewport Culling** - Only render/process entities visible in current viewport
+    11→2. **Spatial Indexing** - O(log n) queries instead of O(n) iteration
+    12→3. **Memory Management** - Eliminate GC pauses via TypedArrays and Object Pooling
+    13→4. **Draw Call Optimization** - Minimize GPU state changes
+    14→
+    15→**Key Finding from PDF Research:** The primary bottleneck in WebGL applications on mobile is **Garbage Collection**, not rendering. Traditional React patterns (useState, Proxy-based stores) are inadequate for 60fps updates.
+    16→
+    17→---
+    18→
+    19→## Table of Contents
+    20→
+    21→1. [Current State Analysis](#current-state-analysis)
+    22→2. [Three.js InstancedMesh Culling](#threejs-instancedmesh-culling)
+    23→3. [Spatial Indexing with RBush](#spatial-indexing-with-rbush)
+    24→4. [Deck.gl Techniques](#deckgl-techniques)
+    25→5. [Figma Architecture Insights](#figma-architecture-insights)
+    26→6. [Memory Management](#memory-management)
+    27→7. [Proposed Architecture](#proposed-architecture)
+    28→8. [Implementation Phases](#implementation-phases)
+    29→9. [References](#references)
+    30→
+    31→---
+    32→
+    33→## Current State Analysis
+    34→
+    35→### What We Have
+    36→
+    37→| Component | Current Implementation | Limitation |
+    38→|-----------|----------------------|------------|
+    39→| **MesoLayer** | InstancedMesh with 60k instances | No per-instance culling - all instances sent to GPU |
+    40→| **MacroLayer** | InstancedMesh heatmap cells | Same limitation |
+    41→| **MicroLayer** | HTML overlay + frustum filter | Has `filterVisibleTasks()` but iterates O(n) |
+    42→| **Data Storage** | JavaScript objects (AoS pattern) | GC pressure, poor cache locality |
+    43→| **Spatial Queries** | Linear search O(n) | Slow viewport queries |
+    44→
+    45→### The Problem
+    46→
+    47→```
+    48→Current Flow:
+    49→┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+    50→│  All 60k    │───▶│  All sent   │───▶│  GPU culls  │
+    51→│  tasks      │    │  to GPU     │    │  fragments  │
+    52→└─────────────┘    └─────────────┘    └─────────────┘
+    53→
+    54→Even if only 100 tasks are visible, we:
+    55→1. Iterate 60k tasks in JavaScript (CPU)
+    56→2. Upload 60k instances to GPU (bandwidth)
+    57→3. GPU processes all vertex shaders (GPU compute)
+    58→4. GPU only then culls fragments (wasted work)
+    59→```
+    60→
+    61→### Target State
+    62→
+    63→```
+    64→Optimized Flow:
+    65→┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+    66→│  Viewport   │───▶│  R-tree     │───▶│  ~500 tasks │
+    67→│  bounds     │    │  query O(log n)│ │  to GPU     │
+    68→└─────────────┘    └─────────────┘    └─────────────┘
+    69→
+    70→With viewport culling:
+    71→1. Query R-tree for visible tasks (~4ms for 1000 results)
+    72→2. Update only visible instances
+    73→3. Set InstancedMesh.count to visible count
+    74→4. Minimal GPU work
+    75→```
+    76→
+    77→---
+    78→
+    79→## Three.js InstancedMesh Culling
+    80→
+    81→### Native Three.js Limitation
+    82→
+    83→From [Three.js Forum Discussion](https://discourse.threejs.org/t/how-to-do-frustum-culling-with-instancedmesh/22633):
+    84→
+    85→> "In native object mode, meshes are removed by the view frustum culling step in the Three.js render pipeline and never sent to the GPU. In instanced mode, however, all the meshes are sent to the GPU."
+    86→
+    87→### Solution 1: InstancedMesh2 Library
+    88→
+    89→The [@three.ez/instanced-mesh](https://www.npmjs.com/package/@three.ez/instanced-mesh) library provides:
+    90→
+    91→- **Per-instance frustum culling** - skip rendering for out-of-view instances
+    92→- **Object3D-like instances** - use instances like Object3D with transforms
+    93→- **Dynamic capacity** - add or remove instances seamlessly
+    94→- **BVH spatial indexing** - O(log n) frustum culling
+    95→
+    96→```typescript
+    97→// Example usage
+    98→import { InstancedMesh2 } from '@three.ez/instanced-mesh';
+    99→
+   100→const mesh = new InstancedMesh2(geometry, material, {
+   101→  capacity: 60000,
+   102→  behavior: 'dynamic',
+   103→  // Enable BVH for fast culling
+   104→  createBVH: true,
+   105→});
+   106→
+   107→// In render loop - culling happens automatically
+   108→mesh.updateCulling(camera);
+   109→```
+   110→
+   111→### Solution 2: Manual Culling with Count Manipulation
+   112→
+   113→From [VR Me Up Blog](https://vrmeup.com/devlog/devlog_10_threejs_instancedmesh_performance_optimizations.html):
+   114→
+   115→> "Allocate space for a maximum number of instances when creating the Instanced Mesh but set the count to only render the number of instances that are visible. On each frame, iterate over the instances and move the visible ones to the front of the instance array."
+   116→
+   117→```typescript
+   118→// Pseudocode for manual culling
+   119→function updateVisibleInstances(camera: Camera, tasks: Task[], mesh: InstancedMesh) {
+   120→  const frustum = new Frustum().setFromProjectionMatrix(
+   121→    new Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+   122→  );
+   123→
+   124→  let visibleCount = 0;
+   125→  const tempMatrix = new Matrix4();
+   126→  const tempPosition = new Vector3();
+   127→
+   128→  for (let i = 0; i < tasks.length; i++) {
+   129→    const task = tasks[i];
+   130→    tempPosition.set(task.x, task.y, 0);
+   131→
+   132→    if (frustum.containsPoint(tempPosition)) {
+   133→      // Move visible instance to front of array
+   134→      mesh.getMatrixAt(i, tempMatrix);
+   135→      mesh.setMatrixAt(visibleCount, tempMatrix);
+   136→      visibleCount++;
+   137→    }
+   138→  }
+   139→
+   140→  mesh.count = visibleCount;
+   141→  mesh.instanceMatrix.needsUpdate = true;
+   142→}
+   143→```
+   144→
+   145→### Solution 3: BatchedMesh (Three.js r159+)
+   146→
+   147→From Three.js core:
+   148→
+   149→- Supports **different geometries** batched together
+   150→- **Per-instance frustum culling** built-in
+   151→- Uses WebGL `multi_draw` extension for single draw call
+   152→
+   153→```typescript
+   154→// BatchedMesh is newer and has native culling
+   155→const batchedMesh = new BatchedMesh(maxInstanceCount, maxVertexCount, maxIndexCount);
+   156→
+   157→// Individual items can be culled
+   158→batchedMesh.setVisibleAt(index, false); // Hide specific instance
+   159→```
+   160→
+   161→### Recommendation for MMS
+   162→
+   163→| Approach | Pros | Cons | Recommended |
+   164→|----------|------|------|-------------|
+   165→| InstancedMesh2 | Full-featured, BVH | External dependency | ✅ Best for complex scenes |
+   166→| Manual culling | No dependencies | More code, requires R-tree | ✅ Good for our case |
+   167→| BatchedMesh | Native, mixed geometry | Newer API, less docs | ⚠️ Future consideration |
+   168→
+   169→**Recommendation:** Implement manual culling with RBush spatial index. This integrates well with STATE-ARCH-001 architecture.
+   170→
+   171→---
+   172→
+   173→## Spatial Indexing with RBush
+   174→
+   175→### RBush Overview
+   176→
+   177→From [RBush GitHub](https://github.com/mourner/rbush):
+   178→
+   179→> "RBush is a high-performance JavaScript library for 2D spatial indexing of points and rectangles. It's based on an optimized R-tree data structure with bulk insertion support."
+   180→
+   181→### Performance Characteristics
+   182→
+   183→| Operation | Time Complexity | Benchmark |
+   184→|-----------|-----------------|-----------|
+   185→| Bulk load 1M items | O(n log n) | ~1600ms |
+   186→| Single insert | O(log n) | <1ms |
+   187→| Viewport query (1000 results) | O(log n + k) | ~4ms |
+   188→| Remove | O(log n) | <1ms |
+   189→
+   190→### Configuration
+   191→
+   192→```typescript
+   193→import RBush from 'rbush';
+   194→
+   195→interface TaskBBox {
+   196→  minX: number;  // startDay
+   197→  minY: number;  // trainIndex
+   198→  maxX: number;  // startDay + duration
+   199→  maxY: number;  // trainIndex + 1
+   200→  taskId: string;
+   201→}
+   202→
+   203→// Node size 9 is default - good balance
+   204→// Higher = faster insert, slower query
+   205→// Lower = slower insert, faster query
+   206→const taskIndex = new RBush<TaskBBox>(9);
+   207→
+   208→// Bulk load is 2-3x faster than individual inserts
+   209→taskIndex.load(tasks.map(toTaskBBox));
+   210→
+   211→// Viewport query
+   212→const visibleTasks = taskIndex.search({
+   213→  minX: viewportBounds.minX,
+   214→  minY: viewportBounds.minY,
+   215→  maxX: viewportBounds.maxX,
+   216→  maxY: viewportBounds.maxY,
+   217→});
+   218→```
+   219→
+   220→### Flatbush Alternative
+   221→
+   222→For **static data** (tasks don't change frequently), [Flatbush](https://github.com/mourner/flatbush) is 5-8x faster:
+   223→
+   224→```typescript
+   225→import Flatbush from 'flatbush';
+   226→
+   227→// Create index (bulk-only, no dynamic updates)
+   228→const index = new Flatbush(tasks.length);
+   229→
+   230→for (const task of tasks) {
+   231→  index.add(task.minX, task.minY, task.maxX, task.maxY);
+   232→}
+   233→
+   234→index.finish();
+   235→
+   236→// Query returns indices, not items
+   237→const resultIndices = index.search(minX, minY, maxX, maxY);
+   238→const visibleTasks = resultIndices.map(i => tasks[i]);
+   239→```
+   240→
+   241→### Recommendation for MMS
+   242→
+   243→| Scenario | Library | Rationale |
+   244→|----------|---------|-----------|
+   245→| Demo/MVP | RBush | Supports dynamic updates |
+   246→| Production with static data | Flatbush | 5-8x faster queries |
+   247→| Future: editing | RBush | CRUD operations supported |
+   248→
+   249→**Recommendation:** Start with **RBush** for flexibility. Migrate to **Flatbush** if data is predominantly static.
+   250→
+   251→---
+   252→
+   253→## Deck.gl Techniques
+   254→
+   255→### Performance Benchmarks
+   256→
+   257→From [deck.gl Performance Guide](https://deck.gl/docs/developer-guide/performance):
+   258→
+   259→> "Most basic layers (like ScatterplotLayer) render fluidly at 60 FPS during pan and zoom operations up to about 1M (one million) data items, with framerates dropping into low double digits (10-20FPS) when the data sets approach 10M items."
+   260→
+   261→### Frustum Culling Implementation
+   262→
+   263→From [deck.gl Layer Culling RFC](https://github.com/visgl/deck.gl/blob/master/dev-docs/RFCs/proposals/layer-culling-rfc.md):
+   264→
+   265→> "When moving in first-person view inside big point clouds, the idea is to only render things within the current view frustum. This can lead to substantial performance increase, often 3-4x depending on direction of view."
+   266→
+   267→### Key Techniques
+   268→
+   269→1. **GPU Aggregation**
+   270→   - Move aggregation from CPU to GPU
+   271→   - Up to 12x speedup for 4.5M points
+   272→
+   273→2. **Binary Data Formats**
+   274→   - Use TypedArrays for data transfer
+   275→   - Avoid JavaScript object overhead
+   276→
+   277→3. **Layer Filtering**
+   278→   - Filter layers by viewport before rendering
+   279→   - Skip completely occluded layers
+   280→
+   281→4. **Data Chunking**
+   282→   - Break large datasets into chunks
+   283→   - Chrome caps allocations at 1GB
+   284→   - Multiple layers for 10M+ items
+   285→
+   286→### Applicable to MMS
+   287→
+   288→| Technique | Applicability | Priority |
+   289→|-----------|--------------|----------|
+   290→| Viewport culling | High | P0 |
+   291→| GPU aggregation | Medium (for MacroLayer heatmap) | P2 |
+   292→| TypedArrays | High (STATE-ARCH-001) | P0 |
+   293→| Data chunking | Low (60k is manageable) | P3 |
+   294→
+   295→---
+   296→
+   297→## Figma Architecture Insights
+   298→
+   299→### Key Architecture Decisions
+   300→
+   301→From [Figma Blog - Building a Professional Design Tool](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/):
+   302→
+   303→1. **WebGL for everything** - No HTML/CSS for canvas
+   304→2. **Custom engine** - Tile-based renderer
+   305→3. **WASM for state** - C++ structures in WASM heap
+   306→4. **React for UI only** - React receives snapshots, never owns state
+   307→
+   308→### Performance Strategies
+   309→
+   310→From [Keeping Figma Fast](https://www.figma.com/blog/keeping-figma-fast/):
+   311→
+   312→1. **Narrow bridge** - React only gets data needed for display
+   313→2. **Event subscriptions** - React subscribes to specific events
+   314→3. **Binary serialization** - No JSON parsing overhead
+   315→4. **WebGPU migration** - Compute shaders for off-CPU work
+   316→
+   317→### WebGPU Transition (2024)
+   318→
+   319→From [Figma Rendering: Powered by WebGPU](https://www.figma.com/blog/figma-rendering-powered-by-webgpu/):
+   320→
+   321→> "While WebGPU enables new performance optimizations, just moving from WebGL to WebGPU by itself isn't guaranteed to improve performance."
+   322→
+   323→Key optimizations:
+   324→- Caching and reusing bindGroups
+   325→- Batching draw calls into renderPasses
+   326→- Compute shaders for blur
+   327→- MSAA (Multi-Sample Anti-Aliasing)
+   328→- RenderBundles for CPU overhead reduction
+   329→
+   330→### Applicable to MMS
+   331→
+   332→| Figma Technique | MMS Equivalent | Notes |
+   333→|-----------------|---------------|-------|
+   334→| WASM state | TypedArray store | STATE-ARCH-001 |
+   335→| Tile-based rendering | LOD layers | Already implemented |
+   336→| Binary serialization | TypedArray buffers | STATE-ARCH-001 |
+   337→| React bridge | useSyncExternalStore | @mms/toolkit |
+   338→| WebGPU | Future consideration | WebGL is sufficient for 60k entities |
+   339→
+   340→---
+   341→
+   342→## Memory Management
+   343→
+   344→### The GC Problem
+   345→
+   346→From State Management Research PDF:
+   347→
+   348→> "The primary bottleneck in WebGL applications is Garbage Collection, not rendering. Pausas de GC em dispositivos móveis podem facilmente exceder o frame budget de 16.67ms."
+   349→
+   350→### Structure of Arrays (SoA) Pattern
+   351→
+   352→```typescript
+   353→// ❌ Array of Structures (AoS) - Bad for performance
+   354→const tasks = [
+   355→  { id: 'T1', x: 0, y: 0, width: 10, type: 'maintenance' },
+   356→  { id: 'T2', x: 15, y: 1, width: 5, type: 'overhaul' },
+   357→  // ... 60,000 more objects = 60,000 GC-tracked allocations
+   358→];
+   359→
+   360→// ✅ Structure of Arrays (SoA) - Good for performance
+   361→const taskStore = {
+   362→  count: 60000,
+   363→  x: new Float32Array(60000),      // startDay
+   364→  y: new Float32Array(60000),      // trainIndex
+   365→  width: new Float32Array(60000),  // duration
+   366→  type: new Uint8Array(60000),     // enum index
+   367→  flags: new Uint8Array(60000),    // hasConflict, etc.
+   368→};
+   369→
+   370→// Memory comparison:
+   371→// AoS: ~60MB (60k objects × ~1KB each with overhead)
+   372→// SoA: ~1.2MB (60k × 20 bytes in TypedArrays)
+   373→```
+   374→
+   375→### Object Pooling
+   376→
+   377→```typescript
+   378→// Vector pool for temporary calculations
+   379→class VectorPool {
+   380→  private pool: Vector3[] = [];
+   381→  private index = 0;
+   382→
+   383→  constructor(size: number) {
+   384→    for (let i = 0; i < size; i++) {
+   385→      this.pool.push(new Vector3());
+   386→    }
+   387→  }
+   388→
+   389→  acquire(): Vector3 {
+   390→    const vec = this.pool[this.index];
+   391→    this.index = (this.index + 1) % this.pool.length;
+   392→    return vec;
+   393→  }
+   394→
+   395→  reset() {
+   396→    this.index = 0;
+   397→  }
+   398→}
+   399→
+   400→// Usage in render loop
+   401→const vectorPool = new VectorPool(100);
+   402→
+   403→function updateFrame() {
+   404→  vectorPool.reset(); // Reuse all vectors
+   405→
+   406→  for (let i = 0; i < visibleCount; i++) {
+   407→    const pos = vectorPool.acquire(); // No allocation!
+   408→    pos.set(taskStore.x[i], taskStore.y[i], 0);
+   409→    // ... use pos
+   410→  }
+   411→}
+   412→```
+   413→
+   414→### Avoiding GC in Hot Paths
+   415→
+   416→| Bad Pattern | Good Pattern |
+   417→|-------------|--------------|
+   418→| `new Vector3()` in loop | Pre-allocated pool |
+   419→| `.map()` creating new arrays | For loop with reused array |
+   420→| Object spread `{...obj}` | Direct property assignment |
+   421→| String concatenation | StringBuilder or template |
+   422→| Closures capturing scope | Static functions |
+   423→
+   424→---
+   425→
+   426→## Proposed Architecture
+   427→
+   428→### Overview
+   429→
+   430→```
+   431→┌─────────────────────────────────────────────────────────────────────────┐
+   432→│                           MMS Performance Architecture                   │
+   433→├─────────────────────────────────────────────────────────────────────────┤
+   434→│                                                                          │
+   435→│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────────┐   │
+   436→│  │   React UI   │◀──▶│  @mms/toolkit│◀──▶│      UI State            │   │
+   437→│  │  Components  │    │   Bridge     │    │  (selectedTask, zoom)    │   │
+   438→│  └──────────────┘    └──────────────┘    └──────────────────────────┘   │
+   439→│         │                                           ▲                    │
+   440→│         │                                           │ 30fps sync         │
+   441→│         ▼                                           │                    │
+   442→│  ┌──────────────────────────────────────────────────┴──────────────┐    │
+   443→│  │                     ENTITY STORE (TypedArrays/SoA)               │    │
+   444→│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │    │
+   445→│  │  │  Positions  │  │   Sizes     │  │   Flags     │              │    │
+   446→│  │  │ Float32Array│  │ Float32Array│  │  Uint8Array │              │    │
+   447→│  │  └─────────────┘  └─────────────┘  └─────────────┘              │    │
+   448→│  └──────────────────────────────────────────────────────────────────┘    │
+   449→│         │                                                                │
+   450→│         │                                                                │
+   451→│         ▼                                                                │
+   452→│  ┌──────────────────────────────────────────────────────────────────┐   │
+   453→│  │                     SPATIAL INDEX (RBush R-tree)                  │   │
+   454→│  │                                                                    │   │
+   455→│  │   Query: getVisibleTasks(viewportBounds) → taskIds[] (O(log n))   │   │
+   456→│  └──────────────────────────────────────────────────────────────────┘   │
+   457→│         │                                                                │
+   458→│         │ Visible task IDs                                              │
+   459→│         ▼                                                                │
+   460→│  ┌──────────────────────────────────────────────────────────────────┐   │
+   461→│  │                     CULLED INSTANCE BUFFER                        │   │
+   462→│  │                                                                    │   │
+   463→│  │   - Reorder instances: visible first, hidden last                 │   │
+   464→│  │   - Set InstancedMesh.count = visibleCount                        │   │
+   465→│  │   - Only upload changed portions to GPU                           │   │
+   466→│  └──────────────────────────────────────────────────────────────────┘   │
+   467→│         │                                                                │
+   468→│         ▼                                                                │
+   469→│  ┌──────────────────────────────────────────────────────────────────┐   │
+   470→│  │                     R3F CANVAS (WebGL)                            │   │
+   471→│  │                                                                    │   │
+   472→│  │   MacroLayer ─── MesoLayer ─── MicroLayer                         │   │
+   473→│  │       │              │              │                              │   │
+   474→│  │   Heatmap       InstancedMesh    HTML Labels                      │   │
+   475→│  │   (culled)       (culled)       (culled)                          │   │
+   476→│  └──────────────────────────────────────────────────────────────────┘   │
+   477→│                                                                          │
+   478→└─────────────────────────────────────────────────────────────────────────┘
+   479→```
+   480→
+   481→### Component Responsibilities
+   482→
+   483→| Component | Responsibility | Update Frequency |
+   484→|-----------|---------------|------------------|
+   485→| Entity Store | Task data (TypedArrays) | On data change |
+   486→| Spatial Index | Viewport queries | On data change |
+   487→| Culled Buffer | Visible instance ordering | Every frame |
+   488→| React UI | Panels, controls | Event-driven |
+   489→| @mms/toolkit | UI state (zoom, selection) | Event-driven |
+   490→
+   491→---
+   492→
+   493→## Implementation Phases
+   494→
+   495→### Phase 1: Spatial Index (PERF-002-A)
+   496→
+   497→**Goal:** O(log n) viewport queries instead of O(n)
+   498→
+   499→**Tasks:**
+   500→1. Install RBush: `bun add rbush @types/rbush`
+   501→2. Create `SpatialIndex` wrapper class
+   502→3. Build index from task data on load
+   503→4. Implement `getVisibleTasks(bounds): TaskId[]`
+   504→5. Integrate with MicroLayer's `filterVisibleTasks`
+   505→
+   506→**Files:**
+   507→- `apps/canvas/src/spatial/SpatialIndex.ts` (new)
+   508→- `apps/canvas/src/canvas/layers/MicroLayer.tsx` (modify)
+   509→
+   510→**Metrics:**
+   511→- Query time: <5ms for 1000 results
+   512→- Memory: <1MB for index
+   513→
+   514→### Phase 2: InstancedMesh Culling (PERF-002-B)
+   515→
+   516→**Goal:** Only send visible instances to GPU
+   517→
+   518→**Tasks:**
+   519→1. Create `CulledInstancedMesh` wrapper
+   520→2. Implement instance reordering algorithm
+   521→3. Track dirty regions for partial updates
+   522→4. Integrate with MesoLayer and MacroLayer
+   523→
+   524→**Files:**
+   525→- `apps/canvas/src/rendering/CulledInstancedMesh.ts` (new)
+   526→- `apps/canvas/src/canvas/layers/MesoLayer.tsx` (modify)
+   527→- `apps/canvas/src/canvas/layers/MacroLayer.tsx` (modify)
+   528→
+   529→**Metrics:**
+   530→- Draw calls: 1 per layer (unchanged)
+   531→- Instances sent to GPU: Only visible count
+   532→- Update time: <1ms for 1000 visible
+   533→
+   534→### Phase 3: TypedArray Entity Store (STATE-ARCH-001 Phase 1)
+   535→
+   536→**Goal:** Eliminate GC pressure from entity data
+   537→
+   538→**Tasks:**
+   539→1. Create `EntityStore` with SoA pattern
+   540→2. Implement views/cursors for ergonomic access
+   541→3. Migrate task data from objects to TypedArrays
+   542→4. Update data generator
+   543→
+   544→**Files:**
+   545→- `apps/canvas/src/store/EntityStore.ts` (new)
+   546→- `apps/canvas/src/data/generator.ts` (modify)
+   547→- `apps/canvas/src/data/types.ts` (modify)
+   548→
+   549→**Metrics:**
+   550→- Memory: <1MB for 60k entities (vs ~60MB objects)
+   551→- GC pauses: None during pan/zoom
+   552→
+   553→### Phase 4: Object Pooling (STATE-ARCH-001 Phase 4)
+   554→
+   555→**Goal:** Zero allocations in render loop
+   556→
+   557→**Tasks:**
+   558→1. Create `VectorPool` for Three.js vectors
+   559→2. Create `ResultPool` for query results
+   560→3. Audit render loop for allocations
+   561→4. Replace all `new` calls with pool.acquire()
+   562→
+   563→**Files:**
+   564→- `apps/canvas/src/pools/VectorPool.ts` (new)
+   565→- `apps/canvas/src/pools/ResultPool.ts` (new)
+   566→- `apps/canvas/src/canvas/InfiniteCanvas.tsx` (modify)
+   567→
+   568→**Metrics:**
+   569→- Allocations per frame: 0
+   570→- GC pauses during interaction: 0
+   571→
+   572→### Phase 5: Performance Validation
+   573→
+   574→**Goal:** Verify 60fps on target devices
+   575→
+   576→**Tasks:**
+   577→1. Create performance test suite
+   578→2. Test on mobile devices (iOS Safari, Chrome Android)
+   579→3. Profile with Chrome DevTools
+   580→4. Document results
+   581→
+   582→**Metrics:**
+   583→- FPS: ≥60 idle, ≥30 during heavy pan/zoom
+   584→- Frame time: ≤16.67ms
+   585→- Memory: Stable (no growth)
+   586→
+   587→---
+   588→
+   589→## References
+   590→
+   591→### Three.js/R3F
+   592→- [InstancedMesh2 - Frustum Culling Discussion](https://discourse.threejs.org/t/instancedmesh2-easy-handling-and-frustum-culling/58622)
+   593→- [InstancedMesh Performance Optimizations](https://vrmeup.com/devlog/devlog_10_threejs_instancedmesh_performance_optimizations.html)
+   594→- [R3F Scaling Performance](https://r3f.docs.pmnd.rs/advanced/scaling-performance)
+   595→- [R3F Performance Pitfalls](https://r3f.docs.pmnd.rs/advanced/pitfalls)
+   596→
+   597→### Spatial Indexing
+   598→- [RBush - R-tree Library](https://github.com/mourner/rbush)
+   599→- [Flatbush - Static Spatial Index](https://github.com/mourner/flatbush)
+   600→
+   601→### Figma
+   602→- [Building a Professional Design Tool](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/)
+   603→- [Keeping Figma Fast](https://www.figma.com/blog/keeping-figma-fast/)
+   604→- [Figma Rendering: Powered by WebGPU](https://www.figma.com/blog/figma-rendering-powered-by-webgpu/)
+   605→
+   606→### deck.gl
+   607→- [Performance Optimization Guide](https://deck.gl/docs/developer-guide/performance)
+   608→- [Layer Culling RFC](https://github.com/visgl/deck.gl/blob/master/dev-docs/RFCs/proposals/layer-culling-rfc.md)
+   609→
+   610→### Internal
+   611→- [State Management Research PDF](./state-management-research/relatorio-state-management.pdf)
+   612→
+   613→---
+   614→
+   615→*Document prepared for MMS Canvas Performance Optimization*
+   616→*Last updated: 2025-12-17*
+   617→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

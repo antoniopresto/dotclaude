@@ -1,0 +1,314 @@
+     1→# Building an infinite canvas for railway maintenance planning
+     2→
+     3→**Recommendation**: Migrate from React Three Fiber to **deck.gl** for a timeline-focused visualization or **Pixi.js** for maximum rendering flexibility. Pair either with **@use-gesture/react** for cross-platform input handling, implement spatial indexing with **RBush**, and build a custom semantic zoom layer using threshold-based LOD switching.
+     4→
+     5→The current R3F stack carries unnecessary overhead—Three.js is a 3D engine, and using it for 2D canvas visualization is like bringing a sledgehammer to hang a picture frame. Both deck.gl and Pixi.js offer WebGL performance without 3D baggage, and both handle **60,000+ elements** comfortably with proper optimization.
+     6→
+     7→---
+     8→
+     9→## The rendering stack decision
+    10→
+    11→### Why deck.gl wins for timeline visualization
+    12→
+    13→deck.gl emerges as the strongest candidate for your specific use case. Originally built for Uber's massive geospatial datasets, it handles **1 million data points at 60fps** during pan/zoom operations. More importantly, its architecture directly supports your semantic zoom requirements through built-in aggregation layers.
+    14→
+    15→The framework's `CompositeLayer` pattern allows defining different sublayers for each zoom level, with `filterSubLayer()` providing near-zero-cost LOD switching. For your macro-level heatmap view, `HeatmapLayer` and `GridLayer` exist out of the box with GPU-accelerated aggregation. Your meso and micro levels render as `ScatterplotLayer` or `PolygonLayer` instances—all using automatic GPU instancing.
+    16→
+    17→```javascript
+    18→// deck.gl handles LOD natively
+    19→renderSubLayers() {
+    20→  const { zoom } = this.context.viewport;
+    21→  return [
+    22→    new HeatmapLayer({ id: 'macro', visible: zoom < 8 }),
+    23→    new ScatterplotLayer({ id: 'meso', visible: zoom >= 8 && zoom < 14 }),
+    24→    new PolygonLayer({ id: 'micro', visible: zoom >= 14 })
+    25→  ];
+    26→}
+    27→```
+    28→
+    29→One critical note: deck.gl assumes geographic coordinates by default. For your maintenance timeline, use `OrthographicView` instead of `MapView`—this provides a standard 2D canvas coordinate system perfect for timeline layouts where X represents time and Y represents trains.
+    30→
+    31→### When to choose Pixi.js instead
+    32→
+    33→If you need finer control over visual aesthetics, custom rendering pipelines, or plan to add game-like interactive elements, **Pixi.js with pixi-viewport** provides more flexibility. Benchmarks show Pixi.js achieving **60fps with 8,000 boxes** in Chrome, significantly outperforming Canvas 2D options. Its sprite batching handles up to **16 textures per draw call**, making it ideal when your task blocks share similar visual styles.
+    34→
+    35→Pixi requires more manual work for LOD and aggregation—you'll implement zoom threshold detection yourself and swap container visibility. But this tradeoff buys complete rendering control, which matters if BlueprintJS-style UI elements need to render at the micro level.
+    36→
+    37→### Framework comparison summary
+    38→
+    39→| Factor | deck.gl | Pixi.js | R3F (Current) | Konva |
+    40→|--------|---------|---------|---------------|-------|
+    41→| **60K elements** | ✅ Trivial | ✅ With batching | ⚠️ Needs instancing | ❌ Struggles |
+    42→| **Semantic zoom** | ✅ Built-in layers | ⚠️ Manual | ✅ LOD component | ⚠️ Manual |
+    43→| **Timeline fit** | ✅ OrthographicView | ✅ Flexible | ⚠️ 3D concepts | ✅ Native |
+    44→| **Learning curve** | Moderate | Moderate | Steep | Easy |
+    45→| **Bundle size** | ~400KB | ~200KB | ~600KB+ | ~150KB |
+    46→
+    47→**Verdict**: Use deck.gl if timeline visualization is primary and you want built-in aggregation. Use Pixi.js if you need maximum rendering control and plan significant custom UI work.
+    48→
+    49→---
+    50→
+    51→## Solving cross-platform input nightmares
+    52→
+    53→Cross-platform zoom/pan handling is where most infinite canvas projects accumulate technical debt. The core problem: browsers report wheel, trackpad, and touch events inconsistently, and there's no reliable way to distinguish a mouse wheel from a precision trackpad.
+    54→
+    55→### The browser fragmentation reality
+    56→
+    57→**Safari** is the outlier. It's the only browser implementing `GestureEvent` with true `scale` and `rotation` properties for trackpad pinch gestures. All other browsers fake pinch-to-zoom by setting `ctrlKey: true` on wheel events—the browser literally lies about the Ctrl key being pressed.
+    58→
+    59→**Windows precision touchpads** complicate matters further. Two-finger scroll sends normal wheel events, but pinch sends `ctrlKey: true` wheel events—indistinguishable from actual Ctrl+wheel combinations.
+    60→
+    61→**WheelEvent deltaMode** varies wildly: Firefox reports `DOM_DELTA_LINE` for external mice requiring multiplication to pixels, while Chrome pre-multiplies to pixel values. Edge reports a fixed `deltaY: ±100` regardless of mouse settings.
+    62→
+    63→### The recommended solution: @use-gesture/react
+    64→
+    65→The `@use-gesture/react` library (from the same team as R3F) handles most cross-platform normalization automatically. It detects Safari's GestureEvents, normalizes wheel deltas, and provides velocity data for custom inertia. Critical configuration:
+    66→
+    67→```javascript
+    68→const bind = useGesture({
+    69→  onPinch: ({ offset: [scale], origin: [ox, oy] }) => {
+    70→    zoomAtPoint(scale, ox, oy);
+    71→  },
+    72→  onWheel: ({ delta: [dx, dy], ctrlKey }) => {
+    73→    if (ctrlKey) return; // Handled by onPinch
+    74→    pan(-dx, -dy);
+    75→  },
+    76→  onDrag: ({ delta: [dx, dy] }) => pan(dx, dy)
+    77→}, {
+    78→  target: canvasRef,
+    79→  eventOptions: { passive: false } // Required for preventDefault
+    80→});
+    81→```
+    82→
+    83→### Edge cases requiring manual handling
+    84→
+    85→Even with @use-gesture, you'll need custom code for:
+    86→
+    87→1. **Preventing browser zoom**: Add `gesturestart` and `gesturechange` listeners on `document` calling `preventDefault()`. Block Ctrl+Plus/Minus keyboard shortcuts. Set `touch-action: none` CSS on your canvas container.
+    88→
+    89→2. **Safari momentum scrolling**: Safari emits synthetic wheel events after finger lift for momentum effect. These are indistinguishable from real events—design your pan behavior to handle continuous event streams gracefully.
+    90→
+    91→3. **Delta normalization**: Clamp delta values to prevent wild jumps from high-speed gaming mice:
+    92→
+    93→```javascript
+    94→const MAX_DELTA = 50;
+    95→dx = Math.sign(dx) * Math.min(MAX_DELTA, Math.abs(dx));
+    96→```
+    97→
+    98→### How the industry leaders handle this
+    99→
+   100→**Figma** uses middle-click for panning (preserving left-click for selection), two-finger trackpad for pan, and Ctrl/Cmd+wheel for zoom. They accept that plain wheel scroll only pans vertically due to browser limitations.
+   101→
+   102→**tldraw** provides `wheelBehavior` options ('pan' | 'zoom') but acknowledges the same setting applies to both mouse and trackpad since perfect distinction is impossible.
+   103→
+   104→---
+   105→
+   106→## Implementing semantic zoom with smooth LOD transitions
+   107→
+   108→Your three-level semantic zoom (Macro/Heatmap → Meso/Task Blocks → Micro/Detailed Cards) requires careful threshold design and transition handling to avoid jarring "pop-in" when switching levels.
+   109→
+   110→### Defining zoom thresholds with hysteresis
+   111→
+   112→Simple threshold-based switching causes flickering when users hover near a transition boundary. Add hysteresis—a buffer zone preventing rapid toggling:
+   113→
+   114→```typescript
+   115→const THRESHOLDS = {
+   116→  MACRO_TO_MESO: { up: 0.3, down: 0.25 },  // 0.05 buffer
+   117→  MESO_TO_MICRO: { up: 0.8, down: 0.72 }
+   118→};
+   119→
+   120→function getLODLevel(zoom: number, currentLOD: string): string {
+   121→  if (currentLOD === 'macro' && zoom >= THRESHOLDS.MACRO_TO_MESO.up) return 'meso';
+   122→  if (currentLOD === 'meso' && zoom < THRESHOLDS.MACRO_TO_MESO.down) return 'macro';
+   123→  if (currentLOD === 'meso' && zoom >= THRESHOLDS.MESO_TO_MICRO.up) return 'micro';
+   124→  if (currentLOD === 'micro' && zoom < THRESHOLDS.MESO_TO_MICRO.down) return 'meso';
+   125→  return currentLOD;
+   126→}
+   127→```
+   128→
+   129→### Crossfade transitions eliminate pop-in
+   130→
+   131→During the transition zone, render **both** LOD levels simultaneously with opacity crossfade:
+   132→
+   133→```typescript
+   134→function calculateCrossfade(zoom: number, threshold: number, width: number = 0.1) {
+   135→  const t = (zoom - threshold) / width;
+   136→  return {
+   137→    outgoing: 1 - Math.max(0, Math.min(1, t)),
+   138→    incoming: Math.max(0, Math.min(1, t))
+   139→  };
+   140→}
+   141→```
+   142→
+   143→For your macro heatmap → meso task blocks transition, this means:
+   144→- At zoom 0.25: Heatmap 100%, tasks 0%
+   145→- At zoom 0.30: Heatmap 50%, tasks 50%  
+   146→- At zoom 0.35: Heatmap 0%, tasks 100%
+   147→
+   148→deck.gl's `opacity` prop on layers supports this directly. Pixi.js containers have an `alpha` property.
+   149→
+   150→### Preload next LOD before users need it
+   151→
+   152→When zoom approaches a threshold, preload the next level's data:
+   153→
+   154→```typescript
+   155→function preloadNextLOD(zoom: number, visibleBounds: Box) {
+   156→  const proximity = THRESHOLDS.MACRO_TO_MESO.up - zoom;
+   157→  if (proximity < 0.15 && proximity > 0) {
+   158→    loadMesoDataForBounds(visibleBounds); // Background fetch
+   159→  }
+   160→}
+   161→```
+   162→
+   163→---
+   164→
+   165→## Performance optimization for 60,000+ elements
+   166→
+   167→Your 150 trains × 12 years of maintenance data creates approximately **65,000 task elements**. This is well within WebGL's capabilities but requires specific optimization patterns.
+   168→
+   169→### Viewport culling is non-negotiable
+   170→
+   171→Never render off-screen elements. Use the **RBush R-tree** library for O(log n) spatial queries instead of O(n) array filtering:
+   172→
+   173→```typescript
+   174→import RBush from 'rbush';
+   175→
+   176→const tree = new RBush(9);
+   177→tree.load(tasks.map(t => ({
+   178→  minX: t.x, minY: t.y,
+   179→  maxX: t.x + t.width, maxY: t.y + t.height,
+   180→  data: t
+   181→})));
+   182→
+   183→// Query visible elements - returns only tasks in viewport
+   184→const visible = tree.search({
+   185→  minX: viewport.left - margin,
+   186→  minY: viewport.top - margin,
+   187→  maxX: viewport.right + margin,
+   188→  maxY: viewport.bottom + margin
+   189→});
+   190→```
+   191→
+   192→Add a margin (overscan) beyond the visible viewport so elements don't pop in during rapid panning.
+   193→
+   194→### GPU instancing for repeated elements
+   195→
+   196→Maintenance tasks are likely visually similar—same shape, varying position/color/width. This is perfect for GPU instancing, where a single draw call renders thousands of copies:
+   197→
+   198→**deck.gl**: Automatic. All layers use instancing by default.
+   199→
+   200→**Pixi.js**: Use shared `GraphicsGeometry` or sprite batching:
+   201→```javascript
+   202→// All task sprites with same texture batch into single draw call
+   203→const taskTexture = PIXI.Texture.from('task-block.png');
+   204→tasks.forEach(t => container.addChild(new PIXI.Sprite(taskTexture)));
+   205→```
+   206→
+   207→**R3F** (if staying): Use `InstancedMesh`:
+   208→```jsx
+   209→<instancedMesh args={[geometry, material, 60000]}>
+   210→  {tasks.map((t, i) => <Instance position={[t.x, t.y, 0]} scale={[t.width, 1, 1]} />)}
+   211→</instancedMesh>
+   212→```
+   213→
+   214→### Performance checklist
+   215→
+   216→- [ ] Spatial index (RBush) for O(log n) visibility queries
+   217→- [ ] Viewport culling with overscan margin
+   218→- [ ] GPU instancing for similar elements
+   219→- [ ] Memoize LOD calculations with zoom-based cache keys
+   220→- [ ] Throttle zoom events to 60fps maximum
+   221→- [ ] Use texture atlases for icons (single texture bind)
+   222→- [ ] Consider Web Workers for heavy calculations
+   223→
+   224→---
+   225→
+   226→## Production canvas solutions assessment
+   227→
+   228→None of the existing production canvas libraries perfectly fit your railway maintenance use case. Here's why:
+   229→
+   230→**tldraw** uses React DOM rendering—every element is a React component. While excellent for collaborative whiteboards with embedded content, DOM-based rendering struggles at 60K+ elements. It also lacks any timeline/time-axis concepts.
+   231→
+   232→**ReactFlow** excels at node-based editors (flowcharts, pipelines) but uses d3-zoom internally and wasn't designed for timeline visualization. Performance issues appear around 500+ complex nodes. No time-scale abstraction exists.
+   233→
+   234→**Excalidraw** uses Canvas 2D with RoughJS for its hand-drawn aesthetic—completely wrong for professional planning tool visuals. GitHub issues document performance degradation at 5,000+ elements.
+   235→
+   236→**vis-timeline** claims to handle "hundreds of thousands of items" but qualifies that "rendering runs smooth for up to a few hundreds." Multiple GitHub issues document performance problems at 400+ groups.
+   237→
+   238→### Commercial Gantt libraries deserve consideration
+   239→
+   240→**dhtmlxGantt** (GPL/commercial) provides the closest architectural fit. Its smart rendering mode handles **12,000+ tasks** within one second initialization, includes built-in zoom levels from minutes to decades, and uses Canvas-based rendering. If you're open to commercial licensing, this accelerates timeline-specific development significantly.
+   241→
+   242→**Bryntum Gantt** offers the highest performance claims with their "Chronograph" scheduling engine, but at premium pricing.
+   243→
+   244→---
+   245→
+   246→## Recommended architecture
+   247→
+   248→Based on this research, here's the optimal architecture for your railway maintenance planning tool:
+   249→
+   250→```
+   251→┌────────────────────────────────────────────────────────────┐
+   252→│                    React Application                        │
+   253→├────────────────────────────────────────────────────────────┤
+   254→│  ┌─────────────┐  ┌───────────────┐  ┌─────────────────┐  │
+   255→│  │  Camera     │  │ @use-gesture  │  │  Zustand/Jotai  │  │
+   256→│  │  State      │←→│ Input Handler │←→│  Data Store     │  │
+   257→│  └─────────────┘  └───────────────┘  └─────────────────┘  │
+   258→├────────────────────────────────────────────────────────────┤
+   259→│                  LOD Decision Layer                         │
+   260→│     zoom < 0.3 → Macro  │  < 0.8 → Meso  │  → Micro       │
+   261→├───────────┬─────────────┼────────────────┼────────────────┤
+   262→│  Heatmap  │  Task Block │   Detailed     │                │
+   263→│  Layer    │  Layer      │   Card Layer   │   (deck.gl    │
+   264→│  (aggr)   │  (instance) │   (full data)  │   layers)     │
+   265→├────────────────────────────────────────────────────────────┤
+   266→│           RBush Spatial Index (60K+ tasks)                 │
+   267→├────────────────────────────────────────────────────────────┤
+   268→│      deck.gl OrthographicView + WebGL Renderer             │
+   269→└────────────────────────────────────────────────────────────┘
+   270→```
+   271→
+   272→### Primary recommendation: deck.gl + @use-gesture + RBush
+   273→
+   274→1. **deck.gl with OrthographicView**: Provides WebGL performance, built-in layer system for semantic zoom, and GPU aggregation for heatmaps. X-axis = time (days/months), Y-axis = train index.
+   275→
+   276→2. **@use-gesture/react**: Normalizes cross-platform zoom/pan with velocity data for custom inertia. Same ecosystem as your current R3F stack.
+   277→
+   278→3. **RBush spatial index**: O(log n) queries for viewport culling across 60K+ elements.
+   279→
+   280→4. **Zustand for state**: Lightweight, works well with both deck.gl and React. Store camera state, task data, and selection separately.
+   281→
+   282→### Alternative: Pixi.js + pixi-viewport
+   283→
+   284→Choose this if:
+   285→- You need more custom rendering control
+   286→- BlueprintJS components must render inside the canvas
+   287→- Game-like interactions are planned
+   288→- You prefer a 2D-focused API over deck.gl's geospatial heritage
+   289→
+   290→### Migration path from R3F
+   291→
+   292→**Phase 1** (Quick optimization if needed): Add `InstancedMesh` for tasks, implement camera bounds, add viewport culling. Validates whether R3F can meet performance requirements.
+   293→
+   294→**Phase 2** (Stack migration): Replace R3F canvas with deck.gl `DeckGL` component. Convert Three.js meshes to deck.gl layers. Implement `OrthographicView` with time/train coordinates.
+   295→
+   296→**Estimated effort**: 3-5 weeks for full migration, depending on existing R3F complexity.
+   297→
+   298→---
+   299→
+   300→## Key risks and mitigations
+   301→
+   302→| Risk | Mitigation |
+   303→|------|------------|
+   304→| deck.gl's geo-focus feels foreign | Use OrthographicView exclusively; ignore lat/lng documentation |
+   305→| Safari GestureEvent edge cases | Comprehensive test matrix across Safari iOS/macOS + fallback handlers |
+   306→| LOD transitions feel janky | Implement crossfade with 0.1 zoom-unit transition zone |
+   307→| 60K elements still lag | Profile first; likely culling issue. Fall back to progressive loading |
+   308→| BlueprintJS integration | Use deck.gl's HTML overlay layer for UI components at micro zoom |
+   309→
+   310→This architecture provides the performance headroom for 60K+ elements, the semantic zoom capabilities your spec requires, and cross-platform input handling that won't break on Safari or Windows trackpads. The POC phase should focus on validating deck.gl's OrthographicView for timeline layouts and the LOD transition smoothness—these are the highest-uncertainty areas.
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

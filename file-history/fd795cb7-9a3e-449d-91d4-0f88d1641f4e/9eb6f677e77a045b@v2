@@ -1,0 +1,147 @@
+# F013: Storage Architecture - Plano Final
+
+## Decisao de Arquitetura: JSONL Sharding + LanceDB (opcional)
+
+### Estrutura Proposta
+```
+project/.harness/          # OU raiz do projeto
+├── progress.txt           # MANTIDO: Resumo para humanos
+├── features.json          # MANTIDO: Status das features
+├── sessions/              # NOVO: Sessoes estruturadas (git-tracked)
+│   ├── 2026-01-02.jsonl
+│   └── 2026-01-04.jsonl
+├── index/                 # NOVO: Cache de queries (git-ignored)
+│   └── sessions.lance     # LanceDB (opcional)
+└── config.toml            # NOVO: Configuracao
+```
+
+### Justificativa
+
+| Criterio | JSONL | SQLite | LanceDB puro |
+|----------|-------|--------|--------------|
+| Git-friendly | **Sim** | Nao | Nao |
+| Mergeable | **Sim** | Nao | Nao |
+| Human-readable | **Sim** | Nao | Nao |
+| Query performance | Bom | Excelente | Excelente |
+| Semantic search | Via LanceDB | Via ext | Nativo |
+
+---
+
+## Arquivos a Criar
+
+| Arquivo | Proposito |
+|---------|-----------|
+| `src-tauri/src/harness/mod.rs` | Modulo principal |
+| `src-tauri/src/harness/types.rs` | Structs e enums |
+| `src-tauri/src/harness/parser.rs` | Parser de progress.txt |
+| `src-tauri/src/harness/storage.rs` | JSONL read/write |
+| `src-tauri/src/harness/index.rs` | LanceDB (feature flag) |
+| `src-tauri/src/harness/watcher.rs` | File watching |
+| `src-tauri/src/harness/commands.rs` | Tauri commands |
+| `src/types/harness.ts` | TypeScript types |
+| `src/lib/harness.ts` | Frontend API client |
+
+## Arquivos a Modificar
+
+| Arquivo | Mudanca |
+|---------|---------|
+| `src-tauri/src/lib.rs` | Adicionar mod harness |
+| `src-tauri/Cargo.toml` | Deps: serde-jsonlines, notify, chrono, regex |
+| `src/lib/rpc.ts` | Wrappers para harness_* |
+| `src/state/store.ts` | Slice para sessions |
+
+---
+
+## Comandos Tauri
+
+```rust
+// Deteccao e info
+harness_detect(project_path) -> HarnessInfo
+harness_stats(project_path) -> HarnessStats
+
+// Leitura
+harness_list_sessions(project_path, from?, to?, limit?, offset?) -> Vec<SessionSummary>
+harness_get_session(project_path, session_id) -> Session
+harness_get_features(project_path) -> Vec<Feature>
+harness_get_progress_raw(project_path) -> String
+
+// Busca
+harness_search(project_path, query, limit?) -> Vec<SearchResult>
+harness_semantic_search(project_path, query, limit?) -> Vec<SearchResult>  // opcional
+
+// Migracao
+harness_migrate(project_path, dry_run) -> MigrationResult
+harness_rebuild_index(project_path) -> IndexStats
+```
+
+---
+
+## Schema Principal (Rust)
+
+```rust
+pub struct Session {
+    pub id: String,              // UUID v7
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub title: String,
+    pub features: Vec<String>,
+    pub sections: Vec<SessionSection>,
+    pub metadata: SessionMetadata,
+}
+
+pub struct SessionSection {
+    pub section_type: SectionType,  // what_was_done, key_learnings, etc.
+    pub content: String,
+    pub items: Vec<String>,
+}
+```
+
+---
+
+## Dependencias Rust
+
+```toml
+serde-jsonlines = "0.5"     # JSONL streaming
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+notify = "8"                # File watching
+uuid = { version = "1", features = ["v7", "serde"] }
+toml = "0.8"
+
+# Opcional (feature flag)
+lancedb = { version = "0.16", optional = true }
+```
+
+---
+
+## Ordem de Implementacao
+
+1. **Types & Parser** (~2h) - Structs, parser progress.txt
+2. **JSONL Storage** (~1.5h) - Read/write sessions/
+3. **Tauri Commands** (~2h) - detect, list, get, migrate
+4. **File Watcher** (~1.5h) - Sync automatico
+5. **Frontend** (~2h) - Types TS, RPC, state
+6. **LanceDB** (opcional, ~3h) - Semantic search
+
+**Total estimado: ~9h core + 3h opcional**
+
+---
+
+## Estrategia de Migracao
+
+1. Detectar formato (legacy vs modern vs hybrid)
+2. Parse progress.txt com regex tolerante
+3. Criar sessions/*.jsonl (uma sessao por bloco)
+4. Manter progress.txt original
+5. Criar config.toml
+
+---
+
+## Riscos Mitigados
+
+| Risco | Mitigacao |
+|-------|-----------|
+| progress.txt malformado | Parser tolerante, skip linhas invalidas |
+| LanceDB nao compila | Feature flag, fallback para text search |
+| Conflito merge JSONL | Append-only, cada linha independente |
+| Index corrompido | Rebuild a partir do JSONL |

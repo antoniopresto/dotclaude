@@ -1,0 +1,492 @@
+# F012: Native UX Polish - Implementation Plan
+
+## Objective
+Transform HQ from a "web app in a window" to a native-feeling macOS application.
+
+---
+
+## Research Summary
+
+### Sources Consulted
+- [Tauri Window Customization](https://v2.tauri.app/learn/window-customization/)
+- [window-vibrancy crate](https://github.com/tauri-apps/window-vibrancy)
+- [tauri-plugin-prevent-default](https://github.com/ferreira-tb/tauri-plugin-prevent-default)
+- [Tauri Global Shortcuts](https://v2.tauri.app/plugin/global-shortcut/)
+- [Tauri Menu API](https://v2.tauri.app/reference/javascript/api/namespacemenu/)
+- [Making Electron Apps Feel Native on Mac](https://getlotus.app/21-making-electron-apps-feel-native-on-mac)
+- [Motion (Framer Motion)](https://motion.dev/)
+- [NSVisualEffectView Materials](https://developer.apple.com/documentation/appkit/nsvisualeffectview/material)
+
+---
+
+## User Requirements (Confirmed)
+
+- **Prioridade:** Todas as fases em ordem
+- **Animações:** Incluir Motion (spring physics)
+- **Plataforma:** macOS only
+- **Foco especial:**
+  - Menu bar atual tem cara de "web app" (HQ, Edit...) → precisa ser nativo macOS
+  - Context menu é o default do browser → precisa ser nativo
+  - DevTools pode ser inspecionado via context menu/atalho → desabilitar em produção
+
+---
+
+## Implementation Phases
+
+### Phase 0: Native Menu Bar (macOS style)
+
+**Problema atual:** O menu "HQ, Edit..." parece web, não nativo.
+
+**File: `src-tauri/src/lib.rs`**
+```rust
+use tauri::menu::{Menu, Submenu, MenuItem, PredefinedMenuItem};
+
+fn create_native_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    // macOS standard menu structure
+    let app_menu = Submenu::with_items(app, "HQ", true, &[
+        &MenuItem::with_id(app, "about", "About HQ", true, None::<&str>)?,
+        &PredefinedMenuItem::separator(app)?,
+        &MenuItem::with_id(app, "settings", "Settings...", true, Some("CmdOrCtrl+,"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::services(app, None)?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::hide(app, None)?,
+        &PredefinedMenuItem::hide_others(app, None)?,
+        &PredefinedMenuItem::show_all(app, None)?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::quit(app, None)?,
+    ])?;
+
+    let file_menu = Submenu::with_items(app, "File", true, &[
+        &MenuItem::with_id(app, "new_project", "Open Project...", true, Some("CmdOrCtrl+O"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &MenuItem::with_id(app, "new_tab", "New Tab", true, Some("CmdOrCtrl+T"))?,
+        &MenuItem::with_id(app, "close_tab", "Close Tab", true, Some("CmdOrCtrl+W"))?,
+    ])?;
+
+    let edit_menu = Submenu::with_items(app, "Edit", true, &[
+        &PredefinedMenuItem::undo(app, None)?,
+        &PredefinedMenuItem::redo(app, None)?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::cut(app, None)?,
+        &PredefinedMenuItem::copy(app, None)?,
+        &PredefinedMenuItem::paste(app, None)?,
+        &PredefinedMenuItem::select_all(app, None)?,
+    ])?;
+
+    let view_menu = Submenu::with_items(app, "View", true, &[
+        &MenuItem::with_id(app, "toggle_sidebar", "Toggle Sidebar", true, Some("CmdOrCtrl+\\"))?,
+        &MenuItem::with_id(app, "toggle_logs", "Toggle Logs", true, Some("CmdOrCtrl+J"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::fullscreen(app, None)?,
+    ])?;
+
+    let window_menu = Submenu::with_items(app, "Window", true, &[
+        &PredefinedMenuItem::minimize(app, None)?,
+        &PredefinedMenuItem::maximize(app, None)?,
+        &PredefinedMenuItem::separator(app)?,
+        &MenuItem::with_id(app, "prev_tab", "Previous Tab", true, Some("CmdOrCtrl+Shift+["))?,
+        &MenuItem::with_id(app, "next_tab", "Next Tab", true, Some("CmdOrCtrl+Shift+]"))?,
+    ])?;
+
+    let help_menu = Submenu::with_items(app, "Help", true, &[
+        &MenuItem::with_id(app, "docs", "Documentation", true, None::<&str>)?,
+        &MenuItem::with_id(app, "github", "GitHub Repository", true, None::<&str>)?,
+    ])?;
+
+    Menu::with_items(app, &[
+        &app_menu,
+        &file_menu,
+        &edit_menu,
+        &view_menu,
+        &window_menu,
+        &help_menu,
+    ])
+}
+```
+
+**Effort:** 1 hour
+
+---
+
+### Phase 1: CSS Foundation (No dependencies)
+
+**File: `src/index.css`**
+
+```css
+/* Native-feel base styles */
+:root {
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 14px; /* Native apps use 13-14px, not 16px */
+}
+
+/* Disable text selection on UI elements */
+*:not(input):not(textarea):not([contenteditable="true"]):not(.selectable) {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Allow selection only on content areas */
+.selectable, pre, code, .log-content {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Default cursor everywhere (native apps don't use pointer) */
+*, a, button {
+  cursor: default;
+}
+
+/* Pointer only for external links */
+a[href^="http"] {
+  cursor: pointer;
+}
+
+/* Focus-visible: show outline only on keyboard navigation */
+*:focus {
+  outline: none;
+}
+*:focus-visible {
+  outline: 2px solid var(--pf-t--global--border--color--clicked);
+  outline-offset: 2px;
+}
+
+/* Disable image/element dragging */
+img, svg, [draggable="false"] {
+  -webkit-user-drag: none;
+  user-drag: none;
+}
+
+/* Prevent overscroll bounce */
+html, body {
+  overscroll-behavior: none;
+}
+
+/* Titlebar drag region */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Transparent background for vibrancy */
+html, body {
+  background: transparent;
+}
+```
+
+**Effort:** 30 min
+
+---
+
+### Phase 2: Disable Browser Behaviors (Rust plugin)
+
+**File: `src-tauri/Cargo.toml`**
+```toml
+tauri-plugin-prevent-default = "2.1"
+```
+
+**File: `src-tauri/src/lib.rs`**
+```rust
+use tauri_plugin_prevent_default::Flags;
+
+// Disable browser shortcuts except dev tools in debug mode
+#[cfg(debug_assertions)]
+let prevent = tauri_plugin_prevent_default::Builder::new()
+    .with_flags(Flags::all() - Flags::DEV_TOOLS - Flags::RELOAD)
+    .build();
+
+#[cfg(not(debug_assertions))]
+let prevent = tauri_plugin_prevent_default::init();
+
+tauri::Builder::default()
+    .plugin(prevent)
+    // ...
+```
+
+**Disables:**
+- Cmd+F (find)
+- Cmd+P (print)
+- Cmd+G (find next)
+- Cmd+[+/-] (zoom)
+- Right-click context menu (we'll add our own native one)
+- F5/Cmd+R reload (in production)
+- Pinch-to-zoom
+
+**Effort:** 15 min
+
+---
+
+### Phase 3: Window Vibrancy (macOS blur effect)
+
+**File: `src-tauri/Cargo.toml`**
+```toml
+window-vibrancy = "0.7"
+```
+
+**File: `src-tauri/tauri.conf.json`**
+```json
+{
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [{
+      "transparent": true,
+      "decorations": true,
+      "titleBarStyle": "Overlay",
+      "hiddenTitle": true
+    }]
+  }
+}
+```
+
+**File: `src-tauri/src/lib.rs`**
+```rust
+use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+
+fn setup_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let window = app.get_webview_window("main").unwrap();
+
+    #[cfg(target_os = "macos")]
+    apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None)?;
+
+    Ok(())
+}
+```
+
+**NSVisualEffectMaterial options:**
+- `Sidebar` - Standard sidebar blur (recommended)
+- `HudWindow` - Darker, more contrast
+- `FullScreenUI` - Full screen overlay style
+- `ContentBackground` - Subtle content area blur
+
+**Effort:** 45 min
+
+---
+
+### Phase 4: Native Context Menus
+
+**File: `src-tauri/src/lib.rs`** (or new `src-tauri/src/menu.rs`)
+
+```rust
+use tauri::menu::{Menu, MenuItem, Submenu, PredefinedMenuItem};
+
+fn create_context_menu(app: &tauri::AppHandle) -> Menu {
+    let edit_menu = Submenu::with_items(app, "Edit", true, &[
+        &PredefinedMenuItem::undo(app, None),
+        &PredefinedMenuItem::redo(app, None),
+        &PredefinedMenuItem::separator(app),
+        &PredefinedMenuItem::cut(app, None),
+        &PredefinedMenuItem::copy(app, None),
+        &PredefinedMenuItem::paste(app, None),
+        &PredefinedMenuItem::select_all(app, None),
+    ]).unwrap();
+
+    Menu::with_items(app, &[&edit_menu]).unwrap()
+}
+```
+
+**Frontend trigger:**
+```typescript
+import { Menu, Submenu, MenuItem } from '@tauri-apps/api/menu';
+
+async function showContextMenu(e: React.MouseEvent) {
+  e.preventDefault();
+  const menu = await Menu.new({
+    items: [
+      { id: 'copy', text: 'Copy', accelerator: 'CmdOrCtrl+C' },
+      { id: 'paste', text: 'Paste', accelerator: 'CmdOrCtrl+V' },
+    ]
+  });
+  await menu.popup();
+}
+```
+
+**Effort:** 1 hour
+
+---
+
+### Phase 5: Global Keyboard Shortcuts
+
+**File: `src-tauri/Cargo.toml`**
+```toml
+tauri-plugin-global-shortcut = "2"
+```
+
+**File: `package.json`**
+```json
+"dependencies": {
+  "@tauri-apps/plugin-global-shortcut": "^2.0.0"
+}
+```
+
+**File: `src/hooks/useKeyboardShortcuts.ts`**
+```typescript
+import { register, unregister } from '@tauri-apps/plugin-global-shortcut';
+
+export function useKeyboardShortcuts() {
+  useEffect(() => {
+    const shortcuts = [
+      { key: 'CommandOrControl+T', action: () => createNewTab() },
+      { key: 'CommandOrControl+W', action: () => closeCurrentTab() },
+      { key: 'CommandOrControl+Shift+[', action: () => prevTab() },
+      { key: 'CommandOrControl+Shift+]', action: () => nextTab() },
+      { key: 'CommandOrControl+,', action: () => openSettings() },
+      { key: 'CommandOrControl+K', action: () => openCommandPalette() },
+    ];
+
+    shortcuts.forEach(s => register(s.key, s.action));
+    return () => shortcuts.forEach(s => unregister(s.key));
+  }, []);
+}
+```
+
+**Effort:** 1 hour
+
+---
+
+### Phase 6: Spring Animations (Optional polish)
+
+**Install:**
+```bash
+bun add motion
+```
+
+**File: `src/components/AnimatedCard.tsx`**
+```typescript
+import { motion } from 'motion/react';
+
+export function AnimatedCard({ children }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -10 }}
+      transition={{ type: "spring", stiffness: 300, damping: 30 }}
+    >
+      {children}
+    </motion.div>
+  );
+}
+```
+
+**Key animations:**
+- Tab switching: spring with `stiffness: 400, damping: 30`
+- Card expand/collapse: `type: "spring", bounce: 0.2`
+- Panel resize: `type: "tween", ease: "easeOut"`
+
+**Effort:** 2 hours (apply across components)
+
+---
+
+### Phase 7: Focus/Blur Window State
+
+**File: `src-tauri/src/lib.rs`**
+```rust
+use tauri::Manager;
+
+window.on_window_event(|event| {
+    match event {
+        tauri::WindowEvent::Focused(focused) => {
+            // Emit to frontend
+            window.emit("window-focus", focused).unwrap();
+        }
+        _ => {}
+    }
+});
+```
+
+**File: `src/hooks/useWindowFocus.ts`**
+```typescript
+import { listen } from '@tauri-apps/api/event';
+
+export function useWindowFocus() {
+  const [isFocused, setIsFocused] = useState(true);
+
+  useEffect(() => {
+    const unlisten = listen<boolean>('window-focus', (e) => {
+      setIsFocused(e.payload);
+      document.documentElement.classList.toggle('window-unfocused', !e.payload);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
+  return isFocused;
+}
+```
+
+**File: `src/index.css`**
+```css
+/* Dim colors when window loses focus */
+.window-unfocused .tab-active {
+  background-color: var(--pf-t--global--background--color--secondary--default);
+}
+.window-unfocused .sidebar-item-selected {
+  background-color: #808080;
+}
+```
+
+**Effort:** 45 min
+
+---
+
+## Files to Modify
+
+| File | Changes |
+|------|---------|
+| `src-tauri/Cargo.toml` | Add `window-vibrancy`, `tauri-plugin-prevent-default`, `tauri-plugin-global-shortcut` |
+| `src-tauri/tauri.conf.json` | Add `transparent`, `titleBarStyle`, `hiddenTitle`, `macOSPrivateApi` |
+| `src-tauri/src/lib.rs` | Setup vibrancy, prevent-default plugin, window events |
+| `src/index.css` | Native-feel CSS (selection, focus, drag regions) |
+| `src/hooks/useKeyboardShortcuts.ts` | New file for shortcuts |
+| `src/hooks/useWindowFocus.ts` | New file for focus state |
+| `package.json` | Add `@tauri-apps/plugin-global-shortcut`, `motion` |
+
+---
+
+## Implementation Order (Recommended)
+
+1. **Phase 1: CSS Foundation** - Quick wins, no dependencies
+2. **Phase 2: Disable Browser Behaviors** - Essential for native feel
+3. **Phase 3: Window Vibrancy** - Visual impact, macOS only
+4. **Phase 5: Keyboard Shortcuts** - Core UX
+5. **Phase 4: Context Menus** - Polish
+6. **Phase 7: Focus/Blur State** - Refinement
+7. **Phase 6: Animations** - Final polish
+
+---
+
+## Known Limitations
+
+1. **Vibrancy is macOS-only** - Windows/Linux will have solid background
+2. **backdrop-filter bug in Tauri 2.2.5** - CSS blur may not work with transparency enabled
+3. **Linux pinch-zoom** - Cannot be fully disabled (GTK limitation)
+4. **NumPad accelerators** - Don't work in menu items (Tauri bug)
+
+---
+
+## Estimated Total Effort
+
+| Phase | Time |
+|-------|------|
+| Phase 1: CSS | 30 min |
+| Phase 2: Prevent Default | 15 min |
+| Phase 3: Vibrancy | 45 min |
+| Phase 4: Context Menus | 1 hour |
+| Phase 5: Shortcuts | 1 hour |
+| Phase 6: Animations | 2 hours |
+| Phase 7: Focus/Blur | 45 min |
+| **Total** | **~6 hours** |
+
+---
+
+## Success Criteria
+
+- [ ] No focus outlines on mouse click, only on Tab navigation
+- [ ] Text not selectable on buttons, labels, headers
+- [ ] Cmd+F, Cmd+P, pinch-zoom disabled
+- [ ] Window has translucent blur effect (macOS)
+- [ ] Right-click shows native context menu
+- [ ] Cmd+T/W/[ /] work for tab management
+- [ ] UI dims when window loses focus
+- [ ] Animations feel "springy", not "tweeny"

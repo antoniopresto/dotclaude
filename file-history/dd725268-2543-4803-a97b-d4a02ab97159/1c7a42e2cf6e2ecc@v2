@@ -1,0 +1,365 @@
+/**
+ * Verification and Rollback System
+ *
+ * Handles:
+ * - Automated verification of feature completion
+ * - Git branch isolation per feature
+ * - Rollback of failed features
+ * - Merge of successful features
+ */
+
+import { EventEmitter } from 'node:events';
+import type { Feature, HarnessConfig } from '../types.js';
+import { GitManager, type MergeResult } from './GitManager.js';
+import { StateManager } from '../state/StateManager.js';
+
+export interface VerificationResult {
+  featureId: string;
+  passed: boolean;
+  checks: VerificationCheck[];
+  error?: string;
+}
+
+export interface VerificationCheck {
+  name: string;
+  passed: boolean;
+  details?: string;
+}
+
+export interface VerifierOptions {
+  /** Enable git branch isolation */
+  useBranches: boolean;
+  /** Auto-merge successful features */
+  autoMerge: boolean;
+  /** Auto-rollback failed features */
+  autoRollback: boolean;
+  /** Run custom verification scripts */
+  runVerificationScripts: boolean;
+  /** Working directory */
+  cwd: string;
+}
+
+export type VerificationStrategy = 'strict' | 'lenient';
+
+const DEFAULT_OPTIONS: VerifierOptions = {
+  useBranches: true,
+  autoMerge: true,
+  autoRollback: true,
+  runVerificationScripts: false,
+  cwd: process.cwd(),
+};
+
+export class Verifier extends EventEmitter {
+  private options: VerifierOptions;
+  private git: GitManager;
+  private stateManager: StateManager;
+  private verificationResults: Map<string, VerificationResult> = new Map();
+
+  constructor(
+    featuresPath: string,
+    options: Partial<VerifierOptions> = {}
+  ) {
+    super();
+    this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.git = new GitManager({ cwd: this.options.cwd });
+    this.stateManager = new StateManager(featuresPath);
+
+    // Forward git events
+    this.git.on('branch-created', (e) => this.emit('git:branch-created', e));
+    this.git.on('branch-merged', (e) => this.emit('git:branch-merged', e));
+    this.git.on('branch-deleted', (e) => this.emit('git:branch-deleted', e));
+    this.git.on('reset', (e) => this.emit('git:reset', e));
+  }
+
+  /**
+   * Prepare a feature for execution (create branch if enabled)
+   */
+  async prepareFeature(feature: Feature): Promise<{ branchName?: string }> {
+    if (!this.options.useBranches) {
+      return {};
+    }
+
+    if (!this.git.isGitRepo()) {
+      this.emit('warning', { message: 'Not a git repository, skipping branch isolation' });
+      return {};
+    }
+
+    try {
+      const branchName = this.git.createFeatureBranch(feature.id);
+      this.emit('feature:prepared', { featureId: feature.id, branchName });
+      return { branchName };
+    } catch (error: any) {
+      // Branch might already exist
+      if (error.message.includes('already exists')) {
+        const branchName = this.git.getBranchName(feature.id);
+        this.git.checkoutBranch(branchName);
+        return { branchName };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Verify a feature's completion
+   */
+  async verifyFeature(feature: Feature): Promise<VerificationResult> {
+    const checks: VerificationCheck[] = [];
+    let allPassed = true;
+
+    // Check 1: Feature marked as passes in state
+    const config = this.stateManager.load();
+    const storedFeature = config.features.find(f => f.id === feature.id);
+    const stateCheck = {
+      name: 'State file updated',
+      passed: storedFeature?.passes === true,
+      details: storedFeature?.passes ? 'Feature marked as complete' : 'Feature not marked as complete',
+    };
+    checks.push(stateCheck);
+    allPassed = allPassed && stateCheck.passed;
+
+    // Check 2: All steps completed (based on feature description)
+    const stepsCheck = {
+      name: 'Steps validation',
+      passed: true, // Would need more context to verify steps
+      details: `${feature.steps.length} steps defined`,
+    };
+    checks.push(stepsCheck);
+
+    // Check 3: Git changes committed (if using branches)
+    if (this.options.useBranches && this.git.isGitRepo()) {
+      const isClean = !this.git.hasUncommittedChanges();
+      const gitCheck = {
+        name: 'Git changes committed',
+        passed: isClean,
+        details: isClean ? 'Working directory clean' : 'Uncommitted changes present',
+      };
+      checks.push(gitCheck);
+      allPassed = allPassed && gitCheck.passed;
+    }
+
+    // Check 4: No blockers (dependencies satisfied)
+    const blockers = this.getBlockers(feature, config);
+    const blockersCheck = {
+      name: 'Dependencies satisfied',
+      passed: blockers.length === 0,
+      details: blockers.length === 0
+        ? 'All dependencies complete'
+        : `Blocked by: ${blockers.join(', ')}`,
+    };
+    checks.push(blockersCheck);
+    allPassed = allPassed && blockersCheck.passed;
+
+    const result: VerificationResult = {
+      featureId: feature.id,
+      passed: allPassed,
+      checks,
+    };
+
+    this.verificationResults.set(feature.id, result);
+    this.emit('feature:verified', result);
+
+    return result;
+  }
+
+  /**
+   * Get features that are blocking a feature
+   */
+  private getBlockers(feature: Feature, config: HarnessConfig): string[] {
+    if (!feature.blockedBy) return [];
+
+    const blockers = Array.isArray(feature.blockedBy)
+      ? feature.blockedBy
+      : [feature.blockedBy];
+
+    return blockers.filter(blockerId => {
+      const blocker = config.features.find(f => f.id === blockerId);
+      return blocker && !blocker.passes;
+    });
+  }
+
+  /**
+   * Finalize a feature (merge or rollback based on verification)
+   */
+  async finalizeFeature(feature: Feature): Promise<{
+    action: 'merged' | 'rolled-back' | 'none';
+    result?: MergeResult;
+    error?: string;
+  }> {
+    const verification = this.verificationResults.get(feature.id);
+
+    if (!this.options.useBranches || !this.git.isGitRepo()) {
+      return { action: 'none' };
+    }
+
+    if (verification?.passed && this.options.autoMerge) {
+      // Merge successful feature
+      const result = this.git.mergeFeatureBranch(
+        feature.id,
+        `feat(${feature.id.toLowerCase()}): ${feature.description}`
+      );
+
+      if (result.success) {
+        this.emit('feature:merged', { featureId: feature.id });
+        return { action: 'merged', result };
+      } else {
+        this.emit('feature:merge-failed', {
+          featureId: feature.id,
+          error: result.error,
+          conflictFiles: result.conflictFiles,
+        });
+        return { action: 'none', error: result.error };
+      }
+    } else if (!verification?.passed && this.options.autoRollback) {
+      // Rollback failed feature
+      this.git.rollbackFeature(feature.id);
+      this.emit('feature:rolled-back', { featureId: feature.id });
+      return { action: 'rolled-back' };
+    }
+
+    return { action: 'none' };
+  }
+
+  /**
+   * Get verification summary
+   */
+  getSummary(): {
+    total: number;
+    verified: number;
+    passed: number;
+    failed: number;
+    pending: number;
+  } {
+    const config = this.stateManager.load();
+    const total = config.features.length;
+    const verified = this.verificationResults.size;
+    let passed = 0;
+    let failed = 0;
+
+    for (const result of this.verificationResults.values()) {
+      if (result.passed) {
+        passed++;
+      } else {
+        failed++;
+      }
+    }
+
+    return {
+      total,
+      verified,
+      passed,
+      failed,
+      pending: total - verified,
+    };
+  }
+
+  /**
+   * Get all verification results
+   */
+  getResults(): VerificationResult[] {
+    return [...this.verificationResults.values()];
+  }
+
+  /**
+   * Get verification result for a specific feature
+   */
+  getResult(featureId: string): VerificationResult | undefined {
+    return this.verificationResults.get(featureId);
+  }
+
+  /**
+   * Create a pre-orchestration snapshot
+   */
+  createSnapshot(label: string): string | null {
+    if (!this.git.isGitRepo()) {
+      return null;
+    }
+
+    try {
+      return this.git.createSnapshot(`snapshot: ${label}`);
+    } catch (error: any) {
+      this.emit('warning', { message: `Failed to create snapshot: ${error.message}` });
+      return null;
+    }
+  }
+
+  /**
+   * Rollback to a snapshot
+   */
+  rollbackToSnapshot(commitHash: string): void {
+    if (!this.git.isGitRepo()) {
+      throw new Error('Not a git repository');
+    }
+
+    this.git.resetToCommit(commitHash, true);
+    this.emit('snapshot:restored', { commitHash });
+  }
+
+  /**
+   * Get git status
+   */
+  getGitStatus(): ReturnType<GitManager['getStatus']> | null {
+    if (!this.git.isGitRepo()) {
+      return null;
+    }
+    return this.git.getStatus();
+  }
+
+  /**
+   * List all feature branches
+   */
+  listFeatureBranches(): ReturnType<GitManager['listFeatureBranches']> {
+    if (!this.git.isGitRepo()) {
+      return [];
+    }
+    return this.git.listFeatureBranches();
+  }
+
+  /**
+   * Cleanup merged feature branches
+   */
+  cleanupMergedBranches(): string[] {
+    if (!this.git.isGitRepo()) {
+      return [];
+    }
+
+    const branches = this.git.listFeatureBranches();
+    const deleted: string[] = [];
+
+    for (const branch of branches) {
+      if (branch.isMerged) {
+        this.git.rollbackFeature(branch.featureId);
+        deleted.push(branch.name);
+      }
+    }
+
+    if (deleted.length > 0) {
+      this.emit('branches:cleaned', { deleted });
+    }
+
+    return deleted;
+  }
+
+  /**
+   * Resolve merge conflicts using a strategy
+   *
+   * NOTE: Currently only supports 'manual' which requires user intervention.
+   * Auto-resolution strategies ('ours', 'theirs') are not yet implemented.
+   */
+  resolveConflicts(
+    _featureId: string,
+    strategy: 'ours' | 'theirs' | 'manual'
+  ): { success: boolean; error?: string } {
+    if (!this.git.isGitRepo()) {
+      return { success: false, error: 'Not a git repository' };
+    }
+
+    // All strategies currently require manual intervention
+    // TODO: Implement 'ours' and 'theirs' auto-resolution
+    return {
+      success: false,
+      error: strategy === 'manual'
+        ? 'Manual conflict resolution required'
+        : `Auto-resolution strategy '${strategy}' not yet implemented. Please resolve conflicts manually.`
+    };
+  }
+}

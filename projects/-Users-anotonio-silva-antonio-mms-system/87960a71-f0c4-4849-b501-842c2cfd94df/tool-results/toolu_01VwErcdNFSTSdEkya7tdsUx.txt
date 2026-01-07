@@ -1,0 +1,194 @@
+     1→"""
+     2→MMS Solver - Simulation Engine
+     3→
+     4→Simulates the impact of allocation changes over a projection period.
+     5→Calculates km variance, dead running, and other metrics.
+     6→"""
+     7→
+     8→import statistics
+     9→from typing import Optional
+    10→from ..models.schemas import (
+    11→    AllocationChange,
+    12→    SimulationMetric,
+    13→    SimulationResponse
+    14→)
+    15→
+    16→
+    17→def calculate_km_variance(km_values: list[int]) -> float:
+    18→    """
+    19→    Calculate coefficient of variation (CV) for km distribution.
+    20→    CV = (std dev / mean) * 100
+    21→
+    22→    Lower CV means more balanced distribution.
+    23→    """
+    24→    if len(km_values) < 2:
+    25→        return 0.0
+    26→
+    27→    mean = statistics.mean(km_values)
+    28→    if mean == 0:
+    29→        return 0.0
+    30→
+    31→    std_dev = statistics.stdev(km_values)
+    32→    return (std_dev / mean) * 100
+    33→
+    34→
+    35→def simulate_allocations(
+    36→    trains_km: list[dict],
+    37→    changes: list[AllocationChange],
+    38→    projection_days: int = 30
+    39→) -> SimulationResponse:
+    40→    """
+    41→    Simulate the impact of allocation changes over time.
+    42→
+    43→    Args:
+    44→        trains_km: Current km values for all trains
+    45→        changes: List of allocation changes to simulate
+    46→        projection_days: Number of days to project forward
+    47→
+    48→    Returns:
+    49→        SimulationResponse with metrics comparison
+    50→    """
+    51→    import time
+    52→    start_time = time.perf_counter()
+    53→
+    54→    # Build km lookup
+    55→    train_km_map = {str(t['train_id']): t['current_km'] for t in trains_km}
+    56→
+    57→    # Calculate current state
+    58→    current_km_values = [t['current_km'] for t in trains_km if t['current_km'] > 0]
+    59→    current_variance = calculate_km_variance(current_km_values)
+    60→
+    61→    # Apply changes and project forward
+    62→    projected_km_map = dict(train_km_map)
+    63→    total_dead_running = 0.0
+    64→    affected_trains = set()
+    65→
+    66→    for change in changes:
+    67→        train_id = change.new_train_id
+    68→        if train_id in projected_km_map:
+    69→            # Add service km to the assigned train
+    70→            service_km = change.service_km
+    71→
+    72→            # Estimate km per day based on projection
+    73→            daily_factor = projection_days / 30.0
+    74→            projected_addition = int(service_km * daily_factor)
+    75→
+    76→            projected_km_map[train_id] += projected_addition
+    77→            affected_trains.add(train_id)
+    78→
+    79→        # If there was an original train, reduce its projected usage
+    80→        if change.original_train_id and change.original_train_id in projected_km_map:
+    81→            # The original train won't do this service anymore
+    82→            daily_factor = projection_days / 30.0
+    83→            projected_reduction = int(change.service_km * daily_factor)
+    84→            projected_km_map[change.original_train_id] = max(
+    85→                0,
+    86→                projected_km_map[change.original_train_id] - projected_reduction
+    87→            )
+    88→            affected_trains.add(change.original_train_id)
+    89→
+    90→        # Estimate dead running (simplified: assume 10km average per reassignment)
+    91→        total_dead_running += 10.0
+    92→
+    93→    # Calculate projected state
+    94→    projected_km_values = [km for km in projected_km_map.values() if km > 0]
+    95→    projected_variance = calculate_km_variance(projected_km_values)
+    96→
+    97→    # Build metrics comparison
+    98→    variance_change = projected_variance - current_variance
+    99→    metrics = [
+   100→        SimulationMetric(
+   101→            metric="Km Variance (%)",
+   102→            current=round(current_variance, 1),
+   103→            projected=round(projected_variance, 1),
+   104→            change=round(variance_change, 1),
+   105→            improved=variance_change < 0
+   106→        ),
+   107→        SimulationMetric(
+   108→            metric="Dead Running (km)",
+   109→            current=0.0,
+   110→            projected=round(total_dead_running, 1),
+   111→            change=round(total_dead_running, 1),
+   112→            improved=total_dead_running < 50  # Threshold for "acceptable"
+   113→        ),
+   114→        SimulationMetric(
+   115→            metric="Affected Trains",
+   116→            current=0.0,
+   117→            projected=float(len(affected_trains)),
+   118→            change=float(len(affected_trains)),
+   119→            improved=True  # Neutral metric
+   120→        )
+   121→    ]
+   122→
+   123→    # Calculate min/max km spread
+   124→    if projected_km_values:
+   125→        current_spread = max(current_km_values) - min(current_km_values) if current_km_values else 0
+   126→        projected_spread = max(projected_km_values) - min(projected_km_values)
+   127→        spread_change = projected_spread - current_spread
+   128→
+   129→        metrics.append(SimulationMetric(
+   130→            metric="Km Spread (max-min)",
+   131→            current=float(current_spread),
+   132→            projected=float(projected_spread),
+   133→            change=float(spread_change),
+   134→            improved=spread_change < 0
+   135→        ))
+   136→
+   137→    solver_time = int((time.perf_counter() - start_time) * 1000)
+   138→
+   139→    return SimulationResponse(
+   140→        scenario_id=f"sim-{int(time.time())}",
+   141→        projected_variance=round(projected_variance, 1),
+   142→        projected_dead_running=round(total_dead_running, 1),
+   143→        comparison=metrics,
+   144→        affected_trains=list(affected_trains),
+   145→        solver_time_ms=solver_time
+   146→    )
+   147→
+   148→
+   149→def calculate_optimal_swaps(
+   150→    trains_km: list[dict],
+   151→    max_swaps: int = 5
+   152→) -> list[tuple[str, str, int]]:
+   153→    """
+   154→    Find optimal train swaps to minimize km variance.
+   155→
+   156→    Returns list of (over_utilized_train, under_utilized_train, potential_km_transfer)
+   157→    """
+   158→    if len(trains_km) < 2:
+   159→        return []
+   160→
+   161→    # Calculate average km
+   162→    km_values = [t['current_km'] for t in trains_km]
+   163→    avg_km = statistics.mean(km_values)
+   164→
+   165→    # Identify over and under-utilized trains
+   166→    over_utilized = [
+   167→        (t['train_id'], t['current_km'])
+   168→        for t in trains_km
+   169→        if t['current_km'] > avg_km * 1.1  # >10% above average
+   170→    ]
+   171→    under_utilized = [
+   172→        (t['train_id'], t['current_km'])
+   173→        for t in trains_km
+   174→        if t['current_km'] < avg_km * 0.9  # >10% below average
+   175→    ]
+   176→
+   177→    # Sort by deviation
+   178→    over_utilized.sort(key=lambda x: x[1], reverse=True)
+   179→    under_utilized.sort(key=lambda x: x[1])
+   180→
+   181→    # Generate swap recommendations
+   182→    swaps = []
+   183→    for i, (over_id, over_km) in enumerate(over_utilized[:max_swaps]):
+   184→        if i < len(under_utilized):
+   185→            under_id, under_km = under_utilized[i]
+   186→            potential_transfer = int((over_km - avg_km + avg_km - under_km) / 2)
+   187→            swaps.append((over_id, under_id, potential_transfer))
+   188→
+   189→    return swaps
+   190→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

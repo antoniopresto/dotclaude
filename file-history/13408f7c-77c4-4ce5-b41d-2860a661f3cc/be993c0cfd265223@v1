@@ -1,0 +1,197 @@
+# StateMachine: A Headless State Logic Builder
+
+> The goal of this `StateMachine` is to **empower** and **simplify** state management logic by reducing the amount of boilerplate code and tests that need to be written, promoting robustness for state management beyond simple data fetching.
+
+## FAQ:
+
+- **"Is this a new state manager?"**
+
+  No. It's a logic builder. It doesn't manage the state itself; it declaratively defines the logic (reducers, actions, async operations). It is self-contained and does not require any UI framework or external state management library.
+
+- **"Is this a risky, custom 'black box'?"**
+
+  No. It's a thin abstraction layer that generates predictable, standard code (pure functions, reducers). The risk is minimized because the state logic becomes "headless" (decoupled), and manual complexity (action types, etc.) is eliminated, reducing the surface for bugs.
+
+- **"Will this make testing harder?"**
+
+  On the contrary. The state logic becomes testable as pure functions, without depending on a UI framework or a complex store setup. The boilerplate complexity is abstracted away and already covered by the toolkit's own tests, resulting in high test coverage "for free."
+
+---
+
+> 💎 The state-machine code, in isolation, has **over 95%** test coverage. <br>
+> This allows for a drastic reduction in the amount of code that needs to be written and tested.
+
+---
+
+## 1. Overview
+
+`createMachine` is a platform-agnostic factory function designed to standardize and streamline the creation of state logic.
+
+The main goal is to address the verbosity of manual state management setups by automating the generation of boilerplate (reducers, actions, action types) and promoting a state architecture aligned with **SOLID** principles and "Headless State Management."
+
+This approach decouples the state _logic_ from its _implementation_.
+
+## 2. Core Concepts
+
+The machine is composed of logical units called `Slices`, which adhere to the **Single Responsibility Principle (SRP)**.
+
+### a. `createSlice` (Synchronous State)
+
+Manages synchronous states, such as UI controls or session data.
+
+- **Input:** `id`, `initial` (initial state), `reducers` (pure functions), and `cache` (caching strategy).
+
+- **Output (Generated):** A reducer and typed Action Creators.
+
+```typescript
+import { createSlice } from '@dm/toolkit/state-machine';
+
+// Definition of a synchronous Slice
+const homeSlice = createSlice({
+  id: 'Home',
+  cache: { policy: 'private' }, // Cache strategy
+  initial: {
+    showAmounts: true,
+  },
+  reducers: {
+    // The 'state' is an Immer proxy, allowing for safe mutations
+    toggleShowAmounts: state => {
+      // type state: { showAmounts: boolean }
+      state.showAmounts = !state.showAmounts;
+    },
+    setShowAmounts: (state, payload: boolean) => {
+      // type state: { showAmounts: boolean }
+      // type payload: boolean
+      state.showAmounts = payload;
+    },
+  },
+});
+```
+
+### b. `createAsyncSlice` (Asynchronous State)
+
+Manages the complete lifecycle of asynchronous operations (e.g., API calls), abstracting the `REQUEST`, `SUCCESS`, `FAILURE` pattern.
+
+- **Input:** `id`, a single `load` function (which returns a `Promise`), the `context` (dependencies), and `cache`.
+
+- **Output (Generated):**
+  1.  A reducer that manages the state (`loading`, `loaded`, `failed`, `error`, `value`).
+  2.  Action creators for `load`, `success`, `fail`, and `clear`.
+
+```typescript
+import { createAsyncSlice } from '@dm/toolkit/state-machine';
+
+// Required context (Dependency Injection)
+const context = {
+  userID: null as string | null,
+  GET: (url: string) => Promise.resolve({ data: {} as any }),
+};
+
+// Definition of an asynchronous Slice
+const cashbackSlice = createAsyncSlice({
+  id: 'Cashback',
+  cache: {
+    policy: 'private',
+    ttl: '1h',
+  }, // Private cache, valid for 1 hour
+  context: context,
+  load: async (planID: string, context) => {
+    // type planID: string
+    // type context: { userID: string | null, GET: (url: string) => ... }
+    const response = await context.GET(`plans/${planID}/${context.userID}`);
+
+    // The return type is inferred as the 'value' of the state
+    return response.data as {
+      planID: string;
+      plan: { label: string };
+    };
+  },
+});
+```
+
+### c. `Context` (Dependency Injection)
+
+The `context` implements the **Dependency Inversion Principle (DIP)**. Instead of importing services (like API clients) directly, the context injects them into the machine at runtime. This makes the state logic "headless," pure, and easily testable by allowing dependencies to be mocked.
+
+### d. `Selectors` (Derived State)
+
+Allows the definition of selectors that compute derived state. These selectors are integrated into the final state and are automatically recalculated.
+
+## 3. Anatomy of `createMachine`
+
+`createMachine` aggregates slices, selectors, and configurations into a cohesive unit.
+
+```typescript
+import { createMachine } from '@dm/toolkit/state-machine';
+
+const appMachine = createMachine({
+  id: 'App', // Global machine ID
+  slices: {
+    home: homeSlice,
+    cashback: cashbackSlice,
+  },
+  context: {
+    // Provide dependencies (DIP)
+    userID: null,
+    GET: (url: string) => Promise.resolve({} as any),
+  },
+  selectors: {
+    // Derived state
+    amountsTogglerIcon: state => {
+      return state.home.showAmounts ? 'eye-open' : 'eye-closed';
+    },
+    cashbackLabel: state => {
+      // state.cashback.value is fully typed
+      return state.cashback.value?.plan.label ?? 'N/A';
+    },
+  },
+  initial: {
+    // Optional: Initial state (hydration)
+    home: { showAmounts: false },
+  },
+});
+
+// --- Generated Outputs (Inferred Types) ---
+
+// appMachine.actions.home.toggleShowAmounts
+// Inferred type: () => { type: "@App/Home/toggleShowAmounts", payload: void }
+
+// appMachine.actions.cashback.load
+// Inferred type: (payload: string) => { type: "@App/Cashback/load", payload: string }
+
+// appMachine.actions.cashback.success
+// Inferred type: (payload: { planID: string; plan: { label: string } }) => { ... }
+
+// appMachine.actionTypes.cashback.load
+// Inferred value: "@App/Cashback/load"
+```
+
+## 4. Advanced Features
+
+### a. Cache Management
+
+Each slice defines a `CacheStrategy`. The cache is checked upon machine initialization (e.g., when hydrating state).
+
+- **`policy`**: Defines the invalidation scope.
+  - `'public'`: Invalidated only by `ttl`.
+  - `'private'`: Invalidated by `ttl` OR if the runtime `userID` differs from the cached `userID`.
+  - `'session'`: Invalidated by `ttl` OR if the runtime `sessionID` differs from the cached `sessionID`.
+
+- **`ttl` (Time-To-Live)**: Cache lifetime (e.g., `'30m'`, `'1h'`, `'1y'`). If the time since `updatedAt` (in the metadata) exceeds the `ttl`, the cache is considered expired.
+
+- **`swr` (Stale-While-Revalidate)**:
+  - If `true` (default) and the cache is expired _only_ by `ttl`, the old (stale) data is retained, and a `@@${ID}/refetch_stale_slices` action is dispatched for background revalidation.
+  - If `false`, and the cache is expired (by `ttl` or `policy`), the slice's state is immediately reset to its `initial` state.
+
+## 5. Benefits and Guarantees
+
+1.  **Reduced Boilerplate and Risk:** Automates the creation of actions, types, and reducers. Less manually written code means a smaller surface area for bugs.
+
+2.  **Safety and Testability:** The state logic is "headless" (decoupled from the UI) and can be tested as pure functions. The `context` (DIP) allows for easy mocking of dependencies.
+
+3.  **Adherence to SOLID:**
+    - **SRP:** `Slices` isolate responsibilities.
+    - **DIP:** The `context` implements dependency injection.
+
+4.  **Framework Agnostic:** The logic is defined once and is not tied to any specific UI framework or external state manager.
+
