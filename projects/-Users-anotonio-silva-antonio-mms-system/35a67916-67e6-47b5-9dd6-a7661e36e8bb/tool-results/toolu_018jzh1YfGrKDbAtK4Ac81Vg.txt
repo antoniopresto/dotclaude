@@ -1,0 +1,393 @@
+     1→/**
+     2→ * Mileage Management Routes
+     3→ *
+     4→ * REST endpoints for mileage readings, anomalies, and meter events.
+     5→ * Wraps IngestionService with HTTP interface per spec 005.4.
+     6→ *
+     7→ * @see specs/005-api.md Section 5.4
+     8→ */
+     9→
+    10→import { Hono } from 'hono';
+    11→import {
+    12→  success,
+    13→  paginatedSuccess,
+    14→  error,
+    15→  parsePaginationQuery,
+    16→  ErrorCodes,
+    17→  type AppVariables,
+    18→} from '../types';
+    19→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    20→import {
+    21→  getIngestionService,
+    22→  type MileageReadingFilters,
+    23→  type AnomalyQueryFilters,
+    24→  type DbAnomalyType,
+    25→} from '../../services';
+    26→import { isValidUuid } from '../../lib/schemas';
+    27→
+    28→// Singleton service instance
+    29→let ingestionService: ReturnType<typeof getIngestionService> | null = null;
+    30→
+    31→function getService(): ReturnType<typeof getIngestionService> {
+    32→  if (!ingestionService) {
+    33→    ingestionService = getIngestionService();
+    34→  }
+    35→  return ingestionService;
+    36→}
+    37→
+    38→export const mileageRoutes = new Hono<{ Variables: AppVariables }>();
+    39→
+    40→/**
+    41→ * GET /mileage/readings
+    42→ *
+    43→ * Get mileage readings with filtering.
+    44→ *
+    45→ * Query Parameters:
+    46→ * - trainId: Filter by train UUID
+    47→ * - fromDate: Start date (inclusive, YYYY-MM-DD)
+    48→ * - toDate: End date (inclusive, YYYY-MM-DD)
+    49→ * - validationStatus: Filter by validation status (PENDING, VALID, ANOMALY, CORRECTED)
+    50→ * - page: Page number (default: 1)
+    51→ * - pageSize: Items per page (default: 50, max: 200)
+    52→ */
+    53→mileageRoutes.get('/mileage/readings', async (c) => {
+    54→  const requestId = getRequestId(c);
+    55→  const service = getService();
+    56→
+    57→  // Parse query filters
+    58→  const filters: MileageReadingFilters = {};
+    59→
+    60→  const trainId = c.req.query('trainId');
+    61→  const fromDate = c.req.query('fromDate');
+    62→  const toDate = c.req.query('toDate');
+    63→  const validationStatus = c.req.query('validationStatus');
+    64→
+    65→  if (trainId) {
+    66→    if (!isValidUuid(trainId)) {
+    67→      return c.json(
+    68→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid trainId format', requestId),
+    69→        400
+    70→      );
+    71→    }
+    72→    filters.trainId = trainId;
+    73→  }
+    74→
+    75→  if (fromDate) {
+    76→    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+    77→      return c.json(
+    78→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromDate format (expected YYYY-MM-DD)', requestId),
+    79→        400
+    80→      );
+    81→    }
+    82→    filters.fromDate = fromDate;
+    83→  }
+    84→
+    85→  if (toDate) {
+    86→    if (!/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+    87→      return c.json(
+    88→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toDate format (expected YYYY-MM-DD)', requestId),
+    89→        400
+    90→      );
+    91→    }
+    92→    filters.toDate = toDate;
+    93→  }
+    94→
+    95→  if (validationStatus) {
+    96→    const validStatuses = ['PENDING', 'VALID', 'ANOMALY', 'CORRECTED'] as const;
+    97→    if (!validStatuses.includes(validationStatus as (typeof validStatuses)[number])) {
+    98→      return c.json(
+    99→        error(
+   100→          ErrorCodes.VALIDATION_ERROR,
+   101→          `Invalid validationStatus. Must be one of: ${validStatuses.join(', ')}`,
+   102→          requestId
+   103→        ),
+   104→        400
+   105→      );
+   106→    }
+   107→    filters.validationStatus = validationStatus as 'PENDING' | 'VALID' | 'ANOMALY' | 'CORRECTED';
+   108→  }
+   109→
+   110→  // Parse pagination
+   111→  const pagination = parsePaginationQuery({
+   112→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   113→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   114→  });
+   115→
+   116→  filters.page = pagination.page;
+   117→  filters.pageSize = pagination.pageSize;
+   118→
+   119→  const result = await service.getMileageReadings(filters);
+   120→
+   121→  return c.json(
+   122→    paginatedSuccess(
+   123→      result.data,
+   124→      {
+   125→        page: pagination.page,
+   126→        pageSize: pagination.pageSize,
+   127→        totalItems: result.total,
+   128→      },
+   129→      { durationMs: getRequestDuration(c) }
+   130→    )
+   131→  );
+   132→});
+   133→
+   134→/**
+   135→ * GET /mileage/anomalies
+   136→ *
+   137→ * Get mileage anomalies requiring review.
+   138→ *
+   139→ * Query Parameters:
+   140→ * - trainId: Filter by train UUID
+   141→ * - fromDate: Start date (inclusive, YYYY-MM-DD)
+   142→ * - toDate: End date (inclusive, YYYY-MM-DD)
+   143→ * - anomalyType: Filter by anomaly type (NEGATIVE, SPIKE, DUPLICATE, MISSING, FUTURE_DATE, UNKNOWN_TRAIN)
+   144→ * - page: Page number (default: 1)
+   145→ * - pageSize: Items per page (default: 50, max: 200)
+   146→ */
+   147→mileageRoutes.get('/mileage/anomalies', async (c) => {
+   148→  const requestId = getRequestId(c);
+   149→  const service = getService();
+   150→
+   151→  // Parse query filters
+   152→  const filters: AnomalyQueryFilters = {};
+   153→
+   154→  const trainId = c.req.query('trainId');
+   155→  const fromDate = c.req.query('fromDate');
+   156→  const toDate = c.req.query('toDate');
+   157→  const anomalyType = c.req.query('anomalyType');
+   158→
+   159→  if (trainId) {
+   160→    if (!isValidUuid(trainId)) {
+   161→      return c.json(
+   162→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid trainId format', requestId),
+   163→        400
+   164→      );
+   165→    }
+   166→    filters.trainId = trainId;
+   167→  }
+   168→
+   169→  if (fromDate) {
+   170→    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+   171→      return c.json(
+   172→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromDate format (expected YYYY-MM-DD)', requestId),
+   173→        400
+   174→      );
+   175→    }
+   176→    filters.fromDate = fromDate;
+   177→  }
+   178→
+   179→  if (toDate) {
+   180→    if (!/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+   181→      return c.json(
+   182→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toDate format (expected YYYY-MM-DD)', requestId),
+   183→        400
+   184→      );
+   185→    }
+   186→    filters.toDate = toDate;
+   187→  }
+   188→
+   189→  if (anomalyType) {
+   190→    // Only database-stored anomaly types are queryable
+   191→    const validTypes = ['NEGATIVE', 'SPIKE', 'DUPLICATE', 'MISSING'] as const;
+   192→    if (!validTypes.includes(anomalyType as (typeof validTypes)[number])) {
+   193→      return c.json(
+   194→        error(
+   195→          ErrorCodes.VALIDATION_ERROR,
+   196→          `Invalid anomalyType. Must be one of: ${validTypes.join(', ')}`,
+   197→          requestId
+   198→        ),
+   199→        400
+   200→      );
+   201→    }
+   202→    filters.anomalyType = anomalyType as DbAnomalyType;
+   203→  }
+   204→
+   205→  // Parse pagination
+   206→  const pagination = parsePaginationQuery({
+   207→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   208→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   209→  });
+   210→
+   211→  filters.page = pagination.page;
+   212→  filters.pageSize = pagination.pageSize;
+   213→
+   214→  const result = await service.getAnomalies(filters);
+   215→
+   216→  return c.json(
+   217→    paginatedSuccess(
+   218→      result.data,
+   219→      {
+   220→        page: pagination.page,
+   221→        pageSize: pagination.pageSize,
+   222→        totalItems: result.total,
+   223→      },
+   224→      { durationMs: getRequestDuration(c) }
+   225→    )
+   226→  );
+   227→});
+   228→
+   229→/**
+   230→ * POST /mileage/meter-events
+   231→ *
+   232→ * Record a meter event (swap, replacement, calibration).
+   233→ *
+   234→ * Request Body:
+   235→ * {
+   236→ *   trainId: string (UUID),
+   237→ *   eventDate: string (YYYY-MM-DD),
+   238→ *   eventType: 'REPLACEMENT' | 'RESET' | 'CALIBRATION' | 'SWAP',
+   239→ *   oldMeterSerial?: string,
+   240→ *   newMeterSerial?: string,
+   241→ *   oldMeterReading: number,
+   242→ *   newMeterReading: number,
+   243→ *   reason?: string
+   244→ * }
+   245→ */
+   246→mileageRoutes.post('/mileage/meter-events', async (c) => {
+   247→  const requestId = getRequestId(c);
+   248→  const service = getService();
+   249→
+   250→  let body: unknown;
+   251→  try {
+   252→    body = await c.req.json();
+   253→  } catch {
+   254→    return c.json(
+   255→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid JSON body', requestId),
+   256→      400
+   257→    );
+   258→  }
+   259→
+   260→  // Validate required fields
+   261→  const data = body as Record<string, unknown>;
+   262→
+   263→  if (!data.trainId || typeof data.trainId !== 'string') {
+   264→    return c.json(
+   265→      error(ErrorCodes.VALIDATION_ERROR, 'trainId is required and must be a string', requestId),
+   266→      400
+   267→    );
+   268→  }
+   269→
+   270→  if (!isValidUuid(data.trainId)) {
+   271→    return c.json(
+   272→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid trainId format', requestId),
+   273→      400
+   274→    );
+   275→  }
+   276→
+   277→  if (!data.eventDate || typeof data.eventDate !== 'string') {
+   278→    return c.json(
+   279→      error(ErrorCodes.VALIDATION_ERROR, 'eventDate is required and must be a string', requestId),
+   280→      400
+   281→    );
+   282→  }
+   283→
+   284→  if (!/^\d{4}-\d{2}-\d{2}$/.test(data.eventDate)) {
+   285→    return c.json(
+   286→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid eventDate format (expected YYYY-MM-DD)', requestId),
+   287→      400
+   288→    );
+   289→  }
+   290→
+   291→  if (!data.eventType || typeof data.eventType !== 'string') {
+   292→    return c.json(
+   293→      error(ErrorCodes.VALIDATION_ERROR, 'eventType is required and must be a string', requestId),
+   294→      400
+   295→    );
+   296→  }
+   297→
+   298→  const validEventTypes = ['REPLACEMENT', 'RESET', 'CALIBRATION', 'SWAP'] as const;
+   299→  if (!validEventTypes.includes(data.eventType as (typeof validEventTypes)[number])) {
+   300→    return c.json(
+   301→      error(
+   302→        ErrorCodes.VALIDATION_ERROR,
+   303→        `Invalid eventType. Must be one of: ${validEventTypes.join(', ')}`,
+   304→        requestId
+   305→      ),
+   306→      400
+   307→    );
+   308→  }
+   309→
+   310→  if (typeof data.oldMeterReading !== 'number' || data.oldMeterReading < 0) {
+   311→    return c.json(
+   312→      error(ErrorCodes.VALIDATION_ERROR, 'oldMeterReading is required and must be a non-negative number', requestId),
+   313→      400
+   314→    );
+   315→  }
+   316→
+   317→  if (typeof data.newMeterReading !== 'number' || data.newMeterReading < 0) {
+   318→    return c.json(
+   319→      error(ErrorCodes.VALIDATION_ERROR, 'newMeterReading is required and must be a non-negative number', requestId),
+   320→      400
+   321→    );
+   322→  }
+   323→
+   324→  const reason = typeof data.reason === 'string' ? data.reason : undefined;
+   325→
+   326→  // Get user ID from auth context (if available)
+   327→  const user = c.get('user');
+   328→  const createdBy = user?.id;
+   329→
+   330→  const meterEvent = await service.createMeterEvent(
+   331→    data.trainId,
+   332→    data.eventType as 'REPLACEMENT' | 'RESET' | 'CALIBRATION' | 'SWAP',
+   333→    data.eventDate,
+   334→    data.oldMeterReading,
+   335→    data.newMeterReading,
+   336→    reason,
+   337→    createdBy
+   338→  );
+   339→
+   340→  return c.json(
+   341→    success(meterEvent, {
+   342→      timing: { durationMs: getRequestDuration(c) },
+   343→    }),
+   344→    201
+   345→  );
+   346→});
+   347→
+   348→/**
+   349→ * GET /mileage/stats
+   350→ *
+   351→ * Get ingestion statistics for the specified time period.
+   352→ *
+   353→ * Query Parameters:
+   354→ * - days: Number of days to look back (default: 7)
+   355→ */
+   356→mileageRoutes.get('/mileage/stats', async (c) => {
+   357→  const service = getService();
+   358→
+   359→  const daysParam = c.req.query('days');
+   360→  const days = daysParam ? Math.max(1, Math.min(365, Number(daysParam) || 7)) : 7;
+   361→
+   362→  const stats = await service.getIngestionStats(days);
+   363→
+   364→  return c.json(
+   365→    success(stats, {
+   366→      timing: { durationMs: getRequestDuration(c) },
+   367→    })
+   368→  );
+   369→});
+   370→
+   371→/**
+   372→ * GET /mileage/health
+   373→ *
+   374→ * Check mileage file ingestion health.
+   375→ *
+   376→ * Returns whether files have been received within the expected timeframe.
+   377→ */
+   378→mileageRoutes.get('/mileage/health', async (c) => {
+   379→  const service = getService();
+   380→
+   381→  const health = await service.checkFileArrivalHealth();
+   382→
+   383→  return c.json(
+   384→    success(health, {
+   385→      timing: { durationMs: getRequestDuration(c) },
+   386→    })
+   387→  );
+   388→});
+   389→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

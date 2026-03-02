@@ -1,0 +1,578 @@
+     1→/**
+     2→ * MMS Resilience Utilities
+     3→ *
+     4→ * Provides retry and circuit breaker patterns for handling transient failures.
+     5→ * Critical for integration with external systems (Maximo, OCC) and for
+     6→ * maintaining service availability during infrastructure issues.
+     7→ *
+     8→ * @see specs/007-integration.md - External system integration patterns
+     9→ * @see specs/004-domain-services.md - Service reliability requirements
+    10→ */
+    11→
+    12→import { withSpan, addSpanEvent, SpanKind } from '../tracing';
+    13→import { TimeoutError, ExternalServiceError, ServiceUnavailableError } from '../errors';
+    14→import { logger } from '../logging/logger';
+    15→
+    16→// =============================================================================
+    17→// Retry Configuration & Implementation
+    18→// =============================================================================
+    19→
+    20→/**
+    21→ * Retry configuration options
+    22→ */
+    23→export interface RetryConfig {
+    24→  /** Maximum number of retry attempts */
+    25→  maxAttempts: number;
+    26→  /** Initial delay between retries (ms) */
+    27→  initialDelayMs: number;
+    28→  /** Maximum delay between retries (ms) */
+    29→  maxDelayMs: number;
+    30→  /** Backoff multiplier (e.g., 2 for exponential) */
+    31→  backoffMultiplier: number;
+    32→  /** Add random jitter to delays (prevents thundering herd) */
+    33→  jitter: boolean;
+    34→  /** Predicate to determine if an error is retryable */
+    35→  isRetryable?: (error: unknown) => boolean;
+    36→  /** Callback invoked before each retry */
+    37→  onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
+    38→}
+    39→
+    40→/**
+    41→ * Default retry configuration
+    42→ * Suitable for most transient failure scenarios
+    43→ */
+    44→export const DEFAULT_RETRY_CONFIG: RetryConfig = {
+    45→  maxAttempts: 3,
+    46→  initialDelayMs: 1000,
+    47→  maxDelayMs: 30000,
+    48→  backoffMultiplier: 2,
+    49→  jitter: true,
+    50→  isRetryable: defaultIsRetryable,
+    51→};
+    52→
+    53→/**
+    54→ * Aggressive retry configuration
+    55→ * Use for critical operations that must succeed
+    56→ */
+    57→export const AGGRESSIVE_RETRY_CONFIG: RetryConfig = {
+    58→  maxAttempts: 5,
+    59→  initialDelayMs: 500,
+    60→  maxDelayMs: 60000,
+    61→  backoffMultiplier: 2,
+    62→  jitter: true,
+    63→  isRetryable: defaultIsRetryable,
+    64→};
+    65→
+    66→/**
+    67→ * Quick retry configuration
+    68→ * Use for fast operations where quick recovery is expected
+    69→ */
+    70→export const QUICK_RETRY_CONFIG: RetryConfig = {
+    71→  maxAttempts: 3,
+    72→  initialDelayMs: 100,
+    73→  maxDelayMs: 2000,
+    74→  backoffMultiplier: 2,
+    75→  jitter: true,
+    76→  isRetryable: defaultIsRetryable,
+    77→};
+    78→
+    79→/**
+    80→ * External service retry configuration
+    81→ * Use for Maximo, OCC, and other external integrations
+    82→ */
+    83→export const EXTERNAL_SERVICE_RETRY_CONFIG: RetryConfig = {
+    84→  maxAttempts: 5,
+    85→  initialDelayMs: 2000,
+    86→  maxDelayMs: 60000,
+    87→  backoffMultiplier: 2,
+    88→  jitter: true,
+    89→  isRetryable: (error) => {
+    90→    // Retry on network errors, timeouts, and 5xx responses
+    91→    if (error instanceof TimeoutError) return true;
+    92→    if (error instanceof ExternalServiceError) return true;
+    93→    if (error instanceof ServiceUnavailableError) return true;
+    94→
+    95→    // Check for fetch/network errors
+    96→    if (error instanceof Error) {
+    97→      const message = error.message.toLowerCase();
+    98→      return (
+    99→        message.includes('network') ||
+   100→        message.includes('timeout') ||
+   101→        message.includes('econnrefused') ||
+   102→        message.includes('econnreset') ||
+   103→        message.includes('socket hang up')
+   104→      );
+   105→    }
+   106→
+   107→    return false;
+   108→  },
+   109→};
+   110→
+   111→/**
+   112→ * Default function to determine if an error is retryable
+   113→ */
+   114→function defaultIsRetryable(error: unknown): boolean {
+   115→  // Don't retry validation errors or not found errors
+   116→  if (error instanceof Error) {
+   117→    const code = (error as Error & { code?: string }).code ?? '';
+   118→    const statusCode = (error as Error & { statusCode?: number }).statusCode ?? 0;
+   119→
+   120→    // Don't retry 4xx client errors (except 408 timeout, 429 rate limit)
+   121→    if (statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 429) {
+   122→      return false;
+   123→    }
+   124→
+   125→    // Don't retry certain error codes
+   126→    if (code.startsWith('BUS_') || code.startsWith('AUTH_')) {
+   127→      return false;
+   128→    }
+   129→  }
+   130→
+   131→  return true;
+   132→}
+   133→
+   134→/**
+   135→ * Calculate delay for a given attempt with optional jitter
+   136→ */
+   137→function calculateDelay(attempt: number, config: RetryConfig): number {
+   138→  const exponentialDelay = config.initialDelayMs * Math.pow(config.backoffMultiplier, attempt - 1);
+   139→  let delay = Math.min(exponentialDelay, config.maxDelayMs);
+   140→
+   141→  if (config.jitter) {
+   142→    // Add ±25% jitter
+   143→    const jitterRange = delay * 0.25;
+   144→    delay = delay - jitterRange + Math.random() * jitterRange * 2;
+   145→  }
+   146→
+   147→  return Math.round(delay);
+   148→}
+   149→
+   150→/**
+   151→ * Sleep for a specified duration
+   152→ */
+   153→function sleep(ms: number): Promise<void> {
+   154→  return new Promise((resolve) => setTimeout(resolve, ms));
+   155→}
+   156→
+   157→/**
+   158→ * Execute a function with retry logic
+   159→ *
+   160→ * Uses exponential backoff with optional jitter to handle transient failures.
+   161→ * Integrates with OpenTelemetry tracing for observability.
+   162→ *
+   163→ * @example
+   164→ * ```typescript
+   165→ * const result = await withRetry(
+   166→ *   async () => {
+   167→ *     return await fetchFromMaximo('/api/workorders');
+   168→ *   },
+   169→ *   {
+   170→ *     maxAttempts: 5,
+   171→ *     initialDelayMs: 1000,
+   172→ *     isRetryable: (error) => error instanceof NetworkError
+   173→ *   },
+   174→ *   'fetchWorkOrders'
+   175→ * );
+   176→ * ```
+   177→ */
+   178→export async function withRetry<T>(
+   179→  fn: () => Promise<T>,
+   180→  config?: Partial<RetryConfig>,
+   181→  operationName?: string
+   182→): Promise<T> {
+   183→  const opts = { ...DEFAULT_RETRY_CONFIG, ...config };
+   184→  const name = operationName ?? 'retry';
+   185→
+   186→  return withSpan(
+   187→    `resilience.${name}`,
+   188→    async (span) => {
+   189→      span.setAttribute('retry.max_attempts', opts.maxAttempts);
+   190→      let lastError: unknown;
+   191→
+   192→      for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
+   193→        try {
+   194→          span.setAttribute('retry.current_attempt', attempt);
+   195→          addSpanEvent('retry.attempt', { attempt });
+   196→
+   197→          const result = await fn();
+   198→
+   199→          if (attempt > 1) {
+   200→            addSpanEvent('retry.success', { attempt, totalAttempts: attempt });
+   201→          }
+   202→
+   203→          return result;
+   204→        } catch (error) {
+   205→          lastError = error;
+   206→
+   207→          // Check if we should retry
+   208→          const shouldRetry = attempt < opts.maxAttempts && (opts.isRetryable?.(error) ?? true);
+   209→
+   210→          if (!shouldRetry) {
+   211→            addSpanEvent('retry.exhausted', {
+   212→              attempt,
+   213→              error: error instanceof Error ? error.message : String(error),
+   214→              retryable: opts.isRetryable?.(error) ?? true,
+   215→            });
+   216→            throw error;
+   217→          }
+   218→
+   219→          // Calculate delay
+   220→          const delayMs = calculateDelay(attempt, opts);
+   221→
+   222→          addSpanEvent('retry.waiting', {
+   223→            attempt,
+   224→            delayMs,
+   225→            error: error instanceof Error ? error.message : String(error),
+   226→          });
+   227→
+   228→          // Invoke callback if provided
+   229→          opts.onRetry?.(error, attempt, delayMs);
+   230→
+   231→          logger.warn(
+   232→            {
+   233→              operation: name,
+   234→              attempt,
+   235→              nextAttempt: attempt + 1,
+   236→              delayMs,
+   237→              error: error instanceof Error ? error.message : String(error),
+   238→            },
+   239→            `Retry attempt ${attempt}/${opts.maxAttempts} failed, waiting ${delayMs}ms`
+   240→          );
+   241→
+   242→          await sleep(delayMs);
+   243→        }
+   244→      }
+   245→
+   246→      // Should never reach here, but TypeScript needs this
+   247→      throw lastError;
+   248→    },
+   249→    { kind: SpanKind.INTERNAL }
+   250→  );
+   251→}
+   252→
+   253→// =============================================================================
+   254→// Circuit Breaker Implementation
+   255→// =============================================================================
+   256→
+   257→/**
+   258→ * Circuit breaker states
+   259→ */
+   260→export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+   261→
+   262→/**
+   263→ * Circuit breaker configuration
+   264→ */
+   265→export interface CircuitBreakerConfig {
+   266→  /** Number of failures before opening the circuit */
+   267→  failureThreshold: number;
+   268→  /** Number of successes in half-open state to close circuit */
+   269→  successThreshold: number;
+   270→  /** Time to wait before transitioning from OPEN to HALF_OPEN (ms) */
+   271→  resetTimeoutMs: number;
+   272→  /** Function to determine if an error counts as a failure */
+   273→  isFailure?: (error: unknown) => boolean;
+   274→  /** Callback when circuit state changes */
+   275→  onStateChange?: (from: CircuitState, to: CircuitState) => void;
+   276→}
+   277→
+   278→/**
+   279→ * Default circuit breaker configuration
+   280→ */
+   281→export const DEFAULT_CIRCUIT_BREAKER_CONFIG: CircuitBreakerConfig = {
+   282→  failureThreshold: 5,
+   283→  successThreshold: 3,
+   284→  resetTimeoutMs: 30000,
+   285→  isFailure: () => true,
+   286→};
+   287→
+   288→/**
+   289→ * Circuit breaker metrics
+   290→ */
+   291→export interface CircuitBreakerMetrics {
+   292→  state: CircuitState;
+   293→  failures: number;
+   294→  successes: number;
+   295→  lastFailureTime: Date | null;
+   296→  lastSuccessTime: Date | null;
+   297→  totalRequests: number;
+   298→  totalFailures: number;
+   299→  totalSuccesses: number;
+   300→}
+   301→
+   302→/**
+   303→ * Circuit Breaker implementation
+   304→ *
+   305→ * Prevents cascading failures by stopping requests to a failing service.
+   306→ * Implements the standard circuit breaker pattern:
+   307→ * - CLOSED: Normal operation, requests flow through
+   308→ * - OPEN: Failures exceeded threshold, requests fail fast
+   309→ * - HALF_OPEN: Testing if service has recovered
+   310→ *
+   311→ * @example
+   312→ * ```typescript
+   313→ * const maximoBreaker = new CircuitBreaker({
+   314→ *   failureThreshold: 5,
+   315→ *   resetTimeoutMs: 30000,
+   316→ *   onStateChange: (from, to) => {
+   317→ *     logger.warn({ from, to }, 'Maximo circuit breaker state changed');
+   318→ *   }
+   319→ * }, 'maximo');
+   320→ *
+   321→ * // In service
+   322→ * const result = await maximoBreaker.execute(
+   323→ *   async () => fetchFromMaximo('/api/workorders')
+   324→ * );
+   325→ * ```
+   326→ */
+   327→export class CircuitBreaker {
+   328→  private state: CircuitState = 'CLOSED';
+   329→  private failures = 0;
+   330→  private successes = 0;
+   331→  private lastFailureTime: Date | null = null;
+   332→  private lastSuccessTime: Date | null = null;
+   333→  private totalRequests = 0;
+   334→  private totalFailures = 0;
+   335→  private totalSuccesses = 0;
+   336→  private readonly config: CircuitBreakerConfig;
+   337→  private readonly name: string;
+   338→  private readonly log: typeof logger;
+   339→
+   340→  constructor(config: Partial<CircuitBreakerConfig> = {}, name = 'default') {
+   341→    this.config = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...config };
+   342→    this.name = name;
+   343→    this.log = logger.child({ circuitBreaker: name });
+   344→  }
+   345→
+   346→  /**
+   347→   * Execute a function through the circuit breaker
+   348→   */
+   349→  async execute<T>(fn: () => Promise<T>): Promise<T> {
+   350→    return withSpan(
+   351→      `circuitBreaker.${this.name}`,
+   352→      async (span) => {
+   353→        span.setAttribute('circuit_breaker.name', this.name);
+   354→        span.setAttribute('circuit_breaker.state', this.state);
+   355→
+   356→        this.totalRequests++;
+   357→
+   358→        // Check if circuit should transition from OPEN to HALF_OPEN
+   359→        this.checkResetTimeout();
+   360→
+   361→        // If circuit is OPEN, fail fast
+   362→        if (this.state === 'OPEN') {
+   363→          addSpanEvent('circuit_breaker.rejected', { state: this.state });
+   364→          throw new ServiceUnavailableError(
+   365→            `Circuit breaker ${this.name} is OPEN. Service unavailable.`,
+   366→            { retryAfter: Math.ceil(this.config.resetTimeoutMs / 1000) }
+   367→          );
+   368→        }
+   369→
+   370→        try {
+   371→          const result = await fn();
+   372→          this.recordSuccess();
+   373→          addSpanEvent('circuit_breaker.success', { state: this.state });
+   374→          return result;
+   375→        } catch (error) {
+   376→          if (this.config.isFailure?.(error) ?? true) {
+   377→            this.recordFailure();
+   378→            addSpanEvent('circuit_breaker.failure', {
+   379→              state: this.state,
+   380→              failures: this.failures,
+   381→            });
+   382→          }
+   383→          throw error;
+   384→        }
+   385→      },
+   386→      { kind: SpanKind.INTERNAL }
+   387→    );
+   388→  }
+   389→
+   390→  /**
+   391→   * Check if the reset timeout has elapsed and transition to HALF_OPEN
+   392→   */
+   393→  private checkResetTimeout(): void {
+   394→    if (this.state !== 'OPEN' || !this.lastFailureTime) return;
+   395→
+   396→    const elapsed = Date.now() - this.lastFailureTime.getTime();
+   397→    if (elapsed >= this.config.resetTimeoutMs) {
+   398→      this.transition('HALF_OPEN');
+   399→    }
+   400→  }
+   401→
+   402→  /**
+   403→   * Record a successful execution
+   404→   */
+   405→  private recordSuccess(): void {
+   406→    this.successes++;
+   407→    this.totalSuccesses++;
+   408→    this.lastSuccessTime = new Date();
+   409→
+   410→    if (this.state === 'HALF_OPEN') {
+   411→      if (this.successes >= this.config.successThreshold) {
+   412→        this.transition('CLOSED');
+   413→      }
+   414→    } else if (this.state === 'CLOSED') {
+   415→      // Reset failure count on success in CLOSED state
+   416→      this.failures = 0;
+   417→    }
+   418→  }
+   419→
+   420→  /**
+   421→   * Record a failed execution
+   422→   */
+   423→  private recordFailure(): void {
+   424→    this.failures++;
+   425→    this.totalFailures++;
+   426→    this.lastFailureTime = new Date();
+   427→    this.successes = 0; // Reset success count on failure
+   428→
+   429→    if (this.state === 'HALF_OPEN') {
+   430→      // Any failure in HALF_OPEN opens the circuit again
+   431→      this.transition('OPEN');
+   432→    } else if (this.state === 'CLOSED') {
+   433→      if (this.failures >= this.config.failureThreshold) {
+   434→        this.transition('OPEN');
+   435→      }
+   436→    }
+   437→  }
+   438→
+   439→  /**
+   440→   * Transition to a new state
+   441→   */
+   442→  private transition(to: CircuitState): void {
+   443→    const from = this.state;
+   444→    if (from === to) return;
+   445→
+   446→    this.log.info({ from, to }, `Circuit breaker transitioning: ${from} -> ${to}`);
+   447→
+   448→    this.state = to;
+   449→    this.failures = 0;
+   450→    this.successes = 0;
+   451→
+   452→    this.config.onStateChange?.(from, to);
+   453→  }
+   454→
+   455→  /**
+   456→   * Get current circuit breaker metrics
+   457→   */
+   458→  getMetrics(): CircuitBreakerMetrics {
+   459→    return {
+   460→      state: this.state,
+   461→      failures: this.failures,
+   462→      successes: this.successes,
+   463→      lastFailureTime: this.lastFailureTime,
+   464→      lastSuccessTime: this.lastSuccessTime,
+   465→      totalRequests: this.totalRequests,
+   466→      totalFailures: this.totalFailures,
+   467→      totalSuccesses: this.totalSuccesses,
+   468→    };
+   469→  }
+   470→
+   471→  /**
+   472→   * Get current state
+   473→   */
+   474→  getState(): CircuitState {
+   475→    this.checkResetTimeout();
+   476→    return this.state;
+   477→  }
+   478→
+   479→  /**
+   480→   * Manually reset the circuit breaker to CLOSED state
+   481→   * Use with caution - primarily for testing or manual intervention
+   482→   */
+   483→  reset(): void {
+   484→    this.log.warn('Circuit breaker manually reset');
+   485→    this.state = 'CLOSED';
+   486→    this.failures = 0;
+   487→    this.successes = 0;
+   488→  }
+   489→
+   490→  /**
+   491→   * Manually open the circuit
+   492→   * Use for graceful degradation scenarios
+   493→   */
+   494→  open(): void {
+   495→    this.log.warn('Circuit breaker manually opened');
+   496→    this.transition('OPEN');
+   497→    this.lastFailureTime = new Date();
+   498→  }
+   499→}
+   500→
+   501→// =============================================================================
+   502→// Combined Retry + Circuit Breaker
+   503→// =============================================================================
+   504→
+   505→/**
+   506→ * Execute a function with both retry logic and circuit breaker protection
+   507→ *
+   508→ * The circuit breaker wraps the retry logic, so if the circuit is open,
+   509→ * no retries will be attempted.
+   510→ *
+   511→ * @example
+   512→ * ```typescript
+   513→ * const result = await withResilience(
+   514→ *   async () => fetchFromMaximo('/api/workorders'),
+   515→ *   maximoCircuitBreaker,
+   516→ *   EXTERNAL_SERVICE_RETRY_CONFIG,
+   517→ *   'fetchWorkOrders'
+   518→ * );
+   519→ * ```
+   520→ */
+   521→export async function withResilience<T>(
+   522→  fn: () => Promise<T>,
+   523→  circuitBreaker: CircuitBreaker,
+   524→  retryConfig?: Partial<RetryConfig>,
+   525→  operationName?: string
+   526→): Promise<T> {
+   527→  return circuitBreaker.execute(async () => withRetry(fn, retryConfig, operationName));
+   528→}
+   529→
+   530→// =============================================================================
+   531→// Timeout Utility
+   532→// =============================================================================
+   533→
+   534→/**
+   535→ * Execute a function with a timeout
+   536→ *
+   537→ * @example
+   538→ * ```typescript
+   539→ * const result = await withTimeout(
+   540→ *   async () => slowOperation(),
+   541→ *   5000,
+   542→ *   'slowOperation'
+   543→ * );
+   544→ * ```
+   545→ */
+   546→export async function withTimeout<T>(
+   547→  fn: () => Promise<T>,
+   548→  timeoutMs: number,
+   549→  operationName?: string
+   550→): Promise<T> {
+   551→  const name = operationName ?? 'operation';
+   552→
+   553→  return new Promise((resolve, reject) => {
+   554→    const timer = setTimeout(() => {
+   555→      reject(
+   556→        new TimeoutError(`Operation ${name} timed out after ${timeoutMs}ms`, {
+   557→          operation: name,
+   558→          timeoutMs,
+   559→        })
+   560→      );
+   561→    }, timeoutMs);
+   562→
+   563→    fn()
+   564→      .then((result) => {
+   565→        clearTimeout(timer);
+   566→        resolve(result);
+   567→      })
+   568→      .catch((error) => {
+   569→        clearTimeout(timer);
+   570→        reject(error);
+   571→      });
+   572→  });
+   573→}
+   574→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

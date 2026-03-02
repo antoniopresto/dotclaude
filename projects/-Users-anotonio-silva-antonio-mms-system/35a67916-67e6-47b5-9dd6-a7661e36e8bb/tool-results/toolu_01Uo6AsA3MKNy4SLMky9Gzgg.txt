@@ -1,0 +1,324 @@
+     1→/**
+     2→ * MMS OpenTelemetry Tracing Configuration
+     3→ *
+     4→ * Provides distributed tracing for all MMS services.
+     5→ * Integrates with Pino logging for correlated trace context.
+     6→ *
+     7→ * Features:
+     8→ * - Automatic span context propagation
+     9→ * - Span attribute helpers for domain-specific data
+    10→ * - Integration with existing Pino logger
+    11→ * - Configurable exporters (OTLP, Jaeger, Console)
+    12→ *
+    13→ * @see specs/004-domain-services.md - All services emit OpenTelemetry traces
+    14→ */
+    15→
+    16→import {
+    17→  trace,
+    18→  context,
+    19→  SpanStatusCode,
+    20→  SpanKind,
+    21→  type Span,
+    22→  type Tracer,
+    23→  type Context,
+    24→  type SpanOptions,
+    25→  type Attributes,
+    26→} from '@opentelemetry/api';
+    27→import {
+    28→  SEMRESATTRS_SERVICE_NAME,
+    29→  SEMRESATTRS_SERVICE_VERSION,
+    30→  SEMRESATTRS_DEPLOYMENT_ENVIRONMENT,
+    31→} from '@opentelemetry/semantic-conventions';
+    32→
+    33→const SERVICE_NAME = process.env['SERVICE_NAME'] ?? 'mms';
+    34→const SERVICE_VERSION = process.env['SERVICE_VERSION'] ?? '0.1.0';
+    35→const ENVIRONMENT = process.env['NODE_ENV'] ?? 'development';
+    36→
+    37→/**
+    38→ * Domain-specific span attributes for MMS
+    39→ */
+    40→export const MmsAttributes = {
+    41→  // Train attributes
+    42→  TRAIN_ID: 'mms.train.id',
+    43→  TRAIN_NUMBER: 'mms.train.number',
+    44→  FLEET_ID: 'mms.fleet.id',
+    45→
+    46→  // PM attributes
+    47→  PM_SCHEDULE_ID: 'mms.pm.schedule_id',
+    48→  PM_TYPE_CODE: 'mms.pm.type_code',
+    49→  PM_STATUS: 'mms.pm.status',
+    50→
+    51→  // Depot attributes
+    52→  DEPOT_ID: 'mms.depot.id',
+    53→  DEPOT_CODE: 'mms.depot.code',
+    54→
+    55→  // Mileage attributes
+    56→  MILEAGE_KM: 'mms.mileage.km',
+    57→  DAILY_KM: 'mms.mileage.daily_km',
+    58→
+    59→  // Ingestion attributes
+    60→  INGESTION_FILE: 'mms.ingestion.file',
+    61→  INGESTION_JOB_ID: 'mms.ingestion.job_id',
+    62→  INGESTION_RECORD_COUNT: 'mms.ingestion.record_count',
+    63→  INGESTION_RECORDS: 'mms.ingestion.records',
+    64→  INGESTION_VALID: 'mms.ingestion.valid',
+    65→  INGESTION_INVALID: 'mms.ingestion.invalid',
+    66→
+    67→  // Optimizer attributes
+    68→  OPTIMIZER_JOB_ID: 'mms.optimizer.job_id',
+    69→  OPTIMIZER_SOLVER: 'mms.optimizer.solver',
+    70→  OPTIMIZER_SOLVE_TIME_MS: 'mms.optimizer.solve_time_ms',
+    71→  OPTIMIZER_OBJECTIVE: 'mms.optimizer.objective',
+    72→  OPTIMIZER_STATUS: 'mms.optimizer.status',
+    73→
+    74→  // Baseline attributes
+    75→  BASELINE_ID: 'mms.baseline.id',
+    76→  BASELINE_VERSION: 'mms.baseline.version',
+    77→
+    78→  // Scenario attributes
+    79→  SCENARIO_ID: 'mms.scenario.id',
+    80→  SCENARIO_NAME: 'mms.scenario.name',
+    81→
+    82→  // Queue attributes
+    83→  QUEUE_NAME: 'mms.queue.name',
+    84→  JOB_ID: 'mms.job.id',
+    85→  JOB_ATTEMPT: 'mms.job.attempt',
+    86→
+    87→  // User attributes
+    88→  USER_ID: 'mms.user.id',
+    89→  USER_EMAIL: 'mms.user.email',
+    90→
+    91→  // Database attributes
+    92→  DB_OPERATION: 'mms.db.operation',
+    93→  DB_TABLE: 'mms.db.table',
+    94→  DB_ROWS_AFFECTED: 'mms.db.rows_affected',
+    95→
+    96→  // Error attributes
+    97→  ERROR_CODE: 'mms.error.code',
+    98→  ERROR_TYPE: 'mms.error.type',
+    99→} as const;
+   100→
+   101→/**
+   102→ * Get the configured tracer for a service
+   103→ */
+   104→export function getTracer(serviceName?: string): Tracer {
+   105→  return trace.getTracer(serviceName ?? SERVICE_NAME, SERVICE_VERSION);
+   106→}
+   107→
+   108→/**
+   109→ * Get service-level attributes for span context
+   110→ */
+   111→export function getServiceAttributes(): Attributes {
+   112→  return {
+   113→    [SEMRESATTRS_SERVICE_NAME]: SERVICE_NAME,
+   114→    [SEMRESATTRS_SERVICE_VERSION]: SERVICE_VERSION,
+   115→    [SEMRESATTRS_DEPLOYMENT_ENVIRONMENT]: ENVIRONMENT,
+   116→  };
+   117→}
+   118→
+   119→/**
+   120→ * Start a new span for an operation
+   121→ */
+   122→export function startSpan(
+   123→  name: string,
+   124→  options?: SpanOptions & { tracer?: Tracer }
+   125→): Span {
+   126→  const tracer = options?.tracer ?? getTracer();
+   127→  return tracer.startSpan(name, {
+   128→    ...options,
+   129→    attributes: {
+   130→      ...getServiceAttributes(),
+   131→      ...options?.attributes,
+   132→    },
+   133→  });
+   134→}
+   135→
+   136→/**
+   137→ * Execute a function within a traced span
+   138→ *
+   139→ * Automatically records errors and sets span status.
+   140→ *
+   141→ * @example
+   142→ * const result = await withSpan('processRecord', async (span) => {
+   143→ *   span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   144→ *   return processRecord(record);
+   145→ * });
+   146→ */
+   147→export async function withSpan<T>(
+   148→  name: string,
+   149→  fn: (span: Span) => Promise<T>,
+   150→  options?: SpanOptions & { tracer?: Tracer }
+   151→): Promise<T> {
+   152→  const tracer = options?.tracer ?? getTracer();
+   153→  const span = tracer.startSpan(name, {
+   154→    kind: SpanKind.INTERNAL,
+   155→    ...options,
+   156→    attributes: {
+   157→      ...getServiceAttributes(),
+   158→      ...options?.attributes,
+   159→    },
+   160→  });
+   161→
+   162→  const ctx = trace.setSpan(context.active(), span);
+   163→
+   164→  try {
+   165→    const result = await context.with(ctx, () => fn(span));
+   166→    span.setStatus({ code: SpanStatusCode.OK });
+   167→    return result;
+   168→  } catch (error) {
+   169→    recordSpanError(span, error);
+   170→    throw error;
+   171→  } finally {
+   172→    span.end();
+   173→  }
+   174→}
+   175→
+   176→/**
+   177→ * Synchronous version of withSpan
+   178→ */
+   179→export function withSpanSync<T>(
+   180→  name: string,
+   181→  fn: (span: Span) => T,
+   182→  options?: SpanOptions & { tracer?: Tracer }
+   183→): T {
+   184→  const tracer = options?.tracer ?? getTracer();
+   185→  const span = tracer.startSpan(name, {
+   186→    kind: SpanKind.INTERNAL,
+   187→    ...options,
+   188→    attributes: {
+   189→      ...getServiceAttributes(),
+   190→      ...options?.attributes,
+   191→    },
+   192→  });
+   193→
+   194→  const ctx = trace.setSpan(context.active(), span);
+   195→
+   196→  try {
+   197→    const result = context.with(ctx, () => fn(span));
+   198→    span.setStatus({ code: SpanStatusCode.OK });
+   199→    return result;
+   200→  } catch (error) {
+   201→    recordSpanError(span, error);
+   202→    throw error;
+   203→  } finally {
+   204→    span.end();
+   205→  }
+   206→}
+   207→
+   208→/**
+   209→ * Record an error on a span
+   210→ */
+   211→export function recordSpanError(span: Span, error: unknown): void {
+   212→  span.setStatus({
+   213→    code: SpanStatusCode.ERROR,
+   214→    message: error instanceof Error ? error.message : String(error),
+   215→  });
+   216→
+   217→  if (error instanceof Error) {
+   218→    span.recordException(error);
+   219→
+   220→    // Add MMS error attributes if available
+   221→    const mmsError = error as Error & { code?: string; statusCode?: number };
+   222→    if (mmsError.code) {
+   223→      span.setAttribute(MmsAttributes.ERROR_CODE, mmsError.code);
+   224→    }
+   225→    if (mmsError.statusCode) {
+   226→      span.setAttribute('http.status_code', mmsError.statusCode);
+   227→    }
+   228→    span.setAttribute(MmsAttributes.ERROR_TYPE, error.name);
+   229→  }
+   230→}
+   231→
+   232→/**
+   233→ * Add an event to the current span
+   234→ */
+   235→export function addSpanEvent(
+   236→  name: string,
+   237→  attributes?: Attributes,
+   238→  span?: Span
+   239→): void {
+   240→  const currentSpan = span ?? trace.getActiveSpan();
+   241→  currentSpan?.addEvent(name, attributes);
+   242→}
+   243→
+   244→/**
+   245→ * Get the current active span
+   246→ */
+   247→export function getActiveSpan(): Span | undefined {
+   248→  return trace.getActiveSpan();
+   249→}
+   250→
+   251→/**
+   252→ * Get the current trace ID (for correlation with logs)
+   253→ */
+   254→export function getTraceId(): string | undefined {
+   255→  return getActiveSpan()?.spanContext().traceId;
+   256→}
+   257→
+   258→/**
+   259→ * Get the current span ID
+   260→ */
+   261→export function getSpanId(): string | undefined {
+   262→  return getActiveSpan()?.spanContext().spanId;
+   263→}
+   264→
+   265→/**
+   266→ * Create a trace context object for logging
+   267→ */
+   268→export function getTraceContext(): { traceId?: string; spanId?: string } {
+   269→  const span = getActiveSpan();
+   270→  if (!span) return {};
+   271→
+   272→  const ctx = span.spanContext();
+   273→  return {
+   274→    traceId: ctx.traceId,
+   275→    spanId: ctx.spanId,
+   276→  };
+   277→}
+   278→
+   279→/**
+   280→ * Execute a function within the context of an existing span
+   281→ */
+   282→export async function withContext<T>(
+   283→  ctx: Context,
+   284→  fn: () => Promise<T>
+   285→): Promise<T> {
+   286→  return context.with(ctx, fn);
+   287→}
+   288→
+   289→/**
+   290→ * Create a linked span (for async operations that continue from another trace)
+   291→ */
+   292→export function createLinkedSpan(
+   293→  name: string,
+   294→  parentSpan: Span,
+   295→  options?: SpanOptions
+   296→): Span {
+   297→  const tracer = getTracer();
+   298→  return tracer.startSpan(name, {
+   299→    ...options,
+   300→    links: [
+   301→      ...(options?.links ?? []),
+   302→      { context: parentSpan.spanContext() },
+   303→    ],
+   304→    attributes: {
+   305→      ...getServiceAttributes(),
+   306→      ...options?.attributes,
+   307→    },
+   308→  });
+   309→}
+   310→
+   311→/**
+   312→ * Span kind constants for convenience
+   313→ */
+   314→export { SpanKind, SpanStatusCode } from '@opentelemetry/api';
+   315→
+   316→/**
+   317→ * Type exports
+   318→ */
+   319→export type { Span, Tracer, Context, SpanOptions, Attributes };
+   320→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

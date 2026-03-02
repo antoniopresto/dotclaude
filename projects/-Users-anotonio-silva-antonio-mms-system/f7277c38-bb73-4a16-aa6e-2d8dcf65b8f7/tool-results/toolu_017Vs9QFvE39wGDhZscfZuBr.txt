@@ -1,0 +1,904 @@
+     1→# Ralph Wiggum Manual
+     2→
+     3→> **Project**: MMS (Metro Fleet Mileage Management System)
+     4→> **Version**: 2.1
+     5→> **Philosophy**: "Disk is state, git is memory" — Geoffrey Huntley
+     6→
+     7→---
+     8→
+     9→## Table of Contents
+    10→
+    11→1. [Quick Start](#1-quick-start)
+    12→2. [Core Concepts](#2-core-concepts)
+    13→3. [Main Loop (loop.sh)](#3-main-loop-loopsh)
+    14→4. [Modes of Operation](#4-modes-of-operation)
+    15→5. [Mid-Course Corrections](#5-mid-course-corrections)
+    16→6. [Utility Scripts](#6-utility-scripts)
+    17→7. [Circuit Breaker](#7-circuit-breaker)
+    18→8. [Monitoring](#8-monitoring)
+    19→9. [Configuration Reference](#9-configuration-reference)
+    20→10. [Prompt Files](#10-prompt-files)
+    21→11. [Troubleshooting](#11-troubleshooting)
+    22→12. [Best Practices](#12-best-practices)
+    23→13. [Intentional Behaviors](#13-intentional-behaviors)
+    24→
+    25→---
+    26→
+    27→## 1. Quick Start
+    28→
+    29→### Start Ralph (Unlimited Run)
+    30→```bash
+    31→./ralph/loop.sh
+    32→```
+    33→
+    34→### Start with Iteration Limit
+    35→```bash
+    36→./ralph/loop.sh 50          # Max 50 iterations
+    37→```
+    38→
+    39→### Planning Mode
+    40→```bash
+    41→./ralph/loop.sh plan        # Generate/update implementation plan
+    42→./ralph/loop.sh plan 3      # Max 3 planning iterations
+    43→```
+    44→
+    45→### Stop Ralph
+    46→- **Graceful**: Wait for completion signal (`<promise>ALL_TASKS_COMPLETE</promise>`)
+    47→- **Manual**: `Ctrl+C`
+    48→
+    49→### Monitor Progress
+    50→```bash
+    51→./ralph/monitor.sh          # Full tmux dashboard
+    52→./ralph/monitor.sh stats    # Quick status
+    53→```
+    54→
+    55→---
+    56→
+    57→## 2. Core Concepts
+    58→
+    59→### The Ralph Loop
+    60→
+    61→Ralph is an infinite loop that feeds prompts to Claude Code, with progress persisting in files and git, not in context.
+    62→
+    63→```
+    64→┌────────────────────────────────────────────────────────────┐
+    65→│                      RALPH LOOP                            │
+    66→├────────────────────────────────────────────────────────────┤
+    67→│                                                            │
+    68→│   ┌─────────────┐    ┌──────────────┐    ┌────────────┐   │
+    69→│   │ Read Prompt │ -> │ Claude Code  │ -> │ Git Commit │   │
+    70→│   │   Files     │    │  Execution   │    │   Changes  │   │
+    71→│   └─────────────┘    └──────────────┘    └────────────┘   │
+    72→│         ^                                      │           │
+    73→│         │                                      │           │
+    74→│         └──────────── Loop ────────────────────┘           │
+    75→│                                                            │
+    76→│   State persists in:                                       │
+    77→│   - IMPLEMENTATION_PLAN.md (task state)                    │
+    78→│   - Git history (code changes)                             │
+    79→│   - AGENTS.md (operational knowledge)                      │
+    80→│                                                            │
+    81→└────────────────────────────────────────────────────────────┘
+    82→```
+    83→
+    84→### The 5 Golden Rules
+    85→
+    86→1. **"Disk is state, git is memory"** — Progress lives in files and commits, not context
+    87→2. **"Plans are disposable"** — Regenerate rather than accumulate
+    88→3. **"Fresh context is reliability"** — Each iteration starts clean
+    89→4. **"Ralph maintains Ralph"** — Use subagents for self-cleanup
+    90→5. **"Tune like a guitar"** — Add signage for observed failures
+    91→
+    92→### Key Files
+    93→
+    94→| File | Purpose | Max Size |
+    95→|------|---------|----------|
+    96→| `IMPLEMENTATION_PLAN.md` | Active tasks, blockers, progress | <400 lines |
+    97→| `AGENTS.md` | Operational commands, quick reference | <60 lines |
+    98→| `PROMPT_build.md` | Build mode instructions | ~200 lines |
+    99→| `PROMPT_plan.md` | Planning mode instructions | ~100 lines |
+   100→| `@fix_plan.md` | Immediate task override (optional) | Any |
+   101→
+   102→---
+   103→
+   104→## 3. Main Loop (loop.sh)
+   105→
+   106→### Synopsis
+   107→```bash
+   108→./ralph/loop.sh [MODE] [ITERATIONS] [OPTIONS]
+   109→```
+   110→
+   111→### Options
+   112→
+   113→| Option | Description | Default |
+   114→|--------|-------------|---------|
+   115→| `<number>` | Max iterations (0 = unlimited) | 0 |
+   116→| `plan` | Planning mode | - |
+   117→| `plan-work "desc"` | Scoped planning | - |
+   118→| `-m, --model MODEL` | Model to use (opus/sonnet/haiku) | opus |
+   119→| `-v, --verbose` | Verbose output | off |
+   120→| `--no-push` | Don't push to remote | enabled |
+   121→| `--no-stop-on-complete` | Continue after completion signal | off |
+   122→| `-h, --help` | Show help | - |
+   123→
+   124→### Examples
+   125→
+   126→```bash
+   127→# Unlimited build iterations (default)
+   128→./ralph/loop.sh
+   129→
+   130→# Max 50 iterations
+   131→./ralph/loop.sh 50
+   132→
+   133→# Planning mode with 3 iterations
+   134→./ralph/loop.sh plan 3
+   135→
+   136→# Scoped planning for specific work
+   137→./ralph/loop.sh plan-work "API authentication" 5
+   138→
+   139→# Use sonnet model with verbose output
+   140→./ralph/loop.sh -m sonnet -v 20
+   141→
+   142→# Override NO_PUSH for this run
+   143→NO_PUSH=false ./ralph/loop.sh
+   144→```
+   145→
+   146→### Environment Variables
+   147→
+   148→| Variable | Description | Default |
+   149→|----------|-------------|---------|
+   150→| `BASH_DEFAULT_TIMEOUT_MS` | Bash command timeout | 1800000 (30min) |
+   151→| `BASH_MAX_TIMEOUT_MS` | Maximum bash timeout | 7200000 (2hr) |
+   152→| `API_TIMEOUT_MS` | API request timeout | 600000 (10min) |
+   153→| `MAX_CALLS_PER_HOUR` | Rate limit | 9999999 |
+   154→| `MAX_RETRIES` | Retry count for transient errors | 3 |
+   155→| `RETRY_DELAY` | Seconds between retries | 5 |
+   156→
+   157→### Completion Signals
+   158→
+   159→Ralph stops when detecting these signals in output:
+   160→
+   161→- `ALL_TASKS_COMPLETE`
+   162→- `PLAN_COMPLETE`
+   163→- `EXIT_SIGNAL`
+   164→- `<promise>DONE</promise>`
+   165→- `<promise>COMPLETE</promise>`
+   166→- `<promise>ALL_TASKS_COMPLETE</promise>`
+   167→- `<promise>PLAN_COMPLETE</promise>`
+   168→
+   169→---
+   170→
+   171→## 4. Modes of Operation
+   172→
+   173→### Build Mode (Default)
+   174→
+   175→Implements tasks from `IMPLEMENTATION_PLAN.md`:
+   176→
+   177→```bash
+   178→./ralph/loop.sh         # Unlimited
+   179→./ralph/loop.sh 50      # Max 50 iterations
+   180→```
+   181→
+   182→**Workflow per iteration**:
+   183→1. Check for `@fix_plan.md` (priority override)
+   184→2. Read `IMPLEMENTATION_PLAN.md`
+   185→3. Select highest-priority incomplete task
+   186→4. Implement with validation (test → typecheck → lint → build)
+   187→5. Commit changes
+   188→6. Update plan, loop
+   189→
+   190→### Planning Mode
+   191→
+   192→Generates or updates implementation plan from specs:
+   193→
+   194→```bash
+   195→./ralph/loop.sh plan        # Unlimited planning
+   196→./ralph/loop.sh plan 3      # Max 3 iterations
+   197→```
+   198→
+   199→**Use when**:
+   200→- Starting a new phase
+   201→- Plan is stale or bloated
+   202→- Need fresh gap analysis
+   203→
+   204→### Scoped Planning Mode
+   205→
+   206→Plan specific work area:
+   207→
+   208→```bash
+   209→./ralph/loop.sh plan-work "API endpoints" 5
+   210→./ralph/loop.sh plan-work "database migrations" 3
+   211→```
+   212→
+   213→**Requirements**:
+   214→- Must be on a work branch (not main/master)
+   215→- Sets `WORK_SCOPE` environment variable
+   216→- Uses `PROMPT_plan_work.md`
+   217→
+   218→---
+   219→
+   220→## 5. Mid-Course Corrections
+   221→
+   222→### How It Works
+   223→
+   224→Ralph reads files fresh each iteration. Edit files → changes take effect next iteration.
+   225→
+   226→**Geoffrey Huntley's Method**:
+   227→> *"Tune Ralph like a guitar. When Ralph fails a specific way, add a sign to help him next time."*
+   228→
+   229→### Method 1: @fix_plan.md (Highest Priority)
+   230→
+   231→Create `ralph/@fix_plan.md` for immediate tasks:
+   232→
+   233→```bash
+   234→./ralph/scripts/request.sh "Create documentation for running the app"
+   235→```
+   236→
+   237→Or manually:
+   238→
+   239→```markdown
+   240→# Immediate Task: Documentation
+   241→
+   242→## Objective
+   243→Create comprehensive documentation for running MMS locally.
+   244→
+   245→## Deliverables
+   246→1. `docs/QUICKSTART.md` with full setup instructions
+   247→2. Update `ralph/AGENTS.md` quick reference
+   248→
+   249→## Completion Signal
+   250→<promise>DOCS_COMPLETE</promise>
+   251→```
+   252→
+   253→**Behavior**: Ralph completes `@fix_plan.md` tasks before anything else, then deletes the file.
+   254→
+   255→### Method 2: BLOCKER in IMPLEMENTATION_PLAN.md
+   256→
+   257→Add P1 blocker at top of plan:
+   258→
+   259→```markdown
+   260→## BLOCKERS (Resolve First)
+   261→
+   262→- [ ] **P1 HUMAN REQUEST**: Create authentication tests
+   263→  - Deliverable: `src/services/__tests__/AuthService.test.ts`
+   264→  - Acceptance: All tests passing
+   265→```
+   266→
+   267→### Method 3: Signpost in PROMPT_build.md
+   268→
+   269→Add temporary focus to prompt file:
+   270→
+   271→```bash
+   272→./ralph/scripts/focus.sh "Focus ONLY on Phase 7 UI components"
+   273→```
+   274→
+   275→Or manually add to top of `PROMPT_build.md`:
+   276→
+   277→```markdown
+   278→## SESSION FOCUS (Remove when complete)
+   279→
+   280→This session: Focus ONLY on Phase 7 (UI Components).
+   281→- Do NOT work on backend services
+   282→- Do NOT work on API endpoints
+   283→- ONLY work on: React components, deck.gl layers
+   284→
+   285→---
+   286→```
+   287→
+   288→### Method 4: Signage (Permanent Corrections)
+   289→
+   290→When Ralph makes repeated mistakes, add permanent signage:
+   291→
+   292→```markdown
+   293→## SIGNAGE
+   294→- DO NOT use useState — use machine.useMachine() instead
+   295→- DO NOT assume endpoints exist — search codebase first
+   296→- ALWAYS run typecheck before committing
+   297→```
+   298→
+   299→### Quick Reference
+   300→
+   301→| Need | Method | Command |
+   302→|------|--------|---------|
+   303→| Specific task | @fix_plan.md | `./ralph/scripts/request.sh "description"` |
+   304→| Documentation | @fix_plan.md | `./ralph/scripts/request.sh --template docs "topic"` |
+   305→| Specific tests | @fix_plan.md | `./ralph/scripts/request.sh --template test "component"` |
+   306→| Session focus | Signpost | `./ralph/scripts/focus.sh "focus description"` |
+   307→| Bug fix | BLOCKER | Edit `IMPLEMENTATION_PLAN.md` |
+   308→| Stop for review | Checkpoint | Add task with `<promise>REVIEW_NEEDED</promise>` |
+   309→| Prevent behavior | Signage | Edit `PROMPT_build.md` |
+   310→
+   311→---
+   312→
+   313→## 6. Utility Scripts
+   314→
+   315→### scripts/request.sh
+   316→
+   317→Create task request via `@fix_plan.md`:
+   318→
+   319→```bash
+   320→# Basic request
+   321→./ralph/scripts/request.sh "Create API documentation"
+   322→
+   323→# With template
+   324→./ralph/scripts/request.sh --template docs "Application startup"
+   325→./ralph/scripts/request.sh --template test "AuthService"
+   326→./ralph/scripts/request.sh --template fix "Login timeout bug"
+   327→
+   328→# With priority
+   329→./ralph/scripts/request.sh --priority P1 "Critical security fix"
+   330→```
+   331→
+   332→**Templates**:
+   333→- `docs` — Documentation request
+   334→- `test` — Test writing request
+   335→- `fix` — Bug fix request
+   336→- `feature` — Feature implementation
+   337→
+   338→### scripts/focus.sh
+   339→
+   340→Manage session focus:
+   341→
+   342→```bash
+   343→# Add focus
+   344→./ralph/scripts/focus.sh "Complete Phase 7.2 only"
+   345→
+   346→# Show current focus
+   347→./ralph/scripts/focus.sh --show
+   348→
+   349→# Remove focus
+   350→./ralph/scripts/focus.sh --remove
+   351→```
+   352→
+   353→### scripts/archive-completed.sh
+   354→
+   355→Archive completed tasks to reduce plan size:
+   356→
+   357→```bash
+   358→# Archive completed tasks
+   359→./ralph/scripts/archive-completed.sh
+   360→
+   361→# Dry run (preview)
+   362→./ralph/scripts/archive-completed.sh --dry-run
+   363→
+   364→# Archive specific phase
+   365→./ralph/scripts/archive-completed.sh --phase 3
+   366→```
+   367→
+   368→**Output**: Creates files in `ralph/IMPLEMENTATION_ARCHIVE/YYYY-MM-DD/`
+   369→
+   370→### scripts/refresh-plan.sh
+   371→
+   372→Regenerate plan from specs (disposable plans philosophy):
+   373→
+   374→```bash
+   375→# Full refresh
+   376→./ralph/scripts/refresh-plan.sh
+   377→
+   378→# Keep learnings
+   379→./ralph/scripts/refresh-plan.sh --keep-learnings
+   380→
+   381→# Archive current plan first
+   382→./ralph/scripts/refresh-plan.sh --archive
+   383→```
+   384→
+   385→### scripts/check-plan-size.sh
+   386→
+   387→Check if plan exceeds size limit:
+   388→
+   389→```bash
+   390→./ralph/scripts/check-plan-size.sh
+   391→# Output: IMPLEMENTATION_PLAN.md: 234 lines (OK, max: 400)
+   392→
+   393→./ralph/scripts/check-plan-size.sh --warn-at 300
+   394→# Output: WARNING: IMPLEMENTATION_PLAN.md: 350 lines (exceeds 300)
+   395→```
+   396→
+   397→---
+   398→
+   399→## 7. Circuit Breaker
+   400→
+   401→### Overview
+   402→
+   403→Prevents runaway loops by monitoring:
+   404→- Iterations without git commits (stuck loop)
+   405→- Repeated errors
+   406→- Estimated cost
+   407→
+   408→### Commands
+   409→
+   410→```bash
+   411→# Show status
+   412→./ralph/circuit-breaker.sh status
+   413→
+   414→# Check if circuit is open (exit 1 = blocked)
+   415→./ralph/circuit-breaker.sh check
+   416→
+   417→# Reset after stuck loop
+   418→./ralph/circuit-breaker.sh reset
+   419→
+   420→# Show recent errors
+   421→./ralph/circuit-breaker.sh errors
+   422→```
+   423→
+   424→### Configuration
+   425→
+   426→| Variable | Description | Default |
+   427→|----------|-------------|---------|
+   428→| `CB_NO_PROGRESS_THRESHOLD` | Iterations without commit | 9999999* |
+   429→| `CB_SAME_ERROR_THRESHOLD` | Repeated error count | 5 |
+   430→| `CB_MAX_COST_USD` | Cost limit in USD | 9999999* |
+   431→| `COST_PER_ITERATION` | Estimated cost per iteration | 0.45 |
+   432→
+   433→*High defaults are intentional for 24h+ runs. See [Intentional Behaviors](#13-intentional-behaviors).
+   434→
+   435→### Override for Stricter Limits
+   436→
+   437→```bash
+   438→CB_NO_PROGRESS_THRESHOLD=10 CB_MAX_COST_USD=100 ./ralph/loop.sh
+   439→```
+   440→
+   441→### State File
+   442→
+   443→Location: `/tmp/ralph-circuit-breaker/state.json`
+   444→
+   445→```json
+   446→{
+   447→  "iterations": 42,
+   448→  "last_commit": "abc123",
+   449→  "no_progress_count": 0,
+   450→  "errors": [],
+   451→  "estimated_cost": 18.90,
+   452→  "start_time": 1705766400,
+   453→  "session_id": "12345"
+   454→}
+   455→```
+   456→
+   457→---
+   458→
+   459→## 8. Monitoring
+   460→
+   461→### Dashboard (tmux)
+   462→
+   463→```bash
+   464→./ralph/monitor.sh              # Full dashboard
+   465→./ralph/monitor.sh dashboard    # Same as above
+   466→```
+   467→
+   468→**Panels**:
+   469→- Stats (iterations, cost, progress)
+   470→- Git log (recent commits)
+   471→- Implementation plan (head)
+   472→- Docker logs (if running)
+   473→
+   474→### Quick Stats
+   475→
+   476→```bash
+   477→./ralph/monitor.sh stats
+   478→```
+   479→
+   480→**Output**:
+   481→```
+   482→═══════════════════════════════════════════════════════════════
+   483→  Ralph Wiggum Monitor v2.1 - MMS Project
+   484→═══════════════════════════════════════════════════════════════
+   485→
+   486→Git Status:
+   487→  Branch:        feature/auth
+   488→  Commits today: 12
+   489→  Last commit:   abc123 feat(auth): add login endpoint
+   490→
+   491→Timeout Configuration:
+   492→  Bash timeout:  1800000ms (30 min)
+   493→  API timeout:   600000ms (10 min)
+   494→
+   495→Implementation Plan:
+   496→  Total tasks:   45
+   497→  Completed:     32
+   498→  Pending:       13
+   499→  Progress:      71%
+   500→
+   501→Circuit Breaker:
+   502→  Iterations:    42
+   503→  Est. cost:     $18.90 / $9999999
+   504→  No progress:   0 / 9999999
+   505→  Status:        CLOSED (OK)
+   506→```
+   507→
+   508→### Follow Git Log
+   509→
+   510→```bash
+   511→./ralph/monitor.sh tail
+   512→```
+   513→
+   514→---
+   515→
+   516→## 9. Configuration Reference
+   517→
+   518→### Directory Structure
+   519→
+   520→```
+   521→ralph/
+   522→├── loop.sh                    # Main loop script
+   523→├── circuit-breaker.sh         # Circuit breaker
+   524→├── monitor.sh                 # Monitoring dashboard
+   525→├── setup.sh                   # Initial setup
+   526→│
+   527→├── PROMPT_build.md            # Build mode instructions
+   528→├── PROMPT_plan.md             # Planning mode instructions
+   529→├── PROMPT_plan_work.md        # Scoped planning template
+   530→│
+   531→├── AGENTS.md                  # Operational quick reference
+   532→├── IMPLEMENTATION_PLAN.md     # Current task state
+   533→├── @fix_plan.md               # Immediate task (optional)
+   534→│
+   535→├── scripts/
+   536→│   ├── request.sh             # Create task requests
+   537→│   ├── focus.sh               # Manage session focus
+   538→│   ├── archive-completed.sh   # Archive completed tasks
+   539→│   ├── refresh-plan.sh        # Regenerate plan
+   540→│   └── check-plan-size.sh     # Validate plan size
+   541→│
+   542→├── hooks/
+   543→│   └── pre-iteration.sh       # Pre-iteration checks
+   544→│
+   545→└── IMPLEMENTATION_ARCHIVE/    # Archived completed work
+   546→    └── YYYY-MM-DD/
+   547→        ├── completed-tasks.md
+   548→        └── resolved-gaps.md
+   549→```
+   550→
+   551→### Timeout Configuration
+   552→
+   553→**Critical for long-running operations** (C++ builds, full test suites):
+   554→
+   555→```bash
+   556→# In your shell or .bashrc
+   557→export BASH_DEFAULT_TIMEOUT_MS=1800000   # 30 minutes
+   558→export BASH_MAX_TIMEOUT_MS=7200000       # 2 hours
+   559→export API_TIMEOUT_MS=600000             # 10 minutes
+   560→export MCP_TIMEOUT=30000                 # 30 seconds
+   561→```
+   562→
+   563→Without these, Claude CLI defaults to 2-minute timeout!
+   564→
+   565→### Claude Settings
+   566→
+   567→Location: `.claude/settings.json`
+   568→
+   569→Key sections:
+   570→- `hooks.PreToolUse` — Pre-execution validation
+   571→- `hooks.PostToolUse` — Post-execution checks
+   572→- `permissions` — Allowed operations
+   573→
+   574→---
+   575→
+   576→## 10. Prompt Files
+   577→
+   578→### PROMPT_build.md Structure
+   579→
+   580→```markdown
+   581→## Pre-Flight (0.x)
+   582→0a. CHECK @fix_plan.md — Complete if exists
+   583→0b. CHECK Plan Size — Archive if > 400 lines
+   584→0c. Study specs/* for context
+   585→0d. Study IMPLEMENTATION_PLAN.md
+   586→
+   587→## Work Phase (1.x)
+   588→1. Choose highest-priority P1/P2 task
+   589→2. Search codebase before implementing
+   590→3. Implement completely (no stubs)
+   591→4. Validate: test → typecheck → lint → build
+   592→
+   593→## Completion Phase (9.x)
+   594→9a. Update IMPLEMENTATION_PLAN.md
+   595→9b. Git commit with descriptive message
+   596→9c. Check for remaining tasks
+   597→
+   598→## Guardrails (G.x)
+   599→G1. PLAN SIZE: Archive if > 400 lines
+   600→G2. TESTS: Required tests must pass
+   601→G3. SINGLE TASK: One task per iteration
+   602→```
+   603→
+   604→### Adding Custom Instructions
+   605→
+   606→**Temporary (signpost)**:
+   607→```markdown
+   608→## SESSION FOCUS (Remove when complete)
+   609→Focus ONLY on X. Do NOT work on Y.
+   610→---
+   611→```
+   612→
+   613→**Permanent (signage)**:
+   614→```markdown
+   615→## SIGNAGE
+   616→- DO NOT use X
+   617→- ALWAYS do Y before Z
+   618→```
+   619→
+   620→### @fix_plan.md Format
+   621→
+   622→```markdown
+   623→# Immediate Task: [Title]
+   624→
+   625→## Objective
+   626→[What needs to be done]
+   627→
+   628→## Deliverables
+   629→1. [Specific file or outcome]
+   630→2. [Another deliverable]
+   631→
+   632→## Acceptance Criteria
+   633→- [Criterion 1]
+   634→- [Criterion 2]
+   635→
+   636→## Completion Signal
+   637→<promise>CUSTOM_SIGNAL</promise>
+   638→```
+   639→
+   640→---
+   641→
+   642→## 11. Troubleshooting
+   643→
+   644→### Ralph Stops Unexpectedly
+   645→
+   646→**Check circuit breaker**:
+   647→```bash
+   648→./ralph/circuit-breaker.sh status
+   649→```
+   650→
+   651→**Common causes**:
+   652→- No progress threshold exceeded
+   653→- Cost limit reached
+   654→- Repeated errors
+   655→
+   656→**Fix**:
+   657→```bash
+   658→./ralph/circuit-breaker.sh reset
+   659→./ralph/loop.sh
+   660→```
+   661→
+   662→### Timeout Errors
+   663→
+   664→**Symptom**: Operations killed after 2 minutes
+   665→
+   666→**Fix**: Set timeout environment variables:
+   667→```bash
+   668→export BASH_DEFAULT_TIMEOUT_MS=1800000
+   669→export BASH_MAX_TIMEOUT_MS=7200000
+   670→./ralph/loop.sh
+   671→```
+   672→
+   673→### Plan Too Large
+   674→
+   675→**Symptom**: Context rot, partial reads, forgotten tasks
+   676→
+   677→**Check**:
+   678→```bash
+   679→wc -l ralph/IMPLEMENTATION_PLAN.md
+   680→./ralph/scripts/check-plan-size.sh
+   681→```
+   682→
+   683→**Fix**:
+   684→```bash
+   685→./ralph/scripts/archive-completed.sh
+   686→# Or regenerate:
+   687→./ralph/scripts/refresh-plan.sh
+   688→```
+   689→
+   690→### Git Push Failures
+   691→
+   692→**Symptom**: Loop stops with push error (especially on VPN)
+   693→
+   694→**Workaround**: Run with NO_PUSH (default):
+   695→```bash
+   696→./ralph/loop.sh  # NO_PUSH=true by default
+   697→```
+   698→
+   699→**Manual push when convenient**:
+   700→```bash
+   701→git push origin $(git branch --show-current)
+   702→```
+   703→
+   704→### Completion Signal Not Detected
+   705→
+   706→**Symptom**: Loop continues despite task completion
+   707→
+   708→**Check**: Signals are case-sensitive by default
+   709→```bash
+   710→grep -i "ALL_TASKS_COMPLETE" /tmp/ralph-outputs-*/iteration-*.json
+   711→```
+   712→
+   713→**Fix**: Ensure exact signal format in output:
+   714→```
+   715→<promise>ALL_TASKS_COMPLETE</promise>
+   716→```
+   717→
+   718→### Stuck in Loop
+   719→
+   720→**Symptom**: Same task attempted repeatedly
+   721→
+   722→**Diagnosis**:
+   723→```bash
+   724→./ralph/circuit-breaker.sh errors
+   725→git log --oneline -10
+   726→```
+   727→
+   728→**Fixes**:
+   729→1. Add signage to prevent repeated mistake
+   730→2. Manually complete the blocking task
+   731→3. Reset and add explicit instructions
+   732→
+   733→```bash
+   734→./ralph/circuit-breaker.sh reset
+   735→# Add signage to PROMPT_build.md, then:
+   736→./ralph/loop.sh
+   737→```
+   738→
+   739→---
+   740→
+   741→## 12. Best Practices
+   742→
+   743→### From Geoffrey Huntley
+   744→
+   745→1. **Never interrupt mid-iteration** — Let it finish, then adjust
+   746→2. **Tune via file edits** — Not runtime commands
+   747→3. **Plans are disposable** — Regenerate rather than accumulate
+   748→4. **Add signage for failures** — Prevent same mistake twice
+   749→5. **Trust eventual consistency** — Ralph will get there
+   750→
+   751→### Plan Management
+   752→
+   753→- Keep `IMPLEMENTATION_PLAN.md` under 400 lines
+   754→- Archive completed phases regularly
+   755→- Use specific, actionable task descriptions
+   756→- Include acceptance criteria
+   757→
+   758→### Mid-Course Corrections
+   759→
+   760→- **Urgent task**: Use `@fix_plan.md`
+   761→- **Session focus**: Use signpost in `PROMPT_build.md`
+   762→- **Permanent rule**: Add to SIGNAGE section
+   763→- **Bug fix**: Add P1 BLOCKER to plan
+   764→
+   765→### Long Runs (24h+)
+   766→
+   767→- Use `NO_PUSH=true` (default) to avoid VPN issues
+   768→- Monitor periodically: `./ralph/monitor.sh stats`
+   769→- High circuit breaker thresholds are intentional
+   770→- Trust git history for recovery
+   771→
+   772→### Debugging
+   773→
+   774→- Check circuit breaker status first
+   775→- Review recent commits: `git log --oneline -20`
+   776→- Check for errors: `./ralph/circuit-breaker.sh errors`
+   777→- Add verbose mode: `./ralph/loop.sh -v`
+   778→
+   779→---
+   780→
+   781→## 13. Intentional Behaviors
+   782→
+   783→These behaviors appear to be defects but are intentional design decisions:
+   784→
+   785→### NO_PUSH=true Default
+   786→
+   787→**Appears as**: Data loss risk (work only local)
+   788→
+   789→**Why intentional**: VPN interference causes git push failures, which stop the loop. Local commits still preserve work.
+   790→
+   791→**Override**: `NO_PUSH=false ./ralph/loop.sh`
+   792→
+   793→### High Circuit Breaker Thresholds (9999999)
+   794→
+   795→**Appears as**: No safety limits
+   796→
+   797→**Why intentional**: 24h+ continuous runs required. Human monitoring via dashboard provides oversight.
+   798→
+   799→**Override**: `CB_NO_PROGRESS_THRESHOLD=10 CB_MAX_COST_USD=100 ./ralph/loop.sh`
+   800→
+   801→### Absurd Line Numbers (99, 999, 9999...)
+   802→
+   803→**Appears as**: Typos or errors
+   804→
+   805→**Why intentional**: Huntley's guardrail pattern — high numbers indicate "always applicable" rules. Allows insertion without renumbering.
+   806→
+   807→### Case-Sensitive Completion Detection
+   808→
+   809→**Appears as**: Bug (might miss signals)
+   810→
+   811→**Why intentional**: Completion signals are code-defined, not user-typed. Case-sensitivity prevents false positives.
+   812→
+   813→---
+   814→
+   815→## Appendix A: Complete Command Reference
+   816→
+   817→### loop.sh
+   818→
+   819→```bash
+   820→./ralph/loop.sh                    # Build, unlimited
+   821→./ralph/loop.sh 50                 # Build, max 50
+   822→./ralph/loop.sh plan               # Plan, unlimited
+   823→./ralph/loop.sh plan 3             # Plan, max 3
+   824→./ralph/loop.sh plan-work "desc"   # Scoped planning
+   825→./ralph/loop.sh -m sonnet          # Use sonnet model
+   826→./ralph/loop.sh -v                 # Verbose mode
+   827→./ralph/loop.sh --help             # Show help
+   828→```
+   829→
+   830→### circuit-breaker.sh
+   831→
+   832→```bash
+   833→./ralph/circuit-breaker.sh status  # Show state
+   834→./ralph/circuit-breaker.sh check   # Check if open
+   835→./ralph/circuit-breaker.sh reset   # Reset state
+   836→./ralph/circuit-breaker.sh errors  # Show errors
+   837→```
+   838→
+   839→### monitor.sh
+   840→
+   841→```bash
+   842→./ralph/monitor.sh                 # Dashboard (tmux)
+   843→./ralph/monitor.sh stats           # Quick stats
+   844→./ralph/monitor.sh tail            # Follow git log
+   845→```
+   846→
+   847→### scripts/
+   848→
+   849→```bash
+   850→./ralph/scripts/request.sh "desc"              # Task request
+   851→./ralph/scripts/request.sh --template docs     # With template
+   852→./ralph/scripts/focus.sh "desc"                # Add focus
+   853→./ralph/scripts/focus.sh --remove              # Remove focus
+   854→./ralph/scripts/archive-completed.sh           # Archive tasks
+   855→./ralph/scripts/refresh-plan.sh                # Regenerate plan
+   856→./ralph/scripts/check-plan-size.sh             # Check size
+   857→```
+   858→
+   859→---
+   860→
+   861→## Appendix B: Environment Variables
+   862→
+   863→```bash
+   864→# Timeouts (CRITICAL)
+   865→export BASH_DEFAULT_TIMEOUT_MS=1800000   # 30 min
+   866→export BASH_MAX_TIMEOUT_MS=7200000       # 2 hr
+   867→export API_TIMEOUT_MS=600000             # 10 min
+   868→export MCP_TIMEOUT=30000                 # 30 sec
+   869→
+   870→# Rate limiting
+   871→export MAX_CALLS_PER_HOUR=9999999        # Unlimited
+   872→export MAX_RETRIES=3                     # Retry count
+   873→export RETRY_DELAY=5                     # Seconds
+   874→
+   875→# Circuit breaker
+   876→export CB_NO_PROGRESS_THRESHOLD=9999999  # Iterations
+   877→export CB_SAME_ERROR_THRESHOLD=5         # Repeated errors
+   878→export CB_MAX_COST_USD=9999999           # Cost limit
+   879→export COST_PER_ITERATION=0.45           # Est. cost
+   880→
+   881→# Behavior
+   882→export NO_PUSH=true                      # Don't push
+   883→export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+   884→```
+   885→
+   886→---
+   887→
+   888→## Appendix C: Sources
+   889→
+   890→- [Geoffrey Huntley's Ralph](https://ghuntley.com/ralph/)
+   891→- [Dev Interrupted Podcast](https://linearb.io/dev-interrupted/podcast/inventing-the-ralph-wiggum-loop) (Jan 13, 2026)
+   892→- [The Ralph Wiggum Playbook](https://paddo.dev/blog/ralph-wiggum-playbook/)
+   893→- [ghuntley/how-to-ralph-wiggum](https://github.com/ghuntley/how-to-ralph-wiggum)
+   894→- [snarktank/ralph](https://github.com/snarktank/ralph)
+   895→- [Anthropic Claude Code Plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md)
+   896→
+   897→---
+   898→
+   899→*"That's the beauty of Ralph — the technique is deterministically bad in an undeterministic world."* — Geoffrey Huntley
+   900→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

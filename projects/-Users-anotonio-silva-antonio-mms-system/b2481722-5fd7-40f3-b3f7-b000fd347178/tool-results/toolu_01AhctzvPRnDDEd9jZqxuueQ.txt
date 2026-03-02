@@ -1,0 +1,545 @@
+     1→# MMS Demo Application
+     2→
+     3→**Metro Fleet Mileage Management System** - Win-the-bid demonstration application.
+     4→
+     5→## Overview
+     6→
+     7→This is a demonstration application for Metro fleet preventive maintenance (PM) management. It showcases CSV-based PM projection over a 10-year horizon with an infinite canvas interface using semantic zoom levels (strategic → tactical → operational views).
+     8→
+     9→**Key Features:**
+    10→- Drag-and-drop PM rescheduling with constraint validation
+    11→- "Bow-wave" risk visualization (fleet maintenance clustering)
+    12→- WebGL-powered infinite canvas rendering with deck.gl
+    13→- State management with @belt/tools
+    14→
+    15→## Getting Started
+    16→
+    17→```bash
+    18→# Install dependencies
+    19→bun install
+    20→
+    21→# Start development server
+    22→bun dev
+    23→
+    24→# Build for production
+    25→bun run build
+    26→
+    27→# Lint code
+    28→bun run lint
+    29→
+    30→# Format code
+    31→bun run format
+    32→```
+    33→
+    34→## Project Structure
+    35→
+    36→```
+    37→src/
+    38→├── main.tsx              # Entry point
+    39→├── App.tsx               # Root component
+    40→├── store/                # @belt/tools state machines
+    41→├── engine/               # PM projection algorithm (CRITICAL)
+    42→├── import/               # CSV parsing and validation
+    43→├── canvas/               # deck.gl infinite canvas
+    44→├── components/           # React UI components
+    45→├── types/                # TypeScript interfaces
+    46→└── utils/                # Helpers
+    47→
+    48→public/sample-data/       # Sample CSV files for testing
+    49→docs/                     # 9-part specification (MMS_SPEC_001-009)
+    50→```
+    51→
+    52→---
+    53→
+    54→## @belt/tools Utilities Reference
+    55→
+    56→The `@belt/tools` package provides comprehensive utilities for state management, runtime validation, and common operations. All utilities are already available in this project.
+    57→
+    58→### State Machine
+    59→
+    60→Immer-based reactive state management with React hooks and automatic cache management.
+    61→
+    62→#### Creating Slices
+    63→
+    64→```typescript
+    65→import { createSlice, createAsyncSlice, createMachine } from '@belt/tools';
+    66→
+    67→// Synchronous slice for local state
+    68→const fleetSlice = createSlice({
+    69→  id: 'fleet',
+    70→  initial: {
+    71→    trains: [],
+    72→    pmHistory: [],
+    73→    selectedTrain: null as string | null,
+    74→  },
+    75→  cache: { policy: 'session' }, // or 'public', 'private'
+    76→  reducers: {
+    77→    importFleet: (state, payload: Train[]) => {
+    78→      state.trains = payload; // Immer allows direct mutations
+    79→    },
+    80→    selectTrain: (state, trainId: string) => {
+    81→      state.selectedTrain = trainId;
+    82→    },
+    83→    clearSelection: (state) => {
+    84→      state.selectedTrain = null;
+    85→    },
+    86→  },
+    87→});
+    88→
+    89→// Async slice for data fetching
+    90→const analyticsSlice = createAsyncSlice({
+    91→  id: 'analytics',
+    92→  cache: {
+    93→    policy: 'public',
+    94→    ttl: '5m', // Time-to-live using ms() format
+    95→    swr: true, // Stale-while-revalidate
+    96→  },
+    97→  context: {},
+    98→  load: async () => {
+    99→    const response = await fetch('/api/analytics');
+   100→    return response.json();
+   101→  },
+   102→});
+   103→```
+   104→
+   105→#### Creating Machines
+   106→
+   107→```tsx
+   108→import { createMachine } from '@belt/tools';
+   109→
+   110→const appMachine = createMachine({
+   111→  id: 'mms',
+   112→  slices: {
+   113→    fleet: fleetSlice,
+   114→    analytics: analyticsSlice,
+   115→  },
+   116→  context: { userId: null }, // Global context
+   117→});
+   118→
+   119→// Use in React components
+   120→function FleetView() {
+   121→  const { state, actions } = appMachine.useMachine('fleet');
+   122→
+   123→  return (
+   124→    <div>
+   125→      <button onClick={() => actions.importFleet(trains)}>
+   126→        Import Fleet
+   127→      </button>
+   128→      <div>{state.trains.length} trains loaded</div>
+   129→    </div>
+   130→  );
+   131→}
+   132→```
+   133→
+   134→**Cache Policies:**
+   135→- `public` - Shared cache, TTL-based invalidation
+   136→- `private` - User-specific cache, invalidated on user change
+   137→- `session` - Session-specific cache, invalidated on app restart
+   138→
+   139→---
+   140→
+   141→### Runtime Schema Validation
+   142→
+   143→Type-safe runtime validation using TypeBox with concise syntax.
+   144→
+   145→#### Basic Types
+   146→
+   147→```typescript
+   148→import { createType, createSchema, isType, invariantType, InferType } from '@belt/tools';
+   149→
+   150→// Primitive types
+   151→const StringType = createType('string');
+   152→const NumberType = createType('number');
+   153→const BooleanType = createType('boolean');
+   154→const DateType = createType('date');
+   155→
+   156→// Optional types (append ?)
+   157→const OptionalString = createType('string?');
+   158→const OptionalNumber = createType('number?');
+   159→
+   160→// Array types (append [])
+   161→const StringArray = createType('string[]');
+   162→const NumberArray = createType('number[]');
+   163→
+   164→// Type guards
+   165→if (isType(value, 'string')) {
+   166→  console.log(value.toUpperCase()); // TypeScript knows it's string
+   167→}
+   168→
+   169→if (isType(value, 'date')) {
+   170→  console.log(value.toISOString()); // TypeScript knows it's Date
+   171→}
+   172→```
+   173→
+   174→#### Object Schemas
+   175→
+   176→```typescript
+   177→import { createSchema, InferType } from '@belt/tools';
+   178→
+   179→// Define schema
+   180→const TrainModel = createSchema({
+   181→  id: 'string',
+   182→  name: 'string',
+   183→  mileage: 'number',
+   184→  lastPM: 'date',
+   185→  tags: 'string[]',
+   186→  metadata: 'object?', // Optional generic object
+   187→});
+   188→
+   189→// Infer TypeScript type
+   190→type Train = InferType<typeof TrainModel>;
+   191→
+   192→// Parse and validate
+   193→const train = TrainModel.parse({
+   194→  id: 'T001',
+   195→  name: 'Red Line',
+   196→  mileage: 50000,
+   197→  lastPM: new Date('2025-01-01'),
+   198→  tags: ['metro', 'active'],
+   199→});
+   200→
+   201→// Validate without parsing
+   202→if (TrainModel.isValid(data)) {
+   203→  // TypeScript knows data is Train
+   204→}
+   205→
+   206→// Assert type (throws if invalid)
+   207→invariantType(TrainModel, data);
+   208→```
+   209→
+   210→#### Complex Types
+   211→
+   212→```typescript
+   213→import { createType } from '@belt/tools';
+   214→
+   215→// Nested objects
+   216→const PMEventType = createType({
+   217→  properties: {
+   218→    trainId: 'string',
+   219→    scheduledDate: 'date',
+   220→    location: {
+   221→      properties: {
+   222→        facility: 'string',
+   223→        bay: 'number',
+   224→      },
+   225→    },
+   226→    tasks: {
+   227→      items: { // Array of objects
+   228→        properties: {
+   229→          code: 'string',
+   230→          duration: 'number',
+   231→          completed: 'boolean?',
+   232→        },
+   233→      },
+   234→    },
+   235→  },
+   236→});
+   237→
+   238→// Enums
+   239→const StatusEnum = createType({
+   240→  enum: ['pending', 'in-progress', 'completed', 'cancelled'],
+   241→});
+   242→
+   243→// Unions
+   244→const IDType = createType({
+   245→  union: ['string', 'number'],
+   246→});
+   247→
+   248→// Records (key-value maps)
+   249→const ConfigType = createType({
+   250→  record: 'string', // Record<string, string>
+   251→});
+   252→```
+   253→
+   254→#### List Parsing
+   255→
+   256→```typescript
+   257→// Parse array of items
+   258→const trainList = TrainModel.list().parse([
+   259→  { id: 'T001', name: 'Red Line', mileage: 50000, lastPM: new Date(), tags: [] },
+   260→  { id: 'T002', name: 'Blue Line', mileage: 30000, lastPM: new Date(), tags: [] },
+   261→]);
+   262→
+   263→// Parse array from nested path
+   264→const events = PMEventType.parseList(response, 'data.events');
+   265→```
+   266→
+   267→---
+   268→
+   269→### Date Utilities
+   270→
+   271→Date manipulation and formatting using date-fns.
+   272→
+   273→```typescript
+   274→import { formatDate, setDefaultDateLocale, ms } from '@belt/tools';
+   275→import { ptBR } from 'date-fns/locale';
+   276→
+   277→// Format dates
+   278→formatDate(new Date(), 'yyyy-MM-dd'); // '2026-01-14'
+   279→formatDate(new Date(), 'MMM dd, yyyy'); // 'Jan 14, 2026'
+   280→formatDate('2026-01-14', 'dd/MM/yyyy'); // '14/01/2026'
+   281→
+   282→// Set global locale
+   283→setDefaultDateLocale(ptBR);
+   284→formatDate(new Date(), 'MMMM'); // 'janeiro'
+   285→
+   286→// Override locale for single call
+   287→import { enUS } from 'date-fns/locale';
+   288→formatDate(new Date(), 'MMMM', { locale: enUS }); // 'January'
+   289→
+   290→// Time string conversion
+   291→ms('1s');       // 1000
+   292→ms('5m');       // 300000
+   293→ms('1h');       // 3600000
+   294→ms('2d');       // 172800000
+   295→ms('1w');       // 604800000
+   296→ms('1mo');      // ~2629800000
+   297→ms('1y');       // ~31557600000
+   298→ms('500ms');    // 500
+   299→
+   300→// Use in configs
+   301→const CACHE_TTL = ms('5m');
+   302→const DEBOUNCE = ms('300ms');
+   303→const POLL_INTERVAL = ms('30s');
+   304→```
+   305→
+   306→**Supported time units:** `ms`, `s`, `m`/`min`, `h`, `d`, `w`, `mo`/`mon`/`months`, `y`
+   307→
+   308→---
+   309→
+   310→### Object Utilities
+   311→
+   312→Type-safe object manipulation with deep path access.
+   313→
+   314→```typescript
+   315→import {
+   316→  getProperty,
+   317→  setProperty,
+   318→  objectKeys,
+   319→  objectEntries,
+   320→  objectValues,
+   321→  keyBy,
+   322→  isObject,
+   323→  assertObject,
+   324→  requireAll,
+   325→  deepFreeze,
+   326→} from '@belt/tools';
+   327→
+   328→// Deep property access (type-safe)
+   329→const street = getProperty(user, 'address.street');
+   330→const city = getProperty(user, 'address.city', true); // Allow falsy values
+   331→
+   332→// Set nested properties
+   333→setProperty(train, 'metadata.lastInspection', new Date());
+   334→
+   335→// Object manipulation
+   336→const keys = objectKeys(train); // Type-safe keys
+   337→const entries = objectEntries(train); // Typed entries
+   338→const values = objectValues(train); // Typed values
+   339→
+   340→// Array to object by key
+   341→const trainsById = keyBy(trains, 'id');
+   342→// Or with function
+   343→const trainsByName = keyBy(trains, (t) => t.name);
+   344→
+   345→// Type guards
+   346→if (isObject(value)) {
+   347→  // value is UnknownRecord
+   348→}
+   349→
+   350→// Assert object with no falsy values
+   351→const validated = requireAll({
+   352→  id: train.id,
+   353→  name: train.name,
+   354→  mileage: train.mileage,
+   355→});
+   356→
+   357→// Deep freeze (immutability)
+   358→const frozen = deepFreeze(config);
+   359→```
+   360→
+   361→**Path Examples:**
+   362→```typescript
+   363→type User = {
+   364→  id: string;
+   365→  profile: {
+   366→    address: {
+   367→      street: string;
+   368→      city: string;
+   369→    };
+   370→  };
+   371→};
+   372→
+   373→// All paths are type-checked
+   374→getProperty(user, 'id');                    // ✓ string
+   375→getProperty(user, 'profile.address.city');  // ✓ string
+   376→getProperty(user, 'profile.invalid');       // ✗ Type error
+   377→```
+   378→
+   379→---
+   380→
+   381→### String Utilities
+   382→
+   383→String manipulation with type inference.
+   384→
+   385→```typescript
+   386→import { capitalize, isString, assertString } from '@belt/tools';
+   387→
+   388→// Capitalize
+   389→capitalize('hello'); // 'Hello' (type: 'Hello')
+   390→
+   391→// Type guards
+   392→if (isString(value)) {
+   393→  console.log(value.toUpperCase());
+   394→}
+   395→
+   396→// Assertions
+   397→assertString(value);
+   398→assertString(value, { notEmpty: true });
+   399→assertString(value, { message: 'Name is required', notEmpty: true });
+   400→```
+   401→
+   402→---
+   403→
+   404→### Error Handling
+   405→
+   406→Comprehensive error utilities with stack trace management.
+   407→
+   408→```typescript
+   409→import {
+   410→  invariant,
+   411→  tryCatch,
+   412→  InvariantError,
+   413→  createErrorList,
+   414→} from '@belt/tools';
+   415→
+   416→// Assertions
+   417→invariant(user.id, 'User ID is required');
+   418→invariant(trains.length > 0, 'No trains found');
+   419→
+   420→// Safe error handling
+   421→const [error, result] = tryCatch(() => JSON.parse(data));
+   422→if (error) {
+   423→  console.error('Parse failed:', error.message);
+   424→} else {
+   425→  console.log('Success:', result);
+   426→}
+   427→
+   428→// Collect multiple errors
+   429→const errors = createErrorList('Validation failed: ');
+   430→if (!train.id) errors.add('Missing ID');
+   431→if (!train.name) errors.add('Missing name');
+   432→if (train.mileage < 0) errors.add('Invalid mileage');
+   433→errors.check(); // Throws if any errors
+   434→```
+   435→
+   436→---
+   437→
+   438→### Type Utilities
+   439→
+   440→Advanced TypeScript type helpers.
+   441→
+   442→```typescript
+   443→import type {
+   444→  Paths,          // All dot-notation paths of object
+   445→  PathType,       // Type at specific path
+   446→  Compute,        // Flatten intersection types
+   447→  Writable,       // Remove readonly modifiers
+   448→  Falsy,          // Union of falsy values
+   449→  InferType,      // Infer type from schema
+   450→  UnknownRecord,  // { [key: string]: unknown }
+   451→  AnyRecord,      // { [key: string]: any }
+   452→  MaybePromise,   // T | Promise<T>
+   453→  MaybeArray,     // T | T[]
+   454→  PromiseValue,   // Extract Promise<T> → T
+   455→  Simplify,       // Flatten complex types
+   456→  Merge,          // Deep merge two types
+   457→  PartialFields,  // Make specific fields optional
+   458→  NullableToPartial, // Convert nullable to optional
+   459→  UnionToIntersection, // Union → Intersection
+   460→  CastUnknown,    // Cast if unknown
+   461→  SerializableOnly, // Only serializable fields
+   462→} from '@belt/tools';
+   463→
+   464→// Example: Paths
+   465→type User = {
+   466→  id: string;
+   467→  profile: {
+   468→    address: {
+   469→      street: string;
+   470→    };
+   471→  };
+   472→};
+   473→
+   474→type UserPaths = Paths<User>;
+   475→// 'id' | 'profile' | 'profile.address' | 'profile.address.street'
+   476→
+   477→type StreetType = PathType<User, 'profile.address.street'>;
+   478→// string
+   479→
+   480→// Example: Compute (flatten intersections)
+   481→type A = { a: number };
+   482→type B = { b: string };
+   483→type Flat = Compute<A & B>; // { a: number; b: string }
+   484→
+   485→// Example: Writable
+   486→type ReadOnly = { readonly id: string; readonly name: string };
+   487→type Mutable = Writable<ReadOnly>; // { id: string; name: string }
+   488→
+   489→// Example: PartialFields
+   490→type Train = { id: string; name: string; metadata: object };
+   491→type Optional = PartialFields<Train, ['metadata']>;
+   492→// { id: string; name: string; metadata?: object }
+   493→```
+   494→
+   495→**Type Guards:**
+   496→```typescript
+   497→import { isFalsy } from '@belt/tools';
+   498→import type { Falsy } from '@belt/tools';
+   499→
+   500→// All falsy values
+   501→const falsyValues: Falsy = false | '' | null | undefined | 0 | 0n | NaN;
+   502→
+   503→if (isFalsy(value)) {
+   504→  // value is one of the falsy values
+   505→}
+   506→```
+   507→
+   508→---
+   509→
+   510→### Other Utilities
+   511→
+   512→```typescript
+   513→import { delay, maskData, getTypeOf, createProxy } from '@belt/tools';
+   514→
+   515→// Async delay
+   516→await delay(500); // Wait 500ms
+   517→await delay();    // Default 500ms
+   518→
+   519→// Mask sensitive data for logging
+   520→const masked = maskData({
+   521→  password: 'secret123',
+   522→  email: 'user@example.com',
+   523→  nested: { token: 'abc123' },
+   524→});
+   525→// { password: 'String', email: 'String', nested: { token: 'String' } }
+   526→
+   527→// Get type name
+   528→getTypeOf(null);           // 'Null'
+   529→getTypeOf(undefined);      // 'Undefined'
+   530→getTypeOf(new Date());     // 'Date'
+   531→getTypeOf({});             // 'Object'
+   532→getTypeOf([]);             // 'Array'
+   533→getTypeOf(NaN);            // 'NaN'
+   534→
+   535→// Lazy initialization
+   536→const lazyConfig = createProxy(() => loadConfig());
+   537→// Config is only loaded on first access
+   538→```
+   539→
+   540→
+   541→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

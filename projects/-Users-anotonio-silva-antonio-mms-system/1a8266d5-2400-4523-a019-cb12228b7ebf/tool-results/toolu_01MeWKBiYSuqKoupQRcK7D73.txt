@@ -1,0 +1,382 @@
+     1→/**
+     2→ * Scenario Slice
+     3→ *
+     4→ * State management for what-if scenarios and comparison views.
+     5→ * Supports event-sourced delta tracking per spec 004.11.
+     6→ *
+     7→ * @see specs/006-user-interface.md Section 6.7
+     8→ */
+     9→
+    10→import { createSlice, createAsyncSlice } from '@belt/tools';
+    11→import type {
+    12→  Scenario,
+    13→  ScenarioDelta,
+    14→  ScenarioStatus,
+    15→  DeltaType,
+    16→  Baseline,
+    17→  DriftAnalysis,
+    18→} from '../types';
+    19→
+    20→// =============================================================================
+    21→// Scenario Slice State
+    22→// =============================================================================
+    23→
+    24→export interface ScenarioSliceState {
+    25→  scenarios: Scenario[];
+    26→  activeScenarioId: string | null;
+    27→  activeDeltas: ScenarioDelta[];
+    28→  isComparing: boolean;
+    29→  comparisonScenarioId: string | null;
+    30→  comparisonBaselineId: string | null;
+    31→  baselines: Baseline[];
+    32→  activeBaselineId: string | null;
+    33→  driftAnalysis: DriftAnalysis[];
+    34→  isCreating: boolean;
+    35→  createError: string | null;
+    36→  isPromoting: boolean;
+    37→  promotionError: string | null;
+    38→  [key: string]: unknown;
+    39→}
+    40→
+    41→const initialScenarioState: ScenarioSliceState = {
+    42→  scenarios: [],
+    43→  activeScenarioId: null,
+    44→  activeDeltas: [],
+    45→  isComparing: false,
+    46→  comparisonScenarioId: null,
+    47→  comparisonBaselineId: null,
+    48→  baselines: [],
+    49→  activeBaselineId: null,
+    50→  driftAnalysis: [],
+    51→  isCreating: false,
+    52→  createError: null,
+    53→  isPromoting: false,
+    54→  promotionError: null,
+    55→};
+    56→
+    57→export const scenarioSlice = createSlice({
+    58→  id: 'scenario',
+    59→  initial: initialScenarioState,
+    60→  cache: { policy: 'session' },
+    61→  reducers: {
+    62→    // Scenarios
+    63→    setScenarios: (s, scenarios: Scenario[]) => {
+    64→      const state = s as ScenarioSliceState;
+    65→      state.scenarios = scenarios;
+    66→    },
+    67→
+    68→    addScenario: (s, scenario: Scenario) => {
+    69→      const state = s as ScenarioSliceState;
+    70→      state.scenarios.push(scenario);
+    71→    },
+    72→
+    73→    updateScenario: (s, scenario: Partial<Scenario> & { id: string }) => {
+    74→      const state = s as ScenarioSliceState;
+    75→      const index = state.scenarios.findIndex((sc) => sc.id === scenario.id);
+    76→      if (index !== -1) {
+    77→        state.scenarios[index] = { ...state.scenarios[index], ...scenario };
+    78→      }
+    79→    },
+    80→
+    81→    removeScenario: (s, scenarioId: string) => {
+    82→      const state = s as ScenarioSliceState;
+    83→      state.scenarios = state.scenarios.filter((sc) => sc.id !== scenarioId);
+    84→      if (state.activeScenarioId === scenarioId) {
+    85→        state.activeScenarioId = null;
+    86→        state.activeDeltas = [];
+    87→      }
+    88→      if (state.comparisonScenarioId === scenarioId) {
+    89→        state.comparisonScenarioId = null;
+    90→        state.isComparing = false;
+    91→      }
+    92→    },
+    93→
+    94→    updateScenarioStatus: (s, payload: { scenarioId: string; status: ScenarioStatus }) => {
+    95→      const state = s as ScenarioSliceState;
+    96→      const scenario = state.scenarios.find((sc) => sc.id === payload.scenarioId);
+    97→      if (scenario) {
+    98→        scenario.status = payload.status;
+    99→      }
+   100→    },
+   101→
+   102→    // Active Scenario
+   103→    setActiveScenario: (s, scenarioId: string | null) => {
+   104→      const state = s as ScenarioSliceState;
+   105→      state.activeScenarioId = scenarioId;
+   106→      if (!scenarioId) {
+   107→        state.activeDeltas = [];
+   108→      }
+   109→    },
+   110→
+   111→    setActiveDeltas: (s, deltas: ScenarioDelta[]) => {
+   112→      const state = s as ScenarioSliceState;
+   113→      state.activeDeltas = deltas;
+   114→    },
+   115→
+   116→    addDelta: (s, delta: ScenarioDelta) => {
+   117→      const state = s as ScenarioSliceState;
+   118→      state.activeDeltas.push(delta);
+   119→      const scenario = state.scenarios.find((sc) => sc.id === state.activeScenarioId);
+   120→      if (scenario) {
+   121→        scenario.changeCount = state.activeDeltas.length;
+   122→        scenario.updatedAt = new Date().toISOString();
+   123→      }
+   124→    },
+   125→
+   126→    undoLastDelta: (s) => {
+   127→      const state = s as ScenarioSliceState;
+   128→      if (state.activeDeltas.length > 0) {
+   129→        state.activeDeltas.pop();
+   130→        const scenario = state.scenarios.find((sc) => sc.id === state.activeScenarioId);
+   131→        if (scenario) {
+   132→          scenario.changeCount = state.activeDeltas.length;
+   133→          scenario.updatedAt = new Date().toISOString();
+   134→        }
+   135→      }
+   136→    },
+   137→
+   138→    clearDeltas: (s) => {
+   139→      const state = s as ScenarioSliceState;
+   140→      state.activeDeltas = [];
+   141→    },
+   142→
+   143→    // Comparison
+   144→    startComparison: (s, payload: { scenarioId?: string; baselineId?: string }) => {
+   145→      const state = s as ScenarioSliceState;
+   146→      state.isComparing = true;
+   147→      state.comparisonScenarioId = payload.scenarioId ?? null;
+   148→      state.comparisonBaselineId = payload.baselineId ?? null;
+   149→    },
+   150→
+   151→    endComparison: (s) => {
+   152→      const state = s as ScenarioSliceState;
+   153→      state.isComparing = false;
+   154→      state.comparisonScenarioId = null;
+   155→      state.comparisonBaselineId = null;
+   156→    },
+   157→
+   158→    setComparisonTarget: (s, payload: { type: 'scenario' | 'baseline'; id: string }) => {
+   159→      const state = s as ScenarioSliceState;
+   160→      if (payload.type === 'scenario') {
+   161→        state.comparisonScenarioId = payload.id;
+   162→        state.comparisonBaselineId = null;
+   163→      } else {
+   164→        state.comparisonBaselineId = payload.id;
+   165→        state.comparisonScenarioId = null;
+   166→      }
+   167→    },
+   168→
+   169→    // Baselines
+   170→    setBaselines: (s, baselines: Baseline[]) => {
+   171→      const state = s as ScenarioSliceState;
+   172→      state.baselines = baselines;
+   173→    },
+   174→
+   175→    addBaseline: (s, baseline: Baseline) => {
+   176→      const state = s as ScenarioSliceState;
+   177→      state.baselines.push(baseline);
+   178→    },
+   179→
+   180→    updateBaseline: (s, baseline: Partial<Baseline> & { id: string }) => {
+   181→      const state = s as ScenarioSliceState;
+   182→      const index = state.baselines.findIndex((b) => b.id === baseline.id);
+   183→      if (index !== -1) {
+   184→        state.baselines[index] = { ...state.baselines[index], ...baseline };
+   185→      }
+   186→    },
+   187→
+   188→    setActiveBaseline: (s, baselineId: string | null) => {
+   189→      const state = s as ScenarioSliceState;
+   190→      state.activeBaselineId = baselineId;
+   191→    },
+   192→
+   193→    // Drift Analysis
+   194→    setDriftAnalysis: (s, analysis: DriftAnalysis[]) => {
+   195→      const state = s as ScenarioSliceState;
+   196→      state.driftAnalysis = analysis;
+   197→    },
+   198→
+   199→    clearDriftAnalysis: (s) => {
+   200→      const state = s as ScenarioSliceState;
+   201→      state.driftAnalysis = [];
+   202→    },
+   203→
+   204→    // Creation State
+   205→    startCreating: (s) => {
+   206→      const state = s as ScenarioSliceState;
+   207→      state.isCreating = true;
+   208→      state.createError = null;
+   209→    },
+   210→
+   211→    finishCreating: (s, error?: string) => {
+   212→      const state = s as ScenarioSliceState;
+   213→      state.isCreating = false;
+   214→      state.createError = error ?? null;
+   215→    },
+   216→
+   217→    // Promotion State
+   218→    startPromoting: (s) => {
+   219→      const state = s as ScenarioSliceState;
+   220→      state.isPromoting = true;
+   221→      state.promotionError = null;
+   222→    },
+   223→
+   224→    finishPromoting: (s, error?: string) => {
+   225→      const state = s as ScenarioSliceState;
+   226→      state.isPromoting = false;
+   227→      state.promotionError = error ?? null;
+   228→    },
+   229→
+   230→    // Reset
+   231→    reset: (s) => {
+   232→      const state = s as ScenarioSliceState;
+   233→      Object.assign(state, initialScenarioState);
+   234→    },
+   235→
+   236→    resetComparison: (s) => {
+   237→      const state = s as ScenarioSliceState;
+   238→      state.isComparing = false;
+   239→      state.comparisonScenarioId = null;
+   240→      state.comparisonBaselineId = null;
+   241→    },
+   242→  },
+   243→});
+   244→
+   245→// =============================================================================
+   246→// Async Scenario Slice
+   247→// =============================================================================
+   248→
+   249→export interface ScenarioApiResponse {
+   250→  scenarios: Scenario[];
+   251→  baselines: Baseline[];
+   252→}
+   253→
+   254→export const scenarioAsyncSlice = createAsyncSlice({
+   255→  id: 'scenarioApi',
+   256→  cache: {
+   257→    policy: 'private',
+   258→    ttl: '5m',
+   259→    swr: true,
+   260→  },
+   261→  context: { baseUrl: '/api/v1' },
+   262→  load: async (ctx) => {
+   263→    const baseUrl = (ctx as { baseUrl: string }).baseUrl;
+   264→
+   265→    const [scenariosRes, baselinesRes] = await Promise.all([
+   266→      fetch(`${baseUrl}/scenarios?status=ACTIVE`),
+   267→      fetch(`${baseUrl}/baselines`),
+   268→    ]);
+   269→
+   270→    if (!scenariosRes.ok || !baselinesRes.ok) {
+   271→      throw new Error('Failed to fetch scenario data');
+   272→    }
+   273→
+   274→    const [scenariosData, baselinesData] = await Promise.all([
+   275→      scenariosRes.json() as Promise<{ data: Scenario[] }>,
+   276→      baselinesRes.json() as Promise<{ data: Baseline[] }>,
+   277→    ]);
+   278→
+   279→    return {
+   280→      scenarios: scenariosData.data,
+   281→      baselines: baselinesData.data,
+   282→    };
+   283→  },
+   284→});
+   285→
+   286→// =============================================================================
+   287→// Selectors
+   288→// =============================================================================
+   289→
+   290→export function selectScenarioById(
+   291→  state: ScenarioSliceState,
+   292→  scenarioId: string
+   293→): Scenario | undefined {
+   294→  return state.scenarios.find((s) => s.id === scenarioId);
+   295→}
+   296→
+   297→export function selectActiveScenario(state: ScenarioSliceState): Scenario | undefined {
+   298→  return state.activeScenarioId
+   299→    ? state.scenarios.find((s) => s.id === state.activeScenarioId)
+   300→    : undefined;
+   301→}
+   302→
+   303→export function selectBaselineById(
+   304→  state: ScenarioSliceState,
+   305→  baselineId: string
+   306→): Baseline | undefined {
+   307→  return state.baselines.find((b) => b.id === baselineId);
+   308→}
+   309→
+   310→export function selectPublishedBaseline(state: ScenarioSliceState): Baseline | undefined {
+   311→  return state.baselines.find((b) => b.status === 'PUBLISHED');
+   312→}
+   313→
+   314→export function selectActiveScenarios(state: ScenarioSliceState): Scenario[] {
+   315→  return state.scenarios.filter((s) => s.status === 'ACTIVE');
+   316→}
+   317→
+   318→export function selectComparisonTarget(
+   319→  state: ScenarioSliceState
+   320→): { type: 'scenario' | 'baseline'; entity: Scenario | Baseline } | null {
+   321→  if (state.comparisonScenarioId) {
+   322→    const scenario = state.scenarios.find((s) => s.id === state.comparisonScenarioId);
+   323→    if (scenario) {
+   324→      return { type: 'scenario', entity: scenario };
+   325→    }
+   326→  }
+   327→  if (state.comparisonBaselineId) {
+   328→    const baseline = state.baselines.find((b) => b.id === state.comparisonBaselineId);
+   329→    if (baseline) {
+   330→      return { type: 'baseline', entity: baseline };
+   331→    }
+   332→  }
+   333→  return null;
+   334→}
+   335→
+   336→export function selectTrainsRequiringReplan(state: ScenarioSliceState): DriftAnalysis[] {
+   337→  return state.driftAnalysis.filter((d) => d.requiresReplan);
+   338→}
+   339→
+   340→export function selectDriftSummary(state: ScenarioSliceState): {
+   341→  totalTrains: number;
+   342→  lowDrift: number;
+   343→  mediumDrift: number;
+   344→  highDrift: number;
+   345→  criticalDrift: number;
+   346→  requireReplan: number;
+   347→} {
+   348→  const analysis = state.driftAnalysis;
+   349→  return {
+   350→    totalTrains: analysis.length,
+   351→    lowDrift: analysis.filter((d) => d.severity === 'LOW').length,
+   352→    mediumDrift: analysis.filter((d) => d.severity === 'MEDIUM').length,
+   353→    highDrift: analysis.filter((d) => d.severity === 'HIGH').length,
+   354→    criticalDrift: analysis.filter((d) => d.severity === 'CRITICAL').length,
+   355→    requireReplan: analysis.filter((d) => d.requiresReplan).length,
+   356→  };
+   357→}
+   358→
+   359→export function selectDeltaCountByType(state: ScenarioSliceState): Record<DeltaType, number> {
+   360→  const counts: Record<DeltaType, number> = {
+   361→    PM_MOVE: 0,
+   362→    PM_ADD: 0,
+   363→    PM_REMOVE: 0,
+   364→    CAPACITY_CHANGE: 0,
+   365→    TRAIN_STATUS_CHANGE: 0,
+   366→  };
+   367→
+   368→  state.activeDeltas.forEach((delta) => {
+   369→    counts[delta.deltaType]++;
+   370→  });
+   371→
+   372→  return counts;
+   373→}
+   374→
+   375→export function hasUnsavedChanges(state: ScenarioSliceState): boolean {
+   376→  return state.activeDeltas.length > 0;
+   377→}
+   378→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

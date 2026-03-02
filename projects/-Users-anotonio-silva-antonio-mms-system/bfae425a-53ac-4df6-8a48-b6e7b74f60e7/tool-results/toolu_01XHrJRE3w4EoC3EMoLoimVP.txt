@@ -1,0 +1,612 @@
+     1→/**
+     2→ * Drift Analysis Routes
+     3→ *
+     4→ * REST endpoints for drift analysis monitoring.
+     5→ * Drift analysis compares actual fleet state against published baselines
+     6→ * to detect schedule and mileage deviations requiring attention.
+     7→ *
+     8→ * @see specs/005-api.md Section 5.9
+     9→ */
+    10→
+    11→import { Hono } from 'hono';
+    12→import {
+    13→  success,
+    14→  paginatedSuccess,
+    15→  error,
+    16→  parsePaginationQuery,
+    17→  ErrorCodes,
+    18→  type AppVariables,
+    19→} from '../types';
+    20→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    21→import {
+    22→  getDriftMonitorService,
+    23→  getBaselineService,
+    24→  type DriftHistoryFilters,
+    25→} from '../../services';
+    26→import { isValidUuid } from '../../lib/schemas';
+    27→
+    28→// Singleton service instances
+    29→let driftService: ReturnType<typeof getDriftMonitorService> | null = null;
+    30→let baselineService: ReturnType<typeof getBaselineService> | null = null;
+    31→
+    32→function getDriftService(): ReturnType<typeof getDriftMonitorService> {
+    33→  if (!driftService) {
+    34→    driftService = getDriftMonitorService();
+    35→  }
+    36→  return driftService;
+    37→}
+    38→
+    39→function getBaseline(): ReturnType<typeof getBaselineService> {
+    40→  if (!baselineService) {
+    41→    baselineService = getBaselineService();
+    42→  }
+    43→  return baselineService;
+    44→}
+    45→
+    46→export const driftRoutes = new Hono<{ Variables: AppVariables }>();
+    47→
+    48→/**
+    49→ * Map drift severity based on whether replan is required
+    50→ */
+    51→function getDriftSeverity(
+    52→  mileageDriftPct: number,
+    53→  maxPmDriftDays: number,
+    54→  requiresReplan: boolean,
+    55→  thresholds: { mileageDriftPct: number; scheduleDriftDays: number }
+    56→): 'GREEN' | 'YELLOW' | 'RED' {
+    57→  if (requiresReplan) {
+    58→    return 'RED';
+    59→  }
+    60→
+    61→  // Approaching threshold (>70% of threshold)
+    62→  const mileageApproaching = Math.abs(mileageDriftPct) > thresholds.mileageDriftPct * 0.7;
+    63→  const scheduleApproaching = maxPmDriftDays > thresholds.scheduleDriftDays * 0.7;
+    64→
+    65→  if (mileageApproaching || scheduleApproaching) {
+    66→    return 'YELLOW';
+    67→  }
+    68→
+    69→  return 'GREEN';
+    70→}
+    71→
+    72→/**
+    73→ * GET /drift/analysis
+    74→ *
+    75→ * Get drift analysis results comparing actual state against baseline.
+    76→ * Returns the latest drift analysis with summary and per-train details.
+    77→ *
+    78→ * Query Parameters:
+    79→ * - baselineId: Filter by specific baseline (UUID, optional - defaults to latest published)
+    80→ * - trainId: Filter by specific train (UUID, optional)
+    81→ * - requiresReplan: Filter trains requiring replan (boolean, optional)
+    82→ * - page: Page number for train analyses (default: 1)
+    83→ * - pageSize: Items per page (default: 50, max: 200)
+    84→ */
+    85→driftRoutes.get('/drift/analysis', async (c) => {
+    86→  const requestId = getRequestId(c);
+    87→  const service = getDriftService();
+    88→  const baselines = getBaseline();
+    89→
+    90→  // Parse query parameters
+    91→  const baselineIdParam = c.req.query('baselineId');
+    92→  const trainIdParam = c.req.query('trainId');
+    93→  const requiresReplanParam = c.req.query('requiresReplan');
+    94→
+    95→  // Validate UUIDs if provided
+    96→  if (baselineIdParam && !isValidUuid(baselineIdParam)) {
+    97→    return c.json(
+    98→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId),
+    99→      400
+   100→    );
+   101→  }
+   102→
+   103→  if (trainIdParam && !isValidUuid(trainIdParam)) {
+   104→    return c.json(
+   105→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid train ID format', requestId),
+   106→      400
+   107→    );
+   108→  }
+   109→
+   110→  // Get baseline (specific or latest published)
+   111→  let baseline;
+   112→  if (baselineIdParam) {
+   113→    try {
+   114→      baseline = await baselines.getBaselineById(baselineIdParam);
+   115→    } catch {
+   116→      return c.json(
+   117→        error(ErrorCodes.NOT_FOUND, `Baseline not found: ${baselineIdParam}`, requestId),
+   118→        404
+   119→      );
+   120→    }
+   121→  } else {
+   122→    baseline = await baselines.getLatestBaseline();
+   123→    if (!baseline) {
+   124→      return c.json(
+   125→        error(ErrorCodes.NOT_FOUND, 'No published baseline found', requestId),
+   126→        404
+   127→      );
+   128→    }
+   129→  }
+   130→
+   131→  // Build filters for drift history query
+   132→  const filters: DriftHistoryFilters = {
+   133→    baselineId: baseline.id,
+   134→  };
+   135→
+   136→  if (trainIdParam) {
+   137→    filters.trainId = trainIdParam;
+   138→  }
+   139→
+   140→  if (requiresReplanParam !== undefined) {
+   141→    filters.requiresReplan = requiresReplanParam === 'true';
+   142→  }
+   143→
+   144→  // Parse pagination
+   145→  const pagination = parsePaginationQuery({
+   146→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   147→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   148→  });
+   149→
+   150→  // Get drift summary
+   151→  const summary = await service.getDriftSummary(baseline.id);
+   152→
+   153→  // Get drift history (train analyses)
+   154→  const driftHistory = await service.getDriftHistory(filters, {
+   155→    page: pagination.page,
+   156→    pageSize: pagination.pageSize,
+   157→  });
+   158→
+   159→  // Get current thresholds for severity calculation
+   160→  const thresholds = service.getThresholds();
+   161→
+   162→  // Map to API response format per spec 005.9
+   163→  const trainAnalyses = driftHistory.data.map((drift) => ({
+   164→    trainId: drift.trainId,
+   165→    trainNumber: null, // Would need train lookup for number
+   166→    baselineProjectedKm: drift.baselineProjectedKm,
+   167→    actualKm: drift.actualKm,
+   168→    mileageDriftKm: drift.actualKm - drift.baselineProjectedKm,
+   169→    mileageDriftPct: drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   170→    pmDrifts: [], // PM drift details would need to be stored/retrieved separately
+   171→    avgPmDriftDays: drift.avgPmDriftDays ? parseFloat(drift.avgPmDriftDays) : 0,
+   172→    maxPmDriftDays: drift.maxPmDriftDays ?? 0,
+   173→    requiresReplan: drift.requiresReplan,
+   174→    replanReason: drift.replanReason,
+   175→    driftSeverity: getDriftSeverity(
+   176→      drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   177→      drift.maxPmDriftDays ?? 0,
+   178→      drift.requiresReplan ?? false,
+   179→      thresholds
+   180→    ),
+   181→  }));
+   182→
+   183→  // Build response
+   184→  const responseData = {
+   185→    baselineId: baseline.id,
+   186→    baselineName: baseline.name,
+   187→    baselineVersion: baseline.version,
+   188→    analysisDate: driftHistory.data[0]?.analysisDate ?? null,
+   189→    summary: summary
+   190→      ? {
+   191→          totalTrains: summary.totalTrains,
+   192→          trainsWithDrift: summary.trainsWithDrift,
+   193→          trainsRequiringReplan: summary.trainsRequiringReplan,
+   194→          avgFleetDriftPct: Math.round(summary.avgMileageDriftPct * 100) / 100,
+   195→          maxMileageDriftPct: Math.round(summary.maxMileageDriftPct * 100) / 100,
+   196→          avgPmDriftDays: Math.round(summary.avgPmDriftDays * 10) / 10,
+   197→          maxPmDriftDays: summary.maxPmDriftDays,
+   198→        }
+   199→      : {
+   200→          totalTrains: 0,
+   201→          trainsWithDrift: 0,
+   202→          trainsRequiringReplan: 0,
+   203→          avgFleetDriftPct: 0,
+   204→          maxMileageDriftPct: 0,
+   205→          avgPmDriftDays: 0,
+   206→          maxPmDriftDays: 0,
+   207→        },
+   208→    trainAnalyses,
+   209→  };
+   210→
+   211→  // Return paginated response if filtering by train or paginating through results
+   212→  if (driftHistory.total > driftHistory.pageSize) {
+   213→    return c.json(
+   214→      paginatedSuccess(
+   215→        [responseData],
+   216→        {
+   217→          page: driftHistory.page,
+   218→          pageSize: driftHistory.pageSize,
+   219→          totalItems: driftHistory.total,
+   220→        },
+   221→        { durationMs: getRequestDuration(c) }
+   222→      )
+   223→    );
+   224→  }
+   225→
+   226→  return c.json(
+   227→    success(responseData, {
+   228→      timing: { durationMs: getRequestDuration(c) },
+   229→    })
+   230→  );
+   231→});
+   232→
+   233→/**
+   234→ * GET /drift/trains-requiring-replan
+   235→ *
+   236→ * Convenience endpoint to get only trains that require replanning.
+   237→ * Returns a focused list for immediate action.
+   238→ */
+   239→driftRoutes.get('/drift/trains-requiring-replan', async (c) => {
+   240→  const requestId = getRequestId(c);
+   241→  const service = getDriftService();
+   242→  const baselines = getBaseline();
+   243→
+   244→  // Get latest baseline
+   245→  const baseline = await baselines.getLatestBaseline();
+   246→  if (!baseline) {
+   247→    return c.json(
+   248→      error(ErrorCodes.NOT_FOUND, 'No published baseline found', requestId),
+   249→      404
+   250→    );
+   251→  }
+   252→
+   253→  // Get trains requiring replan
+   254→  const trains = await service.getTrainsRequiringReplan();
+   255→
+   256→  // Get thresholds for severity calculation
+   257→  const thresholds = service.getThresholds();
+   258→
+   259→  // Map to response format
+   260→  const data = trains.map((drift) => ({
+   261→    trainId: drift.trainId,
+   262→    analysisDate: drift.analysisDate,
+   263→    baselineProjectedKm: drift.baselineProjectedKm,
+   264→    actualKm: drift.actualKm,
+   265→    mileageDriftKm: drift.actualKm - drift.baselineProjectedKm,
+   266→    mileageDriftPct: drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   267→    avgPmDriftDays: drift.avgPmDriftDays ? parseFloat(drift.avgPmDriftDays) : 0,
+   268→    maxPmDriftDays: drift.maxPmDriftDays ?? 0,
+   269→    replanReason: drift.replanReason,
+   270→    driftSeverity: getDriftSeverity(
+   271→      drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   272→      drift.maxPmDriftDays ?? 0,
+   273→      true,
+   274→      thresholds
+   275→    ),
+   276→  }));
+   277→
+   278→  return c.json(
+   279→    success(
+   280→      {
+   281→        baselineId: baseline.id,
+   282→        baselineName: baseline.name,
+   283→        count: data.length,
+   284→        trains: data,
+   285→      },
+   286→      { timing: { durationMs: getRequestDuration(c) } }
+   287→    )
+   288→  );
+   289→});
+   290→
+   291→/**
+   292→ * GET /drift/summary
+   293→ *
+   294→ * Get drift analysis summary for the latest baseline.
+   295→ * Convenience endpoint for dashboard display.
+   296→ */
+   297→driftRoutes.get('/drift/summary', async (c) => {
+   298→  const requestId = getRequestId(c);
+   299→  const service = getDriftService();
+   300→  const baselines = getBaseline();
+   301→
+   302→  const baselineIdParam = c.req.query('baselineId');
+   303→  const analysisDateParam = c.req.query('analysisDate');
+   304→
+   305→  // Validate UUID if provided
+   306→  if (baselineIdParam && !isValidUuid(baselineIdParam)) {
+   307→    return c.json(
+   308→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId),
+   309→      400
+   310→    );
+   311→  }
+   312→
+   313→  // Get baseline
+   314→  let baseline;
+   315→  if (baselineIdParam) {
+   316→    try {
+   317→      baseline = await baselines.getBaselineById(baselineIdParam);
+   318→    } catch {
+   319→      return c.json(
+   320→        error(ErrorCodes.NOT_FOUND, `Baseline not found: ${baselineIdParam}`, requestId),
+   321→        404
+   322→      );
+   323→    }
+   324→  } else {
+   325→    baseline = await baselines.getLatestBaseline();
+   326→    if (!baseline) {
+   327→      return c.json(
+   328→        error(ErrorCodes.NOT_FOUND, 'No published baseline found', requestId),
+   329→        404
+   330→      );
+   331→    }
+   332→  }
+   333→
+   334→  // Get summary
+   335→  const summary = await service.getDriftSummary(baseline.id, analysisDateParam);
+   336→
+   337→  if (!summary) {
+   338→    return c.json(
+   339→      success(
+   340→        {
+   341→          baselineId: baseline.id,
+   342→          baselineName: baseline.name,
+   343→          analysisDate: null,
+   344→          hasAnalysis: false,
+   345→          summary: null,
+   346→        },
+   347→        { timing: { durationMs: getRequestDuration(c) } }
+   348→      )
+   349→    );
+   350→  }
+   351→
+   352→  // Get thresholds for context
+   353→  const thresholds = service.getThresholds();
+   354→
+   355→  return c.json(
+   356→    success(
+   357→      {
+   358→        baselineId: baseline.id,
+   359→        baselineName: baseline.name,
+   360→        hasAnalysis: true,
+   361→        summary: {
+   362→          totalTrains: summary.totalTrains,
+   363→          trainsWithDrift: summary.trainsWithDrift,
+   364→          trainsRequiringReplan: summary.trainsRequiringReplan,
+   365→          avgMileageDriftPct: Math.round(summary.avgMileageDriftPct * 100) / 100,
+   366→          maxMileageDriftPct: Math.round(summary.maxMileageDriftPct * 100) / 100,
+   367→          avgPmDriftDays: Math.round(summary.avgPmDriftDays * 10) / 10,
+   368→          maxPmDriftDays: summary.maxPmDriftDays,
+   369→        },
+   370→        thresholds: {
+   371→          mileageDriftPct: thresholds.mileageDriftPct,
+   372→          scheduleDriftDays: thresholds.scheduleDriftDays,
+   373→          fleetDriftTrainCount: thresholds.fleetDriftTrainCount,
+   374→        },
+   375→      },
+   376→      { timing: { durationMs: getRequestDuration(c) } }
+   377→    )
+   378→  );
+   379→});
+   380→
+   381→/**
+   382→ * GET /drift/history
+   383→ *
+   384→ * Get historical drift analysis records with filtering and pagination.
+   385→ * Useful for trending and audit purposes.
+   386→ *
+   387→ * Query Parameters:
+   388→ * - baselineId: Filter by baseline (UUID)
+   389→ * - trainId: Filter by train (UUID)
+   390→ * - fromDate: Filter by analysis date (ISO date)
+   391→ * - toDate: Filter by analysis date (ISO date)
+   392→ * - requiresReplan: Filter by replan status (boolean)
+   393→ * - page: Page number (default: 1)
+   394→ * - pageSize: Items per page (default: 50, max: 200)
+   395→ */
+   396→driftRoutes.get('/drift/history', async (c) => {
+   397→  const requestId = getRequestId(c);
+   398→  const service = getDriftService();
+   399→
+   400→  // Parse query parameters
+   401→  const baselineIdParam = c.req.query('baselineId');
+   402→  const trainIdParam = c.req.query('trainId');
+   403→  const fromDateParam = c.req.query('fromDate');
+   404→  const toDateParam = c.req.query('toDate');
+   405→  const requiresReplanParam = c.req.query('requiresReplan');
+   406→
+   407→  // Validate UUIDs
+   408→  if (baselineIdParam && !isValidUuid(baselineIdParam)) {
+   409→    return c.json(
+   410→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId),
+   411→      400
+   412→    );
+   413→  }
+   414→
+   415→  if (trainIdParam && !isValidUuid(trainIdParam)) {
+   416→    return c.json(
+   417→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid train ID format', requestId),
+   418→      400
+   419→    );
+   420→  }
+   421→
+   422→  // Build filters
+   423→  const filters: DriftHistoryFilters = {};
+   424→
+   425→  if (baselineIdParam) {
+   426→    filters.baselineId = baselineIdParam;
+   427→  }
+   428→
+   429→  if (trainIdParam) {
+   430→    filters.trainId = trainIdParam;
+   431→  }
+   432→
+   433→  if (fromDateParam) {
+   434→    const parsed = new Date(fromDateParam);
+   435→    if (!isNaN(parsed.getTime())) {
+   436→      filters.fromDate = parsed;
+   437→    }
+   438→  }
+   439→
+   440→  if (toDateParam) {
+   441→    const parsed = new Date(toDateParam);
+   442→    if (!isNaN(parsed.getTime())) {
+   443→      filters.toDate = parsed;
+   444→    }
+   445→  }
+   446→
+   447→  if (requiresReplanParam !== undefined) {
+   448→    filters.requiresReplan = requiresReplanParam === 'true';
+   449→  }
+   450→
+   451→  // Parse pagination
+   452→  const pagination = parsePaginationQuery({
+   453→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   454→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   455→  });
+   456→
+   457→  // Get drift history
+   458→  const result = await service.getDriftHistory(filters, {
+   459→    page: pagination.page,
+   460→    pageSize: pagination.pageSize,
+   461→  });
+   462→
+   463→  // Map to API response format
+   464→  const data = result.data.map((drift) => ({
+   465→    id: drift.id,
+   466→    baselineId: drift.baselineId,
+   467→    trainId: drift.trainId,
+   468→    analysisDate: drift.analysisDate,
+   469→    baselineProjectedKm: drift.baselineProjectedKm,
+   470→    actualKm: drift.actualKm,
+   471→    mileageDriftPct: drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   472→    avgPmDriftDays: drift.avgPmDriftDays ? parseFloat(drift.avgPmDriftDays) : 0,
+   473→    maxPmDriftDays: drift.maxPmDriftDays ?? 0,
+   474→    requiresReplan: drift.requiresReplan,
+   475→    replanReason: drift.replanReason,
+   476→    createdAt: drift.createdAt,
+   477→  }));
+   478→
+   479→  return c.json(
+   480→    paginatedSuccess(
+   481→      data,
+   482→      {
+   483→        page: result.page,
+   484→        pageSize: result.pageSize,
+   485→        totalItems: result.total,
+   486→      },
+   487→      { durationMs: getRequestDuration(c) }
+   488→    )
+   489→  );
+   490→});
+   491→
+   492→/**
+   493→ * POST /drift/run-analysis
+   494→ *
+   495→ * Trigger a drift analysis run.
+   496→ * Typically run as a nightly job, but can be triggered manually.
+   497→ * Requires appropriate permissions (admin or scheduler role).
+   498→ *
+   499→ * Request Body:
+   500→ * - analysisDate: Optional date for analysis (ISO date, defaults to today)
+   501→ */
+   502→driftRoutes.post('/drift/run-analysis', async (c) => {
+   503→  const requestId = getRequestId(c);
+   504→  const service = getDriftService();
+   505→
+   506→  // Parse request body
+   507→  let analysisDate: Date | undefined;
+   508→  try {
+   509→    const body = await c.req.json();
+   510→    if (body.analysisDate) {
+   511→      analysisDate = new Date(body.analysisDate);
+   512→      if (isNaN(analysisDate.getTime())) {
+   513→        return c.json(
+   514→          error(ErrorCodes.VALIDATION_ERROR, 'Invalid analysis date format', requestId),
+   515→          400
+   516→        );
+   517→      }
+   518→    }
+   519→  } catch {
+   520→    // Empty body is fine, use default date
+   521→  }
+   522→
+   523→  // Run analysis
+   524→  const result = await service.runDriftAnalysis(analysisDate);
+   525→
+   526→  if (result.skipped) {
+   527→    return c.json(
+   528→      success(
+   529→        {
+   530→          status: 'skipped',
+   531→          reason: result.reason,
+   532→        },
+   533→        { timing: { durationMs: getRequestDuration(c) } }
+   534→      )
+   535→    );
+   536→  }
+   537→
+   538→  return c.json(
+   539→    success(
+   540→      {
+   541→        status: 'completed',
+   542→        baselineId: result.baselineId,
+   543→        baselineVersion: result.baselineVersion,
+   544→        analysisDate: result.analysisDate,
+   545→        summary: result.summary,
+   546→        alertCount: result.alerts.length,
+   547→        alerts: result.alerts,
+   548→      },
+   549→      { timing: { durationMs: getRequestDuration(c) } }
+   550→    )
+   551→  );
+   552→});
+   553→
+   554→/**
+   555→ * GET /drift/train/:trainId
+   556→ *
+   557→ * Get the latest drift analysis for a specific train.
+   558→ * Convenience endpoint for train detail views.
+   559→ */
+   560→driftRoutes.get('/drift/train/:trainId', async (c) => {
+   561→  const requestId = getRequestId(c);
+   562→  const trainId = c.req.param('trainId');
+   563→
+   564→  if (!isValidUuid(trainId)) {
+   565→    return c.json(
+   566→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid train ID format', requestId),
+   567→      400
+   568→    );
+   569→  }
+   570→
+   571→  const service = getDriftService();
+   572→
+   573→  try {
+   574→    const drift = await service.getLatestTrainDrift(trainId);
+   575→    const thresholds = service.getThresholds();
+   576→
+   577→    return c.json(
+   578→      success(
+   579→        {
+   580→          trainId: drift.trainId,
+   581→          baselineId: drift.baselineId,
+   582→          analysisDate: drift.analysisDate,
+   583→          baselineProjectedKm: drift.baselineProjectedKm,
+   584→          actualKm: drift.actualKm,
+   585→          mileageDriftKm: drift.actualKm - drift.baselineProjectedKm,
+   586→          mileageDriftPct: drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   587→          avgPmDriftDays: drift.avgPmDriftDays ? parseFloat(drift.avgPmDriftDays) : 0,
+   588→          maxPmDriftDays: drift.maxPmDriftDays ?? 0,
+   589→          requiresReplan: drift.requiresReplan,
+   590→          replanReason: drift.replanReason,
+   591→          driftSeverity: getDriftSeverity(
+   592→            drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0,
+   593→            drift.maxPmDriftDays ?? 0,
+   594→            drift.requiresReplan ?? false,
+   595→            thresholds
+   596→          ),
+   597→        },
+   598→        { timing: { durationMs: getRequestDuration(c) } }
+   599→      )
+   600→    );
+   601→  } catch {
+   602→    return c.json(
+   603→      error(ErrorCodes.NOT_FOUND, `No drift analysis found for train: ${trainId}`, requestId),
+   604→      404
+   605→    );
+   606→  }
+   607→});
+   608→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

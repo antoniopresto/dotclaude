@@ -1,0 +1,504 @@
+     1→# MMS Implementation Plan
+     2→
+     3→> **Status**: Comprehensive gap analysis complete (v2.5)
+     4→> **Last Updated**: 2026-01-20
+     5→> **Last Verified**: 2026-01-20 (Deep Opus 4.5 multi-agent analysis with 8 parallel subagents)
+     6→> **Priority**: P1 (Critical) → P2 (High) → P3 (Medium) → P4 (Low)
+     7→> **Overall Completion**: ~62% (foundations+services+API complete, UI overlays/ops/demo pending)
+     8→
+     9→---
+    10→
+    11→## Verification Summary (2026-01-20 - Multi-Agent Deep Scan)
+    12→
+    13→| Component | Files | Lines | Tests | Status |
+    14→|-----------|-------|-------|-------|--------|
+    15→| Database Schema | 14 | 3,165+ | N/A | ✅ Complete (40+ tables, 27 enums) |
+    16→| Shared Library | 27 | ~7,500 | 4,500+ | ✅ Complete (all utilities + comprehensive tests) |
+    17→| Domain Services | 18 | ~15,000 | 700+ | ✅ Complete (17 services, minor TODOs in 2) |
+    18→| API Layer | 38 | ~5,000 | 500+ | ✅ 47+ REST endpoints + WebSocket Hub (98% complete) |
+    19→| Workers | 9 | ~2,753 | 16 | ⚠️ 8/9 production-ready, Report worker has placeholders |
+    20→| TypeScript Optimizer | 4 | ~2,200 | 669 | ✅ Fallback complete with comprehensive tests |
+    21→| C++ Optimizer | 6 | ~1,620 | 0 | ⚠️ Source 100% complete, **BINARY NOT COMPILED** |
+    22→| Frontend | 18 | ~5,500 | 7 | ⚠️ Canvas 5/5 views done, overlays/keyboard/a11y pending |
+    23→| Operations | 1 | ~100 | 0 | ❌ Only optimizer Dockerfile (1/5 images needed) |
+    24→| Demo | 0 | 0 | 0 | ❌ Not started |
+    25→
+    26→**Package Status**:
+    27→- `@belt/tools` v0.1.2 in package.json - ✅ NOW IN USE (migrated from zod)
+    28→- `zod` - ✅ REMOVED from package.json
+    29→- `zustand` - ✅ REMOVED from package.json
+    30→
+    31→---
+    32→
+    33→## 🔴 CRITICAL GAPS (2026-01-20 Multi-Agent Deep Scan Findings)
+    34→
+    35→### GAP-1: C++ Optimizer Binary NOT COMPILED (P1 - CRITICAL)
+    36→- **Location**: `mms-optimizer/`
+    37→- **Status**: Source code 100% complete (1,620 LOC), but NO build/ directory
+    38→- **Impact**: Cannot use C++ CP-SAT solver in production, falls back to TypeScript greedy
+    39→- **Fix**: Run `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build` in mms-optimizer/
+    40→- **Additional Issues**:
+    41→  - Soft constraint breakdown uses hardcoded ratios (80%/20%) instead of actual solver values
+    42→  - `summary.materialBlocks = 0` placeholder, not counted from warnings
+    43→  - `test/` directory missing for C++ unit tests
+    44→
+    45→### GAP-2: Report Worker Placeholder Implementation (P2 - HIGH)
+    46→- **Location**: `src/workers/processors/report.ts` (lines 209-262, 286-394)
+    47→- **Status**: 4 data fetching functions return empty mock data; Excel/PDF generation creates placeholder files
+    48→- **Impact**: Reports will generate with zero data rows; exports are non-functional
+    49→- **Fix**:
+    50→  - Implement actual database queries in `fetchPmScheduleData()`, `fetchFleetStatusData()`, `fetchDriftReportData()`, `fetchTcoProjectionData()`
+    51→  - Integrate ExcelJS for proper .xlsx generation
+    52→  - Integrate Puppeteer for HTML-to-PDF rendering
+    53→- **Placeholder Comments Found**: Lines 286, 318-319, 360, 393-394
+    54→
+    55→### GAP-3: /metrics Endpoint NOT EXPOSED (P2 - HIGH)
+    56→- **Location**: `src/api/index.ts` (missing endpoint)
+    57→- **Status**: 100+ Prometheus metrics fully implemented in `src/lib/metrics/index.ts` (753 lines), but /metrics endpoint NOT in API
+    58→- **Impact**: Cannot scrape metrics for production monitoring; Grafana dashboards non-functional
+    59→- **Fix**: Add `GET /metrics` endpoint returning `getMetrics()` with `text/plain; version=0.0.4` content type
+    60→
+    61→### GAP-4: Health Check Returns Hardcoded Values (P2 - HIGH)
+    62→- **Location**: `src/api/index.ts:113`
+    63→- **Status**: /ready endpoint returns `{ database: 'healthy', redis: 'healthy' }` with TODO comment
+    64→- **Impact**: K8s readiness probes cannot detect actual service health; rolling updates may promote unhealthy pods
+    65→- **Fix**: Implement actual DB (`checkDatabaseHealth()`) and Redis (`checkRedisHealth()`) connectivity checks with timeout
+    66→
+    67→### GAP-5: Database Missing Generated Columns (P2 - MEDIUM)
+    68→- **Status**: 8 generated columns defined in spec 003 are computed in queries/application instead of database
+    69→- **Tables Affected**:
+    70→  - `trains.mileage_variance_km` - Calculated in queries
+    71→  - `inventory_positions.quantity_available` - Calculated in queries
+    72→  - `manhour_projections` - 4 columns: `variance_hours`, `utilization_pct`, `is_overloaded`, `is_underutilized`
+    73→  - `drift_analysis.mileage_drift_km` - Calculated in queries
+    74→  - `cost_baselines.variance_pct` - Calculated in queries
+    75→- **Impact**: Data consistency risk; requires additional query complexity
+    76→- **Fix**: Add generated columns via SQL migration (Drizzle ORM limitation)
+    77→
+    78→### GAP-6: Database Missing notification_templates Table (P2 - MEDIUM)
+    79→- **Location**: `src/lib/db/schema/notifications.ts`
+    80→- **Status**: Spec requires `notification_templates` table, not implemented
+    81→- **Impact**: Hardcoded templates in NotificationService; cannot customize without code changes
+    82→- **Fix**: Add `notification_templates` table with template name, subject, body HTML, placeholders
+    83→
+    84→### GAP-7: Database Missing Materialized Views (P2 - MEDIUM)
+    85→- **Status**: 4 materialized views required by spec 003 not created
+    86→- **Required Views**:
+    87→  - `v_canvas_strategic` - Yearly PM aggregates per train
+    88→  - `v_canvas_tactical` - Weekly PM details
+    89→  - `v_manhour_canvas` - Man-hour overlay data
+    90→  - `v_drift_canvas` - Drift severity overlay
+    91→- **Current State**: SQL definitions exist in `drizzle/manual/0004_materialized_views.sql` but NOT applied
+    92→- **Impact**: Canvas queries hit live tables; performance degradation at scale
+    93→- **Fix**: Run migration to create materialized views
+    94→
+    95→### GAP-8: Database Missing Functions/Triggers (P2 - MEDIUM)
+    96→- **Status**: 5 database functions/triggers required by spec not created as database objects
+    97→- **Required**:
+    98→  - `sync_train_fitness_from_unavailability()` trigger - Auto-update train fitness
+    99→  - `refresh_canvas_views()` function - Concurrent refresh of materialized views
+   100→  - `cleanup_expired_scenarios()` function - Scenario expiration
+   101→  - `release_expired_reservations()` function - Soft reservation cleanup
+   102→  - `update_fleet_mileage_targets()` function - Fleet balancing recalculation
+   103→- **Current State**: SQL definitions exist in `drizzle/manual/0003_functions.sql` but NOT applied
+   104→- **Fix**: Run migration to create functions/triggers
+   105→
+   106→### GAP-9: UI Overlay Panels NOT IMPLEMENTED (P3 - MEDIUM)
+   107→- **Status**: State flags exist in canvas slice, but visual components not rendered
+   108→- **Missing Panels**:
+   109→  - **Man-hour Overlay**: Toggle exists, no visual component
+   110→  - **Drift Overlay**: Status bar summary only, no detail panel with train recommendations
+   111→  - **Scenario Comparison**: State infrastructure exists, no side-by-side canvas view
+   112→  - **Baseline Shadow Layer**: State flag exists, no shadow PM blocks rendering
+   113→- **Fix**: Create `ManHourOverlayPanel.tsx`, `DriftOverlayPanel.tsx`, `ScenarioComparisonView.tsx`
+   114→
+   115→### GAP-10: Keyboard Shortcuts NOT IMPLEMENTED (P3 - MEDIUM)
+   116→- **Status**: No global keyboard event listeners or handlers found in InfiniteCanvas
+   117→- **Spec 006.9.2 Required Shortcuts**:
+   118→  - `+` / `-` - Zoom in/out
+   119→  - `t` - Go to today
+   120→  - `s` / `o` - Strategic/Operational view
+   121→  - `Escape` - Cancel drag / Close dialog (partial - dialogs only)
+   122→  - `l` - Lock/unlock selected PM
+   123→  - `Home` - Go to today
+   124→  - `1-5` - Switch zoom levels
+   125→  - `Arrow keys` - Pan canvas
+   126→  - `?` - Show keyboard shortcuts help
+   127→- **Fix**: Add `useEffect` keyboard event listener in InfiniteCanvas (requires @belt/tools integration)
+   128→
+   129→### GAP-11: Accessibility (WCAG 2.1 AA) INSUFFICIENT (P3 - MEDIUM)
+   130→- **Status**: Basic BlueprintJS ARIA support only; canvas elements have no accessibility
+   131→- **Missing Requirements**:
+   132→  - Full keyboard navigation (Tab between panels, Enter to activate)
+   133→  - ARIA labels on canvas elements
+   134→  - Screen reader announcements for PM changes
+   135→  - Focus indicators on interactive elements
+   136→  - `prefers-reduced-motion` support
+   137→- **Impact**: Government contract accessibility compliance risk
+   138→
+   139→### GAP-12: Operations Phase 0% Complete (P3 - MEDIUM)
+   140→- **Dockerfiles**: Only `mms-optimizer/Dockerfile` (1/5 images needed)
+   141→  - Missing: mms-frontend, mms-backend, mms-worker, mms-file-watcher
+   142→- **docker-compose.yml**: Not created
+   143→- **Kubernetes Manifests**: None (deployments, services, HPA, network policies)
+   144→- **CI/CD Pipeline**: No `.github/workflows/`
+   145→- **Grafana Dashboards**: None (0/6 required per spec 008)
+   146→- **Alerting Rules**: None (HighErrorRate, OptimizerSlow, DriftThresholdExceeded, etc.)
+   147→- **Network Policies**: None
+   148→- **Database Backup Automation**: None
+   149→
+   150→### GAP-13: Integration - Actual Maximo API NOT IMPLEMENTED (P2 - HIGH)
+   151→- **Location**: `src/services/maximo-sync.ts`
+   152→- **Status**: MaximoSyncService uses **simulated** Maximo API calls
+   153→- **Impact**: Cannot sync with real Maximo in production
+   154→- **Fix**: Replace simulated API with actual REST/SOAP client using config from `maximo_integration_config` table
+   155→
+   156→### GAP-14: TODO Comments in Production Code (P2-P3)
+   157→- `man-hour-leveling.ts:843-844` - Integrate corrective/overhaul tracking (LOW)
+   158→- `costing.ts:322` - Contractor cost calculation placeholder (MEDIUM)
+   159→- `api/index.ts:113` - Add actual health checks (HIGH - same as GAP-4)
+   160→- `manhour.ts:127` - Count pending adjustments (LOW)
+   161→- `pm-schedule.ts:141` - Get fleet code from relation (LOW)
+   162→- `pm-schedule.ts:417-418` - Calculate manhour impact and conflicts (MEDIUM)
+   163→
+   164→---
+   165→
+   166→## ⚠️ IMMEDIATE BLOCKERS (Fix Before Proceeding)
+   167→
+   168→### BLOCKER-00: Test Infrastructure Verification ✅ VERIFIED (2026-01-20)
+   169→
+   170→**Verification Request**: Confirm Ralph Wiggum methodology requires tests before delivery.
+   171→
+   172→**Current State**:
+   173→- ✅ **Unit Tests**: 700+ tests across 22 test files covering:
+   174→  - Domain Services (fleet, pm-scheduler, baseline, drift-monitor, costing, etc.)
+   175→  - API Routes (canvas, costing, material, scenario)
+   176→  - Library Utilities (date, resilience, transaction, errors)
+   177→  - Optimizer (fallback algorithm)
+   178→- ✅ **Code Quality Hooks** (`.claude/hooks/`):
+   179→  - `block-forbidden-packages.sh` - Blocks zustand, redux, zod, xstate, @mui, antd, tailwind, next.js
+   180→  - `block-forbidden-imports.sh` - Blocks forbidden imports in src/
+   181→  - `session-start.sh` - Audits constraints at session start
+   182→- ✅ **Agent Config** (`.agentrc.ts`):
+   183→  - Blocks React hooks (useState, useEffect, etc.) - forces @belt/tools state machines
+   184→  - Blocks Co-Authored-By commit lines
+   185→- ✅ **Documented Validation Workflow** (AGENTS.md):
+   186→  1. `bun test <path>` - Unit tests for changed files
+   187→  2. `bun run typecheck` - TypeScript strict mode
+   188→  3. `bun run lint` - ESLint code quality
+   189→  4. `bun run build` - Full build verification
+   190→  5. Commit only after ALL validations pass
+   191→
+   192→**Dependencies for Full Automation**:
+   193→- ⏳ **GitHub Actions CI/CD** - Phase 8.7 (P3) - Will automate validation pipeline
+   194→- ⏳ **Playwright E2E Tests** - Requires Phase 7 UI implementation (currently ~1% complete)
+   195→- ⏳ **Pre-commit Hooks** - Optional enhancement (manual workflow currently documented)
+   196→
+   197→**Conclusion**: Test infrastructure is comprehensive and enforced. Full CI/CD automation is planned in Phase 8.7. Playwright tests will be added when frontend is implemented (Phase 7).
+   198→
+   199→### BLOCKER-1: PMSchedulerService NOT Exported (CRITICAL) ✅ RESOLVED
+   200→- **Issue**: `PMSchedulerService` is fully implemented (2,174 lines, 42 passing tests) but NOT exported in `src/services/index.ts`
+   201→- **Impact**: Cannot be imported by API routes, workers, or other services
+   202→- **Fix**: Add export to `src/services/index.ts`
+   203→- **Resolution**: Export added to `src/services/index.ts` on 2026-01-19
+   204→
+   205→### BLOCKER-2: @belt/tools Migration (CRITICAL) ✅ RESOLVED
+   206→- **Issue**: Project uses `zod` for validation but README mandates `@belt/tools`
+   207→- **Issue**: `zustand` is in package.json but BLOCKED by `.claude/hooks/block-forbidden-packages.sh`
+   208→- **Issue**: React hooks (useState, useEffect) BLOCKED by `.agentrc.ts`
+   209→- **Impact**: Cannot build compliant UI; hooks will be rejected by automation
+   210→- **Fix**: Complete Phase 1.3 migration before any UI work
+   211→- **Resolution**: Migrated all Zod schemas to @belt/tools createSchema/createType, removed zod and zustand from package.json on 2026-01-20. All 384 tests pass.
+   212→
+   213→### BLOCKER-3: Missing Lib Utility Tests (HIGH) ✅ RESOLVED
+   214→- **Issue**: Critical utilities have no test coverage:
+   215→  - `src/lib/utils/date.ts` - Compliance window calculations (CRITICAL for PM scheduling) ✅ Tests complete (90 tests)
+   216→  - `src/lib/utils/resilience.ts` - Circuit breaker logic (CRITICAL for Maximo integration) ✅ Tests complete (57 tests)
+   217→  - `src/lib/utils/transaction.ts` - Transaction rollback behavior ✅ Tests complete (51 tests)
+   218→  - `src/lib/errors/index.ts` - Error serialization ✅ Tests complete (110 tests)
+   219→- **Impact**: Bugs in these utilities cascade to all domain services
+   220→- **Resolution**: All critical lib utilities now have comprehensive test coverage (308 tests total)
+   221→
+   222→---
+   223→
+   224→## Current State Analysis
+   225→
+   226→**Codebase Status**: API & Services Complete, UI Overlays & Operations Pending
+   227→
+   228→### ✅ COMPLETE - Phase 1.1: Database Schema (100%)
+   229→- 40+ tables across 14 schema files (Drizzle ORM)
+   230→- 27 PostgreSQL enums defined (16 required + 11 additional)
+   231→- TimescaleDB hypertable configuration (7-day chunks, 30-day compression, 13-year retention)
+   232→- SQL definitions for materialized views exist in `drizzle/manual/0004_materialized_views.sql`
+   233→- SQL definitions for functions/triggers exist in `drizzle/manual/0003_functions.sql`
+   234→- Development seed data script available
+   235→- **Note**: SQL migrations need to be applied to create views/functions/triggers
+   236→
+   237→### ✅ COMPLETE - Phase 1.2: Shared Library (100%)
+   238→- Database connection pool with health checks (`src/lib/db/connection.ts`)
+   239→- Redis connection with cache utilities (`src/lib/redis/connection.ts`)
+   240→- BullMQ queue configuration for 9 worker types (`src/lib/queue/index.ts`)
+   241→- Pino structured logging with sensitive field redaction (`src/lib/logging/logger.ts`)
+   242→- OpenTelemetry tracing with MMS-specific attributes (`src/lib/tracing/index.ts`)
+   243→- Prometheus metrics - 100+ metrics across all domains (`src/lib/metrics/index.ts` - 753 lines)
+   244→- Typed error classes (30+) with error codes (`src/lib/errors/index.ts` - 655 lines, 1015 test lines)
+   245→- Date/time utilities with comprehensive tests (`src/lib/utils/date.ts` - 404 lines, 1076 test lines)
+   246→- Resilience utilities with retry + circuit breaker (`src/lib/utils/resilience.ts` - 574 lines, 1097 test lines)
+   247→- Transaction helpers with automatic rollback (`src/lib/utils/transaction.ts` - 273 lines, 946 test lines)
+   248→- @belt/tools validation schemas (`src/lib/schemas/index.ts` - 1225 lines)
+   249→- Migration runner with rollback support (`src/lib/db/migrator.ts` - 628 lines, 376 test lines)
+   250→
+   251→### ✅ COMPLETE - Phase 2: Core Domain Services (17/17 services)
+   252→| Service | Lines | Tests | Status |
+   253→|---------|-------|-------|--------|
+   254→| FleetService | 1,324 | 36 | ✅ Complete |
+   255→| IngestionService | 952 | 22 | ✅ Complete |
+   256→| UnavailabilityService | 867 | 35 | ✅ Complete |
+   257→| ServiceDemandService | 1,032 | 46 | ✅ Complete |
+   258→| RouteUtilizationService | 1,576 | 56 | ✅ Complete (with run assignment history) |
+   259→| PMSchedulerService | 2,174 | 42 | ✅ Complete |
+   260→| StrategicPlannerService | ~900 | 30+ | ✅ Complete (genetic algorithm) |
+   261→| ManHourLevelingService | ~850 | 76 | ⚠️ Minor TODO (corrective/overhaul tracking) |
+   262→| CostingService | ~600 | 85 | ⚠️ Minor TODO (contractor cost placeholder) |
+   263→| BaselineService | ~500 | 40+ | ✅ Complete |
+   264→| DriftMonitorService | ~700 | 67 | ✅ Complete |
+   265→| SimulationService | ~800 | 89 | ✅ Complete (event-sourced) |
+   266→| MaximoSyncService | 586 | 28 | ⚠️ Simulated API (needs actual REST/SOAP) |
+   267→| NotificationService | ~900 | 94 | ✅ Complete (9 templates) |
+   268→| MaterialService | ~500 | 41 | ✅ Complete |
+   269→| AuthService | ~400 | 20 | ✅ Complete (JWT + refresh) |
+   270→| ExportService | ~400 | 47 | ✅ Complete |
+   271→| BaselineAssumptionService | NEW | TBD | 🔄 In development (uncommitted) |
+   272→
+   273→### ✅ COMPLETE - Phase 1.3: @belt/tools Migration (100%)
+   274→- Zod → @belt/tools createSchema migration ✅ COMPLETE
+   275→- zustand removed from package.json ✅ COMPLETE
+   276→- zod removed from package.json ✅ COMPLETE
+   277→- State machine setup for UI ✅ COMPLETE (6 slices: fleet, canvas, pm, scenario, ui, batch)
+   278→
+   279→### ⚠️ PARTIAL - Phase 3: Optimizers (~85%)
+   280→- `src/optimizer/` directory created with TypeScript fallback
+   281→- C++ OR-Tools source ✅ COMPLETE (mms-optimizer/ - 1,620 LOC)
+   282→- **C++ Binary ❌ NOT COMPILED** - requires `cmake -B build && cmake --build build`
+   283→- TypeScript fallback optimizer ✅ COMPLETE (greedy algorithm with hard/soft constraints, 669 tests)
+   284→- Optimizer worker processor ✅ COMPLETE (BullMQ integration)
+   285→- Worker daemon/runner ✅ COMPLETE (2026-01-20) - Entry point at `src/workers/runner.ts`
+   286→
+   287→### Worker Daemon & Processors (2026-01-20)
+   288→- [x] Created worker daemon runner (`src/workers/runner.ts`) - Entry point for starting workers
+   289→- [x] Implemented optimizer worker processor registration
+   290→- [x] Implemented drift-monitor worker processor (`src/workers/processors/drift-monitor.ts`)
+   291→- [x] Implemented ingestion worker processor (`src/workers/processors/ingestion.ts`)
+   292→- [x] Implemented maximo-sync worker processor (`src/workers/processors/maximo-sync.ts`)
+   293→- [x] Implemented notification worker processor (`src/workers/processors/notification.ts`)
+   294→- [x] Worker tests (`src/workers/runner.test.ts`) - 16 tests passing
+   295→- [x] Implemented tactical_scheduler worker processor (`src/workers/processors/tactical-scheduler.ts`) ✅ COMPLETE (2026-01-20)
+   296→- [x] Implemented manhour_leveling worker processor (`src/workers/processors/manhour-leveling.ts`) ✅ COMPLETE (2026-01-20)
+   297→- [x] Implemented report worker processor (`src/workers/processors/report.ts`) ⚠️ PLACEHOLDER (2026-01-20)
+   298→  - **WARNING**: Data fetching functions return empty mock data (lines 209-262)
+   299→  - **WARNING**: Excel/PDF generation creates placeholder files, not actual reports
+   300→  - **TODO**: Integrate ExcelJS and Puppeteer for production-quality exports
+   301→- All 9 worker processors now implemented: optimizer, drift-monitor, ingestion, maximo-sync, notification, strategic-planner, tactical-scheduler, manhour-leveling, report (8 production-ready, 1 placeholder)
+   302→
+   303→### ✅ COMPLETE - Phase 4: Supporting Services (100%)
+   304→- ~~ManHourLevelingService~~ ✅, ~~CostingService~~ ✅, ~~BaselineService~~ ✅, ~~DriftMonitorService~~ ✅, ~~SimulationService~~ ✅
+   305→
+   306→### ✅ MOSTLY COMPLETE - Phase 5: API Layer (98%)
+   307→- **API Foundation Complete** (src/api/):
+   308→  - Hono framework with CORS, security headers, request tracing
+   309→  - Standard success/error response envelopes per spec 005
+   310→  - Rate limiting middleware (100 req/min, 10 req/min for auth)
+   311→  - Error handling middleware with proper HTTP status mapping
+   312→  - OpenAPI/Swagger documentation at `/api/v1/docs`
+   313→- **47+ REST Endpoints Implemented**:
+   314→  - Authentication: login, refresh, logout, me
+   315→  - Fleet Management: fleets, trains, depots, routes (with filtering/pagination)
+   316→  - PM Schedule: schedule CRUD, lock/unlock, history
+   317→  - Mileage: readings, anomalies, meter-events, stats, health
+   318→  - Optimizer: run-assignment, tactical-schedule, strategic-plan, jobs, queue-stats
+   319→  - Baseline: baselines CRUD, pm-schedule, mileage-projections, latest, archive
+   320→  - Drift: analysis, summary, history, per-train, run-analysis
+   321→  - Man-hour: projections, adjustments, approve, reject
+   322→  - Canvas: strategic, tactical, tactical-wide, operational, detail, overlays
+   323→  - Material: inventory, reservations, fulfill, summary
+   324→  - Costing: tco-projection, variance
+   325→  - Scenario: CRUD, changes, materialized, compare, promote, undo, cleanup
+   326→  - Export: pm-schedule, report, job status, cleanup
+   327→  - Integration: webhooks/maximo, sync (push/pull/full), conflicts, shadow-records
+   328→- **WebSocket Hub Complete** (src/api/websocket/):
+   329→  - Connection management with JWT authentication (10s timeout)
+   330→  - Room-based broadcasting (canvas, optimizer, depot-specific)
+   331→  - Canvas events: pm_updated, pm_locked, manhour_updated, drift_updated
+   332→  - Optimizer events: progress, complete
+   333→  - Canvas subscription/unsubscription (region-based with trainIds, depotIds, date range)
+   334→  - PM move via WebSocket with full constraint validation
+   335→  - Multi-user collaboration with change attribution
+   336→- **MISSING** (GAP-3): `/metrics` endpoint for Prometheus scraping
+   337→- **INCOMPLETE** (GAP-4): `/ready` endpoint returns hardcoded values
+   338→
+   339→### ⚠️ PARTIAL - Phase 6: Integration (~80%)
+   340→- Resilience utilities complete (retry, circuit breaker) ✅
+   341→- **Maximo Integration (Phase 6.1)** - MOSTLY COMPLETE:
+   342→  - Database schema complete: `maximo_shadow_records`, `maximo_sync_history`, `maximo_integration_config`, `maximo_inventory_snapshots`, `maximo_webhook_health` ✅
+   343→  - `MaximoLockError` error class ✅
+   344→  - `checkMaximoLock()` in PMSchedulerService ✅
+   345→  - MaximoSyncService complete with shadow record pattern (586 lines, 28 tests) ✅
+   346→  - Bidirectional sync (push/pull) with conflict resolution ✅
+   347→  - Status mapping (WAPPR/APPR/INPRG/COMP/CLOSE/CAN) ✅
+   348→  - MaximoPollingService with BullMQ repeatable jobs ✅
+   349→  - Webhook health tracking + automatic failover (WEBHOOK → POLLING → HYBRID) ✅
+   350→  - Integration API routes complete: /integration/webhooks/maximo, sync, conflicts, shadow-records ✅
+   351→  - 46 integration route tests ✅
+   352→  - **PENDING** (GAP-13): Actual Maximo REST/SOAP client (currently simulated) ⚠️
+   353→- **Email Notification Service**: ✅ COMPLETE
+   354→  - NotificationService (900 lines, 94 tests)
+   355→  - 9 notification types with HTML templates
+   356→  - User preferences with digest modes (IMMEDIATE, DAILY_DIGEST, WEEKLY_DIGEST)
+   357→  - notification_worker with retry logic
+   358→- **Report Generation**: ⚠️ PLACEHOLDER (GAP-2)
+   359→  - ExportService and report_worker structure complete
+   360→  - Data fetching functions return empty mock data
+   361→  - Excel/PDF generation creates placeholder files, not actual reports
+   362→
+   363→### ⚠️ IN PROGRESS - Phase 7: UI (~55%)
+   364→- React 18 + Vite shell exists with foundational components:
+   365→  - `src/App.tsx` - Root layout with theme support via @belt/tools
+   366→  - `src/main.tsx` - Entry point + BlueprintJS CSS imports
+   367→  - `src/App.css` - Layout styles, responsive, dark mode support
+   368→- Layout Components (BlueprintJS): ✅ IMPLEMENTED (2026-01-20)
+   369→  - `src/components/layout/Header.tsx` - Top navigation with fleet/depot filters
+   370→  - `src/components/layout/Toolbar.tsx` - View controls, zoom, actions
+   371→  - `src/components/layout/Sidebar.tsx` - Train list with filtering/sorting
+   372→  - `src/components/layout/StatusBar.tsx` - Baseline info, drift alerts, sync
+   373→- Canvas Views: ✅ 5/5 COMPLETE (Core rendering)
+   374→  - Strategic Heatmap (deck.gl) - zoom 0-4 ✅
+   375→  - Tactical-Wide (deck.gl) - zoom 4-8 ✅
+   376→  - Tactical Gantt (Konva) - zoom 8-12 ✅
+   377→  - Operational Detail (Konva) - zoom 12-16 ✅ COMPLETE (2026-01-20)
+   378→  - Detail View (React DOM) - zoom 16+ ✅ COMPLETE (2026-01-20)
+   379→- **MISSING**: Overlay detail panels (man-hour, drift, scenario comparison) - toggles exist but panels not rendered
+   380→- **MISSING**: Keyboard shortcuts - no event listeners implemented
+   381→- **MISSING**: Accessibility (WCAG 2.1 AA) - no ARIA labels, screen reader support
+   382→- Canvas Placeholder: ✅ IMPLEMENTED (2026-01-20)
+   383→  - `src/components/canvas/InfiniteCanvas.tsx` - Zoom level placeholders, pan/zoom handlers
+   384→  - Konva.js installed (v9.3.20) for tactical/operational views
+   385→- Infinite Canvas (deck.gl): PENDING
+   386→  - deck.gl packages installed (v9.2.5) but WebGL heatmap not implemented
+   387→- State management (@belt/tools): ✅ COMPLETE
+   388→  - @belt/tools v0.1.2 machine created with 6 slices (fleet, canvas, pm, scenario, ui, and batch utility)
+   389→  - UI components wired to state via useMachine hooks with proper type casting
+   390→- Theme system: ✅ IMPLEMENTED
+   391→  - `src/components/theme/colors.ts` - PM status, constraint, drift, utilization colors
+   392→- React hooks: CORRECTLY NOT USED (blocked by .agentrc.ts)
+   393→
+   394→### ❌ NOT STARTED - Phase 8-9: Operations & Demo (0%)
+   395→- Docker, Kubernetes, observability, demo application
+   396→
+   397→**Next Priority**: Integration (Phase 6) → UI (Phase 7)
+   398→
+   399→**Critical Path**: ~~Database~~ → ~~Shared Lib~~ → ~~Domain Services~~ → ~~FIX BLOCKERS~~ → ~~Optimizers (TS)~~ → ~~Optimizers (C++)~~ → ~~API~~ → **Integration (next)** → UI
+   400→
+   401→---
+   402→
+   403→## Phase 1: Foundation (P1 - Critical)
+   404→
+   405→### 1.1 Database Schema & Migrations
+   406→
+   407→#### Core Fleet Domain
+   408→- [x] P1: Create Drizzle schema for `depots` table (code, name, location, timezone)
+   409→- [x] P1: Create Drizzle schema for `fleets` table (code, name, manufacturer, cars_per_train, base_depot_id)
+   410→- [x] P1: Create Drizzle schema for `trains` table (train_number, fleet_id, current_mileage_km, fitness_status, target_mileage_km, display_color)
+   411→- [x] P1: Create Drizzle schema for `routes` table (route_code, expected_km_per_day, required_trains, allowed_fleet_ids, signaling_system, power_system)
+   412→- [x] P1: Create Drizzle schema for `tracks` table (depot_id, track_number, track_type, max_train_length_m, capabilities)
+   413→
+   414→#### Operational Constraints Domain (v2.1 Critical)
+   415→- [x] P1: Create Drizzle schema for `service_demand` table (fleet_id, day_type, min_trains_required, peak requirements)
+   416→- [x] P1: Create Drizzle schema for `route_utilization_profiles` table (route_id, weekday_km, weekend_km, confidence)
+   417→- [x] P1: Create Drizzle schema for `unavailability_events` table (train_id, event_type, status, restriction_level, estimated_return_date, source_system)
+   418→- [x] P1: Create Drizzle schema for `train_route_compatibility` table (train_id/fleet_id, route_id, is_compatible, constraint_type)
+   419→- [x] P1: Create Drizzle schema for `track_capabilities` table (track_id, capability, is_operational)
+   420→- [x] P1: Create Drizzle schema for `pm_capability_requirements` table (pm_type_id, capability, is_mandatory)
+   421→- [x] P1: Create Drizzle schema for `pm_baseline_assumptions` table (train_id, pm_type_id, assumption_type, confidence_level) - cold start handling
+   422→
+   423→#### PM Management Domain
+   424→- [x] P1: Create Drizzle schema for `pm_types` table (fleet_id, pm_code, interval_km, interval_months, satisfies_codes[], estimated_hours, track_type)
+   425→- [x] P1: Create Drizzle schema for `pm_material_requirements` table (pm_type_id, part_number, quantity_per_pm, criticality, lead_time_days)
+   426→- [x] P1: Create Drizzle schema for `pm_schedule` table (train_id, pm_type_id, target_date, status, constraint_start/end, assigned_track_id, is_locked, scenario_id)
+   427→
+   428→#### Mileage Tracking (TimescaleDB)
+   429→- [x] P1: Create Drizzle schema for `mileage_readings` hypertable (train_id, reading_date, raw_reading, adjusted_reading, daily_km, validation_status)
+   430→- [x] P1: Create Drizzle schema for `meter_events` table (train_id, event_date, event_type, old_reading, new_reading, adjustment_km)
+   431→- [x] P1: Configure TimescaleDB hypertable with 7-day chunks
+   432→- [x] P1: Configure compression policy (30 days)
+   433→- [x] P1: Configure retention policy (13 years)
+   434→- [x] P1: Create `daily_fleet_mileage` continuous aggregate view
+   435→
+   436→#### Component Tracking
+   437→- [x] P1: Create Drizzle schema for `train_components` table (component_type, serial_number, current_train_id, component_mileage_km, status)
+   438→- [x] P1: Create Drizzle schema for `component_installations` table (component_id, train_id, installed_date, removed_date)
+   439→- [x] P1: Create Drizzle schema for `component_pm_tracking` table (component_id, pm_type_id, last_pm_date, next_pm_due)
+   440→
+   441→#### Material Management
+   442→- [x] P1: Create Drizzle schema for `inventory_positions` table (depot_id, part_number, quantity_on_hand, quantity_reserved, quantity_available)
+   443→- [x] P1: Create Drizzle schema for `material_reservations` table (pm_schedule_id, inventory_position_id, quantity_reserved, reservation_type)
+   444→
+   445→#### Man-hour Planning
+   446→- [x] P1: Create Drizzle schema for `manhour_capacity` table (depot_id, day_shift_hours, night_shift_hours, technicians)
+   447→- [x] P1: Create Drizzle schema for `manhour_projections` table (depot_id, period_start, required_hours, available_hours, utilization_pct)
+   448→- [x] P1: Create Drizzle schema for `manhour_adjustments` table (projection_id, adjustment_type, hours_adjusted, status)
+   449→
+   450→#### Baseline & Drift Domain
+   451→- [x] P1: Create Drizzle schema for `plan_baselines` table (name, version, baseline_date, status, pm metrics)
+   452→- [x] P1: Create Drizzle schema for `baseline_pm_schedule` table (baseline_id, train_id, pm_type_id, projected_date)
+   453→- [x] P1: Create Drizzle schema for `baseline_mileage_projection` table (baseline_id, train_id, projection_date, projected_cumulative_km)
+   454→- [x] P1: Create Drizzle schema for `drift_analysis` table (baseline_id, train_id, mileage_drift_km, drift_pct, requires_replan)
+   455→
+   456→#### Scenario Management (Event-Sourced)
+   457→- [x] P1: Create Drizzle schema for `scenarios` table (name, forked_from_baseline_id, status, expires_at)
+   458→- [x] P1: Create Drizzle schema for `scenario_deltas` table (scenario_id, sequence_num, delta_type, entity_id, old_values, new_values)
+   459→- [x] P1: Create Drizzle schema for `scenario_comparisons` table (scenario_a_id, scenario_b_id, baseline_id, metrics)
+   460→
+   461→#### Costing Domain
+   462→- [x] P1: Create Drizzle schema for `labor_rates` table (depot_id, regular_hourly_rate, overtime_multiplier, shop_rate)
+   463→- [x] P1: Create Drizzle schema for `material_costs` table (part_number, unit_cost, effective_from)
+   464→- [x] P1: Create Drizzle schema for `cost_baselines` table (fiscal_year, depot_id, budget vs. actual)
+   465→
+   466→#### Audit & Auth Domain
+   467→- [x] P1: Create Drizzle schema for `pm_schedule_history` table (pm_schedule_id, change_type, old/new values, changed_by)
+   468→- [x] P1: Create Drizzle schema for `audit_log` table (entity_type, entity_id, action, user_id, old/new values)
+   469→- [x] P1: Create Drizzle schema for `users` table (email, password_hash, role_ids, primary_depot_id)
+   470→- [x] P1: Create Drizzle schema for `roles` table (name, permissions JSONB)
+   471→- [x] P1: Create Drizzle schema for `sessions` table (user_id, token_hash, expires_at)
+   472→
+   473→#### Enums & Types
+   474→- [x] P1: Create PostgreSQL enums: fitness_status, pm_status, track_type, shift_type, adjustment_status, baseline_status, scenario_status, material_criticality, reservation_type, day_type, unavailability_type, unavailability_status, track_capability, constraint_type, assumption_type, confidence_level
+   475→
+   476→#### Database Functions & Triggers
+   477→- [x] P1: Create trigger `sync_train_fitness_from_unavailability()` - auto-update train fitness on unavailability events
+   478→- [x] P1: Create function `refresh_canvas_views()` - concurrent materialized view refresh
+   479→- [x] P1: Create function `cleanup_expired_scenarios()` - scenario expiration
+   480→- [x] P1: Create function `release_expired_reservations()` - soft reservation cleanup
+   481→- [x] P1: Create function `update_fleet_mileage_targets()` - fleet balancing recalculation
+   482→
+   483→#### Materialized Views (Canvas Optimization)
+   484→- [x] P1: Create materialized view `v_canvas_strategic` (yearly PM aggregates per train)
+   485→- [x] P1: Create materialized view `v_canvas_tactical` (weekly PM details)
+   486→- [x] P1: Create view `v_manhour_canvas` (man-hour overlay data)
+   487→- [x] P1: Create view `v_drift_canvas` (drift severity overlay)
+   488→
+   489→#### Migrations
+   490→- [x] P1: Write migration for PostgreSQL extensions (uuid-ossp, timescaledb)
+   491→- [x] P1: Write migration runner with rollback support ✅ COMPLETE (2026-01-20)
+   492→  - Created `src/lib/db/migrator.ts` with comprehensive migration system
+   493→  - PostgreSQL advisory locks for concurrent safety
+   494→  - Support for Drizzle-generated and manual migrations
+   495→  - Rollback support with stored rollback SQL
+   496→  - Migration history tracking in `__mms_migrations` table
+   497→  - Progress callbacks for UI feedback
+   498→  - Database verification for prerequisites (TimescaleDB, uuid-ossp)
+   499→  - Unit tests in `src/lib/db/migrator.test.ts` (29 tests)
+   500→- [x] P1: Create seed data script for development
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

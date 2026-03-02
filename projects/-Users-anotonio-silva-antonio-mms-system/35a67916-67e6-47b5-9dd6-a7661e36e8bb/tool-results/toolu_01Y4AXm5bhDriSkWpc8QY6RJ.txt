@@ -1,0 +1,504 @@
+  1500→            std::vector<BoolVar> train_routes;
+  1501→            for (size_t r = 0; r < routes.size(); r++) {
+  1502→                train_routes.push_back(assign[t][r]);
+  1503→            }
+  1504→            model.AddAtMostOne(train_routes);
+  1505→        }
+  1506→        
+  1507→        // Hard constraint: Route requirements (exactly N trains)
+  1508→        for (size_t r = 0; r < routes.size(); r++) {
+  1509→            std::vector<BoolVar> route_trains;
+  1510→            for (size_t t = 0; t < trains.size(); t++) {
+  1511→                // Check fleet compatibility
+  1512→                if (isFleetAllowed(trains[t], routes[r])) {
+  1513→                    route_trains.push_back(assign[t][r]);
+  1514→                }
+  1515→            }
+  1516→            
+  1517→            int required = routes[r]["required_trains"];
+  1518→            model.AddEquality(LinearExpr::Sum(route_trains), required);
+  1519→        }
+  1520→        
+  1521→        // Hard constraint: Fitness status
+  1522→        for (size_t t = 0; t < trains.size(); t++) {
+  1523→            if (trains[t]["fitness_status"] != "FIT") {
+  1524→                for (size_t r = 0; r < routes.size(); r++) {
+  1525→                    model.AddEquality(assign[t][r], 0);
+  1526→                }
+  1527→            }
+  1528→        }
+  1529→        
+  1530→        // Hard constraints from input
+  1531→        for (const auto& constraint : input["hard_constraints"]) {
+  1532→            size_t train_idx = findTrainIndex(trains, constraint["train_id"]);
+  1533→            if (train_idx < trains.size()) {
+  1534→                for (size_t r = 0; r < routes.size(); r++) {
+  1535→                    model.AddEquality(assign[train_idx][r], 0);
+  1536→                }
+  1537→            }
+  1538→        }
+  1539→        
+  1540→        // NEW v2.1: Hard constraint - Unavailability events
+  1541→        if (input.contains("unavailability_events")) {
+  1542→            for (const auto& event : input["unavailability_events"]) {
+  1543→                if (event["status"] == "ACTIVE" && event["blocks_run_assignment"].get<bool>()) {
+  1544→                    size_t train_idx = findTrainIndex(trains, event["train_id"]);
+  1545→                    if (train_idx < trains.size()) {
+  1546→                        for (size_t r = 0; r < routes.size(); r++) {
+  1547→                            model.AddEquality(assign[train_idx][r], 0);
+  1548→                        }
+  1549→                    }
+  1550→                }
+  1551→            }
+  1552→        }
+  1553→        
+  1554→        // NEW v2.1: Hard constraint - Route compatibility
+  1555→        if (input.contains("route_compatibility")) {
+  1556→            for (const auto& compat : input["route_compatibility"]) {
+  1557→                if (!compat["is_compatible"].get<bool>()) {
+  1558→                    size_t train_idx = findTrainIndex(trains, compat["train_id"]);
+  1559→                    size_t route_idx = findRouteIndex(routes, compat["route_id"]);
+  1560→                    if (train_idx < trains.size() && route_idx < routes.size()) {
+  1561→                        model.AddEquality(assign[train_idx][route_idx], 0);
+  1562→                    }
+  1563→                }
+  1564→            }
+  1565→        }
+  1566→        
+  1567→        // Soft constraint: Mileage balance
+  1568→        std::vector<IntVar> mileage_penalties;
+  1569→        auto penalties = config["soft_constraint_penalties"];
+  1570→        int mileage_weight = penalties["mileage_imbalance"].get<int>();
+  1571→        
+  1572→        for (size_t t = 0; t < trains.size(); t++) {
+  1573→            int current = trains[t]["current_mileage"];
+  1574→            int target = trains[t]["target_mileage"];
+  1575→            int variance = std::abs(current - target);
+  1576→            
+  1577→            for (size_t r = 0; r < routes.size(); r++) {
+  1578→                int route_km = routes[r]["expected_km"];
+  1579→                
+  1580→                // Penalty for assigning over-utilized train to high-km route
+  1581→                if (current > target && route_km > 200) {
+  1582→                    IntVar penalty = model.NewIntVar({0, variance * mileage_weight});
+  1583→                    model.AddEquality(penalty, variance * mileage_weight)
+  1584→                        .OnlyEnforceIf(assign[t][r]);
+  1585→                    model.AddEquality(penalty, 0)
+  1586→                        .OnlyEnforceIf(assign[t][r].Not());
+  1587→                    mileage_penalties.push_back(penalty);
+  1588→                }
+  1589→            }
+  1590→        }
+  1591→        
+  1592→        // Objective: Minimize total penalty
+  1593→        model.Minimize(LinearExpr::Sum(mileage_penalties));
+  1594→        
+  1595→        // Solve
+  1596→        SatParameters params;
+  1597→        params.set_max_time_in_seconds(
+  1598→            config["max_solve_time_seconds"].get<double>()
+  1599→        );
+  1600→        params.set_num_search_workers(
+  1601→            config["num_workers"].get<int>()
+  1602→        );
+  1603→        
+  1604→        Model cp_model;
+  1605→        cp_model.Add(NewSatParameters(params));
+  1606→        
+  1607→        // Progress callback
+  1608→        int callback_count = 0;
+  1609→        cp_model.Add(NewFeasibleSolutionObserver([&](const CpSolverResponse& r) {
+  1610→            callback_count++;
+  1611→            if (callback_count % 5 == 0) {
+  1612→                emitProgress(request_id, 
+  1613→                    std::min(90.0, callback_count * 3.0),
+  1614→                    r.objective_value(), true);
+  1615→            }
+  1616→        }));
+  1617→        
+  1618→        CpSolverResponse response = SolveCpModel(model.Build(), &cp_model);
+  1619→        
+  1620→        // Build result
+  1621→        json result;
+  1622→        result["type"] = "RESULT";
+  1623→        result["request_id"] = request_id;
+  1624→        result["solve_time_ms"] = response.wall_time() * 1000;
+  1625→        
+  1626→        if (response.status() == CpSolverStatus::OPTIMAL ||
+  1627→            response.status() == CpSolverStatus::FEASIBLE) {
+  1628→            
+  1629→            result["status"] = response.status() == CpSolverStatus::OPTIMAL 
+  1630→                ? "OPTIMAL" : "FEASIBLE";
+  1631→            
+  1632→            json assignments = json::array();
+  1633→            
+  1634→            for (size_t t = 0; t < trains.size(); t++) {
+  1635→                for (size_t r = 0; r < routes.size(); r++) {
+  1636→                    if (SolutionBooleanValue(response, assign[t][r])) {
+  1637→                        json assignment;
+  1638→                        assignment["train_id"] = trains[t]["id"];
+  1639→                        assignment["route_id"] = routes[r]["id"];
+  1640→                        assignment["score"] = computeScore(trains[t], routes[r], response);
+  1641→                        assignment["explanation"] = generateExplanation(
+  1642→                            trains[t], routes[r], input, response
+  1643→                        );
+  1644→                        assignments.push_back(assignment);
+  1645→                    }
+  1646→                }
+  1647→            }
+  1648→            
+  1649→            result["assignments"] = assignments;
+  1650→            result["unassigned"] = findUnassigned(trains, assignments, input);
+  1651→            result["material_warnings"] = checkMaterialWarnings(input);
+  1652→            result["summary"] = buildSummary(response, assignments);
+  1653→            
+  1654→        } else {
+  1655→            result["status"] = "INFEASIBLE";
+  1656→            result["assignments"] = json::array();
+  1657→            result["unassigned"] = json::array();
+  1658→            result["summary"] = {
+  1659→                {"total_penalty", -1},
+  1660→                {"trains_assigned", 0},
+  1661→                {"trains_unassigned", trains.size()}
+  1662→            };
+  1663→        }
+  1664→        
+  1665→        return result;
+  1666→    }
+  1667→    
+  1668→private:
+  1669→    json generateExplanation(
+  1670→        const json& train,
+  1671→        const json& route,
+  1672→        const json& input,
+  1673→        const CpSolverResponse& response
+  1674→    ) {
+  1675→        json factors = json::array();
+  1676→        
+  1677→        // Mileage balance factor
+  1678→        int current = train["current_mileage"];
+  1679→        int target = train["target_mileage"];
+  1680→        int variance = current - target;
+  1681→        
+  1682→        factors.push_back({
+  1683→            {"constraint_type", "SOFT"},
+  1684→            {"constraint_name", "MILEAGE_BALANCE"},
+  1685→            {"impact", std::abs(variance)},
+  1686→            {"description", fmt::format(
+  1687→                "Train is {}km {} fleet target",
+  1688→                std::abs(variance),
+  1689→                variance < 0 ? "under" : "over"
+  1690→            )}
+  1691→        });
+  1692→        
+  1693→        // Route match factor
+  1694→        int route_km = route["expected_km"];
+  1695→        std::string route_advice = "";
+  1696→        
+  1697→        if (variance < -1000 && route_km > 300) {
+  1698→            route_advice = "High-km route helps balance under-utilized train";
+  1699→        } else if (variance > 1000 && route_km < 150) {
+  1700→            route_advice = "Low-km route reduces over-utilization";
+  1701→        }
+  1702→        
+  1703→        if (!route_advice.empty()) {
+  1704→            factors.push_back({
+  1705→                {"constraint_type", "SOFT"},
+  1706→                {"constraint_name", "ROUTE_MATCH"},
+  1707→                {"impact", route_km},
+  1708→                {"description", route_advice}
+  1709→            });
+  1710→        }
+  1711→        
+  1712→        // Check if alternatives were blocked
+  1713→        for (const auto& constraint : input["hard_constraints"]) {
+  1714→            // Find trains that could have taken this route but were blocked
+  1715→            factors.push_back({
+  1716→                {"constraint_type", "HARD"},
+  1717→                {"constraint_name", constraint["type"]},
+  1718→                {"impact", 0},
+  1719→                {"description", fmt::format(
+  1720→                    "Alternative train {} blocked: {}",
+  1721→                    constraint["train_id"].get<std::string>().substr(0, 8),
+  1722→                    constraint["description"].get<std::string>()
+  1723→                )}
+  1724→            });
+  1725→        }
+  1726→        
+  1727→        return factors;
+  1728→    }
+  1729→};
+  1730→```
+  1731→
+  1732→---
+  1733→
+  1734→## 4.4 PM Scheduler (Tactical)
+  1735→
+  1736→### 4.4.1 Purpose
+  1737→
+  1738→Schedule preventive maintenance for the 12-week tactical horizon, respecting track availability, labor capacity, and material constraints.
+  1739→
+  1740→### 4.4.2 Implementation
+  1741→
+  1742→```typescript
+  1743→interface TacticalSchedulerConfig {
+  1744→  horizonWeeks: number;           // 12
+  1745→  materialCheckDaysHard: number;  // 14 (hard constraint)
+  1746→  materialCheckDaysSoft: number;  // 90 (soft constraint)
+  1747→  trackUtilizationTarget: number; // 0.85
+  1748→}
+  1749→
+  1750→class TacticalPMScheduler {
+  1751→  async schedule(depotId: string): Promise<SchedulingResult> {
+  1752→    const config = this.config;
+  1753→    const horizonEnd = addWeeks(new Date(), config.horizonWeeks);
+  1754→    
+  1755→    // 1. Get pending PMs that need scheduling
+  1756→    const pendingPMs = await this.getPendingPMs(depotId, horizonEnd);
+  1757→    
+  1758→    // 2. Get resource availability
+  1759→    const trackAvailability = await this.getTrackAvailability(depotId, horizonEnd);
+  1760→    const laborCapacity = await this.getLaborCapacity(depotId, horizonEnd);
+  1761→    const materialPositions = await this.getMaterialPositions(depotId);
+  1762→    
+  1763→    // 3. Sort PMs by priority (urgency, criticality)
+  1764→    const sortedPMs = this.prioritizePMs(pendingPMs);
+  1765→    
+  1766→    // 4. Schedule each PM
+  1767→    const scheduled: ScheduledPM[] = [];
+  1768→    const deferred: DeferredPM[] = [];
+  1769→    const materialWarnings: MaterialWarning[] = [];
+  1770→    
+  1771→    for (const pm of sortedPMs) {
+  1772→      const result = await this.scheduleSinglePM(
+  1773→        pm,
+  1774→        trackAvailability,
+  1775→        laborCapacity,
+  1776→        materialPositions,
+  1777→        scheduled
+  1778→      );
+  1779→      
+  1780→      if (result.scheduled) {
+  1781→        scheduled.push(result.scheduled);
+  1782→        
+  1783→        // Reserve materials
+  1784→        await this.reserveMaterials(result.scheduled, materialPositions);
+  1785→        
+  1786→        // Update availability
+  1787→        this.updateAvailability(
+  1788→          result.scheduled,
+  1789→          trackAvailability,
+  1790→          laborCapacity
+  1791→        );
+  1792→      } else {
+  1793→        deferred.push({
+  1794→          pm,
+  1795→          reason: result.reason,
+  1796→          suggestedDate: result.suggestedDate
+  1797→        });
+  1798→      }
+  1799→      
+  1800→      if (result.materialWarning) {
+  1801→        materialWarnings.push(result.materialWarning);
+  1802→      }
+  1803→    }
+  1804→    
+  1805→    // 5. Persist schedule
+  1806→    await this.persistSchedule(scheduled, deferred);
+  1807→    
+  1808→    // 6. Notify if material blocks exist
+  1809→    if (materialWarnings.length > 0) {
+  1810→      await this.notifyMaterialBlocks(materialWarnings);
+  1811→    }
+  1812→    
+  1813→    return {
+  1814→      scheduled,
+  1815→      deferred,
+  1816→      materialWarnings,
+  1817→      summary: {
+  1818→        totalPMs: sortedPMs.length,
+  1819→        scheduledCount: scheduled.length,
+  1820→        deferredCount: deferred.length,
+  1821→        trackUtilization: this.calculateTrackUtilization(trackAvailability),
+  1822→        laborUtilization: this.calculateLaborUtilization(laborCapacity)
+  1823→      }
+  1824→    };
+  1825→  }
+  1826→  
+  1827→  private async scheduleSinglePM(
+  1828→    pm: PendingPM,
+  1829→    trackAvailability: TrackAvailability[],
+  1830→    laborCapacity: LaborCapacity[],
+  1831→    materialPositions: MaterialPosition[],
+  1832→    alreadyScheduled: ScheduledPM[]
+  1833→  ): Promise<ScheduleAttemptResult> {
+  1834→    const pmType = pm.pmType;
+  1835→    
+  1836→    // Find valid dates within compliance window
+  1837→    const validDates = this.getValidDates(
+  1838→      pm.constraintStart,
+  1839→      pm.constraintEnd,
+  1840→      pmType.minTrackDays
+  1841→    );
+  1842→    
+  1843→    for (const targetDate of validDates) {
+  1844→      // Check track availability
+  1845→      const track = this.findAvailableTrack(
+  1846→        targetDate,
+  1847→        pmType.trackType,
+  1848→        pmType.minTrackDays,
+  1849→        trackAvailability
+  1850→      );
+  1851→      
+  1852→      if (!track) continue;
+  1853→      
+  1854→      // Check labor capacity
+  1855→      const laborOk = this.checkLaborCapacity(
+  1856→        targetDate,
+  1857→        pmType.estimatedHours,
+  1858→        laborCapacity
+  1859→      );
+  1860→      
+  1861→      if (!laborOk) continue;
+  1862→      
+  1863→      // Check material availability
+  1864→      const materialCheck = await this.checkMaterialAvailability(
+  1865→        pm,
+  1866→        targetDate,
+  1867→        materialPositions
+  1868→      );
+  1869→      
+  1870→      if (materialCheck.blocked) {
+  1871→        // Within hard constraint window - cannot schedule
+  1872→        if (this.isWithinHardWindow(targetDate)) {
+  1873→          return {
+  1874→            scheduled: null,
+  1875→            reason: `Material unavailable: ${materialCheck.missingParts.join(', ')}`,
+  1876→            suggestedDate: materialCheck.suggestedDate,
+  1877→            materialWarning: {
+  1878→              pmId: pm.id,
+  1879→              trainId: pm.trainId,
+  1880→              missingParts: materialCheck.missingParts,
+  1881→              expectedAvailability: materialCheck.expectedDelivery
+  1882→            }
+  1883→          };
+  1884→        }
+  1885→        // Soft constraint window - add warning but continue
+  1886→        continue;
+  1887→      }
+  1888→      
+  1889→      // Schedule found!
+  1890→      return {
+  1891→        scheduled: {
+  1892→          pmId: pm.id,
+  1893→          trainId: pm.trainId,
+  1894→          pmTypeId: pmType.id,
+  1895→          targetDate,
+  1896→          trackId: track.id,
+  1897→          assignedHours: pmType.estimatedHours,
+  1898→          constraintStart: pm.constraintStart,
+  1899→          constraintEnd: pm.constraintEnd
+  1900→        },
+  1901→        reason: null,
+  1902→        materialWarning: materialCheck.warning
+  1903→      };
+  1904→    }
+  1905→    
+  1906→    // No valid slot found
+  1907→    return {
+  1908→      scheduled: null,
+  1909→      reason: 'No available slot within compliance window',
+  1910→      suggestedDate: addDays(pm.constraintEnd, 7)
+  1911→    };
+  1912→  }
+  1913→  
+  1914→  private async checkMaterialAvailability(
+  1915→    pm: PendingPM,
+  1916→    targetDate: Date,
+  1917→    materialPositions: MaterialPosition[]
+  1918→  ): Promise<MaterialCheckResult> {
+  1919→    const requirements = await this.getPMRequirements(pm.pmType.id);
+  1920→    const missingParts: string[] = [];
+  1921→    let earliestDelivery: Date | null = null;
+  1922→    
+  1923→    for (const req of requirements) {
+  1924→      if (req.criticality === 'CONSUMABLE') continue;
+  1925→      
+  1926→      const position = materialPositions.find(
+  1927→        p => p.partNumber === req.partNumber && p.depotId === pm.depotId
+  1928→      );
+  1929→      
+  1930→      const available = position?.quantityAvailable || 0;
+  1931→      
+  1932→      if (available < req.quantityPerPM) {
+  1933→        if (req.criticality === 'BLOCKING') {
+  1934→          missingParts.push(req.partNumber);
+  1935→          
+  1936→          if (position?.nextDeliveryDate) {
+  1937→            const delivery = new Date(position.nextDeliveryDate);
+  1938→            if (!earliestDelivery || delivery < earliestDelivery) {
+  1939→              earliestDelivery = delivery;
+  1940→            }
+  1941→          }
+  1942→        }
+  1943→      }
+  1944→    }
+  1945→    
+  1946→    return {
+  1947→      blocked: missingParts.length > 0 && 
+  1948→               this.isWithinHardWindow(targetDate),
+  1949→      missingParts,
+  1950→      expectedDelivery: earliestDelivery,
+  1951→      suggestedDate: earliestDelivery 
+  1952→        ? addDays(earliestDelivery, 1)
+  1953→        : null,
+  1954→      warning: missingParts.length > 0 ? {
+  1955→        type: 'LOW_STOCK',
+  1956→        parts: missingParts,
+  1957→        message: `Parts may be unavailable: ${missingParts.join(', ')}`
+  1958→      } : null
+  1959→    };
+  1960→  }
+  1961→}
+  1962→```
+  1963→
+  1964→### 4.4.3 PM Schedule Management Service
+  1965→
+  1966→Handles manual PM modifications (drag-and-drop, manual reschedules) with full validation including Maximo status locks.
+  1967→
+  1968→```typescript
+  1969→/**
+  1970→ * Service for manual PM schedule modifications.
+  1971→ * 
+  1972→ * CRITICAL: All modifications MUST validate against Maximo status to prevent
+  1973→ * race conditions with in-progress work orders. The PMEditValidator from the
+  1974→ * Integration layer (Part 7) provides this validation.
+  1975→ * 
+  1976→ * Operational reality (Maximo) MUST override planning data (MMS).
+  1977→ */
+  1978→class PMScheduleManagementService {
+  1979→  private pmEditValidator: PMEditValidator;  // From Part 7
+  1980→  private auditLogger: AuditLogger;
+  1981→  
+  1982→  /**
+  1983→   * Move a PM to a new date (e.g., from canvas drag-and-drop).
+  1984→   * 
+  1985→   * @throws MaximoLockError if PM is in-progress in Maximo
+  1986→   * @throws ComplianceWindowError if new date is outside allowed window
+  1987→   * @throws TrackConflictError if track is occupied on new date
+  1988→   */
+  1989→  async movePM(
+  1990→    pmId: string,
+  1991→    newTargetDate: Date,
+  1992→    newTrackId: string | null,
+  1993→    userId: string
+  1994→  ): Promise<PMScheduleRecord> {
+  1995→    
+  1996→    // 1. CRITICAL: Validate Maximo status lock
+  1997→    const editValidation = await this.pmEditValidator.validateEdit(pmId);
+  1998→    
+  1999→    if (!editValidation.valid) {
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

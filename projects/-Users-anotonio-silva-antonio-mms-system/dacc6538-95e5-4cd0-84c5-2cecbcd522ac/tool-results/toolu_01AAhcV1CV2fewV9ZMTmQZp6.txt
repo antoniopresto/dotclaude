@@ -1,0 +1,504 @@
+   500→        triggerType,
+   501→        complianceWindow: {
+   502→          startDate: complianceStartDate,
+   503→          endDate: complianceEndDate,
+   504→          startMileageKm: mileageWindowStart,
+   505→          endMileageKm: mileageWindowEnd,
+   506→          idealDate,
+   507→          idealMileageKm,
+   508→        },
+   509→        isOverdue,
+   510→        lastPmDate,
+   511→        lastPmMileageKm,
+   512→      };
+   513→
+   514→      span.setAttribute('pm.triggerType', triggerType);
+   515→      span.setAttribute('pm.isOverdue', isOverdue);
+   516→      span.setAttribute('pm.kmUntilDue', kmUntilDue ?? -1);
+   517→
+   518→      return result;
+   519→    });
+   520→  }
+   521→
+   522→  /**
+   523→   * Calculate PM due dates for all PM types for a train.
+   524→   */
+   525→  async calculateAllPmDue(trainId: string): Promise<PmDueResult[]> {
+   526→    return this.traced('calculateAllPmDue', async (span) => {
+   527→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   528→
+   529→      // Get train with fleet
+   530→      const train = await this.db.query.trains.findFirst({
+   531→        where: eq(trains.id, trainId),
+   532→      });
+   533→
+   534→      if (!train) {
+   535→        throw new TrainNotFoundError(trainId);
+   536→      }
+   537→
+   538→      // Get all active PM types for this fleet
+   539→      const pmTypesList = await this.db.query.pmTypes.findMany({
+   540→        where: and(
+   541→          eq(pmTypes.fleetId, train.fleetId),
+   542→          eq(pmTypes.active, true)
+   543→        ),
+   544→        orderBy: [desc(pmTypes.intervalKm)],
+   545→      });
+   546→
+   547→      const results: PmDueResult[] = [];
+   548→
+   549→      for (const pmType of pmTypesList) {
+   550→        const dueResult = await this.calculateComplianceWindow(trainId, pmType.id);
+   551→        results.push(dueResult);
+   552→      }
+   553→
+   554→      // Sort by due date (most urgent first)
+   555→      results.sort((a, b) => {
+   556→        const aDate = a.complianceWindow.idealDate;
+   557→        const bDate = b.complianceWindow.idealDate;
+   558→        return aDate.localeCompare(bDate);
+   559→      });
+   560→
+   561→      span.setAttribute('result.pmCount', results.length);
+   562→      span.setAttribute('result.overdueCount', results.filter(r => r.isOverdue).length);
+   563→
+   564→      return results;
+   565→    });
+   566→  }
+   567→
+   568→  // ===========================================================================
+   569→  // PM Hierarchy Handling
+   570→  // ===========================================================================
+   571→
+   572→  /**
+   573→   * Check if a higher-level PM has satisfied this PM type's requirement.
+   574→   *
+   575→   * PM Hierarchy: C4 satisfies C1/C2/C3, Overhaul satisfies all
+   576→   */
+   577→  private async checkHierarchySatisfaction(
+   578→    trainId: string,
+   579→    pmType: PmType,
+   580→    sinceDate: Date | null
+   581→  ): Promise<{ satisfiedBy: string | null; satisfiedByPm: PmScheduleRecord | null }> {
+   582→    // Find PM types that satisfy this one
+   583→    const satisfyingTypes = await this.db.query.pmTypes.findMany({
+   584→      where: and(
+   585→        eq(pmTypes.fleetId, pmType.fleetId),
+   586→        eq(pmTypes.active, true),
+   587→        sql`${pmType.pmCode} = ANY(${pmTypes.satisfiesCodes})`
+   588→      ),
+   589→    });
+   590→
+   591→    if (satisfyingTypes.length === 0) {
+   592→      return { satisfiedBy: null, satisfiedByPm: null };
+   593→    }
+   594→
+   595→    // Find the most recent completed PM of a satisfying type
+   596→    const satisfyingTypeIds = satisfyingTypes.map(t => t.id);
+   597→    const sinceDateFilter = sinceDate
+   598→      ? gte(pmSchedule.completedAt, sinceDate)
+   599→      : undefined;
+   600→
+   601→    const satisfyingPm = await this.db.query.pmSchedule.findFirst({
+   602→      where: and(
+   603→        eq(pmSchedule.trainId, trainId),
+   604→        inArray(pmSchedule.pmTypeId, satisfyingTypeIds),
+   605→        eq(pmSchedule.status, 'COMPLETED'),
+   606→        isNull(pmSchedule.scenarioId),
+   607→        sinceDateFilter
+   608→      ),
+   609→      orderBy: desc(pmSchedule.completedAt),
+   610→    });
+   611→
+   612→    if (satisfyingPm) {
+   613→      const satisfyingType = satisfyingTypes.find(t => t.id === satisfyingPm.pmTypeId);
+   614→      return {
+   615→        satisfiedBy: satisfyingType?.pmCode ?? null,
+   616→        satisfiedByPm: satisfyingPm,
+   617→      };
+   618→    }
+   619→
+   620→    return { satisfiedBy: null, satisfiedByPm: null };
+   621→  }
+   622→
+   623→  /**
+   624→   * Get PM types that this PM type satisfies (resets their counters).
+   625→   */
+   626→  async getSatisfiedPmTypes(pmTypeId: string): Promise<PmType[]> {
+   627→    return this.traced('getSatisfiedPmTypes', async (span) => {
+   628→      span.setAttribute('pm.typeId', pmTypeId);
+   629→
+   630→      const pmType = await this.db.query.pmTypes.findFirst({
+   631→        where: eq(pmTypes.id, pmTypeId),
+   632→      });
+   633→
+   634→      if (!pmType || !pmType.satisfiesCodes || pmType.satisfiesCodes.length === 0) {
+   635→        return [];
+   636→      }
+   637→
+   638→      const satisfiedTypes = await this.db.query.pmTypes.findMany({
+   639→        where: and(
+   640→          eq(pmTypes.fleetId, pmType.fleetId),
+   641→          inArray(pmTypes.pmCode, pmType.satisfiesCodes),
+   642→          eq(pmTypes.active, true)
+   643→        ),
+   644→      });
+   645→
+   646→      span.setAttribute('result.satisfiedCount', satisfiedTypes.length);
+   647→      return satisfiedTypes;
+   648→    });
+   649→  }
+   650→
+   651→  // ===========================================================================
+   652→  // Track Allocation
+   653→  // ===========================================================================
+   654→
+   655→  /**
+   656→   * Find suitable tracks for a PM based on type requirements.
+   657→   */
+   658→  async findSuitableTracks(
+   659→    pmTypeId: string,
+   660→    depotId: string | null,
+   661→    targetDate: string,
+   662→    durationDays: number
+   663→  ): Promise<TrackAllocation[]> {
+   664→    return this.traced('findSuitableTracks', async (span) => {
+   665→      span.setAttribute('pm.typeId', pmTypeId);
+   666→      span.setAttribute('pm.targetDate', targetDate);
+   667→
+   668→      // Get PM type requirements
+   669→      const pmType = await this.db.query.pmTypes.findFirst({
+   670→        where: eq(pmTypes.id, pmTypeId),
+   671→      });
+   672→
+   673→      if (!pmType) {
+   674→        throw new NotFoundError(`PM type not found: ${pmTypeId}`, {
+   675→          entityType: 'pm_type',
+   676→          entityId: pmTypeId,
+   677→        });
+   678→      }
+   679→
+   680→      // Get required capabilities for this PM type
+   681→      const requiredCapabilities = await this.db.query.pmCapabilityRequirements.findMany({
+   682→        where: eq(pmCapabilityRequirements.pmTypeId, pmTypeId),
+   683→      });
+   684→
+   685→      const mandatoryCapabilities = requiredCapabilities
+   686→        .filter(c => c.isMandatory)
+   687→        .map(c => c.capability);
+   688→
+   689→      // Find tracks that match the track type
+   690→      const trackConditions: SQL<unknown>[] = [
+   691→        eq(tracks.trackType, pmType.trackType),
+   692→        eq(tracks.active, true),
+   693→      ];
+   694→
+   695→      if (depotId) {
+   696→        trackConditions.push(eq(tracks.depotId, depotId));
+   697→      }
+   698→
+   699→      const candidateTracks = await this.db.query.tracks.findMany({
+   700→        where: and(...trackConditions),
+   701→        with: {
+   702→          depot: true,
+   703→        },
+   704→      });
+   705→
+   706→      // Check each track for capabilities and availability
+   707→      const allocations: TrackAllocation[] = [];
+   708→      const endDate = new Date(targetDate);
+   709→      endDate.setDate(endDate.getDate() + durationDays - 1);
+   710→      const endDateStr = endDate.toISOString().split('T')[0];
+   711→
+   712→      for (const track of candidateTracks) {
+   713→        // Get track capabilities
+   714→        const capabilities = await this.db.query.trackCapabilities.findMany({
+   715→          where: and(
+   716→            eq(trackCapabilities.trackId, track.id),
+   717→            eq(trackCapabilities.isOperational, true)
+   718→          ),
+   719→        });
+   720→
+   721→        const trackCapabilitySet = new Set(capabilities.map(c => c.capability));
+   722→
+   723→        // Check mandatory capabilities
+   724→        const missingCapabilities = mandatoryCapabilities.filter(
+   725→          cap => !trackCapabilitySet.has(cap)
+   726→        );
+   727→
+   728→        // Check availability (no conflicting PM)
+   729→        const conflicts = await this.db.query.pmSchedule.findMany({
+   730→          where: and(
+   731→            eq(pmSchedule.assignedTrackId, track.id),
+   732→            inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   733→            isNull(pmSchedule.scenarioId),
+   734→            sql`${pmSchedule.targetDate} <= ${endDateStr}`,
+   735→            sql`DATE(${pmSchedule.targetDate}) + COALESCE(
+   736→              (SELECT min_track_days FROM pm_types WHERE id = ${pmSchedule.pmTypeId}), 1
+   737→            ) > ${targetDate}`
+   738→          ),
+   739→        });
+   740→
+   741→        if (conflicts.length === 0) {
+   742→          allocations.push({
+   743→            trackId: track.id,
+   744→            trackNumber: track.trackNumber,
+   745→            depotId: track.depotId,
+   746→            depotCode: track.depot?.code ?? 'unknown',
+   747→            trackType: track.trackType as TrackType,
+   748→            startDate: targetDate,
+   749→            endDate: endDateStr,
+   750→            hasAllCapabilities: missingCapabilities.length === 0,
+   751→            missingCapabilities,
+   752→          });
+   753→        }
+   754→      }
+   755→
+   756→      // Sort by capability match (prefer tracks with all capabilities)
+   757→      allocations.sort((a, b) => {
+   758→        if (a.hasAllCapabilities && !b.hasAllCapabilities) return -1;
+   759→        if (!a.hasAllCapabilities && b.hasAllCapabilities) return 1;
+   760→        return a.missingCapabilities.length - b.missingCapabilities.length;
+   761→      });
+   762→
+   763→      span.setAttribute('result.trackCount', allocations.length);
+   764→      return allocations;
+   765→    });
+   766→  }
+   767→
+   768→  /**
+   769→   * Check for track conflicts.
+   770→   */
+   771→  async checkTrackConflict(
+   772→    trackId: string,
+   773→    targetDate: string,
+   774→    durationDays: number,
+   775→    excludePmId?: string
+   776→  ): Promise<PmScheduleRecord | null> {
+   777→    return this.traced('checkTrackConflict', async (span) => {
+   778→      span.setAttribute('track.id', trackId);
+   779→      span.setAttribute('pm.targetDate', targetDate);
+   780→
+   781→      const endDate = new Date(targetDate);
+   782→      endDate.setDate(endDate.getDate() + durationDays - 1);
+   783→      const endDateStr = endDate.toISOString().split('T')[0];
+   784→
+   785→      const conditions: SQL<unknown>[] = [
+   786→        eq(pmSchedule.assignedTrackId, trackId),
+   787→        inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   788→        isNull(pmSchedule.scenarioId),
+   789→        sql`${pmSchedule.targetDate} <= ${endDateStr}`,
+   790→        sql`DATE(${pmSchedule.targetDate}) + COALESCE(
+   791→          (SELECT min_track_days FROM pm_types WHERE id = ${pmSchedule.pmTypeId}), 1
+   792→        ) > ${targetDate}`,
+   793→      ];
+   794→
+   795→      if (excludePmId) {
+   796→        conditions.push(sql`${pmSchedule.id} != ${excludePmId}`);
+   797→      }
+   798→
+   799→      const conflict = await this.db.query.pmSchedule.findFirst({
+   800→        where: and(...conditions),
+   801→      });
+   802→
+   803→      return conflict ?? null;
+   804→    });
+   805→  }
+   806→
+   807→  // ===========================================================================
+   808→  // Material Constraint Checking
+   809→  // ===========================================================================
+   810→
+   811→  /**
+   812→   * Check material availability for a PM.
+   813→   *
+   814→   * Material constraints:
+   815→   * - Hard (14 days): BLOCKING parts must be available
+   816→   * - Soft (90 days): Warning if parts unavailable
+   817→   */
+   818→  async checkMaterialAvailability(
+   819→    pmTypeId: string,
+   820→    depotId: string,
+   821→    targetDate: string
+   822→  ): Promise<MaterialConstraintResult> {
+   823→    return this.traced('checkMaterialAvailability', async (span) => {
+   824→      span.setAttribute('pm.typeId', pmTypeId);
+   825→      span.setAttribute('depot.id', depotId);
+   826→      span.setAttribute('pm.targetDate', targetDate);
+   827→
+   828→      // Get required materials for this PM type
+   829→      const requirements = await this.db.query.pmMaterialRequirements.findMany({
+   830→        where: eq(pmMaterialRequirements.pmTypeId, pmTypeId),
+   831→      });
+   832→
+   833→      if (requirements.length === 0) {
+   834→        return {
+   835→          isBlocked: false,
+   836→          hardConstraintViolations: [],
+   837→          softConstraintWarnings: [],
+   838→          totalMissingParts: 0,
+   839→          reservations: [],
+   840→        };
+   841→      }
+   842→
+   843→      const today = new Date();
+   844→      const pmDate = new Date(targetDate);
+   845→      const daysUntilPm = Math.ceil((pmDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+   846→
+   847→      const hardViolations: MaterialAvailability[] = [];
+   848→      const softWarnings: MaterialAvailability[] = [];
+   849→      const reservations: Array<{ partNumber: string; quantity: number; type: ReservationType }> = [];
+   850→
+   851→      for (const req of requirements) {
+   852→        // Get inventory at the depot
+   853→        const inventory = await this.db.query.inventoryPositions.findFirst({
+   854→          where: and(
+   855→            eq(inventoryPositions.depotId, depotId),
+   856→            eq(inventoryPositions.partNumber, req.partNumber)
+   857→          ),
+   858→        });
+   859→
+   860→        const availableQty = inventory
+   861→          ? (inventory.quantityOnHand ?? 0) - (inventory.quantityReserved ?? 0)
+   862→          : 0;
+   863→
+   864→        const availability: MaterialAvailability = {
+   865→          partNumber: req.partNumber,
+   866→          partDescription: req.partDescription,
+   867→          criticality: req.criticality as MaterialCriticality,
+   868→          requiredQuantity: req.quantityPerPm,
+   869→          availableQuantity: availableQty,
+   870→          depotId,
+   871→          isAvailable: availableQty >= req.quantityPerPm,
+   872→          shortfall: Math.max(0, req.quantityPerPm - availableQty),
+   873→          leadTimeDays: req.leadTimeDays ?? 14,
+   874→          expectedAvailableDate: inventory?.nextDeliveryDate ?? null,
+   875→        };
+   876→
+   877→        if (!availability.isAvailable) {
+   878→          // Check if this is a hard or soft constraint violation
+   879→          if (req.criticality === 'BLOCKING' && daysUntilPm <= HARD_MATERIAL_WINDOW_DAYS) {
+   880→            hardViolations.push(availability);
+   881→          } else if (daysUntilPm <= SOFT_MATERIAL_WINDOW_DAYS) {
+   882→            softWarnings.push(availability);
+   883→          }
+   884→        }
+   885→
+   886→        // Create reservation record
+   887→        if (availableQty >= req.quantityPerPm) {
+   888→          reservations.push({
+   889→            partNumber: req.partNumber,
+   890→            quantity: req.quantityPerPm,
+   891→            type: daysUntilPm <= HARD_MATERIAL_WINDOW_DAYS ? 'HARD' : 'SOFT',
+   892→          });
+   893→        }
+   894→      }
+   895→
+   896→      const isBlocked = hardViolations.length > 0;
+   897→
+   898→      span.setAttribute('material.isBlocked', isBlocked);
+   899→      span.setAttribute('material.hardViolations', hardViolations.length);
+   900→      span.setAttribute('material.softWarnings', softWarnings.length);
+   901→
+   902→      return {
+   903→        isBlocked,
+   904→        hardConstraintViolations: hardViolations,
+   905→        softConstraintWarnings: softWarnings,
+   906→        totalMissingParts: hardViolations.length + softWarnings.length,
+   907→        reservations,
+   908→      };
+   909→    });
+   910→  }
+   911→
+   912→  // ===========================================================================
+   913→  // Maximo Lock Validation
+   914→  // ===========================================================================
+   915→
+   916→  /**
+   917→   * Check if PM is locked by Maximo (INPRG work order).
+   918→   */
+   919→  async checkMaximoLock(pmScheduleId: string): Promise<{
+   920→    isLocked: boolean;
+   921→    workOrderId: string | null;
+   922→    maximoStatus: string | null;
+   923→    reason: string | null;
+   924→  }> {
+   925→    return this.traced('checkMaximoLock', async (span) => {
+   926→      span.setAttribute('pm.scheduleId', pmScheduleId);
+   927→
+   928→      const pm = await this.db.query.pmSchedule.findFirst({
+   929→        where: eq(pmSchedule.id, pmScheduleId),
+   930→      });
+   931→
+   932→      if (!pm) {
+   933→        throw new PmScheduleNotFoundError(pmScheduleId);
+   934→      }
+   935→
+   936→      // Check explicit lock
+   937→      if (pm.isLocked) {
+   938→        return {
+   939→          isLocked: true,
+   940→          workOrderId: pm.maximoWoId,
+   941→          maximoStatus: null,
+   942→          reason: pm.lockedReason ?? 'Manually locked',
+   943→        };
+   944→      }
+   945→
+   946→      // Check Maximo work order status
+   947→      if (pm.maximoWoId) {
+   948→        // In a full implementation, we would query Maximo for status
+   949→        // For now, check if status is IN_PROGRESS
+   950→        if (pm.status === 'IN_PROGRESS') {
+   951→          return {
+   952→            isLocked: true,
+   953→            workOrderId: pm.maximoWoId,
+   954→            maximoStatus: 'INPRG',
+   955→            reason: 'Work order is in progress in Maximo',
+   956→          };
+   957→        }
+   958→      }
+   959→
+   960→      return {
+   961→        isLocked: false,
+   962→        workOrderId: pm.maximoWoId,
+   963→        maximoStatus: null,
+   964→        reason: null,
+   965→      };
+   966→    });
+   967→  }
+   968→
+   969→  // ===========================================================================
+   970→  // PM Scheduling Operations
+   971→  // ===========================================================================
+   972→
+   973→  /**
+   974→   * Schedule a new PM.
+   975→   */
+   976→  async schedulePm(request: SchedulePmRequest): Promise<PmScheduleRecord> {
+   977→    return this.inTransaction('schedulePm', async (tx, span) => {
+   978→      const {
+   979→        trainId,
+   980→        pmTypeId,
+   981→        targetDate,
+   982→        assignedDepotId,
+   983→        assignedTrackId,
+   984→        assignedShift,
+   985→        notes,
+   986→        createdBy,
+   987→        skipMaterialCheck,
+   988→        skipServiceDemandCheck,
+   989→      } = request;
+   990→
+   991→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   992→      span.setAttribute('pm.typeId', pmTypeId);
+   993→      span.setAttribute('pm.targetDate', targetDate);
+   994→
+   995→      // Get train
+   996→      const train = await tx.query.trains.findFirst({
+   997→        where: eq(trains.id, trainId),
+   998→        with: { fleet: true, currentDepot: true },
+   999→      });
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

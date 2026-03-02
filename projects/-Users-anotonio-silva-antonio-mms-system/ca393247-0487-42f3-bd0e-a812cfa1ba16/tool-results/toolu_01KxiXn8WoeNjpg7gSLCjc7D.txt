@@ -1,0 +1,504 @@
+     1→# MMS Implementation Plan
+     2→
+     3→> **Status**: Verified comprehensive plan from spec + code analysis (v2.3)
+     4→> **Last Updated**: 2026-01-20
+     5→> **Last Verified**: 2026-01-20 (automated codebase scan)
+     6→> **Priority**: P1 (Critical) → P2 (High) → P3 (Medium) → P4 (Low)
+     7→
+     8→---
+     9→
+    10→## Verification Summary (2026-01-20)
+    11→
+    12→| Component | Files | Lines | Tests | Status |
+    13→|-----------|-------|-------|-------|--------|
+    14→| Database Schema | 14 | 3,165 | N/A | ✅ Complete |
+    15→| Shared Library | 27 | ~7,261 | 308 | ✅ Complete |
+    16→| Domain Services | 10 | ~10,500 | 529 | ✅ Complete (6 core + 4 supporting) |
+    17→| API Layer | 11 | ~1,550 | 0 | ⚠️ Fleet + PM + Mileage + Optimizer endpoints complete |
+    18→| Workers | 3 | ~450 | 16 | ⚠️ Infrastructure + 3 processors |
+    19→| TypeScript Optimizer | 4 | ~950 | 28 | ✅ Fallback complete |
+    20→| C++ Optimizer | 0 | 0 | 0 | ❌ Not started |
+    21→| Frontend | 2 | 29 | 0 | ⚠️ Placeholder only |
+    22→
+    23→**Package Status**:
+    24→- `@belt/tools` v0.1.2 in package.json - ✅ NOW IN USE (migrated from zod)
+    25→- `zod` - ✅ REMOVED from package.json
+    26→- `zustand` - ✅ REMOVED from package.json
+    27→
+    28→---
+    29→
+    30→## ⚠️ IMMEDIATE BLOCKERS (Fix Before Proceeding)
+    31→
+    32→### BLOCKER-00: Test Infrastructure Verification ✅ VERIFIED (2026-01-20)
+    33→
+    34→**Verification Request**: Confirm Ralph Wiggum methodology requires tests before delivery.
+    35→
+    36→**Current State**:
+    37→- ✅ **Unit Tests**: 700+ tests across 22 test files covering:
+    38→  - Domain Services (fleet, pm-scheduler, baseline, drift-monitor, costing, etc.)
+    39→  - API Routes (canvas, costing, material, scenario)
+    40→  - Library Utilities (date, resilience, transaction, errors)
+    41→  - Optimizer (fallback algorithm)
+    42→- ✅ **Code Quality Hooks** (`.claude/hooks/`):
+    43→  - `block-forbidden-packages.sh` - Blocks zustand, redux, zod, xstate, @mui, antd, tailwind, next.js
+    44→  - `block-forbidden-imports.sh` - Blocks forbidden imports in src/
+    45→  - `session-start.sh` - Audits constraints at session start
+    46→- ✅ **Agent Config** (`.agentrc.ts`):
+    47→  - Blocks React hooks (useState, useEffect, etc.) - forces @belt/tools state machines
+    48→  - Blocks Co-Authored-By commit lines
+    49→- ✅ **Documented Validation Workflow** (AGENTS.md):
+    50→  1. `bun test <path>` - Unit tests for changed files
+    51→  2. `bun run typecheck` - TypeScript strict mode
+    52→  3. `bun run lint` - ESLint code quality
+    53→  4. `bun run build` - Full build verification
+    54→  5. Commit only after ALL validations pass
+    55→
+    56→**Dependencies for Full Automation**:
+    57→- ⏳ **GitHub Actions CI/CD** - Phase 8.7 (P3) - Will automate validation pipeline
+    58→- ⏳ **Playwright E2E Tests** - Requires Phase 7 UI implementation (currently ~1% complete)
+    59→- ⏳ **Pre-commit Hooks** - Optional enhancement (manual workflow currently documented)
+    60→
+    61→**Conclusion**: Test infrastructure is comprehensive and enforced. Full CI/CD automation is planned in Phase 8.7. Playwright tests will be added when frontend is implemented (Phase 7).
+    62→
+    63→### BLOCKER-1: PMSchedulerService NOT Exported (CRITICAL) ✅ RESOLVED
+    64→- **Issue**: `PMSchedulerService` is fully implemented (2,174 lines, 42 passing tests) but NOT exported in `src/services/index.ts`
+    65→- **Impact**: Cannot be imported by API routes, workers, or other services
+    66→- **Fix**: Add export to `src/services/index.ts`
+    67→- **Resolution**: Export added to `src/services/index.ts` on 2026-01-19
+    68→
+    69→### BLOCKER-2: @belt/tools Migration (CRITICAL) ✅ RESOLVED
+    70→- **Issue**: Project uses `zod` for validation but README mandates `@belt/tools`
+    71→- **Issue**: `zustand` is in package.json but BLOCKED by `.claude/hooks/block-forbidden-packages.sh`
+    72→- **Issue**: React hooks (useState, useEffect) BLOCKED by `.agentrc.ts`
+    73→- **Impact**: Cannot build compliant UI; hooks will be rejected by automation
+    74→- **Fix**: Complete Phase 1.3 migration before any UI work
+    75→- **Resolution**: Migrated all Zod schemas to @belt/tools createSchema/createType, removed zod and zustand from package.json on 2026-01-20. All 384 tests pass.
+    76→
+    77→### BLOCKER-3: Missing Lib Utility Tests (HIGH) ✅ RESOLVED
+    78→- **Issue**: Critical utilities have no test coverage:
+    79→  - `src/lib/utils/date.ts` - Compliance window calculations (CRITICAL for PM scheduling) ✅ Tests complete (90 tests)
+    80→  - `src/lib/utils/resilience.ts` - Circuit breaker logic (CRITICAL for Maximo integration) ✅ Tests complete (57 tests)
+    81→  - `src/lib/utils/transaction.ts` - Transaction rollback behavior ✅ Tests complete (51 tests)
+    82→  - `src/lib/errors/index.ts` - Error serialization ✅ Tests complete (110 tests)
+    83→- **Impact**: Bugs in these utilities cascade to all domain services
+    84→- **Resolution**: All critical lib utilities now have comprehensive test coverage (308 tests total)
+    85→
+    86→---
+    87→
+    88→## Current State Analysis
+    89→
+    90→**Codebase Status**: Core Domain Services Complete (Phase 2)
+    91→
+    92→### ✅ COMPLETE - Phase 1.1: Database Schema (100%)
+    93→- 30+ tables across 14 schema files (Drizzle ORM)
+    94→- 17 PostgreSQL enums defined
+    95→- TimescaleDB hypertable (7-day chunks, 30-day compression, 13-year retention)
+    96→- Materialized views for canvas optimization (v_canvas_strategic, v_canvas_tactical, v_manhour_canvas, v_drift_canvas)
+    97→- Database functions and triggers (train fitness sync, canvas refresh, scenario cleanup)
+    98→- Development seed data
+    99→
+   100→### ✅ COMPLETE - Phase 1.2: Shared Library (100%)
+   101→- Database connection pool with health checks
+   102→- Redis connection with cache utilities
+   103→- BullMQ queue configuration for 8 worker types
+   104→- Pino structured logging with redaction
+   105→- OpenTelemetry tracing infrastructure
+   106→- Prometheus metrics (HTTP, PM, optimizer, fleet, drift, queue, ingestion)
+   107→- Typed error classes (30+) with error codes
+   108→- Date/time utilities (compliance windows, PM hierarchy, mileage projection)
+   109→- Resilience utilities (retry, circuit breaker)
+   110→- Transaction helpers with automatic rollback
+   111→- @belt/tools validation schemas (migrated from Zod)
+   112→
+   113→### ✅ COMPLETE - Phase 2: Core Domain Services (6/6 services with 237+ passing tests)
+   114→| Service | Lines | Tests | Status |
+   115→|---------|-------|-------|--------|
+   116→| FleetService | 1,324 | 36 | ✅ Exported |
+   117→| IngestionService | 952 | 22 | ✅ Exported |
+   118→| UnavailabilityService | 867 | 35 | ✅ Exported |
+   119→| ServiceDemandService | 1,032 | 46 | ✅ Exported |
+   120→| RouteUtilizationService | 1,127 | 56 | ✅ Exported |
+   121→| PMSchedulerService | 2,174 | 42 | ✅ Exported |
+   122→
+   123→### ✅ COMPLETE - Phase 1.3: @belt/tools Migration (100%)
+   124→- Zod → @belt/tools createSchema migration ✅ COMPLETE
+   125→- zustand removed from package.json ✅ COMPLETE
+   126→- zod removed from package.json ✅ COMPLETE
+   127→- State machine setup for UI pending (Phase 7 dependency)
+   128→
+   129→### ⚠️ IN PROGRESS - Phase 3: Optimizers (~40%)
+   130→- `src/optimizer/` directory created with TypeScript fallback
+   131→- C++ OR-Tools binary not created ❌
+   132→- TypeScript fallback optimizer ✅ COMPLETE (greedy algorithm with hard/soft constraints)
+   133→- Optimizer worker processor ✅ COMPLETE (BullMQ integration)
+   134→- Worker daemon/runner ✅ COMPLETE (2026-01-20) - Entry point at `src/workers/runner.ts`
+   135→
+   136→### Worker Daemon & Processors (2026-01-20)
+   137→- [x] Created worker daemon runner (`src/workers/runner.ts`) - Entry point for starting workers
+   138→- [x] Implemented optimizer worker processor registration
+   139→- [x] Implemented drift-monitor worker processor (`src/workers/processors/drift-monitor.ts`)
+   140→- [x] Implemented ingestion worker processor (`src/workers/processors/ingestion.ts`)
+   141→- [x] Implemented maximo-sync worker processor (`src/workers/processors/maximo-sync.ts`)
+   142→- [x] Implemented notification worker processor (`src/workers/processors/notification.ts`)
+   143→- [x] Worker tests (`src/workers/runner.test.ts`) - 16 tests passing
+   144→- Remaining: tactical_scheduler, strategic_planner, manhour_leveling, report processors (null placeholders)
+   145→
+   146→### ✅ COMPLETE - Phase 4: Supporting Services (100%)
+   147→- ~~ManHourLevelingService~~ ✅, ~~CostingService~~ ✅, ~~BaselineService~~ ✅, ~~DriftMonitorService~~ ✅, ~~SimulationService~~ ✅
+   148→
+   149→### ✅ COMPLETE - Phase 5: API Layer (100%)
+   150→- **API Foundation Complete** (src/api/):
+   151→  - Hono framework with CORS, security headers, request tracing
+   152→  - Standard success/error response envelopes per spec 005
+   153→  - Fleet management endpoints complete (fleets, trains, depots, routes)
+   154→  - PM Schedule endpoints complete (schedule, lock, unlock, history)
+   155→  - Mileage endpoints complete (readings, anomalies, meter-events, stats, health)
+   156→  - Optimizer endpoints complete (run-assignment, jobs, tactical-schedule, strategic-plan, queue-stats)
+   157→  - Baseline endpoints complete (baselines, pm-schedule, mileage-projections)
+   158→  - Drift endpoints complete (drift/analysis)
+   159→  - Man-hour endpoints complete (projections, adjustments, approve, reject)
+   160→  - Canvas endpoints complete (strategic, tactical, manhour-overlay, drift-overlay)
+   161→  - Material endpoints complete (inventory, reservations, fulfill)
+   162→  - Costing endpoints complete (tco-projection, variance)
+   163→  - Authentication endpoints complete (login, refresh, logout, me)
+   164→  - Scenario endpoints complete (scenarios, changes, materialized, compare, promote)
+   165→  - Export endpoints complete (pm-schedule, report, job status, cleanup)
+   166→  - Server entry point at src/api/server.ts
+   167→- WebSocket Hub complete (2026-01-20):
+   168→  - Connection management with JWT authentication
+   169→  - Canvas event broadcasting (pm_updated, pm_locked, manhour_updated, drift_updated)
+   170→  - Optimizer progress streaming (optimizer:progress, optimizer:complete)
+   171→  - Canvas subscription/unsubscription (region-based)
+   172→  - PM move via WebSocket with full validation
+   173→  - Multi-user collaboration support
+   174→
+   175→### ⚠️ PARTIAL - Phase 6: Integration (~70%)
+   176→- Resilience utilities complete (retry, circuit breaker) ✅
+   177→- Maximo integration (Phase 6.1) - MOSTLY COMPLETE:
+   178→  - Database schema complete: `maximo_shadow_records`, `maximo_sync_history`, `maximo_integration_config`, `maximo_inventory_snapshots` ✅
+   179→  - `MaximoLockError` error class ✅
+   180→  - `checkMaximoLock()` in PMSchedulerService ✅
+   181→  - `updateFromMaximo()` stub in UnavailabilityService ⚠️
+   182→  - MaximoSyncService complete with shadow record pattern ✅
+   183→  - Bidirectional sync (push/pull) with conflict resolution ✅
+   184→  - Status mapping (WAPPR/APPR/INPRG/COMP/CLOSE/CAN) ✅
+   185→  - 28 unit tests covering all sync scenarios ✅
+   186→  - Pending: Actual Maximo REST/SOAP client (currently simulated) ⚠️
+   187→  - Pending: BullMQ sync worker for background sync ⚠️
+   188→  - Pending: Webhook receiver endpoint ⚠️
+   189→- Email notification service: ✅ COMPLETE (NotificationService + notification_worker)
+   190→- Report generation (PDF/Excel): NOT IMPLEMENTED ❌
+   191→
+   192→### ❌ NOT STARTED - Phase 7: UI (~1%)
+   193→- React 18 + Vite shell exists (minimal):
+   194→  - `src/App.tsx` (13 lines - placeholder)
+   195→  - `src/main.tsx` (16 lines - entry point + BlueprintJS CSS imports)
+   196→- Infinite Canvas (deck.gl): NOT IMPLEMENTED
+   197→  - deck.gl packages installed (v9.2.5) but no imports in code
+   198→- All components: NOT IMPLEMENTED
+   199→  - BlueprintJS installed (v6.1.0) but only CSS imported, no components
+   200→- State management (@belt/tools): NOT SETUP
+   201→  - @belt/tools v0.1.2 installed but 0 imports in codebase
+   202→- React hooks: CORRECTLY NOT USED (blocked by .agentrc.ts)
+   203→- Missing directories: src/components/, src/pages/, src/store/
+   204→
+   205→### ❌ NOT STARTED - Phase 8-9: Operations & Demo (0%)
+   206→- Docker, Kubernetes, observability, demo application
+   207→
+   208→**Next Priority**: Integration (Phase 6) → C++ Optimizer (Phase 3.1) → UI (Phase 7)
+   209→
+   210→**Critical Path**: ~~Database~~ → ~~Shared Lib~~ → ~~Domain Services~~ → ~~FIX BLOCKERS~~ → ~~Optimizers (TS)~~ → ~~API~~ → **Integration (next)** → UI
+   211→
+   212→---
+   213→
+   214→## Phase 1: Foundation (P1 - Critical)
+   215→
+   216→### 1.1 Database Schema & Migrations
+   217→
+   218→#### Core Fleet Domain
+   219→- [x] P1: Create Drizzle schema for `depots` table (code, name, location, timezone)
+   220→- [x] P1: Create Drizzle schema for `fleets` table (code, name, manufacturer, cars_per_train, base_depot_id)
+   221→- [x] P1: Create Drizzle schema for `trains` table (train_number, fleet_id, current_mileage_km, fitness_status, target_mileage_km, display_color)
+   222→- [x] P1: Create Drizzle schema for `routes` table (route_code, expected_km_per_day, required_trains, allowed_fleet_ids, signaling_system, power_system)
+   223→- [x] P1: Create Drizzle schema for `tracks` table (depot_id, track_number, track_type, max_train_length_m, capabilities)
+   224→
+   225→#### Operational Constraints Domain (v2.1 Critical)
+   226→- [x] P1: Create Drizzle schema for `service_demand` table (fleet_id, day_type, min_trains_required, peak requirements)
+   227→- [x] P1: Create Drizzle schema for `route_utilization_profiles` table (route_id, weekday_km, weekend_km, confidence)
+   228→- [x] P1: Create Drizzle schema for `unavailability_events` table (train_id, event_type, status, restriction_level, estimated_return_date, source_system)
+   229→- [x] P1: Create Drizzle schema for `train_route_compatibility` table (train_id/fleet_id, route_id, is_compatible, constraint_type)
+   230→- [x] P1: Create Drizzle schema for `track_capabilities` table (track_id, capability, is_operational)
+   231→- [x] P1: Create Drizzle schema for `pm_capability_requirements` table (pm_type_id, capability, is_mandatory)
+   232→- [x] P1: Create Drizzle schema for `pm_baseline_assumptions` table (train_id, pm_type_id, assumption_type, confidence_level) - cold start handling
+   233→
+   234→#### PM Management Domain
+   235→- [x] P1: Create Drizzle schema for `pm_types` table (fleet_id, pm_code, interval_km, interval_months, satisfies_codes[], estimated_hours, track_type)
+   236→- [x] P1: Create Drizzle schema for `pm_material_requirements` table (pm_type_id, part_number, quantity_per_pm, criticality, lead_time_days)
+   237→- [x] P1: Create Drizzle schema for `pm_schedule` table (train_id, pm_type_id, target_date, status, constraint_start/end, assigned_track_id, is_locked, scenario_id)
+   238→
+   239→#### Mileage Tracking (TimescaleDB)
+   240→- [x] P1: Create Drizzle schema for `mileage_readings` hypertable (train_id, reading_date, raw_reading, adjusted_reading, daily_km, validation_status)
+   241→- [x] P1: Create Drizzle schema for `meter_events` table (train_id, event_date, event_type, old_reading, new_reading, adjustment_km)
+   242→- [x] P1: Configure TimescaleDB hypertable with 7-day chunks
+   243→- [x] P1: Configure compression policy (30 days)
+   244→- [x] P1: Configure retention policy (13 years)
+   245→- [x] P1: Create `daily_fleet_mileage` continuous aggregate view
+   246→
+   247→#### Component Tracking
+   248→- [x] P1: Create Drizzle schema for `train_components` table (component_type, serial_number, current_train_id, component_mileage_km, status)
+   249→- [x] P1: Create Drizzle schema for `component_installations` table (component_id, train_id, installed_date, removed_date)
+   250→- [x] P1: Create Drizzle schema for `component_pm_tracking` table (component_id, pm_type_id, last_pm_date, next_pm_due)
+   251→
+   252→#### Material Management
+   253→- [x] P1: Create Drizzle schema for `inventory_positions` table (depot_id, part_number, quantity_on_hand, quantity_reserved, quantity_available)
+   254→- [x] P1: Create Drizzle schema for `material_reservations` table (pm_schedule_id, inventory_position_id, quantity_reserved, reservation_type)
+   255→
+   256→#### Man-hour Planning
+   257→- [x] P1: Create Drizzle schema for `manhour_capacity` table (depot_id, day_shift_hours, night_shift_hours, technicians)
+   258→- [x] P1: Create Drizzle schema for `manhour_projections` table (depot_id, period_start, required_hours, available_hours, utilization_pct)
+   259→- [x] P1: Create Drizzle schema for `manhour_adjustments` table (projection_id, adjustment_type, hours_adjusted, status)
+   260→
+   261→#### Baseline & Drift Domain
+   262→- [x] P1: Create Drizzle schema for `plan_baselines` table (name, version, baseline_date, status, pm metrics)
+   263→- [x] P1: Create Drizzle schema for `baseline_pm_schedule` table (baseline_id, train_id, pm_type_id, projected_date)
+   264→- [x] P1: Create Drizzle schema for `baseline_mileage_projection` table (baseline_id, train_id, projection_date, projected_cumulative_km)
+   265→- [x] P1: Create Drizzle schema for `drift_analysis` table (baseline_id, train_id, mileage_drift_km, drift_pct, requires_replan)
+   266→
+   267→#### Scenario Management (Event-Sourced)
+   268→- [x] P1: Create Drizzle schema for `scenarios` table (name, forked_from_baseline_id, status, expires_at)
+   269→- [x] P1: Create Drizzle schema for `scenario_deltas` table (scenario_id, sequence_num, delta_type, entity_id, old_values, new_values)
+   270→- [x] P1: Create Drizzle schema for `scenario_comparisons` table (scenario_a_id, scenario_b_id, baseline_id, metrics)
+   271→
+   272→#### Costing Domain
+   273→- [x] P1: Create Drizzle schema for `labor_rates` table (depot_id, regular_hourly_rate, overtime_multiplier, shop_rate)
+   274→- [x] P1: Create Drizzle schema for `material_costs` table (part_number, unit_cost, effective_from)
+   275→- [x] P1: Create Drizzle schema for `cost_baselines` table (fiscal_year, depot_id, budget vs. actual)
+   276→
+   277→#### Audit & Auth Domain
+   278→- [x] P1: Create Drizzle schema for `pm_schedule_history` table (pm_schedule_id, change_type, old/new values, changed_by)
+   279→- [x] P1: Create Drizzle schema for `audit_log` table (entity_type, entity_id, action, user_id, old/new values)
+   280→- [x] P1: Create Drizzle schema for `users` table (email, password_hash, role_ids, primary_depot_id)
+   281→- [x] P1: Create Drizzle schema for `roles` table (name, permissions JSONB)
+   282→- [x] P1: Create Drizzle schema for `sessions` table (user_id, token_hash, expires_at)
+   283→
+   284→#### Enums & Types
+   285→- [x] P1: Create PostgreSQL enums: fitness_status, pm_status, track_type, shift_type, adjustment_status, baseline_status, scenario_status, material_criticality, reservation_type, day_type, unavailability_type, unavailability_status, track_capability, constraint_type, assumption_type, confidence_level
+   286→
+   287→#### Database Functions & Triggers
+   288→- [x] P1: Create trigger `sync_train_fitness_from_unavailability()` - auto-update train fitness on unavailability events
+   289→- [x] P1: Create function `refresh_canvas_views()` - concurrent materialized view refresh
+   290→- [x] P1: Create function `cleanup_expired_scenarios()` - scenario expiration
+   291→- [x] P1: Create function `release_expired_reservations()` - soft reservation cleanup
+   292→- [x] P1: Create function `update_fleet_mileage_targets()` - fleet balancing recalculation
+   293→
+   294→#### Materialized Views (Canvas Optimization)
+   295→- [x] P1: Create materialized view `v_canvas_strategic` (yearly PM aggregates per train)
+   296→- [x] P1: Create materialized view `v_canvas_tactical` (weekly PM details)
+   297→- [x] P1: Create view `v_manhour_canvas` (man-hour overlay data)
+   298→- [x] P1: Create view `v_drift_canvas` (drift severity overlay)
+   299→
+   300→#### Migrations
+   301→- [x] P1: Write migration for PostgreSQL extensions (uuid-ossp, timescaledb)
+   302→- [ ] P1: Write migration runner with rollback support
+   303→- [x] P1: Create seed data script for development
+   304→- [ ] P1: Run migrations and verify schema
+   305→
+   306→### 1.2 Shared Library (src/lib/)
+   307→
+   308→#### Database Utilities
+   309→- [x] P1: Create Drizzle database connection pool with health checks
+   310→- [x] P1: Create PostgreSQL connection configuration (max 20 connections)
+   311→- [x] P1: Create Redis connection utilities for cache/sessions/BullMQ
+   312→- [x] P1: Create transaction helper with automatic rollback
+   313→
+   314→#### Base Service Infrastructure
+   315→- [x] P1: Create base service class with OpenTelemetry tracing integration
+   316→- [x] P1: Create Pino structured logging configuration (JSON format, sensitive field redaction)
+   317→- [x] P1: Create prom-client Prometheus metrics registry
+   318→- [x] P1: Create HTTP metrics (requests_total, request_duration_seconds histogram)
+   319→- [x] P1: Create business metrics (pm_scheduled_total, optimizer_solve_seconds, fleet_mileage_km, drift_trains_requiring_replan)
+   320→
+   321→#### Queue Infrastructure
+   322→- [x] P1: Create BullMQ queue configuration (connection, default options)
+   323→- [x] P1: Create typed queue definitions for all 8 worker types
+   324→- [x] P1: Create job progress streaming utilities
+   325→
+   326→#### Validation Utilities
+   327→- [x] P1: Migrate Zod schemas to @belt/tools createSchema/createType (see Phase 1.3)
+   328→- [x] P1: Update CSV import validation to use @belt/tools
+   329→- [x] P1: Update optimizer IPC schemas to use @belt/tools
+   330→
+   331→#### Date/Time Utilities
+   332→- [x] P1: Create compliance window calculation utilities (±10% tolerance)
+   333→- [x] P1: Create PM hierarchy resolution utilities (C4 satisfies C1/C2/C3)
+   334→- [x] P1: Create mileage projection utilities (velocity-based + time-based triggers)
+   335→- [x] P1: Create timezone-aware date utilities
+   336→
+   337→#### Error Handling
+   338→- [x] P1: Create typed error classes (ValidationError, NotFoundError, ConflictError, MaximoLockError, etc.)
+   339→- [x] P1: Create error code registry (FILE_001, ROW_001, SYS_001, etc.)
+   340→- [x] P1: Create retry configuration utilities (exponential backoff)
+   341→- [x] P1: Create circuit breaker implementation
+   342→
+   343→### 1.3 @belt/tools Migration (P1 - Critical)
+   344→
+   345→> **CRITICAL**: Project uses Zod for validation but README mandates @belt/tools.
+   346→> zustand is in package.json but BLOCKED by .claude/hooks/block-forbidden-packages.sh
+   347→> React hooks (useState, useEffect, etc.) are BLOCKED by .agentrc.ts - use machine.useMachine()
+   348→
+   349→#### Schema Migration (Zod → @belt/tools) ✅ COMPLETE (2026-01-20)
+   350→- [x] P1: Migrate primitive schemas (uuidSchema, dateStringSchema, mileageKmSchema) to createType
+   351→- [x] P1: Migrate enum schemas (fitnessStatusSchema, pmStatusSchema, dayTypeSchema, etc.) to createType enum syntax
+   352→- [x] P1: Migrate object schemas (trainSchema, pmScheduleSchema, mileageReadingSchema) to createSchema
+   353→- [x] P1: Migrate CSV row schemas (mileageCsvRowSchema, fleetRosterCsvRowSchema) with transform handling
+   354→- [x] P1: Migrate optimizer IPC schemas (optimizerInputSchema, optimizerOutputSchema)
+   355→- [x] P1: Migrate API response schemas (apiSuccessSchema, apiErrorSchema)
+   356→- [x] P1: Update parseSchema helper to use @belt/tools parse method
+   357→- [x] P1: Update formatZodErrors to work with @belt/tools validation errors (renamed to formatValidationErrors)
+   358→- [x] P1: Update all service imports from 'zod' to '@belt/tools'
+   359→- [x] P1: Remove 'zod' from package.json dependencies
+   360→- [x] P1: Remove 'zustand' from package.json dependencies (FORBIDDEN by hooks)
+   361→
+   362→#### State Machine Setup (for Phase 7 UI)
+   363→- [ ] P2: Create src/store/index.ts with @belt/tools createMachine
+   364→- [ ] P2: Create fleetSlice (trains, selectedTrain, fitnessStatus filters)
+   365→- [ ] P2: Create canvasSlice (zoom, pan, viewportBounds, activeLayer)
+   366→- [ ] P2: Create pmSlice (schedules, selectedPM, dragState, constraints)
+   367→- [ ] P2: Create batch dispatch utility for 60fps WebGL updates (requestAnimationFrame batching)
+   368→
+   369→#### Reference: @belt/tools Patterns
+   370→```typescript
+   371→// Schema validation (replaces Zod)
+   372→import { createSchema, createType, InferType } from '@belt/tools';
+   373→
+   374→const TrainModel = createSchema({
+   375→  id: 'string',
+   376→  trainNumber: 'string',
+   377→  mileageKm: 'number',
+   378→  fitnessStatus: { enum: ['FIT', 'RESTRICTED', 'GROUNDED'] },
+   379→  tags: 'string[]',
+   380→  metadata: 'object?',
+   381→});
+   382→type Train = InferType<typeof TrainModel>;
+   383→const train = TrainModel.parse(data);
+   384→
+   385→// State machine (replaces React hooks + zustand)
+   386→import { createSlice, createMachine } from '@belt/tools';
+   387→
+   388→const fleetSlice = createSlice({
+   389→  id: 'fleet',
+   390→  initial: { trains: [], selected: null },
+   391→  cache: { policy: 'session' },
+   392→  reducers: {
+   393→    setTrains: (state, trains) => { state.trains = trains; },
+   394→    selectTrain: (state, id) => { state.selected = id; },
+   395→  },
+   396→});
+   397→
+   398→const machine = createMachine({
+   399→  id: 'mms',
+   400→  slices: { fleet: fleetSlice },
+   401→  trackMetadata: false, // Critical for 60fps
+   402→});
+   403→
+   404→// In React component (NO useState/useEffect!)
+   405→const { state, actions } = machine.useMachine('fleet');
+   406→```
+   407→
+   408→---
+   409→
+   410→## Phase 2: Core Domain Services (P1-P2)
+   411→
+   412→### 2.1 Ingestion Service (spec 004.2)
+   413→
+   414→#### File Watcher Service
+   415→- [x] P1: Implement FileWatcherService with chokidar
+   416→- [x] P1: Configure watch patterns (`^mileage_\d{8}\.csv$`)
+   417→- [x] P1: Implement file stability detection (2000ms threshold)
+   418→- [x] P1: Implement health alerting (2-hour file gap detection)
+   419→- [x] P1: Implement quarantine handling for invalid files
+   420→- [x] P1: Create BullMQ job dispatch for ingestion queue
+   421→
+   422→#### CSV Parser & Validation
+   423→- [x] P1: Implement streaming CSV parser with PapaParse
+   424→- [x] P1: Implement batch processing (100 records per transaction)
+   425→- [x] P1: Implement validation rules:
+   426→  - [x] File size validation (<10MB)
+   427→  - [x] Required columns validation
+   428→  - [x] Train existence validation
+   429→  - [x] Date format validation (YYYY-MM-DD, not future)
+   430→  - [x] Odometer value validation (positive integer)
+   431→- [x] P1: Implement anomaly detection:
+   432→  - [x] NEGATIVE: daily_km < 0
+   433→  - [x] SPIKE: daily_km > 1000 (configurable)
+   434→  - [x] DUPLICATE: train + date collision
+   435→
+   436→#### Meter Swap Handling
+   437→- [x] P1: Implement meter event detection (reset, replacement, calibration)
+   438→- [x] P1: Implement adjusted reading calculation
+   439→- [x] P2: Implement meter event approval workflow
+   440→
+   441→#### Ingestion Worker
+   442→- [x] P1: Create BullMQ ingestion_worker
+   443→- [x] P1: Implement mileage record insertion with deduplication (UPDATE strategy)
+   444→- [x] P1: Implement train current_mileage update
+   445→- [x] P2: Implement quarantine handling for invalid files
+   446→- [x] P2: Implement detailed ingestion result reporting
+   447→- [x] P2: Write unit tests for all ingestion scenarios
+   448→
+   449→**Note**: Ingestion worker processor implemented at `src/workers/processors/ingestion.ts`
+   450→
+   451→### 2.2 Unavailability Service (spec 004.2.5 - v2.1 Critical)
+   452→
+   453→- [x] P1: Implement UnavailabilityService class
+   454→- [x] P1: Implement createEvent() with automatic train fitness update
+   455→- [x] P1: Implement resolveEvent() with actual return date
+   456→- [x] P1: Implement queryActiveEvents() for optimizer constraints
+   457→- [x] P1: Implement detectPMConflicts() - alert on scheduled PM overlap
+   458→- [x] P1: Create trigger to sync train.fitness_status from active events (done in code, not DB trigger)
+   459→- [ ] P2: Implement Maximo webhook receiver integration
+   460→
+   461→### 2.3 Service Demand Service (spec 004.2.6 - v2.1 Critical)
+   462→
+   463→- [x] P1: Implement ServiceDemandService class
+   464→- [x] P1: Implement getDemand(fleetId, date, dayType) - hard constraint
+   465→- [x] P1: Implement validateAvailability(fleetId, date) - checks available vs. required
+   466→- [x] P1: Implement default calculation (85% of fleet when no config)
+   467→- [x] P1: Implement findViolations() for optimizer batch validation
+   468→- [x] P2: Implement peak period requirements (AM/Midday/PM/Evening)
+   469→
+   470→### 2.4 Route Utilization Service (spec 004.2.7 - v2.1 Critical)
+   471→
+   472→- [x] P1: Implement RouteUtilizationService class
+   473→- [x] P1: Implement getDailyKm(trainId, date) with hierarchy:
+   474→  - [x] Route-specific profile (preferred)
+   475→  - [x] Fleet-wide average (fallback)
+   476→  - [x] System default: 250 km/day (conservative fallback)
+   477→- [x] P1: Implement seasonal multiplier application
+   478→- [x] P2: Implement confidence scoring (HIGH/MEDIUM/LOW/ESTIMATED)
+   479→
+   480→### 2.5 Fleet Service (spec 004.3)
+   481→
+   482→- [x] P1: Implement FleetService class
+   483→- [x] P1: Implement train/car/component CRUD operations
+   484→- [x] P1: Implement lifecycle state management (fitness_status transitions)
+   485→- [x] P1: Implement mileage tracking and accumulation
+   486→- [x] P1: Implement route assignment and utilization profiles (routes CRUD done)
+   487→- [ ] P2: Implement component replacement tracking (mileage follows components)
+   488→- [x] P2: Implement fleet statistics and reporting
+   489→- [x] P2: Implement target_mileage_km calculation for fleet balancing
+   490→
+   491→### 2.6 PM Scheduler Service - Tactical (spec 004.4)
+   492→
+   493→#### Core Scheduling
+   494→- [x] P1: Implement PMSchedulerService class
+   495→- [x] P1: Implement compliance window calculation (mileage OR time triggers)
+   496→- [x] P1: Implement PM hierarchy handling (C4 satisfies C1/C2/C3, resets counters)
+   497→- [x] P1: Implement 12-week horizon scheduling
+   498→
+   499→#### Resource Allocation
+   500→- [x] P1: Implement track allocation logic (match PM requirements to track capabilities)
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

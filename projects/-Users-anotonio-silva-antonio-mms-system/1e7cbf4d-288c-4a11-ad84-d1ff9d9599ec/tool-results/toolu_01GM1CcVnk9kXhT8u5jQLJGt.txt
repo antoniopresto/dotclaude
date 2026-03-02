@@ -1,0 +1,929 @@
+     1→/**
+     2→ * Canvas Slice
+     3→ *
+     4→ * State management for the infinite canvas: viewport, zoom, pan, layers.
+     5→ * Optimized for 60fps WebGL rendering with deck.gl.
+     6→ *
+     7→ * @see specs/006-user-interface.md Section 6.3
+     8→ */
+     9→
+    10→import { createSlice } from '@belt/tools';
+    11→import type { ZoomLevel, ViewportBounds, LayerVisibility, CanvasSelection } from '../types';
+    12→
+    13→// =============================================================================
+    14→// Constants
+    15→// =============================================================================
+    16→
+    17→export const ZOOM_THRESHOLDS = {
+    18→  STRATEGIC: { min: 0, max: 4, granularity: 'year' as const },
+    19→  TACTICAL_WIDE: { min: 4, max: 8, granularity: 'month' as const },
+    20→  TACTICAL: { min: 8, max: 12, granularity: 'week' as const },
+    21→  OPERATIONAL: { min: 12, max: 16, granularity: 'day' as const },
+    22→  DETAIL: { min: 16, max: 20, granularity: 'hour' as const },
+    23→};
+    24→
+    25→export function getZoomLevelName(zoom: number): ZoomLevel {
+    26→  if (zoom < ZOOM_THRESHOLDS.TACTICAL_WIDE.min) return 'STRATEGIC';
+    27→  if (zoom < ZOOM_THRESHOLDS.TACTICAL.min) return 'TACTICAL_WIDE';
+    28→  if (zoom < ZOOM_THRESHOLDS.OPERATIONAL.min) return 'TACTICAL';
+    29→  if (zoom < ZOOM_THRESHOLDS.DETAIL.min) return 'OPERATIONAL';
+    30→  return 'DETAIL';
+    31→}
+    32→
+    33→// =============================================================================
+    34→// Canvas Slice State
+    35→// =============================================================================
+    36→
+    37→interface AnimationTarget {
+    38→  zoom: number | null;
+    39→  panX: number | null;
+    40→  panY: number | null;
+    41→}
+    42→
+    43→export interface CanvasSliceState {
+    44→  zoom: number;
+    45→  panX: number;
+    46→  panY: number;
+    47→  zoomLevel: ZoomLevel;
+    48→  viewport: ViewportBounds;
+    49→  layers: LayerVisibility;
+    50→  selection: CanvasSelection;
+    51→  todayDate: string;
+    52→  isViewportLocked: boolean;
+    53→  showMinimap: boolean;
+    54→  showGrid: boolean;
+    55→  isPerformanceMode: boolean;
+    56→  isPanning: boolean;
+    57→  isZooming: boolean;
+    58→  animationTarget: AnimationTarget;
+    59→  [key: string]: unknown;
+    60→}
+    61→
+    62→const initialCanvasState: CanvasSliceState = {
+    63→  zoom: 10,
+    64→  panX: 0,
+    65→  panY: 0,
+    66→  zoomLevel: 'TACTICAL',
+    67→  viewport: {
+    68→    startDate: new Date().toISOString().split('T')[0],
+    69→    endDate: new Date(Date.now() + 84 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+    70→    trainIds: [],
+    71→  },
+    72→  layers: {
+    73→    pmBlocks: true,
+    74→    complianceWindows: true,
+    75→    manhourOverlay: false,
+    76→    driftOverlay: false,
+    77→    baselineShadow: false,
+    78→  },
+    79→  selection: {
+    80→    selectedPmIds: [],
+    81→    selectedTrainIds: [],
+    82→    isMultiSelect: false,
+    83→  },
+    84→  todayDate: new Date().toISOString().split('T')[0],
+    85→  isViewportLocked: false,
+    86→  showMinimap: true,
+    87→  showGrid: true,
+    88→  isPerformanceMode: false,
+    89→  isPanning: false,
+    90→  isZooming: false,
+    91→  animationTarget: {
+    92→    zoom: null,
+    93→    panX: null,
+    94→    panY: null,
+    95→  },
+    96→};
+    97→
+    98→export const canvasSlice = createSlice({
+    99→  id: 'canvas',
+   100→  initial: initialCanvasState,
+   101→  cache: { policy: 'session' },
+   102→  reducers: {
+   103→    // Viewport Control
+   104→    setZoom: (s, zoom: number) => {
+   105→      const state = s as CanvasSliceState;
+   106→      const clampedZoom = Math.max(0, Math.min(20, zoom));
+   107→      state.zoom = clampedZoom;
+   108→      state.zoomLevel = getZoomLevelName(clampedZoom);
+   109→    },
+   110→
+   111→    zoomIn: (s, factor = 1.2) => {
+   112→      const state = s as CanvasSliceState;
+   113→      const newZoom = Math.min(20, state.zoom * factor);
+   114→      state.zoom = newZoom;
+   115→      state.zoomLevel = getZoomLevelName(newZoom);
+   116→    },
+   117→
+   118→    zoomOut: (s, factor = 1.2) => {
+   119→      const state = s as CanvasSliceState;
+   120→      const newZoom = Math.max(0, state.zoom / factor);
+   121→      state.zoom = newZoom;
+   122→      state.zoomLevel = getZoomLevelName(newZoom);
+   123→    },
+   124→
+   125→    setZoomLevel: (s, level: ZoomLevel) => {
+   126→      const state = s as CanvasSliceState;
+   127→      const thresholds = ZOOM_THRESHOLDS[level];
+   128→      const targetZoom = (thresholds.min + thresholds.max) / 2;
+   129→      state.zoom = targetZoom;
+   130→      state.zoomLevel = level;
+   131→    },
+   132→
+   133→    setPan: (s, payload: { x: number; y: number }) => {
+   134→      const state = s as CanvasSliceState;
+   135→      state.panX = payload.x;
+   136→      state.panY = payload.y;
+   137→    },
+   138→
+   139→    pan: (s, delta: { dx: number; dy: number }) => {
+   140→      const state = s as CanvasSliceState;
+   141→      state.panX += delta.dx;
+   142→      state.panY += delta.dy;
+   143→    },
+   144→
+   145→    setViewport: (s, viewport: Partial<ViewportBounds>) => {
+   146→      const state = s as CanvasSliceState;
+   147→      state.viewport = { ...state.viewport, ...viewport };
+   148→    },
+   149→
+   150→    // Layer Control
+   151→    setLayerVisibility: (s, layers: Partial<LayerVisibility>) => {
+   152→      const state = s as CanvasSliceState;
+   153→      state.layers = { ...state.layers, ...layers };
+   154→    },
+   155→
+   156→    toggleLayer: (s, layer: keyof LayerVisibility) => {
+   157→      const state = s as CanvasSliceState;
+   158→      state.layers[layer] = !state.layers[layer];
+   159→    },
+   160→
+   161→    showAllLayers: (s) => {
+   162→      const state = s as CanvasSliceState;
+   163→      state.layers = {
+   164→        pmBlocks: true,
+   165→        complianceWindows: true,
+   166→        manhourOverlay: true,
+   167→        driftOverlay: true,
+   168→        baselineShadow: true,
+   169→      };
+   170→    },
+   171→
+   172→    hideAllOverlays: (s) => {
+   173→      const state = s as CanvasSliceState;
+   174→      state.layers.manhourOverlay = false;
+   175→      state.layers.driftOverlay = false;
+   176→      state.layers.baselineShadow = false;
+   177→    },
+   178→
+   179→    // Selection
+   180→    selectPm: (s, pmId: string) => {
+   181→      const state = s as CanvasSliceState;
+   182→      if (state.selection.isMultiSelect) {
+   183→        if (!state.selection.selectedPmIds.includes(pmId)) {
+   184→          state.selection.selectedPmIds.push(pmId);
+   185→        }
+   186→      } else {
+   187→        state.selection.selectedPmIds = [pmId];
+   188→      }
+   189→    },
+   190→
+   191→    deselectPm: (s, pmId: string) => {
+   192→      const state = s as CanvasSliceState;
+   193→      state.selection.selectedPmIds = state.selection.selectedPmIds.filter((id) => id !== pmId);
+   194→    },
+   195→
+   196→    selectTrain: (s, trainId: string) => {
+   197→      const state = s as CanvasSliceState;
+   198→      if (state.selection.isMultiSelect) {
+   199→        if (!state.selection.selectedTrainIds.includes(trainId)) {
+   200→          state.selection.selectedTrainIds.push(trainId);
+   201→        }
+   202→      } else {
+   203→        state.selection.selectedTrainIds = [trainId];
+   204→      }
+   205→    },
+   206→
+   207→    deselectTrain: (s, trainId: string) => {
+   208→      const state = s as CanvasSliceState;
+   209→      state.selection.selectedTrainIds = state.selection.selectedTrainIds.filter(
+   210→        (id) => id !== trainId
+   211→      );
+   212→    },
+   213→
+   214→    setMultiSelect: (s, enabled: boolean) => {
+   215→      const state = s as CanvasSliceState;
+   216→      state.selection.isMultiSelect = enabled;
+   217→    },
+   218→
+   219→    clearSelection: (s) => {
+   220→      const state = s as CanvasSliceState;
+   221→      state.selection.selectedPmIds = [];
+   222→      state.selection.selectedTrainIds = [];
+   223→    },
+   224→
+   225→    selectAll: (s, payload: { pmIds?: string[]; trainIds?: string[] }) => {
+   226→      const state = s as CanvasSliceState;
+   227→      if (payload.pmIds) {
+   228→        state.selection.selectedPmIds = payload.pmIds;
+   229→      }
+   230→      if (payload.trainIds) {
+   231→        state.selection.selectedTrainIds = payload.trainIds;
+   232→      }
+   233→    },
+   234→
+   235→    // Navigation
+   236→    goToToday: (s) => {
+   237→      const state = s as CanvasSliceState;
+   238→      state.todayDate = new Date().toISOString().split('T')[0];
+   239→      state.panX = 0;
+   240→    },
+   241→
+   242→    goToDate: (s, date: string) => {
+   243→      const state = s as CanvasSliceState;
+   244→      state.viewport.startDate = date;
+   245→    },
+   246→
+   247→    // UI Controls
+   248→    toggleMinimap: (s) => {
+   249→      const state = s as CanvasSliceState;
+   250→      state.showMinimap = !state.showMinimap;
+   251→    },
+   252→
+   253→    toggleGrid: (s) => {
+   254→      const state = s as CanvasSliceState;
+   255→      state.showGrid = !state.showGrid;
+   256→    },
+   257→
+   258→    setPerformanceMode: (s, enabled: boolean) => {
+   259→      const state = s as CanvasSliceState;
+   260→      state.isPerformanceMode = enabled;
+   261→    },
+   262→
+   263→    lockViewport: (s) => {
+   264→      const state = s as CanvasSliceState;
+   265→      state.isViewportLocked = true;
+   266→    },
+   267→
+   268→    unlockViewport: (s) => {
+   269→      const state = s as CanvasSliceState;
+   270→      state.isViewportLocked = false;
+   271→    },
+   272→
+   273→    // Interaction State
+   274→    startPanning: (s) => {
+   275→      const state = s as CanvasSliceState;
+   276→      state.isPanning = true;
+   277→    },
+   278→
+   279→    stopPanning: (s) => {
+   280→      const state = s as CanvasSliceState;
+   281→      state.isPanning = false;
+   282→    },
+   283→
+   284→    startZooming: (s) => {
+   285→      const state = s as CanvasSliceState;
+   286→      state.isZooming = true;
+   287→    },
+   288→
+   289→    stopZooming: (s) => {
+   290→      const state = s as CanvasSliceState;
+   291→      state.isZooming = false;
+   292→    },
+   293→
+   294→    // Animation
+   295→    setAnimationTarget: (
+   296→      s,
+   297→      target: { zoom?: number | null; panX?: number | null; panY?: number | null }
+   298→    ) => {
+   299→      const state = s as CanvasSliceState;
+   300→      state.animationTarget = {
+   301→        zoom: target.zoom ?? state.animationTarget.zoom,
+   302→        panX: target.panX ?? state.animationTarget.panX,
+   303→        panY: target.panY ?? state.animationTarget.panY,
+   304→      };
+   305→    },
+   306→
+   307→    clearAnimationTarget: (s) => {
+   308→      const state = s as CanvasSliceState;
+   309→      state.animationTarget = { zoom: null, panX: null, panY: null };
+   310→    },
+   311→
+   312→    // Reset
+   313→    reset: (s) => {
+   314→      const state = s as CanvasSliceState;
+   315→      Object.assign(state, initialCanvasState);
+   316→    },
+   317→
+   318→    resetViewport: (s) => {
+   319→      const state = s as CanvasSliceState;
+   320→      state.zoom = 10;
+   321→      state.panX = 0;
+   322→      state.panY = 0;
+   323→      state.zoomLevel = 'TACTICAL';
+   324→    },
+   325→  },
+   326→});
+   327→
+   328→// =============================================================================
+   329→// Selectors
+   330→// =============================================================================
+   331→
+   332→export function isPmSelected(state: CanvasSliceState, pmId: string): boolean {
+   333→  return state.selection.selectedPmIds.includes(pmId);
+   334→}
+   335→
+   336→export function isTrainSelected(state: CanvasSliceState, trainId: string): boolean {
+   337→  return state.selection.selectedTrainIds.includes(trainId);
+   338→}
+   339→
+   340→export function getGranularity(
+   341→  state: CanvasSliceState
+   342→): 'year' | 'month' | 'week' | 'day' | 'hour' {
+   343→  return ZOOM_THRESHOLDS[state.zoomLevel].granularity;
+   344→}
+   345→
+   346→export function viewportContainsDate(state: CanvasSliceState, date: string): boolean {
+   347→  return date >= state.viewport.startDate && date <= state.viewport.endDate;
+   348→}
+   349→
+   350→export function getVisibleTrainIds(state: CanvasSliceState): string[] {
+   351→  return state.viewport.trainIds;
+   352→}
+   353→
+   354→export function hasActiveOverlay(state: CanvasSliceState): boolean {
+   355→  return state.layers.manhourOverlay || state.layers.driftOverlay || state.layers.baselineShadow;
+   356→}
+   357→
+   358→// =============================================================================
+   359→// Canvas Data Types
+   360→// =============================================================================
+   361→
+   362→/** Strategic year data from API */
+   363→export interface StrategicYearData {
+   364→  year: number;
+   365→  pmCount: number;
+   366→  totalHours: number;
+   367→  completedCount: number;
+   368→  lockedCount: number;
+   369→}
+   370→
+   371→/** Strategic train data from API */
+   372→export interface StrategicTrainData {
+   373→  trainId: string;
+   374→  trainNumber: string;
+   375→  fleetCode: string;
+   376→  years: StrategicYearData[];
+   377→}
+   378→
+   379→/** Strategic canvas API response */
+   380→export interface StrategicCanvasData {
+   381→  trains: StrategicTrainData[];
+   382→  heatmapData: {
+   383→    maxPmCount: number;
+   384→    maxHours: number;
+   385→  };
+   386→}
+   387→
+   388→// =============================================================================
+   389→// Canvas Data Slice
+   390→// =============================================================================
+   391→
+   392→/** Tactical PM block data from API */
+   393→export interface TacticalPmBlock {
+   394→  pmId: string;
+   395→  trainId: string;
+   396→  trainNumber: string;
+   397→  pmCode: string;
+   398→  targetDate: string;
+   399→  durationDays: number;
+   400→  status: string;
+   401→  constraintStart: string;
+   402→  constraintEnd: string;
+   403→  isLocked: boolean;
+   404→  trackNumber: string | null;
+   405→  depotCode: string | null;
+   406→  displayColor: string;
+   407→  estimatedHours: number | null;
+   408→}
+   409→
+   410→/** Constraint wall for compliance window boundaries */
+   411→export interface TacticalConstraintWall {
+   412→  pmId: string;
+   413→  type: 'COMPLIANCE_START' | 'COMPLIANCE_END';
+   414→  date: string;
+   415→}
+   416→
+   417→/** Tactical canvas API response */
+   418→export interface TacticalCanvasData {
+   419→  pmBlocks: TacticalPmBlock[];
+   420→  constraintWalls: TacticalConstraintWall[];
+   421→}
+   422→
+   423→// =============================================================================
+   424→// Tactical-Wide Canvas Data Types
+   425→// =============================================================================
+   426→
+   427→/** Train data for tactical-wide view */
+   428→export interface TacticalWideTrainData {
+   429→  trainId: string;
+   430→  trainNumber: string;
+   431→  fleetCode: string;
+   432→}
+   433→
+   434→/** PM block for tactical-wide compressed view */
+   435→export interface TacticalWidePmBlock {
+   436→  pmId: string;
+   437→  trainId: string;
+   438→  pmCode: string;
+   439→  targetDate: string;
+   440→  durationDays: number;
+   441→  status: string;
+   442→  isLocked: boolean;
+   443→  displayColor: string;
+   444→}
+   445→
+   446→/** Tactical-Wide canvas API response */
+   447→export interface TacticalWideCanvasData {
+   448→  trains: TacticalWideTrainData[];
+   449→  pmBlocks: TacticalWidePmBlock[];
+   450→}
+   451→
+   452→// =============================================================================
+   453→// Operational Detail Canvas Data Types
+   454→// =============================================================================
+   455→
+   456→/** Material availability status */
+   457→export type MaterialStatus = 'AVAILABLE' | 'LOW_STOCK' | 'UNAVAILABLE' | 'ARRIVING';
+   458→
+   459→/** Material requirement for PM */
+   460→export interface OperationalMaterialRequirement {
+   461→  materialId: string;
+   462→  materialName: string;
+   463→  quantityRequired: number;
+   464→  quantityAvailable: number;
+   465→  status: MaterialStatus;
+   466→  arrivalDate?: string;
+   467→}
+   468→
+   469→/** PM card for operational detail view */
+   470→export interface OperationalPmBlock {
+   471→  pmId: string;
+   472→  trainId: string;
+   473→  trainNumber: string;
+   474→  fleetCode: string;
+   475→  pmCode: string;
+   476→  pmDescription: string;
+   477→  targetDate: string;
+   478→  endDate: string;
+   479→  durationDays: number;
+   480→  status: string;
+   481→  constraintStart: string;
+   482→  constraintEnd: string;
+   483→  isLocked: boolean;
+   484→  trackNumber: string | null;
+   485→  depotCode: string | null;
+   486→  estimatedHours: number | null;
+   487→  assignedShift: string | null;
+   488→  materials: OperationalMaterialRequirement[];
+   489→  displayColor: string;
+   490→}
+   491→
+   492→/** Operational canvas API response */
+   493→export interface OperationalCanvasData {
+   494→  pmBlocks: OperationalPmBlock[];
+   495→  dateRange: {
+   496→    fromDate: string;
+   497→    toDate: string;
+   498→  };
+   499→}
+   500→
+   501→export interface CanvasDataState {
+   502→  strategicData: StrategicCanvasData | null;
+   503→  strategicLoading: boolean;
+   504→  strategicError: string | null;
+   505→  strategicLastFetch: number | null;
+   506→  fromYear: number;
+   507→  toYear: number;
+   508→  tacticalWideData: TacticalWideCanvasData | null;
+   509→  tacticalWideLoading: boolean;
+   510→  tacticalWideError: string | null;
+   511→  tacticalWideLastFetch: number | null;
+   512→  tacticalWideFromDate: string;
+   513→  tacticalWideToDate: string;
+   514→  tacticalData: TacticalCanvasData | null;
+   515→  tacticalLoading: boolean;
+   516→  tacticalError: string | null;
+   517→  tacticalLastFetch: number | null;
+   518→  tacticalFromDate: string;
+   519→  tacticalToDate: string;
+   520→  operationalData: OperationalCanvasData | null;
+   521→  operationalLoading: boolean;
+   522→  operationalError: string | null;
+   523→  operationalLastFetch: number | null;
+   524→  operationalFromDate: string;
+   525→  operationalToDate: string;
+   526→  [key: string]: unknown;
+   527→}
+   528→
+   529→function getDefaultTacticalDates(): { from: string; to: string } {
+   530→  const today = new Date();
+   531→  const fromDate = new Date(today);
+   532→  fromDate.setDate(today.getDate() - today.getDay()); // Start of current week
+   533→  const toDate = new Date(fromDate);
+   534→  toDate.setDate(toDate.getDate() + 12 * 7); // 12 weeks ahead
+   535→  return {
+   536→    from: fromDate.toISOString().split('T')[0],
+   537→    to: toDate.toISOString().split('T')[0],
+   538→  };
+   539→}
+   540→
+   541→function getDefaultTacticalWideDates(): { from: string; to: string } {
+   542→  const today = new Date();
+   543→  const fromDate = new Date(today.getFullYear(), today.getMonth(), 1); // Start of current month
+   544→  const toDate = new Date(fromDate);
+   545→  toDate.setMonth(toDate.getMonth() + 12); // 12 months ahead
+   546→  return {
+   547→    from: fromDate.toISOString().split('T')[0],
+   548→    to: toDate.toISOString().split('T')[0],
+   549→  };
+   550→}
+   551→
+   552→function getDefaultOperationalDates(): { from: string; to: string } {
+   553→  const today = new Date();
+   554→  const fromDate = new Date(today);
+   555→  fromDate.setDate(today.getDate() - today.getDay()); // Start of current week
+   556→  const toDate = new Date(fromDate);
+   557→  toDate.setDate(toDate.getDate() + 4 * 7); // 4 weeks ahead
+   558→  return {
+   559→    from: fromDate.toISOString().split('T')[0],
+   560→    to: toDate.toISOString().split('T')[0],
+   561→  };
+   562→}
+   563→
+   564→const tacticalDates = getDefaultTacticalDates();
+   565→const tacticalWideDates = getDefaultTacticalWideDates();
+   566→const operationalDates = getDefaultOperationalDates();
+   567→
+   568→const initialCanvasDataState: CanvasDataState = {
+   569→  strategicData: null,
+   570→  strategicLoading: false,
+   571→  strategicError: null,
+   572→  strategicLastFetch: null,
+   573→  fromYear: new Date().getFullYear(),
+   574→  toYear: new Date().getFullYear() + 10,
+   575→  tacticalWideData: null,
+   576→  tacticalWideLoading: false,
+   577→  tacticalWideError: null,
+   578→  tacticalWideLastFetch: null,
+   579→  tacticalWideFromDate: tacticalWideDates.from,
+   580→  tacticalWideToDate: tacticalWideDates.to,
+   581→  tacticalData: null,
+   582→  tacticalLoading: false,
+   583→  tacticalError: null,
+   584→  tacticalLastFetch: null,
+   585→  tacticalFromDate: tacticalDates.from,
+   586→  tacticalToDate: tacticalDates.to,
+   587→  operationalData: null,
+   588→  operationalLoading: false,
+   589→  operationalError: null,
+   590→  operationalLastFetch: null,
+   591→  operationalFromDate: operationalDates.from,
+   592→  operationalToDate: operationalDates.to,
+   593→};
+   594→
+   595→export const canvasDataSlice = createSlice({
+   596→  id: 'canvasData',
+   597→  initial: initialCanvasDataState,
+   598→  cache: { policy: 'session' },
+   599→  reducers: {
+   600→    setStrategicLoading: (s, loading: boolean) => {
+   601→      const state = s as CanvasDataState;
+   602→      state.strategicLoading = loading;
+   603→    },
+   604→
+   605→    setStrategicData: (s, data: StrategicCanvasData) => {
+   606→      const state = s as CanvasDataState;
+   607→      state.strategicData = data;
+   608→      state.strategicLoading = false;
+   609→      state.strategicError = null;
+   610→      state.strategicLastFetch = Date.now();
+   611→    },
+   612→
+   613→    setStrategicError: (s, error: string) => {
+   614→      const state = s as CanvasDataState;
+   615→      state.strategicError = error;
+   616→      state.strategicLoading = false;
+   617→    },
+   618→
+   619→    setYearRange: (s, payload: { fromYear: number; toYear: number }) => {
+   620→      const state = s as CanvasDataState;
+   621→      state.fromYear = payload.fromYear;
+   622→      state.toYear = payload.toYear;
+   623→    },
+   624→
+   625→    clearStrategicData: (s) => {
+   626→      const state = s as CanvasDataState;
+   627→      state.strategicData = null;
+   628→      state.strategicError = null;
+   629→      state.strategicLastFetch = null;
+   630→    },
+   631→
+   632→    // Tactical-Wide data reducers
+   633→    setTacticalWideLoading: (s, loading: boolean) => {
+   634→      const state = s as CanvasDataState;
+   635→      state.tacticalWideLoading = loading;
+   636→    },
+   637→
+   638→    setTacticalWideData: (s, data: TacticalWideCanvasData) => {
+   639→      const state = s as CanvasDataState;
+   640→      state.tacticalWideData = data;
+   641→      state.tacticalWideLoading = false;
+   642→      state.tacticalWideError = null;
+   643→      state.tacticalWideLastFetch = Date.now();
+   644→    },
+   645→
+   646→    setTacticalWideError: (s, error: string) => {
+   647→      const state = s as CanvasDataState;
+   648→      state.tacticalWideError = error;
+   649→      state.tacticalWideLoading = false;
+   650→    },
+   651→
+   652→    setTacticalWideDateRange: (s, payload: { fromDate: string; toDate: string }) => {
+   653→      const state = s as CanvasDataState;
+   654→      state.tacticalWideFromDate = payload.fromDate;
+   655→      state.tacticalWideToDate = payload.toDate;
+   656→    },
+   657→
+   658→    clearTacticalWideData: (s) => {
+   659→      const state = s as CanvasDataState;
+   660→      state.tacticalWideData = null;
+   661→      state.tacticalWideError = null;
+   662→      state.tacticalWideLastFetch = null;
+   663→    },
+   664→
+   665→    // Tactical data reducers
+   666→    setTacticalLoading: (s, loading: boolean) => {
+   667→      const state = s as CanvasDataState;
+   668→      state.tacticalLoading = loading;
+   669→    },
+   670→
+   671→    setTacticalData: (s, data: TacticalCanvasData) => {
+   672→      const state = s as CanvasDataState;
+   673→      state.tacticalData = data;
+   674→      state.tacticalLoading = false;
+   675→      state.tacticalError = null;
+   676→      state.tacticalLastFetch = Date.now();
+   677→    },
+   678→
+   679→    setTacticalError: (s, error: string) => {
+   680→      const state = s as CanvasDataState;
+   681→      state.tacticalError = error;
+   682→      state.tacticalLoading = false;
+   683→    },
+   684→
+   685→    setTacticalDateRange: (s, payload: { fromDate: string; toDate: string }) => {
+   686→      const state = s as CanvasDataState;
+   687→      state.tacticalFromDate = payload.fromDate;
+   688→      state.tacticalToDate = payload.toDate;
+   689→    },
+   690→
+   691→    clearTacticalData: (s) => {
+   692→      const state = s as CanvasDataState;
+   693→      state.tacticalData = null;
+   694→      state.tacticalError = null;
+   695→      state.tacticalLastFetch = null;
+   696→    },
+   697→
+   698→    // Operational data reducers
+   699→    setOperationalLoading: (s, loading: boolean) => {
+   700→      const state = s as CanvasDataState;
+   701→      state.operationalLoading = loading;
+   702→    },
+   703→
+   704→    setOperationalData: (s, data: OperationalCanvasData) => {
+   705→      const state = s as CanvasDataState;
+   706→      state.operationalData = data;
+   707→      state.operationalLoading = false;
+   708→      state.operationalError = null;
+   709→      state.operationalLastFetch = Date.now();
+   710→    },
+   711→
+   712→    setOperationalError: (s, error: string) => {
+   713→      const state = s as CanvasDataState;
+   714→      state.operationalError = error;
+   715→      state.operationalLoading = false;
+   716→    },
+   717→
+   718→    setOperationalDateRange: (s, payload: { fromDate: string; toDate: string }) => {
+   719→      const state = s as CanvasDataState;
+   720→      state.operationalFromDate = payload.fromDate;
+   721→      state.operationalToDate = payload.toDate;
+   722→    },
+   723→
+   724→    clearOperationalData: (s) => {
+   725→      const state = s as CanvasDataState;
+   726→      state.operationalData = null;
+   727→      state.operationalError = null;
+   728→      state.operationalLastFetch = null;
+   729→    },
+   730→
+   731→    reset: (s) => {
+   732→      const state = s as CanvasDataState;
+   733→      Object.assign(state, initialCanvasDataState);
+   734→    },
+   735→  },
+   736→});
+   737→
+   738→/**
+   739→ * Load strategic canvas data from API
+   740→ */
+   741→export async function loadStrategicData(
+   742→  dispatch: {
+   743→    setStrategicLoading: (loading: boolean) => void;
+   744→    setStrategicData: (data: StrategicCanvasData) => void;
+   745→    setStrategicError: (error: string) => void;
+   746→  },
+   747→  options: { baseUrl?: string; fromYear?: number; toYear?: number; fleetId?: string } = {}
+   748→): Promise<void> {
+   749→  const {
+   750→    baseUrl = '/api/v1',
+   751→    fromYear = new Date().getFullYear(),
+   752→    toYear = new Date().getFullYear() + 10,
+   753→    fleetId,
+   754→  } = options;
+   755→
+   756→  dispatch.setStrategicLoading(true);
+   757→
+   758→  const params = new URLSearchParams();
+   759→  params.set('fromYear', String(fromYear));
+   760→  params.set('toYear', String(toYear));
+   761→  if (fleetId) {
+   762→    params.set('fleetId', fleetId);
+   763→  }
+   764→
+   765→  try {
+   766→    const response = await fetch(`${baseUrl}/canvas/strategic?${params}`);
+   767→
+   768→    if (!response.ok) {
+   769→      throw new Error(`Failed to fetch strategic data: ${response.status}`);
+   770→    }
+   771→
+   772→    const json = (await response.json()) as { data: StrategicCanvasData };
+   773→    dispatch.setStrategicData(json.data);
+   774→  } catch (error) {
+   775→    const message = error instanceof Error ? error.message : 'Unknown error';
+   776→    dispatch.setStrategicError(message);
+   777→  }
+   778→}
+   779→
+   780→/**
+   781→ * Load tactical canvas data from API
+   782→ */
+   783→export async function loadTacticalData(
+   784→  dispatch: {
+   785→    setTacticalLoading: (loading: boolean) => void;
+   786→    setTacticalData: (data: TacticalCanvasData) => void;
+   787→    setTacticalError: (error: string) => void;
+   788→  },
+   789→  options: { baseUrl?: string; fromWeek?: string; toWeek?: string; trainIds?: string[] } = {}
+   790→): Promise<void> {
+   791→  const {
+   792→    baseUrl = '/api/v1',
+   793→    fromWeek,
+   794→    toWeek,
+   795→    trainIds,
+   796→  } = options;
+   797→
+   798→  dispatch.setTacticalLoading(true);
+   799→
+   800→  const params = new URLSearchParams();
+   801→  if (fromWeek) {
+   802→    params.set('fromWeek', fromWeek);
+   803→  }
+   804→  if (toWeek) {
+   805→    params.set('toWeek', toWeek);
+   806→  }
+   807→  if (trainIds && trainIds.length > 0) {
+   808→    params.set('trainIds', trainIds.join(','));
+   809→  }
+   810→
+   811→  try {
+   812→    const response = await fetch(`${baseUrl}/canvas/tactical?${params}`);
+   813→
+   814→    if (!response.ok) {
+   815→      throw new Error(`Failed to fetch tactical data: ${response.status}`);
+   816→    }
+   817→
+   818→    const json = (await response.json()) as { data: TacticalCanvasData };
+   819→    dispatch.setTacticalData(json.data);
+   820→  } catch (error) {
+   821→    const message = error instanceof Error ? error.message : 'Unknown error';
+   822→    dispatch.setTacticalError(message);
+   823→  }
+   824→}
+   825→
+   826→/**
+   827→ * Load tactical-wide canvas data from API
+   828→ *
+   829→ * Fetches PM schedule data aggregated at monthly granularity for the
+   830→ * TACTICAL_WIDE zoom level (4-8). Shows compressed PM blocks for 1-year view.
+   831→ */
+   832→export async function loadTacticalWideData(
+   833→  dispatch: {
+   834→    setTacticalWideLoading: (loading: boolean) => void;
+   835→    setTacticalWideData: (data: TacticalWideCanvasData) => void;
+   836→    setTacticalWideError: (error: string) => void;
+   837→  },
+   838→  options: { baseUrl?: string; fromDate?: string; toDate?: string; trainIds?: string[] } = {}
+   839→): Promise<void> {
+   840→  const {
+   841→    baseUrl = '/api/v1',
+   842→    fromDate,
+   843→    toDate,
+   844→    trainIds,
+   845→  } = options;
+   846→
+   847→  dispatch.setTacticalWideLoading(true);
+   848→
+   849→  const params = new URLSearchParams();
+   850→  if (fromDate) {
+   851→    params.set('fromDate', fromDate);
+   852→  }
+   853→  if (toDate) {
+   854→    params.set('toDate', toDate);
+   855→  }
+   856→  if (trainIds && trainIds.length > 0) {
+   857→    params.set('trainIds', trainIds.join(','));
+   858→  }
+   859→
+   860→  try {
+   861→    // Tactical-wide uses the tactical endpoint with monthly aggregation
+   862→    // The API returns the same data format but filtered for the date range
+   863→    const response = await fetch(`${baseUrl}/canvas/tactical-wide?${params}`);
+   864→
+   865→    if (!response.ok) {
+   866→      throw new Error(`Failed to fetch tactical-wide data: ${response.status}`);
+   867→    }
+   868→
+   869→    const json = (await response.json()) as { data: TacticalWideCanvasData };
+   870→    dispatch.setTacticalWideData(json.data);
+   871→  } catch (error) {
+   872→    const message = error instanceof Error ? error.message : 'Unknown error';
+   873→    dispatch.setTacticalWideError(message);
+   874→  }
+   875→}
+   876→
+   877→/**
+   878→ * Load operational canvas data from API
+   879→ *
+   880→ * Fetches detailed PM data with material requirements for the
+   881→ * OPERATIONAL zoom level (12-16). Shows 4-week detailed PM cards.
+   882→ */
+   883→export async function loadOperationalData(
+   884→  dispatch: {
+   885→    setOperationalLoading: (loading: boolean) => void;
+   886→    setOperationalData: (data: OperationalCanvasData) => void;
+   887→    setOperationalError: (error: string) => void;
+   888→  },
+   889→  options: { baseUrl?: string; fromDate?: string; toDate?: string; trainIds?: string[] } = {}
+   890→): Promise<void> {
+   891→  const {
+   892→    baseUrl = '/api/v1',
+   893→    fromDate,
+   894→    toDate,
+   895→    trainIds,
+   896→  } = options;
+   897→
+   898→  dispatch.setOperationalLoading(true);
+   899→
+   900→  const params = new URLSearchParams();
+   901→  if (fromDate) {
+   902→    params.set('fromDate', fromDate);
+   903→  }
+   904→  if (toDate) {
+   905→    params.set('toDate', toDate);
+   906→  }
+   907→  if (trainIds && trainIds.length > 0) {
+   908→    params.set('trainIds', trainIds.join(','));
+   909→  }
+   910→
+   911→  try {
+   912→    const response = await fetch(`${baseUrl}/canvas/operational?${params}`);
+   913→
+   914→    if (!response.ok) {
+   915→      throw new Error(`Failed to fetch operational data: ${response.status}`);
+   916→    }
+   917→
+   918→    const json = (await response.json()) as { data: OperationalCanvasData };
+   919→    dispatch.setOperationalData(json.data);
+   920→  } catch (error) {
+   921→    const message = error instanceof Error ? error.message : 'Unknown error';
+   922→    dispatch.setOperationalError(message);
+   923→  }
+   924→}
+   925→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

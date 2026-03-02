@@ -1,0 +1,992 @@
+     1→/**
+     2→ * Detail Card Overlay
+     3→ *
+     4→ * React DOM overlay for the detail view (zoom levels 16+).
+     5→ * Provides rich PM editing interfaces with:
+     6→ * - Full PM details in expandable cards
+     7→ * - Inline editing (date, depot, track, shift)
+     8→ * - Crew assignment display
+     9→ * - Material status with availability badges
+    10→ * - Compliance window timeline visualization
+    11→ * - Change history panel
+    12→ * - Real-time constraint validation feedback
+    13→ *
+    14→ * Uses BlueprintJS components for consistent UI.
+    15→ * State managed via @belt/tools (no React hooks).
+    16→ *
+    17→ * @see specs/006-user-interface.md Section 6.3.4, 6.3.5
+    18→ */
+    19→
+    20→import { useRef } from 'react';
+    21→import {
+    22→  Card,
+    23→  Elevation,
+    24→  Tag,
+    25→  Intent,
+    26→  Button,
+    27→  ButtonGroup,
+    28→  Collapse,
+    29→  Icon,
+    30→  ProgressBar,
+    31→  Divider,
+    32→  HTMLTable,
+    33→  Tooltip,
+    34→  Position,
+    35→  Popover,
+    36→  Menu,
+    37→  MenuItem,
+    38→  MenuDivider,
+    39→} from '@blueprintjs/core';
+    40→
+    41→import type { OperationalPmBlock, OperationalCanvasData, MaterialStatus } from './types';
+    42→import { PM_STATUS_COLORS, CONSTRAINT_COLORS, FLEET_COLORS } from '../../theme/colors';
+    43→
+    44→// =============================================================================
+    45→// Types
+    46→// =============================================================================
+    47→
+    48→export interface DetailPmBlock extends OperationalPmBlock {
+    49→  /** Change history for audit trail */
+    50→  changeHistory?: ChangeHistoryEntry[];
+    51→  /** Constraint validation results */
+    52→  constraintValidation?: DetailConstraintValidation;
+    53→  /** Assigned crew (if available) */
+    54→  assignedCrew?: CrewAssignment[];
+    55→}
+    56→
+    57→export interface ChangeHistoryEntry {
+    58→  id: string;
+    59→  timestamp: string;
+    60→  changeType: 'CREATE' | 'MOVE' | 'REASSIGN' | 'LOCK' | 'UNLOCK' | 'STATUS_CHANGE';
+    61→  field?: string;
+    62→  oldValue?: string;
+    63→  newValue?: string;
+    64→  userId: string;
+    65→  userName: string;
+    66→  reason?: string;
+    67→}
+    68→
+    69→export interface DetailConstraintValidation {
+    70→  isValid: boolean;
+    71→  violations: DetailConstraintViolation[];
+    72→  warnings: DetailConstraintWarning[];
+    73→}
+    74→
+    75→export interface DetailConstraintViolation {
+    76→  type: 'HARD' | 'SOFT';
+    77→  constraint: string;
+    78→  message: string;
+    79→  canOverride: boolean;
+    80→}
+    81→
+    82→export interface DetailConstraintWarning {
+    83→  type: string;
+    84→  message: string;
+    85→}
+    86→
+    87→export interface CrewAssignment {
+    88→  crewId: string;
+    89→  crewName: string;
+    90→  role: string;
+    91→  shift: string;
+    92→}
+    93→
+    94→export interface DetailCanvasData extends OperationalCanvasData {
+    95→  pmBlocks: DetailPmBlock[];
+    96→}
+    97→
+    98→export interface DetailCardOverlayProps {
+    99→  data: DetailCanvasData | null;
+   100→  fromDate: Date;
+   101→  toDate: Date;
+   102→  width: number;
+   103→  height: number;
+   104→  selectedPmIds?: string[];
+   105→  expandedPmIds?: string[];
+   106→  onPmSelect?: (pmId: string) => void;
+   107→  onPmExpand?: (pmId: string) => void;
+   108→  onPmCollapse?: (pmId: string) => void;
+   109→  onPmEdit?: (pmId: string, field: string, value: unknown) => void;
+   110→  onPmLock?: (pmId: string) => void;
+   111→  onPmUnlock?: (pmId: string) => void;
+   112→  onPmMove?: (pmId: string, newDate: string) => void;
+   113→  onViewHistory?: (pmId: string) => void;
+   114→  showGrid?: boolean;
+   115→}
+   116→
+   117→// =============================================================================
+   118→// Constants
+   119→// =============================================================================
+   120→
+   121→const LAYOUT = {
+   122→  HEADER_HEIGHT: 80,
+   123→  TRAIN_LABEL_WIDTH: 160,
+   124→  CARD_WIDTH: 360,
+   125→  CARD_EXPANDED_WIDTH: 480,
+   126→  CARD_HEIGHT: 200,
+   127→  CARD_EXPANDED_HEIGHT: 500,
+   128→  CARD_MARGIN: 16,
+   129→  DAY_WIDTH: 120,
+   130→  ROW_HEIGHT: 220,
+   131→  EXPANDED_ROW_HEIGHT: 520,
+   132→  GRID_LINE_COLOR: '#e2e8f0',
+   133→  FONT_FAMILY: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+   134→};
+   135→
+   136→const PM_STATUS_INTENT: Record<string, Intent> = {
+   137→  SCHEDULED: Intent.PRIMARY,
+   138→  IN_PROGRESS: Intent.WARNING,
+   139→  COMPLETED: Intent.SUCCESS,
+   140→  CANCELLED: Intent.NONE,
+   141→  DEFERRED: Intent.NONE,
+   142→  OVERDUE: Intent.DANGER,
+   143→};
+   144→
+   145→// =============================================================================
+   146→// Utility Functions
+   147→// =============================================================================
+   148→
+   149→function getPmStatusColor(status: string): string {
+   150→  const normalizedStatus = status.toLowerCase().replace('_', '') as keyof typeof PM_STATUS_COLORS;
+   151→  return PM_STATUS_COLORS[normalizedStatus] ?? PM_STATUS_COLORS.scheduled;
+   152→}
+   153→
+   154→function getPmStatusIntent(status: string): Intent {
+   155→  return PM_STATUS_INTENT[status] ?? Intent.NONE;
+   156→}
+   157→
+   158→function getMaterialStatusIcon(status: MaterialStatus): string {
+   159→  switch (status) {
+   160→    case 'AVAILABLE':
+   161→      return 'tick-circle';
+   162→    case 'LOW_STOCK':
+   163→      return 'warning-sign';
+   164→    case 'UNAVAILABLE':
+   165→      return 'error';
+   166→    case 'ARRIVING':
+   167→      return 'time';
+   168→    default:
+   169→      return 'help';
+   170→  }
+   171→}
+   172→
+   173→function getMaterialStatusIntent(status: MaterialStatus): Intent {
+   174→  switch (status) {
+   175→    case 'AVAILABLE':
+   176→      return Intent.SUCCESS;
+   177→    case 'LOW_STOCK':
+   178→      return Intent.WARNING;
+   179→    case 'UNAVAILABLE':
+   180→      return Intent.DANGER;
+   181→    case 'ARRIVING':
+   182→      return Intent.PRIMARY;
+   183→    default:
+   184→      return Intent.NONE;
+   185→  }
+   186→}
+   187→
+   188→function formatDate(dateStr: string): string {
+   189→  const date = new Date(dateStr);
+   190→  return date.toLocaleDateString('en-US', {
+   191→    weekday: 'short',
+   192→    month: 'short',
+   193→    day: 'numeric',
+   194→    year: 'numeric',
+   195→  });
+   196→}
+   197→
+   198→function formatDateTime(dateStr: string): string {
+   199→  const date = new Date(dateStr);
+   200→  return date.toLocaleDateString('en-US', {
+   201→    month: 'short',
+   202→    day: 'numeric',
+   203→    hour: '2-digit',
+   204→    minute: '2-digit',
+   205→  });
+   206→}
+   207→
+   208→function getDays(fromDate: Date, toDate: Date): Date[] {
+   209→  const days: Date[] = [];
+   210→  const current = new Date(fromDate);
+   211→  while (current <= toDate) {
+   212→    days.push(new Date(current));
+   213→    current.setDate(current.getDate() + 1);
+   214→  }
+   215→  return days;
+   216→}
+   217→
+   218→function dateDiffDays(a: Date, b: Date): number {
+   219→  return Math.floor((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24));
+   220→}
+   221→
+   222→function parseDate(dateStr: string): Date {
+   223→  return new Date(dateStr + 'T00:00:00');
+   224→}
+   225→
+   226→function buildTrainGroups(pmBlocks: DetailPmBlock[]): Map<string, DetailPmBlock[]> {
+   227→  const groups = new Map<string, DetailPmBlock[]>();
+   228→  for (const pm of pmBlocks) {
+   229→    if (!groups.has(pm.trainId)) {
+   230→      groups.set(pm.trainId, []);
+   231→    }
+   232→    groups.get(pm.trainId)!.push(pm);
+   233→  }
+   234→  return groups;
+   235→}
+   236→
+   237→function calculateComplianceProgress(pm: DetailPmBlock): {
+   238→  progress: number;
+   239→  daysRemaining: number;
+   240→  status: 'ok' | 'approaching' | 'violation';
+   241→} {
+   242→  const constraintStart = parseDate(pm.constraintStart);
+   243→  const constraintEnd = parseDate(pm.constraintEnd);
+   244→  const targetDate = parseDate(pm.targetDate);
+   245→  const today = new Date();
+   246→  today.setHours(0, 0, 0, 0);
+   247→
+   248→  const totalWindow = dateDiffDays(constraintEnd, constraintStart) || 1;
+   249→  const positionInWindow = dateDiffDays(targetDate, constraintStart);
+   250→  const daysRemaining = dateDiffDays(constraintEnd, today);
+   251→  const progress = Math.min(100, Math.max(0, (positionInWindow / totalWindow) * 100));
+   252→
+   253→  let status: 'ok' | 'approaching' | 'violation' = 'ok';
+   254→  if (progress > 90 || daysRemaining < 0) {
+   255→    status = 'violation';
+   256→  } else if (progress > 70 || daysRemaining < 7) {
+   257→    status = 'approaching';
+   258→  }
+   259→
+   260→  return { progress, daysRemaining, status };
+   261→}
+   262→
+   263→// =============================================================================
+   264→// Sub-Components
+   265→// =============================================================================
+   266→
+   267→interface ComplianceTimelineProps {
+   268→  pm: DetailPmBlock;
+   269→}
+   270→
+   271→function ComplianceTimeline({ pm }: ComplianceTimelineProps) {
+   272→  const { progress, daysRemaining, status } = calculateComplianceProgress(pm);
+   273→
+   274→  let progressIntent: Intent = Intent.SUCCESS;
+   275→  let statusColor: string = CONSTRAINT_COLORS.ok;
+   276→  if (status === 'violation') {
+   277→    progressIntent = Intent.DANGER;
+   278→    statusColor = CONSTRAINT_COLORS.hardViolation;
+   279→  } else if (status === 'approaching') {
+   280→    progressIntent = Intent.WARNING;
+   281→    statusColor = CONSTRAINT_COLORS.approaching;
+   282→  }
+   283→
+   284→  return (
+   285→    <div style={{ marginTop: 12 }}>
+   286→      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+   287→        <span style={{ fontSize: 11, color: '#64748b' }}>Compliance Window</span>
+   288→        <span style={{ fontSize: 11, color: statusColor, fontWeight: 500 }}>
+   289→          {daysRemaining > 0 ? `${daysRemaining} days remaining` : 'Past deadline'}
+   290→        </span>
+   291→      </div>
+   292→      <ProgressBar
+   293→        value={progress / 100}
+   294→        intent={progressIntent}
+   295→        animate={false}
+   296→        stripes={false}
+   297→      />
+   298→      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+   299→        <span style={{ fontSize: 10, color: '#94a3b8' }}>
+   300→          {formatDate(pm.constraintStart)}
+   301→        </span>
+   302→        <span style={{ fontSize: 10, color: '#1e293b', fontWeight: 500 }}>
+   303→          Scheduled: {formatDate(pm.targetDate)}
+   304→        </span>
+   305→        <span style={{ fontSize: 10, color: '#94a3b8' }}>
+   306→          {formatDate(pm.constraintEnd)}
+   307→        </span>
+   308→      </div>
+   309→    </div>
+   310→  );
+   311→}
+   312→
+   313→interface MaterialsSectionProps {
+   314→  materials: DetailPmBlock['materials'];
+   315→}
+   316→
+   317→function MaterialsSection({ materials }: MaterialsSectionProps) {
+   318→  if (materials.length === 0) {
+   319→    return (
+   320→      <div style={{ padding: '12px 0', color: '#94a3b8', fontStyle: 'italic', fontSize: 12 }}>
+   321→        No materials required for this PM
+   322→      </div>
+   323→    );
+   324→  }
+   325→
+   326→  return (
+   327→    <HTMLTable compact style={{ width: '100%', fontSize: 12 }}>
+   328→      <thead>
+   329→        <tr>
+   330→          <th>Material</th>
+   331→          <th style={{ textAlign: 'center' }}>Required</th>
+   332→          <th style={{ textAlign: 'center' }}>Available</th>
+   333→          <th style={{ textAlign: 'center' }}>Status</th>
+   334→        </tr>
+   335→      </thead>
+   336→      <tbody>
+   337→        {materials.map((material) => (
+   338→          <tr key={material.materialId}>
+   339→            <td>
+   340→              <Tooltip content={material.materialId} position={Position.TOP}>
+   341→                <span>{material.materialName}</span>
+   342→              </Tooltip>
+   343→            </td>
+   344→            <td style={{ textAlign: 'center' }}>{material.quantityRequired}</td>
+   345→            <td style={{ textAlign: 'center' }}>{material.quantityAvailable}</td>
+   346→            <td style={{ textAlign: 'center' }}>
+   347→              <Tag
+   348→                minimal
+   349→                icon={getMaterialStatusIcon(material.status) as 'tick-circle' | 'warning-sign' | 'error' | 'time' | 'help'}
+   350→                intent={getMaterialStatusIntent(material.status)}
+   351→              >
+   352→                {material.status.replace('_', ' ')}
+   353→              </Tag>
+   354→            </td>
+   355→          </tr>
+   356→        ))}
+   357→      </tbody>
+   358→    </HTMLTable>
+   359→  );
+   360→}
+   361→
+   362→interface ChangeHistorySectionProps {
+   363→  history?: ChangeHistoryEntry[];
+   364→}
+   365→
+   366→function ChangeHistorySection({ history }: ChangeHistorySectionProps) {
+   367→  if (!history || history.length === 0) {
+   368→    return (
+   369→      <div style={{ padding: '12px 0', color: '#94a3b8', fontStyle: 'italic', fontSize: 12 }}>
+   370→        No change history available
+   371→      </div>
+   372→    );
+   373→  }
+   374→
+   375→  const getChangeIcon = (type: ChangeHistoryEntry['changeType']) => {
+   376→    switch (type) {
+   377→      case 'CREATE':
+   378→        return 'add';
+   379→      case 'MOVE':
+   380→        return 'move';
+   381→      case 'REASSIGN':
+   382→        return 'swap-horizontal';
+   383→      case 'LOCK':
+   384→        return 'lock';
+   385→      case 'UNLOCK':
+   386→        return 'unlock';
+   387→      case 'STATUS_CHANGE':
+   388→        return 'refresh';
+   389→      default:
+   390→        return 'history';
+   391→    }
+   392→  };
+   393→
+   394→  return (
+   395→    <div style={{ maxHeight: 200, overflowY: 'auto' }}>
+   396→      {history.slice(0, 10).map((entry) => (
+   397→        <div
+   398→          key={entry.id}
+   399→          style={{
+   400→            display: 'flex',
+   401→            alignItems: 'flex-start',
+   402→            padding: '8px 0',
+   403→            borderBottom: '1px solid #f1f5f9',
+   404→          }}
+   405→        >
+   406→          <Icon
+   407→            icon={getChangeIcon(entry.changeType) as 'add' | 'move' | 'swap-horizontal' | 'lock' | 'unlock' | 'refresh' | 'history'}
+   408→            size={14}
+   409→            style={{ marginRight: 8, marginTop: 2, color: '#64748b' }}
+   410→          />
+   411→          <div style={{ flex: 1 }}>
+   412→            <div style={{ fontSize: 12, color: '#1e293b' }}>
+   413→              <strong>{entry.changeType.replace('_', ' ')}</strong>
+   414→              {entry.field && ` - ${entry.field}`}
+   415→            </div>
+   416→            {entry.oldValue && entry.newValue && (
+   417→              <div style={{ fontSize: 11, color: '#64748b' }}>
+   418→                {entry.oldValue} → {entry.newValue}
+   419→              </div>
+   420→            )}
+   421→            <div style={{ fontSize: 10, color: '#94a3b8' }}>
+   422→              {formatDateTime(entry.timestamp)} by {entry.userName}
+   423→            </div>
+   424→          </div>
+   425→        </div>
+   426→      ))}
+   427→    </div>
+   428→  );
+   429→}
+   430→
+   431→interface ConstraintValidationSectionProps {
+   432→  validation?: DetailConstraintValidation;
+   433→}
+   434→
+   435→function ConstraintValidationSection({ validation }: ConstraintValidationSectionProps) {
+   436→  if (!validation) {
+   437→    return (
+   438→      <div style={{ padding: '12px 0' }}>
+   439→        <Tag intent={Intent.SUCCESS} icon="tick">
+   440→          All constraints satisfied
+   441→        </Tag>
+   442→      </div>
+   443→    );
+   444→  }
+   445→
+   446→  if (validation.isValid && validation.warnings.length === 0) {
+   447→    return (
+   448→      <div style={{ padding: '12px 0' }}>
+   449→        <Tag intent={Intent.SUCCESS} icon="tick">
+   450→          All constraints satisfied
+   451→        </Tag>
+   452→      </div>
+   453→    );
+   454→  }
+   455→
+   456→  return (
+   457→    <div style={{ padding: '8px 0' }}>
+   458→      {validation.violations.map((v, i) => (
+   459→        <div
+   460→          key={i}
+   461→          style={{
+   462→            display: 'flex',
+   463→            alignItems: 'center',
+   464→            padding: '6px 8px',
+   465→            marginBottom: 4,
+   466→            backgroundColor: v.type === 'HARD' ? '#fef2f2' : '#fefce8',
+   467→            borderRadius: 4,
+   468→            border: `1px solid ${v.type === 'HARD' ? '#fecaca' : '#fef08a'}`,
+   469→          }}
+   470→        >
+   471→          <Icon
+   472→            icon={v.type === 'HARD' ? 'error' : 'warning-sign'}
+   473→            intent={v.type === 'HARD' ? Intent.DANGER : Intent.WARNING}
+   474→            size={14}
+   475→            style={{ marginRight: 8 }}
+   476→          />
+   477→          <div style={{ flex: 1 }}>
+   478→            <div style={{ fontSize: 12, fontWeight: 500, color: v.type === 'HARD' ? '#dc2626' : '#ca8a04' }}>
+   479→              {v.constraint}
+   480→            </div>
+   481→            <div style={{ fontSize: 11, color: '#64748b' }}>{v.message}</div>
+   482→          </div>
+   483→          {v.canOverride && (
+   484→            <Button small minimal intent={Intent.WARNING}>
+   485→              Override
+   486→            </Button>
+   487→          )}
+   488→        </div>
+   489→      ))}
+   490→      {validation.warnings.map((w, i) => (
+   491→        <div
+   492→          key={`warn-${i}`}
+   493→          style={{
+   494→            display: 'flex',
+   495→            alignItems: 'center',
+   496→            padding: '4px 8px',
+   497→            marginBottom: 4,
+   498→            backgroundColor: '#f0f9ff',
+   499→            borderRadius: 4,
+   500→          }}
+   501→        >
+   502→          <Icon icon="info-sign" intent={Intent.PRIMARY} size={12} style={{ marginRight: 8 }} />
+   503→          <span style={{ fontSize: 11, color: '#0369a1' }}>{w.message}</span>
+   504→        </div>
+   505→      ))}
+   506→    </div>
+   507→  );
+   508→}
+   509→
+   510→interface DetailCardProps {
+   511→  pm: DetailPmBlock;
+   512→  isSelected: boolean;
+   513→  isExpanded: boolean;
+   514→  onSelect?: () => void;
+   515→  onExpand?: () => void;
+   516→  onCollapse?: () => void;
+   517→  onEdit?: (field: string, value: unknown) => void;
+   518→  onLock?: () => void;
+   519→  onUnlock?: () => void;
+   520→  onMove?: (newDate: string) => void;
+   521→  onViewHistory?: () => void;
+   522→}
+   523→
+   524→function DetailCard({
+   525→  pm,
+   526→  isSelected,
+   527→  isExpanded,
+   528→  onSelect,
+   529→  onExpand,
+   530→  onCollapse,
+   531→  onEdit,
+   532→  onLock,
+   533→  onUnlock,
+   534→  onViewHistory,
+   535→}: DetailCardProps) {
+   536→  const statusColor = pm.displayColor || getPmStatusColor(pm.status);
+   537→  const fleetColor = FLEET_COLORS[pm.fleetCode as keyof typeof FLEET_COLORS] || FLEET_COLORS.KS;
+   538→  const historyRef = useRef<HTMLDivElement>(null);
+   539→  const materialsRef = useRef<HTMLDivElement>(null);
+   540→  const constraintsRef = useRef<HTMLDivElement>(null);
+   541→
+   542→  const cardWidth = isExpanded ? LAYOUT.CARD_EXPANDED_WIDTH : LAYOUT.CARD_WIDTH;
+   543→
+   544→  const actionMenu = (
+   545→    <Menu>
+   546→      <MenuItem icon="edit" text="Edit Details" onClick={() => onEdit?.('all', null)} disabled={pm.isLocked} />
+   547→      <MenuItem icon="calendar" text="Reschedule" onClick={() => onEdit?.('targetDate', null)} disabled={pm.isLocked} />
+   548→      <MenuItem icon="swap-horizontal" text="Reassign Track" onClick={() => onEdit?.('track', null)} disabled={pm.isLocked} />
+   549→      <MenuDivider />
+   550→      {pm.isLocked ? (
+   551→        <MenuItem icon="unlock" text="Unlock PM" intent={Intent.WARNING} onClick={onUnlock} />
+   552→      ) : (
+   553→        <MenuItem icon="lock" text="Lock PM" onClick={onLock} />
+   554→      )}
+   555→      <MenuDivider />
+   556→      <MenuItem icon="history" text="View Full History" onClick={onViewHistory} />
+   557→    </Menu>
+   558→  );
+   559→
+   560→  return (
+   561→    <Card
+   562→      elevation={isSelected ? Elevation.THREE : Elevation.ONE}
+   563→      interactive={!isExpanded}
+   564→      onClick={!isExpanded ? onSelect : undefined}
+   565→      style={{
+   566→        width: cardWidth,
+   567→        minHeight: isExpanded ? LAYOUT.CARD_EXPANDED_HEIGHT : LAYOUT.CARD_HEIGHT,
+   568→        borderLeft: `4px solid ${statusColor}`,
+   569→        outline: isSelected ? `2px solid #3b82f6` : 'none',
+   570→        outlineOffset: 2,
+   571→        transition: 'all 0.2s ease',
+   572→        position: 'relative',
+   573→        overflow: 'hidden',
+   574→      }}
+   575→    >
+   576→      {/* Header */}
+   577→      <div style={{ display: 'flex', alignItems: 'flex-start', marginBottom: 12 }}>
+   578→        <div style={{ flex: 1 }}>
+   579→          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+   580→            <span style={{ fontSize: 16, fontWeight: 600, color: '#1e293b' }}>
+   581→              {pm.pmCode}
+   582→            </span>
+   583→            <Tag minimal intent={getPmStatusIntent(pm.status)}>
+   584→              {pm.status.replace('_', ' ')}
+   585→            </Tag>
+   586→            {pm.isLocked && (
+   587→              <Tooltip content="Locked in Maximo - Cannot be modified" position={Position.TOP}>
+   588→                <Icon icon="lock" size={14} style={{ color: '#d97706' }} />
+   589→              </Tooltip>
+   590→            )}
+   591→          </div>
+   592→          <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+   593→            {pm.pmDescription}
+   594→          </div>
+   595→        </div>
+   596→        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+   597→          {isExpanded ? (
+   598→            <Button small minimal icon="collapse-all" onClick={onCollapse} />
+   599→          ) : (
+   600→            <Button small minimal icon="expand-all" onClick={onExpand} />
+   601→          )}
+   602→          <Popover content={actionMenu} position={Position.BOTTOM_RIGHT}>
+   603→            <Button small minimal icon="more" />
+   604→          </Popover>
+   605→        </div>
+   606→      </div>
+   607→
+   608→      {/* Train info row */}
+   609→      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+   610→        <div
+   611→          style={{
+   612→            display: 'flex',
+   613→            alignItems: 'center',
+   614→            gap: 6,
+   615→            padding: '4px 8px',
+   616→            backgroundColor: `${fleetColor}15`,
+   617→            borderRadius: 4,
+   618→          }}
+   619→        >
+   620→          <div
+   621→            style={{
+   622→              width: 4,
+   623→              height: 16,
+   624→              backgroundColor: fleetColor,
+   625→              borderRadius: 2,
+   626→            }}
+   627→          />
+   628→          <span style={{ fontSize: 13, fontWeight: 500, color: '#1e293b' }}>
+   629→            {pm.trainNumber}
+   630→          </span>
+   631→          <span style={{ fontSize: 11, color: '#64748b' }}>{pm.fleetCode}</span>
+   632→        </div>
+   633→        {pm.depotCode && (
+   634→          <div style={{ fontSize: 12, color: '#64748b' }}>
+   635→            <Icon icon="office" size={12} style={{ marginRight: 4 }} />
+   636→            {pm.depotCode}
+   637→          </div>
+   638→        )}
+   639→        {pm.trackNumber && (
+   640→          <div style={{ fontSize: 12, color: '#64748b' }}>
+   641→            <Icon icon="layout-grid" size={12} style={{ marginRight: 4 }} />
+   642→            Track {pm.trackNumber}
+   643→          </div>
+   644→        )}
+   645→      </div>
+   646→
+   647→      {/* Date and duration row */}
+   648→      <div style={{ display: 'flex', gap: 16, marginBottom: 12 }}>
+   649→        <div>
+   650→          <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase' }}>Date</div>
+   651→          <div style={{ fontSize: 13, fontWeight: 500, color: '#1e293b' }}>
+   652→            {formatDate(pm.targetDate)}
+   653→            {pm.durationDays > 1 && (
+   654→              <span style={{ color: '#64748b', fontWeight: 400 }}>
+   655→                {' '}
+   656→                - {formatDate(pm.endDate)}
+   657→              </span>
+   658→            )}
+   659→          </div>
+   660→        </div>
+   661→        <div>
+   662→          <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase' }}>Duration</div>
+   663→          <div style={{ fontSize: 13, fontWeight: 500, color: '#1e293b' }}>
+   664→            {pm.durationDays} day{pm.durationDays > 1 ? 's' : ''}
+   665→            {pm.estimatedHours && (
+   666→              <span style={{ color: '#64748b', fontWeight: 400 }}> ({pm.estimatedHours}h)</span>
+   667→            )}
+   668→          </div>
+   669→        </div>
+   670→        {pm.assignedShift && (
+   671→          <div>
+   672→            <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase' }}>Shift</div>
+   673→            <div style={{ fontSize: 13, fontWeight: 500, color: '#1e293b' }}>{pm.assignedShift}</div>
+   674→          </div>
+   675→        )}
+   676→      </div>
+   677→
+   678→      {/* Compliance timeline */}
+   679→      <ComplianceTimeline pm={pm} />
+   680→
+   681→      {/* Expanded content */}
+   682→      <Collapse isOpen={isExpanded}>
+   683→        <Divider style={{ margin: '16px 0' }} />
+   684→
+   685→        {/* Materials section */}
+   686→        <div ref={materialsRef}>
+   687→          <div style={{ fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 8 }}>
+   688→            <Icon icon="box" size={12} style={{ marginRight: 6 }} />
+   689→            Materials
+   690→          </div>
+   691→          <MaterialsSection materials={pm.materials} />
+   692→        </div>
+   693→
+   694→        <Divider style={{ margin: '16px 0' }} />
+   695→
+   696→        {/* Constraint validation */}
+   697→        <div ref={constraintsRef}>
+   698→          <div style={{ fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 8 }}>
+   699→            <Icon icon="shield" size={12} style={{ marginRight: 6 }} />
+   700→            Constraint Validation
+   701→          </div>
+   702→          <ConstraintValidationSection validation={pm.constraintValidation} />
+   703→        </div>
+   704→
+   705→        <Divider style={{ margin: '16px 0' }} />
+   706→
+   707→        {/* Change history */}
+   708→        <div ref={historyRef}>
+   709→          <div style={{ fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 8 }}>
+   710→            <Icon icon="history" size={12} style={{ marginRight: 6 }} />
+   711→            Recent Changes
+   712→          </div>
+   713→          <ChangeHistorySection history={pm.changeHistory} />
+   714→        </div>
+   715→
+   716→        {/* Actions footer */}
+   717→        <Divider style={{ margin: '16px 0' }} />
+   718→        <ButtonGroup fill>
+   719→          <Button
+   720→            icon="edit"
+   721→            text="Edit"
+   722→            disabled={pm.isLocked}
+   723→            onClick={() => onEdit?.('all', null)}
+   724→          />
+   725→          <Button
+   726→            icon="calendar"
+   727→            text="Reschedule"
+   728→            disabled={pm.isLocked}
+   729→            onClick={() => onEdit?.('targetDate', null)}
+   730→          />
+   731→          {pm.isLocked ? (
+   732→            <Button icon="unlock" text="Unlock" intent={Intent.WARNING} onClick={onUnlock} />
+   733→          ) : (
+   734→            <Button icon="lock" text="Lock" onClick={onLock} />
+   735→          )}
+   736→          <Button icon="history" text="History" onClick={onViewHistory} />
+   737→        </ButtonGroup>
+   738→      </Collapse>
+   739→    </Card>
+   740→  );
+   741→}
+   742→
+   743→// =============================================================================
+   744→// Main Component
+   745→// =============================================================================
+   746→
+   747→export function DetailCardOverlay({
+   748→  data,
+   749→  fromDate,
+   750→  toDate,
+   751→  width,
+   752→  height,
+   753→  selectedPmIds = [],
+   754→  expandedPmIds = [],
+   755→  onPmSelect,
+   756→  onPmExpand,
+   757→  onPmCollapse,
+   758→  onPmEdit,
+   759→  onPmLock,
+   760→  onPmUnlock,
+   761→  onViewHistory,
+   762→}: DetailCardOverlayProps) {
+   763→  const containerRef = useRef<HTMLDivElement>(null);
+   764→
+   765→  if (!data) {
+   766→    return null;
+   767→  }
+   768→
+   769→  const days = getDays(fromDate, toDate);
+   770→  const trainGroups = buildTrainGroups(data.pmBlocks);
+   771→  const trainOrder = Array.from(trainGroups.keys());
+   772→  const selectedSet = new Set(selectedPmIds);
+   773→  const expandedSet = new Set(expandedPmIds);
+   774→
+   775→  const today = new Date();
+   776→  today.setHours(0, 0, 0, 0);
+   777→
+   778→  return (
+   779→    <div
+   780→      ref={containerRef}
+   781→      style={{
+   782→        width,
+   783→        height,
+   784→        overflow: 'auto',
+   785→        backgroundColor: '#f8fafc',
+   786→        fontFamily: LAYOUT.FONT_FAMILY,
+   787→      }}
+   788→    >
+   789→      {/* Timeline header */}
+   790→      <div
+   791→        style={{
+   792→          position: 'sticky',
+   793→          top: 0,
+   794→          zIndex: 10,
+   795→          display: 'flex',
+   796→          backgroundColor: '#ffffff',
+   797→          borderBottom: '1px solid #e2e8f0',
+   798→        }}
+   799→      >
+   800→        {/* Train label header */}
+   801→        <div
+   802→          style={{
+   803→            width: LAYOUT.TRAIN_LABEL_WIDTH,
+   804→            minWidth: LAYOUT.TRAIN_LABEL_WIDTH,
+   805→            height: LAYOUT.HEADER_HEIGHT,
+   806→            padding: 16,
+   807→            backgroundColor: '#f8fafc',
+   808→            borderRight: '1px solid #e2e8f0',
+   809→            display: 'flex',
+   810→            flexDirection: 'column',
+   811→            justifyContent: 'center',
+   812→          }}
+   813→        >
+   814→          <div style={{ fontSize: 14, fontWeight: 600, color: '#1e293b' }}>Trains</div>
+   815→          <div style={{ fontSize: 11, color: '#64748b' }}>{trainOrder.length} trains</div>
+   816→        </div>
+   817→
+   818→        {/* Day columns */}
+   819→        <div style={{ display: 'flex' }}>
+   820→          {days.map((day) => {
+   821→            const isToday = day.getTime() === today.getTime();
+   822→            const isWeekend = day.getDay() === 0 || day.getDay() === 6;
+   823→            const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+   824→
+   825→            return (
+   826→              <div
+   827→                key={day.toISOString()}
+   828→                style={{
+   829→                  width: LAYOUT.DAY_WIDTH,
+   830→                  minWidth: LAYOUT.DAY_WIDTH,
+   831→                  height: LAYOUT.HEADER_HEIGHT,
+   832→                  padding: '12px 8px',
+   833→                  backgroundColor: isToday ? '#dbeafe' : isWeekend ? '#f1f5f9' : '#ffffff',
+   834→                  borderRight: '1px solid #e2e8f0',
+   835→                  textAlign: 'center',
+   836→                }}
+   837→              >
+   838→                <div
+   839→                  style={{
+   840→                    fontSize: 10,
+   841→                    color: isToday ? '#2563eb' : '#94a3b8',
+   842→                    textTransform: 'uppercase',
+   843→                    letterSpacing: '0.5px',
+   844→                  }}
+   845→                >
+   846→                  {dayNames[day.getDay()]}
+   847→                </div>
+   848→                <div
+   849→                  style={{
+   850→                    fontSize: 20,
+   851→                    fontWeight: isToday ? 700 : 500,
+   852→                    color: isToday ? '#2563eb' : '#1e293b',
+   853→                    marginTop: 4,
+   854→                  }}
+   855→                >
+   856→                  {day.getDate()}
+   857→                </div>
+   858→                <div style={{ fontSize: 11, color: '#64748b' }}>
+   859→                  {day.toLocaleDateString('en-US', { month: 'short' })}
+   860→                </div>
+   861→              </div>
+   862→            );
+   863→          })}
+   864→        </div>
+   865→      </div>
+   866→
+   867→      {/* Train rows */}
+   868→      {trainOrder.map((trainId) => {
+   869→        const pms = trainGroups.get(trainId) || [];
+   870→        const firstPm = pms[0];
+   871→        if (!firstPm) return null;
+   872→
+   873→        const fleetColor = FLEET_COLORS[firstPm.fleetCode as keyof typeof FLEET_COLORS] || FLEET_COLORS.KS;
+   874→        const hasExpandedCard = pms.some((pm) => expandedSet.has(pm.pmId));
+   875→        const rowHeight = hasExpandedCard ? LAYOUT.EXPANDED_ROW_HEIGHT : LAYOUT.ROW_HEIGHT;
+   876→
+   877→        return (
+   878→          <div
+   879→            key={trainId}
+   880→            style={{
+   881→              display: 'flex',
+   882→              borderBottom: '1px solid #e2e8f0',
+   883→              minHeight: rowHeight,
+   884→            }}
+   885→          >
+   886→            {/* Train label */}
+   887→            <div
+   888→              style={{
+   889→                width: LAYOUT.TRAIN_LABEL_WIDTH,
+   890→                minWidth: LAYOUT.TRAIN_LABEL_WIDTH,
+   891→                padding: 16,
+   892→                backgroundColor: '#ffffff',
+   893→                borderRight: '1px solid #e2e8f0',
+   894→                position: 'sticky',
+   895→                left: 0,
+   896→                zIndex: 5,
+   897→              }}
+   898→            >
+   899→              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+   900→                <div
+   901→                  style={{
+   902→                    width: 4,
+   903→                    height: 32,
+   904→                    backgroundColor: fleetColor,
+   905→                    borderRadius: 2,
+   906→                  }}
+   907→                />
+   908→                <div>
+   909→                  <div style={{ fontSize: 14, fontWeight: 600, color: '#1e293b' }}>
+   910→                    {firstPm.trainNumber}
+   911→                  </div>
+   912→                  <div style={{ fontSize: 11, color: '#64748b' }}>{firstPm.fleetCode}</div>
+   913→                </div>
+   914→              </div>
+   915→              <div style={{ marginTop: 12, fontSize: 11, color: '#94a3b8' }}>
+   916→                {pms.length} PM{pms.length !== 1 ? 's' : ''} scheduled
+   917→              </div>
+   918→            </div>
+   919→
+   920→            {/* PM cards grid */}
+   921→            <div style={{ flex: 1, position: 'relative', padding: LAYOUT.CARD_MARGIN }}>
+   922→              {pms.map((pm) => {
+   923→                const pmDate = parseDate(pm.targetDate);
+   924→                const dayOffset = dateDiffDays(pmDate, fromDate);
+   925→                if (dayOffset < 0) return null;
+   926→
+   927→                const isSelected = selectedSet.has(pm.pmId);
+   928→                const isExpanded = expandedSet.has(pm.pmId);
+   929→
+   930→                const cardX = dayOffset * LAYOUT.DAY_WIDTH;
+   931→
+   932→                return (
+   933→                  <div
+   934→                    key={pm.pmId}
+   935→                    style={{
+   936→                      position: 'absolute',
+   937→                      left: cardX,
+   938→                      top: 0,
+   939→                      zIndex: isExpanded ? 20 : isSelected ? 15 : 10,
+   940→                    }}
+   941→                  >
+   942→                    <DetailCard
+   943→                      pm={pm}
+   944→                      isSelected={isSelected}
+   945→                      isExpanded={isExpanded}
+   946→                      onSelect={() => onPmSelect?.(pm.pmId)}
+   947→                      onExpand={() => onPmExpand?.(pm.pmId)}
+   948→                      onCollapse={() => onPmCollapse?.(pm.pmId)}
+   949→                      onEdit={(field, value) => onPmEdit?.(pm.pmId, field, value)}
+   950→                      onLock={() => onPmLock?.(pm.pmId)}
+   951→                      onUnlock={() => onPmUnlock?.(pm.pmId)}
+   952→                      onViewHistory={() => onViewHistory?.(pm.pmId)}
+   953→                    />
+   954→                  </div>
+   955→                );
+   956→              })}
+   957→
+   958→              {/* Today indicator line */}
+   959→              {(() => {
+   960→                const todayOffset = dateDiffDays(today, fromDate);
+   961→                if (todayOffset >= 0 && todayOffset < days.length) {
+   962→                  return (
+   963→                    <div
+   964→                      style={{
+   965→                        position: 'absolute',
+   966→                        left: todayOffset * LAYOUT.DAY_WIDTH + LAYOUT.DAY_WIDTH / 2,
+   967→                        top: 0,
+   968→                        bottom: 0,
+   969→                        width: 2,
+   970→                        backgroundColor: '#2563eb',
+   971→                        opacity: 0.3,
+   972→                        zIndex: 1,
+   973→                      }}
+   974→                    />
+   975→                  );
+   976→                }
+   977→                return null;
+   978→              })()}
+   979→            </div>
+   980→          </div>
+   981→        );
+   982→      })}
+   983→    </div>
+   984→  );
+   985→}
+   986→
+   987→export default DetailCardOverlay;
+   988→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

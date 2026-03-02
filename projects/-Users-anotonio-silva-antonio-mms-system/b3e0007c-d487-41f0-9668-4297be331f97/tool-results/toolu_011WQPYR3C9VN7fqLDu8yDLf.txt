@@ -1,0 +1,488 @@
+     1→/**
+     2→ * BowWaveIndicator Component
+     3→ *
+     4→ * Displays bow-wave risk status for maintenance clustering visualization.
+     5→ * Bow-wave occurs when PM work accumulates in later periods, causing
+     6→ * operational overload and potential service disruptions.
+     7→ *
+     8→ * This component shows:
+     9→ * - Current risk level (LOW/MEDIUM/HIGH/CRITICAL)
+    10→ * - Risk score (0-100%)
+    11→ * - Peak periods requiring attention
+    12→ * - Actionable recommendations
+    13→ *
+    14→ * @see specs/006-user-interface.md Section 6.5 - Overlay Panels
+    15→ * @see specs/004-domain-services.md Section 4.6 - Strategic Planner (bow-wave detection)
+    16→ */
+    17→
+    18→import {
+    19→  Tag,
+    20→  Intent,
+    21→  Popover,
+    22→  Menu,
+    23→  MenuItem,
+    24→  MenuDivider,
+    25→  ProgressBar,
+    26→  Tooltip,
+    27→  Spinner,
+    28→  Classes,
+    29→} from '@blueprintjs/core';
+    30→
+    31→import { useOverlay } from '../store';
+    32→import type { OverlaySliceState } from '../store/slices/overlay';
+    33→import {
+    34→  selectBowWaveRiskDisplay,
+    35→  selectBowWavePeakPeriods,
+    36→  selectBowWaveHighPriorityRecommendations,
+    37→  selectBowWaveSummary,
+    38→  loadBowWaveOverlayData,
+    39→  type BowWaveRiskLevel,
+    40→  type BowWavePeakPeriod,
+    41→  type BowWaveRecommendation,
+    42→} from '../store/slices/overlay';
+    43→import { isChaosMonkeyEnabled, toggleChaosMonkeyUrl } from '../demo/chaosMonkey';
+    44→
+    45→// =============================================================================
+    46→// Types
+    47→// =============================================================================
+    48→
+    49→interface BowWaveIndicatorProps {
+    50→  /** Show compact version for toolbar */
+    51→  compact?: boolean;
+    52→  /** Fleet ID to filter by */
+    53→  fleetId?: string;
+    54→  /** Plan ID to show specific plan's bow-wave analysis */
+    55→  planId?: string;
+    56→  /** Custom class name */
+    57→  className?: string;
+    58→}
+    59→
+    60→// =============================================================================
+    61→// Color Mapping
+    62→// =============================================================================
+    63→
+    64→const RISK_INTENT_MAP: Record<BowWaveRiskLevel, Intent> = {
+    65→  LOW: 'success',
+    66→  MEDIUM: 'warning',
+    67→  HIGH: 'warning',
+    68→  CRITICAL: 'danger',
+    69→};
+    70→
+    71→const RISK_ICON_MAP: Record<BowWaveRiskLevel, 'tick-circle' | 'warning-sign' | 'error'> = {
+    72→  LOW: 'tick-circle',
+    73→  MEDIUM: 'warning-sign',
+    74→  HIGH: 'warning-sign',
+    75→  CRITICAL: 'error',
+    76→};
+    77→
+    78→const RECOMMENDATION_ICON_MAP: Record<BowWaveRecommendation['type'], 'arrow-left' | 'arrow-right' | 'people' | 'horizontal-distribution'> = {
+    79→  ADVANCE_PM: 'arrow-left',
+    80→  DEFER_PM: 'arrow-right',
+    81→  ADD_CAPACITY: 'people',
+    82→  SPREAD_WORKLOAD: 'horizontal-distribution',
+    83→};
+    84→
+    85→// =============================================================================
+    86→// Helper Components
+    87→// =============================================================================
+    88→
+    89→function RiskProgressBar({
+    90→  riskScore,
+    91→  riskLevel,
+    92→}: {
+    93→  riskScore: number;
+    94→  riskLevel: BowWaveRiskLevel;
+    95→}) {
+    96→  const intent = RISK_INTENT_MAP[riskLevel];
+    97→
+    98→  return (
+    99→    <div style={{ marginTop: 8 }}>
+   100→      <div
+   101→        style={{
+   102→          display: 'flex',
+   103→          justifyContent: 'space-between',
+   104→          marginBottom: 4,
+   105→          fontSize: 11,
+   106→        }}
+   107→      >
+   108→        <span className={Classes.TEXT_MUTED}>Risk Score</span>
+   109→        <span style={{ fontWeight: 500 }}>{Math.round(riskScore * 100)}%</span>
+   110→      </div>
+   111→      <ProgressBar
+   112→        value={riskScore}
+   113→        intent={intent}
+   114→        stripes={riskLevel === 'CRITICAL'}
+   115→        animate={riskLevel === 'CRITICAL'}
+   116→      />
+   117→    </div>
+   118→  );
+   119→}
+   120→
+   121→function PeakPeriodItem({ period }: { period: BowWavePeakPeriod }) {
+   122→  const intent = RISK_INTENT_MAP[period.riskLevel];
+   123→
+   124→  return (
+   125→    <MenuItem
+   126→      icon="calendar"
+   127→      text={`${period.startQuarter} - ${period.endQuarter}`}
+   128→      labelElement={
+   129→        <Tag minimal intent={intent}>
+   130→          {period.peakLoad} PMs/mo
+   131→        </Tag>
+   132→      }
+   133→    />
+   134→  );
+   135→}
+   136→
+   137→function RecommendationItem({ rec }: { rec: BowWaveRecommendation }) {
+   138→  const priorityIntent: Intent =
+   139→    rec.priority === 'HIGH' ? 'danger' : rec.priority === 'MEDIUM' ? 'warning' : 'none';
+   140→
+   141→  return (
+   142→    <MenuItem
+   143→      icon={RECOMMENDATION_ICON_MAP[rec.type]}
+   144→      text={rec.description}
+   145→      labelElement={
+   146→        <Tag minimal intent={priorityIntent}>
+   147→          {rec.priority}
+   148→        </Tag>
+   149→      }
+   150→    />
+   151→  );
+   152→}
+   153→
+   154→// =============================================================================
+   155→// Popover Content
+   156→// =============================================================================
+   157→
+   158→function BowWavePopoverContent({
+   159→  state,
+   160→  onRefresh,
+   161→}: {
+   162→  state: OverlaySliceState;
+   163→  onRefresh: () => void;
+   164→}) {
+   165→  const riskDisplay = selectBowWaveRiskDisplay(state);
+   166→  const peakPeriods = selectBowWavePeakPeriods(state);
+   167→  const recommendations = selectBowWaveHighPriorityRecommendations(state);
+   168→  const summary = selectBowWaveSummary(state);
+   169→
+   170→  if (state.bowWaveLoading) {
+   171→    return (
+   172→      <Menu>
+   173→        <MenuItem
+   174→          disabled
+   175→          icon={<Spinner size={16} />}
+   176→          text="Loading bow-wave analysis..."
+   177→        />
+   178→      </Menu>
+   179→    );
+   180→  }
+   181→
+   182→  if (state.bowWaveError) {
+   183→    return (
+   184→      <Menu>
+   185→        <MenuItem
+   186→          disabled
+   187→          icon="error"
+   188→          intent="danger"
+   189→          text={`Error: ${state.bowWaveError}`}
+   190→        />
+   191→        <MenuDivider />
+   192→        <MenuItem icon="refresh" text="Retry" onClick={onRefresh} />
+   193→      </Menu>
+   194→    );
+   195→  }
+   196→
+   197→  if (!state.bowWaveData) {
+   198→    return (
+   199→      <Menu>
+   200→        <MenuItem
+   201→          disabled
+   202→          icon="info-sign"
+   203→          text="No bow-wave data available"
+   204→        />
+   205→        <MenuDivider />
+   206→        <MenuItem icon="refresh" text="Load Analysis" onClick={onRefresh} />
+   207→      </Menu>
+   208→    );
+   209→  }
+   210→
+   211→  const { bowWaveData } = state;
+   212→
+   213→  return (
+   214→    <Menu style={{ maxWidth: 400 }}>
+   215→      {/* Header with Risk Level */}
+   216→      <div style={{ padding: '8px 12px' }}>
+   217→        <div
+   218→          style={{
+   219→            display: 'flex',
+   220→            alignItems: 'center',
+   221→            justifyContent: 'space-between',
+   222→            marginBottom: 8,
+   223→          }}
+   224→        >
+   225→          <span style={{ fontWeight: 600, fontSize: 14 }}>{riskDisplay.label}</span>
+   226→          <Tag
+   227→            large
+   228→            intent={RISK_INTENT_MAP[riskDisplay.level]}
+   229→            icon={RISK_ICON_MAP[riskDisplay.level]}
+   230→          >
+   231→            {riskDisplay.level}
+   232→          </Tag>
+   233→        </div>
+   234→
+   235→        <RiskProgressBar
+   236→          riskScore={bowWaveData.riskScore}
+   237→          riskLevel={riskDisplay.level}
+   238→        />
+   239→      </div>
+   240→
+   241→      <MenuDivider />
+   242→
+   243→      {/* Summary Stats */}
+   244→      {summary && (
+   245→        <>
+   246→          <div style={{ padding: '8px 12px' }}>
+   247→            <div className={Classes.TEXT_MUTED} style={{ fontSize: 11, marginBottom: 6 }}>
+   248→              Load Distribution
+   249→            </div>
+   250→            <div
+   251→              style={{
+   252→                display: 'grid',
+   253→                gridTemplateColumns: '1fr 1fr',
+   254→                gap: 8,
+   255→                fontSize: 12,
+   256→              }}
+   257→            >
+   258→              <div>
+   259→                <span className={Classes.TEXT_MUTED}>First Half: </span>
+   260→                <span style={{ fontWeight: 500 }}>{summary.firstHalfLoad} PMs</span>
+   261→              </div>
+   262→              <div>
+   263→                <span className={Classes.TEXT_MUTED}>Second Half: </span>
+   264→                <span style={{ fontWeight: 500 }}>{summary.secondHalfLoad} PMs</span>
+   265→              </div>
+   266→              <div>
+   267→                <span className={Classes.TEXT_MUTED}>Imbalance: </span>
+   268→                <span
+   269→                  style={{
+   270→                    fontWeight: 500,
+   271→                    color:
+   272→                      summary.loadImbalanceRatio > 1.5
+   273→                        ? '#DC2626'
+   274→                        : summary.loadImbalanceRatio > 1.2
+   275→                          ? '#F59E0B'
+   276→                          : '#10B981',
+   277→                  }}
+   278→                >
+   279→                  {summary.loadImbalanceRatio.toFixed(2)}x
+   280→                </span>
+   281→              </div>
+   282→              <div>
+   283→                <span className={Classes.TEXT_MUTED}>Total: </span>
+   284→                <span style={{ fontWeight: 500 }}>{summary.totalPms} PMs</span>
+   285→              </div>
+   286→            </div>
+   287→          </div>
+   288→          <MenuDivider />
+   289→        </>
+   290→      )}
+   291→
+   292→      {/* Peak Periods */}
+   293→      {peakPeriods.length > 0 && (
+   294→        <>
+   295→          <MenuItem disabled text="Peak Periods" icon="timeline-events" />
+   296→          {peakPeriods.slice(0, 3).map((period, idx) => (
+   297→            <PeakPeriodItem key={idx} period={period} />
+   298→          ))}
+   299→          {peakPeriods.length > 3 && (
+   300→            <MenuItem
+   301→              disabled
+   302→              text={`... and ${peakPeriods.length - 3} more`}
+   303→              className={Classes.TEXT_MUTED}
+   304→            />
+   305→          )}
+   306→          <MenuDivider />
+   307→        </>
+   308→      )}
+   309→
+   310→      {/* Recommendations */}
+   311→      {recommendations.length > 0 && (
+   312→        <>
+   313→          <MenuItem disabled text="Recommendations" icon="lightbulb" />
+   314→          {recommendations.slice(0, 3).map((rec, idx) => (
+   315→            <RecommendationItem key={idx} rec={rec} />
+   316→          ))}
+   317→          {recommendations.length > 3 && (
+   318→            <MenuItem
+   319→              disabled
+   320→              text={`... and ${recommendations.length - 3} more`}
+   321→              className={Classes.TEXT_MUTED}
+   322→            />
+   323→          )}
+   324→          <MenuDivider />
+   325→        </>
+   326→      )}
+   327→
+   328→      {/* Actions */}
+   329→      <MenuItem icon="refresh" text="Refresh Analysis" onClick={onRefresh} />
+   330→      <MenuItem icon="chart" text="View Full Report" />
+   331→    </Menu>
+   332→  );
+   333→}
+   334→
+   335→// =============================================================================
+   336→// Main Component
+   337→// =============================================================================
+   338→
+   339→export function BowWaveIndicator({
+   340→  compact = false,
+   341→  fleetId,
+   342→  planId,
+   343→  className,
+   344→}: BowWaveIndicatorProps) {
+   345→  const { state: rawState, actions } = useOverlay();
+   346→  const state = rawState as unknown as OverlaySliceState;
+   347→
+   348→  // Check URL params for chaos monkey on first render (deferred to avoid render-time effects)
+   349→  // This only runs once since chaosMonkeyEnabled state persists
+   350→  if (
+   351→    typeof window !== 'undefined' &&
+   352→    !state.chaosMonkeyEnabled &&
+   353→    state.bowWaveLastFetch === null
+   354→  ) {
+   355→    const urlChaos = isChaosMonkeyEnabled();
+   356→    if (urlChaos) {
+   357→      // Defer state update to next microtask to avoid render-time side effects
+   358→      Promise.resolve().then(() => {
+   359→        actions.setChaosMonkeyEnabled(true);
+   360→      });
+   361→    }
+   362→  }
+   363→
+   364→  // Load data callback
+   365→  const loadData = () => {
+   366→    loadBowWaveOverlayData(
+   367→      {
+   368→        setBowWaveLoading: actions.setBowWaveLoading,
+   369→        setBowWaveData: actions.setBowWaveData,
+   370→        setBowWaveError: actions.setBowWaveError,
+   371→      },
+   372→      { fleetId, planId, chaosMonkey: state.chaosMonkeyEnabled }
+   373→    );
+   374→  };
+   375→
+   376→  // Handle Shift+Click to toggle chaos monkey (hidden demo feature)
+   377→  const handleClick = (e: React.MouseEvent) => {
+   378→    if (e.shiftKey) {
+   379→      e.preventDefault();
+   380→      e.stopPropagation();
+   381→
+   382→      const newEnabled = !state.chaosMonkeyEnabled;
+   383→      actions.toggleChaosMonkey();
+   384→      toggleChaosMonkeyUrl(newEnabled);
+   385→
+   386→      // Reload data with new chaos state
+   387→      Promise.resolve().then(loadData);
+   388→    }
+   389→  };
+   390→
+   391→  // Auto-load data on initial render if never loaded
+   392→  // Conditions: never fetched, not currently loading, no data, and no error
+   393→  // The error check prevents infinite retry loops when the API is unavailable
+   394→  const shouldAutoLoad =
+   395→    state.bowWaveLastFetch === null &&
+   396→    !state.bowWaveLoading &&
+   397→    state.bowWaveData === null &&
+   398→    state.bowWaveError === null;
+   399→
+   400→  if (shouldAutoLoad) {
+   401→    // Defer load to next microtask to avoid state updates during render
+   402→    Promise.resolve().then(loadData);
+   403→  }
+   404→
+   405→  const riskDisplay = selectBowWaveRiskDisplay(state);
+   406→  const intent = state.chaosMonkeyEnabled ? 'danger' : RISK_INTENT_MAP[riskDisplay.level];
+   407→  const icon = state.chaosMonkeyEnabled ? 'flame' : RISK_ICON_MAP[riskDisplay.level];
+   408→
+   409→  // Loading state
+   410→  if (state.bowWaveLoading && !state.bowWaveData) {
+   411→    return (
+   412→      <Tag minimal className={className}>
+   413→        <Spinner size={12} />
+   414→        <span style={{ marginLeft: 6 }}>Loading...</span>
+   415→      </Tag>
+   416→    );
+   417→  }
+   418→
+   419→  // Tooltip content with chaos monkey hint
+   420→  const tooltipContent = state.chaosMonkeyEnabled
+   421→    ? 'Chaos Monkey ACTIVE - Shift+Click to disable'
+   422→    : `${riskDisplay.label} (Shift+Click for Chaos Monkey)`;
+   423→
+   424→  // Compact version for toolbar
+   425→  if (compact) {
+   426→    return (
+   427→      <Popover
+   428→        content={<BowWavePopoverContent state={state} onRefresh={loadData} />}
+   429→        placement="bottom"
+   430→        interactionKind="hover"
+   431→        hoverOpenDelay={200}
+   432→      >
+   433→        <Tooltip content={tooltipContent} placement="bottom">
+   434→          <Tag
+   435→            intent={intent}
+   436→            icon={icon}
+   437→            interactive
+   438→            className={className}
+   439→            style={{ cursor: 'pointer' }}
+   440→            onClick={handleClick}
+   441→          >
+   442→            {state.chaosMonkeyEnabled && (
+   443→              <span style={{ marginRight: 4 }}>CHAOS</span>
+   444→            )}
+   445→            {state.bowWaveData
+   446→              ? `${Math.round(state.bowWaveData.riskScore * 100)}%`
+   447→              : 'N/A'}
+   448→          </Tag>
+   449→        </Tooltip>
+   450→      </Popover>
+   451→    );
+   452→  }
+   453→
+   454→  // Full version for status bar
+   455→  return (
+   456→    <Popover
+   457→      content={<BowWavePopoverContent state={state} onRefresh={loadData} />}
+   458→      placement="top"
+   459→      interactionKind="hover"
+   460→      hoverOpenDelay={200}
+   461→    >
+   462→      <Tooltip content="Shift+Click for Chaos Monkey" placement="top">
+   463→        <Tag
+   464→          intent={intent}
+   465→          icon={icon}
+   466→          interactive
+   467→          className={className}
+   468→          style={{ cursor: 'pointer' }}
+   469→          onClick={handleClick}
+   470→        >
+   471→          {state.chaosMonkeyEnabled ? 'CHAOS MONKEY' : riskDisplay.label}
+   472→          {state.bowWaveData && (
+   473→            <span style={{ marginLeft: 6, opacity: 0.8 }}>
+   474→              ({Math.round(state.bowWaveData.riskScore * 100)}%)
+   475→            </span>
+   476→          )}
+   477→        </Tag>
+   478→      </Tooltip>
+   479→    </Popover>
+   480→  );
+   481→}
+   482→
+   483→export default BowWaveIndicator;
+   484→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,270 @@
+     1→# MMS Operational Guide
+     2→
+     3→## Quick Reference
+     4→
+     5→```bash
+     6→# Full stack (dev)
+     7→docker-compose up -d
+     8→bun run dev
+     9→
+    10→# Tests
+    11→bun test                    # Unit tests
+    12→bun test:watch             # Watch mode
+    13→bun run test:integration   # Integration (needs Docker)
+    14→
+    15→# Validation (run in order!)
+    16→bun run typecheck          # TypeScript strict
+    17→bun run lint               # ESLint
+    18→bun run build              # Full build
+    19→```
+    20→
+    21→## Validation Order (Backpressure)
+    22→
+    23→**IMPORTANT: Run these in order after implementing changes:**
+    24→
+    25→```bash
+    26→# 1. Unit tests for changed files
+    27→bun test <path-to-changed-file>
+    28→
+    29→# 2. TypeScript type checking
+    30→bun run typecheck
+    31→
+    32→# 3. Linting
+    33→bun run lint
+    34→
+    35→# 4. Full build
+    36→bun run build
+    37→
+    38→# 5. Integration tests (if touching API/DB/services/workers)
+    39→PORT=0 bun run test:integration
+    40→
+    41→# 6. E2E via Playwright MCP (if UI modified)
+    42→# Use mcp__playwright__* tools directly - see PROMPT_build.md step 103
+    43→```
+    44→
+    45→**Port Configuration:**
+    46→- Always use `PORT=0` for random port assignment
+    47→- Parse actual port from server startup output
+    48→- Never hardcode ports in tests
+    49→
+    50→All must pass before committing. 12-year contract demands production-grade quality gates.
+    51→
+    52→## Build & Run
+    53→
+    54→### Development Environment
+    55→
+    56→```bash
+    57→# Start infrastructure
+    58→docker-compose up -d postgres redis minio
+    59→
+    60→# Install dependencies
+    61→bun install
+    62→
+    63→# Run migrations
+    64→bun run db:migrate
+    65→
+    66→# Seed demo data (optional)
+    67→bun run db:seed
+    68→
+    69→# Start dev server
+    70→bun run dev
+    71→```
+    72→
+    73→### C++ Optimizer Build
+    74→
+    75→```bash
+    76→# Prerequisites: cmake, or-tools
+    77→cd src/optimizer
+    78→mkdir build && cd build
+    79→cmake .. -DCMAKE_BUILD_TYPE=Release
+    80→make -j$(nproc)
+    81→
+    82→# Binary location: src/optimizer/build/mms-optimizer
+    83→```
+    84→
+    85→### Docker Full Stack
+    86→
+    87→```bash
+    88→docker-compose -f docker-compose.full.yml up -d
+    89→
+    90→# Services:
+    91→# - postgres:5432
+    92→# - redis:6379
+    93→# - minio:9000 (console: 9001)
+    94→# - api:8000
+    95→# - websocket:8001
+    96→# - frontend:3000
+    97→```
+    98→
+    99→## Database
+   100→
+   101→### Migrations
+   102→```bash
+   103→bun run db:migrate              # Run pending
+   104→bun run db:migrate:status       # Check status
+   105→bun run db:rollback             # Rollback last
+   106→```
+   107→
+   108→### Drizzle Studio
+   109→```bash
+   110→bun run db:studio               # Opens at localhost:4983
+   111→```
+   112→
+   113→### Direct Access
+   114→```bash
+   115→docker exec -it mms-postgres psql -U mms -d mms_dev
+   116→```
+   117→
+   118→## Environment Variables
+   119→
+   120→```bash
+   121→# Required
+   122→DATABASE_URL=postgresql://mms:mms@localhost:5432/mms_dev
+   123→REDIS_URL=redis://localhost:6379
+   124→MINIO_ENDPOINT=localhost:9000
+   125→MINIO_ACCESS_KEY=mms
+   126→MINIO_SECRET_KEY=mms_secret
+   127→
+   128→# Optional
+   129→LOG_LEVEL=debug
+   130→OPTIMIZER_PATH=./src/optimizer/build/mms-optimizer
+   131→MAXIMO_API_URL=http://maximo.example.com/api
+   132→```
+   133→
+   134→## Codebase Patterns
+   135→
+   136→### Domain Services
+   137→- Location: `src/services/`
+   138→- Pattern: Class with injected dependencies
+   139→- All services emit OpenTelemetry traces
+   140→- Use Drizzle ORM for database access
+   141→
+   142→### API Routes
+   143→- Location: `src/api/routes/`
+   144→- Framework: Hono
+   145→- All routes have OpenAPI spec
+   146→- Use @belt/tools createSchema for validation
+   147→
+   148→### Workers
+   149→- Location: `src/workers/`
+   150→- Framework: BullMQ (Redis-backed)
+   151→- Central exports: `src/workers/index.ts`
+   152→- Use `registerWorker()` to create new workers
+   153→- 8 queues: ingestion, tactical_scheduler, strategic_planner, optimizer, manhour_leveling, drift_monitor, notification, report
+   154→
+   155→**Running Workers:**
+   156→```bash
+   157→# Start all workers
+   158→bun run src/workers/runner.ts
+   159→
+   160→# Start specific workers only
+   161→WORKERS=optimizer,drift_monitor bun run src/workers/runner.ts
+   162→
+   163→# Workers require Redis to be running
+   164→docker-compose up -d redis
+   165→```
+   166→
+   167→**Implemented Processors:**
+   168→- `optimizer` - Run assignment optimization
+   169→- `drift_monitor` - Baseline drift analysis
+   170→- `ingestion` - CSV mileage file processing
+   171→- `maximo_sync` - Bidirectional sync with Maximo (push/pull/full)
+   172→
+   173→**Pending Processors (null placeholders):**
+   174→- tactical_scheduler, strategic_planner, manhour_leveling, notification, report
+   175→
+   176→### Optimizer IPC
+   177→- Protocol: NDJSON over stdin/stdout
+   178→- Input: `{ type: "solve", data: {...} }`
+   179→- Output: `{ type: "progress" | "solution" | "error", ... }`
+   180→
+   181→### Validation & State Management (@belt/tools)
+   182→
+   183→> **CRITICAL**: See README.md for complete @belt/tools API reference
+   184→
+   185→**Schema Validation** (replaces Zod):
+   186→```typescript
+   187→import { createSchema, createType, InferType } from '@belt/tools';
+   188→
+   189→const TrainModel = createSchema({
+   190→  id: 'string',
+   191→  trainNumber: 'string',
+   192→  mileageKm: 'number',
+   193→  fitnessStatus: { enum: ['FIT', 'RESTRICTED', 'GROUNDED'] },
+   194→});
+   195→type Train = InferType<typeof TrainModel>;
+   196→const train = TrainModel.parse(data);
+   197→```
+   198→
+   199→**State Management** (replaces React hooks + zustand):
+   200→```typescript
+   201→import { createSlice, createMachine } from '@belt/tools';
+   202→
+   203→const fleetSlice = createSlice({
+   204→  id: 'fleet',
+   205→  initial: { trains: [], selected: null },
+   206→  cache: { policy: 'session' },
+   207→  reducers: {
+   208→    setTrains: (state, trains) => { state.trains = trains; },
+   209→  },
+   210→});
+   211→
+   212→const machine = createMachine({
+   213→  id: 'mms',
+   214→  slices: { fleet: fleetSlice },
+   215→  trackMetadata: false, // Critical for 60fps
+   216→});
+   217→
+   218→// In React component (NO useState/useEffect!)
+   219→const { state, actions } = machine.useMachine('fleet');
+   220→```
+   221→
+   222→### Forbidden Packages (enforced by .claude/hooks/)
+   223→
+   224→> These packages are BLOCKED by .claude/hooks/block-forbidden-packages.sh
+   225→
+   226→| Forbidden | Use Instead |
+   227→|-----------|-------------|
+   228→| zustand, redux, mobx, xstate | @belt/tools createMachine/createSlice |
+   229→| @mui, antd, @patternfly | @blueprintjs/core |
+   230→| tailwind | BlueprintJS styles |
+   231→| next.js | Vite SPA |
+   232→
+   233→### React Hook Restrictions (enforced by .agentrc.ts)
+   234→
+   235→> These React hooks are BLOCKED - use @belt/tools machine instead
+   236→
+   237→- ❌ useState, useEffect, useReducer, useContext
+   238→- ❌ useCallback, useMemo, useLayoutEffect
+   239→- ❌ useTransition, useDeferredValue
+   240→- ✅ useRef (explicitly allowed)
+   241→
+   242→## Common Issues
+   243→
+   244→### Port conflicts
+   245→```bash
+   246→lsof -i :5432  # Check postgres
+   247→lsof -i :6379  # Check redis
+   248→```
+   249→
+   250→### Database connection
+   251→```bash
+   252→# Reset completely
+   253→docker-compose down -v
+   254→docker-compose up -d postgres
+   255→bun run db:migrate
+   256→```
+   257→
+   258→### Optimizer not found
+   259→```bash
+   260→# Check binary exists
+   261→ls -la src/optimizer/build/mms-optimizer
+   262→
+   263→# Rebuild if needed
+   264→cd src/optimizer/build && make clean && make
+   265→```
+   266→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

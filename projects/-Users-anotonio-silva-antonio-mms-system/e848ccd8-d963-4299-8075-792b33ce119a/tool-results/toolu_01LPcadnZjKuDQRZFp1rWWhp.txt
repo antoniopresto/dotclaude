@@ -1,0 +1,120 @@
+     1→/**
+     2→ * MMS Database Connection
+     3→ *
+     4→ * PostgreSQL connection pool using postgres.js driver with Drizzle ORM.
+     5→ * Configured for production use with health checks and connection limits.
+     6→ *
+     7→ * Environment Variables:
+     8→ * - DATABASE_URL: PostgreSQL connection string (required)
+     9→ * - DATABASE_MAX_CONNECTIONS: Max pool size (default: 20)
+    10→ * - DATABASE_SSL: Enable SSL (default: true in production)
+    11→ *
+    12→ * @see specs/008-operations-deployment.md for production configuration
+    13→ */
+    14→
+    15→import { drizzle } from 'drizzle-orm/postgres-js';
+    16→import postgres from 'postgres';
+    17→import * as schema from './schema';
+    18→
+    19→/**
+    20→ * Database configuration from environment
+    21→ */
+    22→const config = {
+    23→  url: process.env['DATABASE_URL'] ?? 'postgresql://mms:mms_dev_password@localhost:5432/mms',
+    24→  maxConnections: parseInt(process.env['DATABASE_MAX_CONNECTIONS'] ?? '20', 10),
+    25→  ssl: process.env['DATABASE_SSL'] === 'true' || process.env['NODE_ENV'] === 'production',
+    26→  idleTimeout: 20, // seconds
+    27→  connectTimeout: 10, // seconds
+    28→};
+    29→
+    30→/**
+    31→ * PostgreSQL connection pool
+    32→ *
+    33→ * Using postgres.js for:
+    34→ * - Native ESM support
+    35→ * - Excellent TypeScript support
+    36→ * - Prepared statements
+    37→ * - Connection pooling
+    38→ */
+    39→export const sql = postgres(config.url, {
+    40→  max: config.maxConnections,
+    41→  idle_timeout: config.idleTimeout,
+    42→  connect_timeout: config.connectTimeout,
+    43→  ssl: config.ssl ? { rejectUnauthorized: false } : false,
+    44→  // Prepare statements for better performance
+    45→  prepare: true,
+    46→  // Transform column names from snake_case to camelCase
+    47→  // Note: Drizzle handles this, so we keep original names
+    48→  transform: {
+    49→    undefined: null,
+    50→  },
+    51→  // Connection event handlers for logging/monitoring
+    52→  onnotice: () => {
+    53→    // Suppress notices in production
+    54→  },
+    55→});
+    56→
+    57→/**
+    58→ * Drizzle ORM instance
+    59→ *
+    60→ * Provides type-safe query builder with full schema awareness.
+    61→ * All queries automatically use the connection pool.
+    62→ */
+    63→export const db = drizzle(sql, {
+    64→  schema,
+    65→  logger: process.env['NODE_ENV'] === 'development',
+    66→});
+    67→
+    68→/**
+    69→ * Database health check
+    70→ *
+    71→ * Use this for liveness/readiness probes in Kubernetes.
+    72→ * Returns true if the database is reachable and responsive.
+    73→ */
+    74→export async function checkDatabaseHealth(): Promise<boolean> {
+    75→  try {
+    76→    const result = await sql`SELECT 1 as health`;
+    77→    return result.length === 1 && result[0]?.health === 1;
+    78→  } catch {
+    79→    return false;
+    80→  }
+    81→}
+    82→
+    83→/**
+    84→ * Graceful shutdown
+    85→ *
+    86→ * Close all database connections gracefully.
+    87→ * Call this during application shutdown.
+    88→ */
+    89→export async function closeDatabaseConnection(): Promise<void> {
+    90→  await sql.end();
+    91→}
+    92→
+    93→/**
+    94→ * Database transaction helper
+    95→ *
+    96→ * Executes a function within a database transaction.
+    97→ * Automatically commits on success or rolls back on error.
+    98→ *
+    99→ * @example
+   100→ * const result = await withTransaction(async (tx) => {
+   101→ *   await tx.insert(trains).values({ ... });
+   102→ *   await tx.insert(pmSchedule).values({ ... });
+   103→ *   return { success: true };
+   104→ * });
+   105→ */
+   106→export type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+   107→
+   108→export async function withTransaction<T>(
+   109→  fn: (tx: Transaction) => Promise<T>
+   110→): Promise<T> {
+   111→  return db.transaction(async (tx) => fn(tx));
+   112→}
+   113→
+   114→// Export types for use in services
+   115→export type Database = typeof db;
+   116→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

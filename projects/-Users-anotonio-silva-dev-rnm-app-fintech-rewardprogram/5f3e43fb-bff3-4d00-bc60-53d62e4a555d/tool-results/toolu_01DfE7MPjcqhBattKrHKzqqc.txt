@@ -1,0 +1,1725 @@
+commit 6989f6204f53167d182bcdfc7eba35e58c544508
+Author: antoniopresto <antoniopresto@gmail.com>
+Date:   Tue Feb 10 21:46:56 2026 -0300
+
+    feature: migrate OrderDetail feature
+
+diff --git a/src/routes/Models/index.ts b/src/routes/Models/index.ts
+index 4455ab0c..1414fe4b 100644
+--- a/src/routes/Models/index.ts
++++ b/src/routes/Models/index.ts
+@@ -44,6 +44,13 @@ export type PropsFintechCardRoutes = {
+   } & OptionalAnalyticsProps;
+   ExtractRewardProgram: OptionalAnalyticsProps;
+   MyOrdersRewardProgram: OptionalAnalyticsProps;
++  MyOrdersDetails: {
++    transactionId: string;
++    type?: string;
++    icon?: string;
++    status?: string;
++    origination?: string;
++  } & OptionalAnalyticsProps;
+ };
+ 
+ export type PropsRootStack = PropsFintechCardRoutes;
+diff --git a/src/routes/index.tsx b/src/routes/index.tsx
+index 62e500b2..f59f7e35 100644
+--- a/src/routes/index.tsx
++++ b/src/routes/index.tsx
+@@ -7,6 +7,7 @@ import InvoiceCashbackOnboarding from '../screens/InvoiceCashbackOnboarding';
+ import InvoiceCashbackPoints from '../screens/InvoiceCashbackPoints';
+ import InvoiceCashbackSummary from '../screens/InvoiceCashbackSummary';
+ import LearnMoreRewardProgram from '../screens/LearnMoreRewardProgram';
++import MyOrdersDetails from '../screens/MyOrdersDetails';
+ import MyOrdersRewardProgram from '../screens/MyOrdersRewardProgram';
+ import Points from '../screens/Points';
+ import PointsDetail from '../screens/PointsDetail';
+@@ -50,5 +51,6 @@ export const RewardsProgramRoutes = (
+       name="MyOrdersRewardProgram"
+       component={MyOrdersRewardProgram}
+     />
++    <Stack.Screen name="MyOrdersDetails" component={MyOrdersDetails} />
+   </>
+ );
+diff --git a/src/screens/ExtractRewardProgram/index.ts b/src/screens/ExtractRewardProgram/index.ts
+index b164c4c4..ea1fe632 100644
+--- a/src/screens/ExtractRewardProgram/index.ts
++++ b/src/screens/ExtractRewardProgram/index.ts
+@@ -456,6 +456,10 @@ export function useExtractRewardProgramScreen(
+             label: 'Expirados',
+             value: 'EXPIRED',
+           },
++          {
++            label: 'Estornados',
++            value: 'REFUNDED',
++          },
+         ],
+       },
+     ];
+diff --git a/src/screens/MyOrdersDetails/Models/index.ts b/src/screens/MyOrdersDetails/Models/index.ts
+new file mode 100644
+index 00000000..5246b750
+--- /dev/null
++++ b/src/screens/MyOrdersDetails/Models/index.ts
+@@ -0,0 +1,62 @@
++import type { PropsModalizeRef } from '@semparar/design-system-app/src/@types/modelize';
++import type { TypesTagLabel } from '@semparar/design-system-app/src/atomic/molecules/TagLabel/Models';
++import type { RefObject } from 'react';
++import type { PointsTransaction } from '../../../services/models';
++
++export { TYPE_LABELS } from '../../../services/models';
++export type { TransactionType } from '../../../services/models';
++
++export const STATUS_COLORS: Record<string, TypesTagLabel> = {
++  Disponível: 'success',
++  Confirmado: 'highlight',
++  Estornado: 'error',
++  Pendente: 'neutral',
++  Aguardando: 'neutral',
++  Waiting: 'neutral',
++  Enviado: 'success',
++  Finalizado: 'success',
++  Cancelado: 'error',
++};
++
++export interface MarketplaceItemData {
++  name: string;
++  quantity: number;
++  valuePoints: number | string;
++  imageUrl?: string;
++  cleanedImageUrl?: string;
++}
++
++export interface MarketplaceContentData {
++  orderNumber: string;
++  status?: string;
++  statusColor?: string;
++  paymentType?: string;
++  shippingValuePoints?: number | string;
++  valuePoints?: number | string;
++  vendorName?: string;
++  items: MarketplaceItemData[];
++}
++
++export interface MyOrdersDetailProps {
++  handleGoBack: () => void;
++  modalizeRef: RefObject<PropsModalizeRef | null>;
++  modalizeRefInfo: RefObject<PropsModalizeRef | null>;
++  handleOpenReportProblem: () => void;
++  handleCloseReportProblem: () => void;
++  handleOpenInfo: () => void;
++  handleCloseInfo: () => void;
++  transaction?: PointsTransaction;
++  isLoading?: boolean;
++  hasError?: boolean;
++  handleRetry?: () => void;
++  isCashback?: boolean;
++  cardTitle: string;
++  formattedPointsValue: string;
++  highlightText: string;
++  formattedCurrencyValue: string;
++  marketplaceContent?: MarketplaceContentData;
++  showOrderNumber: boolean;
++  showStatus: boolean;
++  showValue: boolean;
++  height: number;
++}
+diff --git a/src/screens/MyOrdersDetails/index.tsx b/src/screens/MyOrdersDetails/index.tsx
+new file mode 100644
+index 00000000..3bb7ec1c
+--- /dev/null
++++ b/src/screens/MyOrdersDetails/index.tsx
+@@ -0,0 +1,284 @@
++import { useFocusEffect, useNavigation } from '@react-navigation/native';
++import type { PropsModalizeRef } from '@semparar/design-system-app/src/@types/modelize';
++import React, { useCallback, useMemo, useRef } from 'react';
++import { Dimensions } from 'react-native';
++import { useShallow } from 'zustand/react/shallow';
++import {
++  eventModalView,
++  eventScreenViewV3,
++  eventSelectContent,
++} from '~/constants/functions';
++import { useRootStore } from '~/store';
++import type { ScreenProps } from '../../routes/Models';
++import { OrderDetailStatus, type TransactionType } from '../../services/models';
++import { moment } from '../../services/moment';
++import { getOrderDetail } from '../../services/services';
++import { formatToCurrency } from '../../utils/functions';
++import type { MarketplaceContentData, MarketplaceItemData } from './Models';
++import { STATUS_COLORS } from './Models';
++import {
++  getCleanedImageUrl,
++  getFormattedHighlightText,
++  getFormattedPointsValue,
++  getFormattedPointsValueForMarketplace,
++  getMarketplaceTitle,
++  getPaymentTypeLabel,
++  getTransactionGainType,
++} from './utils';
++import MyOrdersDetailView from './view';
++
++const MyOrdersDetails = ({ route }: ScreenProps<'MyOrdersDetails'>) => {
++  const navigation = useNavigation();
++  const hasFocused = useRef(false);
++  const modalizeRef = useRef<PropsModalizeRef>(null);
++  const modalizeRefInfo = useRef<PropsModalizeRef>(null);
++
++  const { orderDetail, orderDetailActions } = useRootStore(
++    useShallow(state => ({
++      orderDetail: state.orderDetail,
++      orderDetailActions: state.orderDetailActions,
++    })),
++  );
++
++  const transactionId = route.params?.transactionId;
++  const passedType = route.params?.type;
++  const passedIcon = route.params?.icon;
++  const passedStatus = route.params?.status;
++  const passedOrigination = route.params?.origination;
++
++  useFocusEffect(
++    useCallback(() => {
++      if (!hasFocused.current) {
++        eventScreenViewV3(
++          'detalhe_pedido',
++          'hub_recompensas_spmais',
++          'monetizacao',
++          {
++            location_1: 'monetizacao',
++            location_2: 'hub_recompensas_spmais',
++            location_3: 'detalhe_pedido',
++          },
++        );
++        hasFocused.current = true;
++      }
++
++      if (transactionId) {
++        orderDetailActions.reset();
++        getOrderDetail({ transactionId });
++      }
++
++      return () => {
++        hasFocused.current = false;
++        orderDetailActions.reset();
++      };
++    }, [
++      transactionId,
++      orderDetailActions,
++    ]),
++  );
++
++  const handleGoBack = () => {
++    navigation.goBack();
++  };
++
++  const handleOpenReportProblem = () => {
++    eventSelectContent({
++      content_type: 'cta',
++      content_id: 'relatar_problema',
++      location_1: 'monetizacao',
++      location_2: 'hub_recompensas_spmais',
++      location_3: 'detalhe_pedido',
++    });
++
++    eventModalView({
++      content_id: 'contato_telefones',
++      location_1: 'monetizacao',
++      location_2: 'hub_recompensas_spmais',
++      location_3: 'detalhe_pedido',
++    });
++
++    modalizeRef.current?.open?.();
++  };
++
++  const handleCloseReportProblem = () => {
++    modalizeRef.current?.close?.();
++  };
++
++  const handleOpenInfo = () => {
++    modalizeRefInfo.current?.open?.();
++  };
++
++  const handleCloseInfo = () => {
++    modalizeRefInfo.current?.close?.();
++  };
++
++  const isLoading = orderDetail.status === OrderDetailStatus.LOADING;
++  const hasError = orderDetail.status === OrderDetailStatus.ERROR;
++  const { height } = Dimensions.get('window');
++
++  const handleRetry = () => {
++    if (transactionId) {
++      getOrderDetail({ transactionId });
++    }
++  };
++
++  const transaction = orderDetail.orderDetail;
++
++  const isValidTransactionType = (
++    type: string | undefined,
++  ): type is TransactionType => {
++    return (
++      type === 'CREDIT' ||
++      type === 'RESCUE' ||
++      type === 'EXPIRED' ||
++      type === 'REFUNDED'
++    );
++  };
++
++  const enrichedTransaction = useMemo(() => {
++    if (!transaction) return undefined;
++    return {
++      ...transaction,
++      type: isValidTransactionType(passedType) ? passedType : transaction.type,
++      icon: passedIcon || transaction.icon,
++      status: passedStatus || transaction.status,
++      details: {
++        ...transaction.details,
++        provider: passedOrigination || transaction.details?.provider || '',
++      },
++    };
++  }, [
++    transaction,
++    passedType,
++    passedIcon,
++    passedStatus,
++    passedOrigination,
++  ]);
++
++  const isCashback = passedType === 'RESCUE';
++
++  const processedData = useMemo(() => {
++    if (!enrichedTransaction) {
++      return {
++        cardTitle: '',
++        formattedPointsValue: '',
++        highlightText: '',
++        formattedCurrencyValue: '',
++        marketplaceContent: undefined,
++        showOrderNumber: false,
++        showStatus: false,
++        showValue: false,
++      };
++    }
++
++    const gainType = getTransactionGainType(enrichedTransaction);
++    const formattedCurrencyValue = formatToCurrency(
++      enrichedTransaction.currencyValue,
++    );
++    const marketplaceValuePoints =
++      enrichedTransaction?.marketplace?.valuePoints;
++    const formattedPointsValue =
++      marketplaceValuePoints !== undefined && marketplaceValuePoints !== null
++        ? `- ${getFormattedPointsValueForMarketplace(marketplaceValuePoints)}`
++        : getFormattedPointsValue(
++            enrichedTransaction.amount,
++            enrichedTransaction.type,
++          );
++    const marketplaceTitle = getMarketplaceTitle(enrichedTransaction);
++    const cardTitle = marketplaceTitle || enrichedTransaction.description || '';
++    const highlightText = getFormattedHighlightText(
++      enrichedTransaction.date,
++      gainType,
++      moment,
++    );
++
++    const isMarketplace = !!enrichedTransaction?.marketplace;
++    const marketplace = enrichedTransaction?.marketplace;
++
++    let marketplaceContent: MarketplaceContentData | undefined;
++    if (isMarketplace && marketplace) {
++      const firstOrder = marketplace.orders?.[0];
++      const firstPayment = marketplace.payments?.[0];
++      const vendorName = firstOrder?.vendor || '';
++
++      const items: MarketplaceItemData[] = [];
++      marketplace.orders?.forEach(order => {
++        order.items?.forEach(item => {
++          items.push({
++            name: item.name,
++            quantity: item.quantity,
++            valuePoints: getFormattedPointsValueForMarketplace(
++              item.valuePoints,
++            ),
++            imageUrl: item.imageUrl,
++            cleanedImageUrl: getCleanedImageUrl(item.imageUrl),
++          });
++        });
++      });
++
++      marketplaceContent = {
++        orderNumber: enrichedTransaction.id,
++        status: enrichedTransaction.status,
++        statusColor: enrichedTransaction.status
++          ? STATUS_COLORS[enrichedTransaction.status] || 'neutral'
++          : undefined,
++        paymentType: firstPayment
++          ? getPaymentTypeLabel(firstPayment.paymentType)
++          : undefined,
++        shippingValuePoints:
++          marketplace.shippingValuePoints !== undefined &&
++          marketplace.shippingValuePoints !== null
++            ? getFormattedPointsValueForMarketplace(
++                marketplace.shippingValuePoints,
++              )
++            : undefined,
++        valuePoints:
++          marketplace.valuePoints !== undefined &&
++          marketplace.valuePoints !== null
++            ? getFormattedPointsValueForMarketplace(marketplace.valuePoints)
++            : undefined,
++        vendorName: vendorName || undefined,
++        items,
++      };
++    }
++
++    return {
++      cardTitle,
++      formattedPointsValue,
++      highlightText,
++      formattedCurrencyValue,
++      marketplaceContent,
++      showOrderNumber: !isMarketplace,
++      showStatus: !isMarketplace,
++      showValue: !isMarketplace,
++    };
++  }, [enrichedTransaction]);
++
++  return (
++    <MyOrdersDetailView
++      handleGoBack={handleGoBack}
++      transaction={enrichedTransaction}
++      modalizeRef={modalizeRef}
++      modalizeRefInfo={modalizeRefInfo}
++      handleOpenReportProblem={handleOpenReportProblem}
++      handleCloseReportProblem={handleCloseReportProblem}
++      handleOpenInfo={handleOpenInfo}
++      handleCloseInfo={handleCloseInfo}
++      isLoading={isLoading}
++      hasError={hasError}
++      handleRetry={handleRetry}
++      isCashback={isCashback}
++      cardTitle={processedData.cardTitle}
++      formattedPointsValue={processedData.formattedPointsValue}
++      highlightText={processedData.highlightText}
++      formattedCurrencyValue={processedData.formattedCurrencyValue}
++      marketplaceContent={processedData.marketplaceContent}
++      showOrderNumber={processedData.showOrderNumber}
++      showStatus={processedData.showStatus}
++      showValue={processedData.showValue}
++      height={height}
++    />
++  );
++};
++
++export default MyOrdersDetails;
+diff --git a/src/screens/MyOrdersDetails/utils.ts b/src/screens/MyOrdersDetails/utils.ts
+new file mode 100644
+index 00000000..dd84fa4a
+--- /dev/null
++++ b/src/screens/MyOrdersDetails/utils.ts
+@@ -0,0 +1,124 @@
++import type moment from 'moment';
++import type { MyOrdersDetailProps, TransactionType } from './Models';
++
++export type TransactionGainType = 'CARD' | 'TAG' | 'CASHBACK';
++
++export const getTransactionGainType = (
++  transaction: MyOrdersDetailProps['transaction'],
++): TransactionGainType => {
++  if (!transaction) return 'CARD';
++
++  const provider = transaction.details?.provider?.toLowerCase() || '';
++
++  if (provider.includes('cashback')) {
++    return 'CASHBACK';
++  }
++
++  const icon = transaction.icon?.toLowerCase() || '';
++  const description = transaction.description?.toLowerCase() || '';
++
++  const tagIndicators = [
++    'tag',
++    'pedágio',
++    'pedagio',
++    'estacionamento',
++    'abastecimento',
++    'abastece',
++    'drive',
++    'lava',
++    'rápido',
++  ];
++
++  const isTag = tagIndicators.some(
++    indicator =>
++      icon.includes(indicator) ||
++      description.includes(indicator) ||
++      provider.includes(indicator),
++  );
++
++  return isTag ? 'TAG' : 'CARD';
++};
++
++export const getFormattedPointsValue = (
++  amount: number,
++  type: TransactionType,
++): string => {
++  const prefix = type === 'CREDIT' || type === 'REFUNDED' ? '+ ' : '- ';
++  const label = Math.abs(amount) === 1 ? 'ponto' : 'pontos';
++  return `${prefix}${Math.abs(amount).toLocaleString('pt-BR')} ${label}`;
++};
++
++export const getFormattedHighlightText = (
++  date: string,
++  _gainType: TransactionGainType,
++  momentInstance: typeof moment,
++): string => {
++  const transactionDate = momentInstance(date);
++  const day = transactionDate.format('DD');
++  const month = transactionDate.format('MMM').toLowerCase();
++  const year = transactionDate.format('YYYY');
++  const time = transactionDate.format('HH:mm');
++
++  return `Pedido feito em ${day} ${month} ${year} às ${time}`;
++};
++
++export const getFormattedPointsValueForMarketplace = (
++  valuePoints: number,
++): string => {
++  const absValue = Math.abs(valuePoints);
++  const label = absValue === 1 ? 'ponto' : 'pontos';
++  return `${absValue.toLocaleString('pt-BR')} ${label}`;
++};
++
++export const getPaymentTypeLabel = (paymentType: string): string => {
++  const labels: Record<string, string> = {
++    POINTS: 'Pontos',
++    CARD: 'Cartão',
++    PIX: 'PIX',
++  };
++  return labels[paymentType] || paymentType;
++};
++
++export const getMarketplaceTitle = (
++  transaction: MyOrdersDetailProps['transaction'],
++): string | null => {
++  if (!transaction?.marketplace?.orders) return null;
++
++  const allItems: Array<{ name: string }> = [];
++  transaction.marketplace.orders.forEach(order => {
++    if (order.items) {
++      allItems.push(...order.items);
++    }
++  });
++
++  if (allItems.length === 0) return null;
++  if (allItems.length === 1) return allItems[0].name;
++
++  const firstItemName = allItems[0].name;
++  const secondItemFirstWord = allItems[1].name.split(' ')[0];
++
++  if (allItems.length === 2) {
++    return `${firstItemName} e ${secondItemFirstWord}`;
++  }
++
++  const remainingCount = allItems.length - 2;
++  return `${firstItemName}, ${secondItemFirstWord} e outros ${remainingCount}`;
++};
++
++export const getCleanedImageUrl = (
++  url: string | undefined,
++): string | undefined => {
++  if (!url) return undefined;
++
++  let cleanedUrl = url.trim();
++
++  if (cleanedUrl.startsWith('imageUrl:')) {
++    cleanedUrl = cleanedUrl.replace(/^imageUrl:/i, '');
++  }
++
++  if (cleanedUrl.startsWith('http://') || cleanedUrl.startsWith('https://')) {
++    return cleanedUrl;
++  }
++
++  return undefined;
++};
+diff --git a/src/screens/MyOrdersDetails/view.tsx b/src/screens/MyOrdersDetails/view.tsx
+new file mode 100644
+index 00000000..d38181c4
+--- /dev/null
++++ b/src/screens/MyOrdersDetails/view.tsx
+@@ -0,0 +1,413 @@
++import {
++  Alert,
++  BackDropBottom,
++  Box,
++  Button,
++  CardActivity,
++  DetailTransactionValue,
++  SeparatorHorizontal,
++  TagLabel,
++  Text,
++} from '@semparar/design-system-app';
++import type { PropsModalizeRef } from '@semparar/design-system-app/src/@types/modelize';
++import theme from '@semparar/design-system-app/src/styles/theme';
++import React, { FC } from 'react';
++import { ActivityIndicator, Linking } from 'react-native';
++import { eventSelectContent } from '~/constants/functions';
++import ApiError from '../../atomic/organisms/ApiError';
++import BasicScreen from '../../atomic/templates/BasicScreen';
++import type { MyOrdersDetailProps } from './Models';
++import { STATUS_COLORS } from './Models';
++
++const MyOrdersDetailView: FC<MyOrdersDetailProps> = ({
++  handleGoBack,
++  transaction,
++  modalizeRef,
++  modalizeRefInfo,
++  handleOpenReportProblem,
++  handleCloseReportProblem,
++  handleCloseInfo,
++  isLoading,
++  hasError,
++  handleRetry,
++  isCashback,
++  cardTitle,
++  formattedPointsValue,
++  highlightText,
++  formattedCurrencyValue,
++  marketplaceContent,
++  showOrderNumber,
++  showStatus,
++  showValue,
++  height,
++}) => {
++  if (hasError) {
++    return (
++      <BasicScreen
++        title="Detalhes do pedido"
++        leftIconOnPress={handleGoBack}
++        errorButtonOnPress={handleRetry || (() => {})}
++      >
++        <ApiError
++          title="Algo deu errado!"
++          subTitle="Por favor, tente de novo."
++          isLoading={isLoading}
++          onPress={handleRetry || (() => {})}
++        />
++      </BasicScreen>
++    );
++  }
++
++  if (isLoading && !transaction) {
++    return (
++      <BasicScreen
++        title="Detalhes do pedido"
++        leftIconOnPress={handleGoBack}
++        hasScroll
++        errorButtonOnPress={() => {}}
++      >
++        <Box flex={1} justify="center" align="center" minHeight={400}>
++          <ActivityIndicator size="large" color={theme.colors.BRAND_BASE_01} />
++        </Box>
++      </BasicScreen>
++    );
++  }
++
++  if (!transaction) {
++    return null;
++  }
++
++  const renderDivider = () => (
++    <SeparatorHorizontal
++      borderWidth="smaller"
++      borderColor="BRAND_COMPLEMENT_02"
++      height={1}
++      width="100%"
++      mt="xxxxs"
++    />
++  );
++
++  const renderMarketplaceContent = () => {
++    if (!marketplaceContent) return null;
++
++    return (
++      <>
++        <Text
++          type="paragraphXL"
++          color="BRAND_COMPLEMENT_01"
++          mb="xxxxs"
++          mt="xxxxs"
++        >
++          Número do pedido
++        </Text>
++        <Text type="paragraphMD" color="INTENSE_COLOR_03">
++          #{marketplaceContent.orderNumber}
++        </Text>
++        {marketplaceContent.status && (
++          <>
++            {renderDivider()}
++            <Text
++              type="paragraphXL"
++              color="BRAND_COMPLEMENT_01"
++              mb="xxxxs"
++              mt="xxxxs"
++            >
++              Status do pedido
++            </Text>
++            <TagLabel
++              type={(marketplaceContent.statusColor as never) || 'neutral'}
++              text={marketplaceContent.status}
++              showSpacing
++            />
++          </>
++        )}
++        {marketplaceContent.paymentType && (
++          <>
++            {renderDivider()}
++            <Text
++              type="paragraphXL"
++              color="BRAND_COMPLEMENT_01"
++              mb="xxxxs"
++              mt="xxxxs"
++            >
++              Forma de pagamento
++            </Text>
++            <Text type="paragraphMD" color="INTENSE_COLOR_03">
++              {marketplaceContent.paymentType}
++            </Text>
++          </>
++        )}
++        {marketplaceContent.shippingValuePoints !== undefined &&
++          marketplaceContent.shippingValuePoints !== null && (
++            <>
++              {renderDivider()}
++              <Text
++                type="paragraphXL"
++                color="BRAND_COMPLEMENT_01"
++                mb="xxxxs"
++                mt="xxxxs"
++              >
++                Frete
++              </Text>
++              <Text type="paragraphMD" color="INTENSE_COLOR_03">
++                {marketplaceContent.shippingValuePoints}
++              </Text>
++            </>
++          )}
++        {marketplaceContent.valuePoints !== undefined &&
++          marketplaceContent.valuePoints !== null && (
++            <>
++              {renderDivider()}
++              <Text
++                type="paragraphXL"
++                color="BRAND_COMPLEMENT_01"
++                mb="xxxxs"
++                mt="xxxxs"
++              >
++                Valor total
++              </Text>
++              <Text type="paragraphMD" color="INTENSE_COLOR_03">
++                {marketplaceContent.valuePoints}
++              </Text>
++            </>
++          )}
++        {marketplaceContent.vendorName && (
++          <>
++            {renderDivider()}
++            <Text
++              type="paragraphXL"
++              color="BRAND_COMPLEMENT_01"
++              mb="xxxxs"
++              mt="xxxxs"
++            >
++              Parceiro: {marketplaceContent.vendorName}
++            </Text>
++          </>
++        )}
++        {marketplaceContent.items.map((item, itemIndex: number) => (
++          <CardActivity
++            key={itemIndex}
++            mt="nano"
++            title={item.name}
++            titleTextType="paragraphMD"
++            description={`Quantidade: ${item.quantity}\nValor: ${item.valuePoints}`}
++            descriptionTextType="paragraphSM"
++            showImage={!!item.cleanedImageUrl}
++            image={
++              item.cleanedImageUrl ? { uri: item.cleanedImageUrl } : undefined
++            }
++            showIcon={false}
++            iconRight={null as never}
++            hideBorder={false}
++          />
++        ))}
++
++        <Alert
++          title="Detalhes da entrega"
++          mt="meddium"
++          label="Você pode acompanhar a entrega do seu pedido pelo site do parceiro."
++          numberOfLines={2}
++          type="highlight"
++          icon="icon-truck"
++          hasIconBackground
++          bgIconColor="BRAND_COMPLEMENT_03"
++        />
++      </>
++    );
++  };
++
++  return (
++    <>
++      <BasicScreen
++        title="Detalhes do pedido"
++        isLoading={isLoading}
++        leftIconOnPress={handleGoBack}
++        rightIcon={
++          isCashback && !transaction?.marketplace ? 'icon-help' : undefined
++        }
++        rightIconOnPress={undefined}
++        hasRightIcon={isCashback && !transaction?.marketplace}
++        hasScroll
++        errorButtonOnPress={() => {}}
++      >
++        <DetailTransactionValue
++          icon={transaction.icon as never}
++          title={cardTitle}
++          titleColor="BRAND_COMPLEMENT_01"
++          iconBgColor="BRAND_COMPLEMENT_03"
++          points={formattedPointsValue}
++          bgColor="BRAND_COMPLEMENT_02"
++          pointsColor={
++            transaction.type === 'CREDIT' || transaction.type === 'REFUNDED'
++              ? 'PLUS_COLOR_02'
++              : ('INTENSE_COLOR_05' as const)
++          }
++        />
++
++        <Box ml="smaller" mr="smaller" mt="xs" flex={1}>
++          <TagLabel
++            icon={undefined}
++            type="neutral"
++            text={highlightText}
++            showSpacing
++            mb="xs"
++          />
++
++          <Box flex={1} width="100%">
++            {showOrderNumber && (
++              <>
++                <Text type="paragraphXL" color="BRAND_COMPLEMENT_01" mb="xxxxs">
++                  Número do pedido
++                </Text>
++                <Text type="paragraphMD" color="INTENSE_COLOR_03">
++                  #{transaction.id}
++                </Text>
++              </>
++            )}
++
++            {showStatus && transaction.status && (
++              <>
++                {renderDivider()}
++                <Text
++                  type="paragraphXL"
++                  color="BRAND_COMPLEMENT_01"
++                  mb="xxxxs"
++                  mt="xxxxs"
++                >
++                  Status do pedido
++                </Text>
++                <TagLabel
++                  type={STATUS_COLORS[transaction.status] || 'neutral'}
++                  text={transaction.status}
++                  showSpacing
++                />
++              </>
++            )}
++
++            {showValue && (
++              <>
++                {renderDivider()}
++                <Text
++                  type="paragraphXL"
++                  color="BRAND_COMPLEMENT_01"
++                  mb="xxxxs"
++                  mt="xxxxs"
++                >
++                  Valor
++                </Text>
++                <Text type="paragraphMD" color="INTENSE_COLOR_03">
++                  {formattedCurrencyValue}
++                </Text>
++              </>
++            )}
++
++            {marketplaceContent && renderMarketplaceContent()}
++          </Box>
++
++          <Box width="100%" align="flex-end" mb="small">
++            <Button
++              type="ghostLarge"
++              text="Relatar Problema"
++              onPress={handleOpenReportProblem}
++            />
++          </Box>
++        </Box>
++      </BasicScreen>
++
++      <BackDropBottom modalizeRef={modalizeRef as PropsModalizeRef}>
++        <Box align="center" width="100%" mt="xxs">
++          <Box align="center" width="100%">
++            <Text
++              type="paragraphXXXL"
++              color="BRAND_COMPLEMENT_01"
++              mb="xs"
++              align="center"
++            >
++              Central de Atendimento
++            </Text>
++          </Box>
++        </Box>
++
++        <Box pd="innerSmall">
++          <CardActivity
++            mt="nano"
++            icon="icon-contact"
++            title="Capitais"
++            description="4002 1552"
++            iconRight="icon-next"
++            showIcon
++            showTagLabel={false}
++            onPress={() => {
++              eventSelectContent({
++                content_type: 'cta',
++                content_id: 'telefones_capitais',
++                location_1: 'monetizacao',
++                location_2: 'hub_recompensas_spmais',
++                location_3: 'contato_telefones',
++              });
++              Linking.openURL('tel:40021552');
++            }}
++          />
++
++          <CardActivity
++            mt="nano"
++            icon="icon-contact"
++            title="Demais localidades"
++            description="0800 015 0252"
++            iconRight="icon-next"
++            showIcon
++            showTagLabel={false}
++            onPress={() => {
++              eventSelectContent({
++                content_type: 'cta',
++                content_id: 'telefones_demais_localidades',
++                location_1: 'monetizacao',
++                location_2: 'hub_recompensas_spmais',
++                location_3: 'contato_telefones',
++              });
++
++              Linking.openURL('tel:08000150252');
++            }}
++          />
++          <Text type="paragraphXS" color="INTENSE_COLOR_04" mt="xxxxs">
++            *Atendimento de segunda à sexta das 9h às 21h. Sábado e domingo das
++            9h às 17h.
++          </Text>
++        </Box>
++
++        <Box align="center" width="100%" mt="xxxxs">
++          <Text
++            type="linkMD"
++            color="INTENSE_COLOR_05"
++            onPress={handleCloseReportProblem}
++            align="center"
++          >
++            Fechar
++          </Text>
++        </Box>
++      </BackDropBottom>
++
++      {isCashback && (
++        <BackDropBottom
++          modalHeight={height * 0.3}
++          modalizeRef={modalizeRefInfo as PropsModalizeRef}
++        >
++          <Text
++            type="paragraphMD"
++            align="center"
++            color="INTENSE_COLOR_05"
++            mt="small"
++            mb="smaller"
++          >
++            Você também pode conferir o valor do desconto nos lançamentos da sua
++            fatura.
++          </Text>
++
++          <Button text="Entendi" onPress={handleCloseInfo} />
++        </BackDropBottom>
++      )}
++    </>
++  );
++};
++
++export default MyOrdersDetailView;
+diff --git a/src/screens/MyOrdersRewardProgram/index.tsx b/src/screens/MyOrdersRewardProgram/index.tsx
+index 548e1560..6f2bd3eb 100644
+--- a/src/screens/MyOrdersRewardProgram/index.tsx
++++ b/src/screens/MyOrdersRewardProgram/index.tsx
+@@ -5,7 +5,7 @@ import {
+ } from '@react-navigation/native';
+ import { PropsModalizeRef } from '@semparar/design-system-app/src/@types/modelize';
+ import { format, parseISO } from 'date-fns';
+-import React, { useMemo, useRef, useState } from 'react';
++import React, { useRef, useState } from 'react';
+ import { Dimensions } from 'react-native';
+ import { PropsRootStack } from 'src/routes/Models';
+ import { useShallow } from 'zustand/react/shallow';
+@@ -26,61 +26,62 @@ const MyOrdersCashback = () => {
+   const SKELETON_COUNT = 3;
+   const { width } = Dimensions.get('window');
+ 
+-  const { pointsExtract, pointsExtractActions } = useRootStore(
++  const navigation = useNavigation<NavigationProp<PropsRootStack>>();
++
++  const { pointsExtract } = useRootStore(
+     useShallow(state => ({
+       pointsExtract: state.pointsExtract,
+-      pointsExtractActions: state.pointsExtractActions,
+     })),
+   );
+ 
++  const filtersPeriod = [
++    {
++      label: '7 dias',
++      value: 7,
++    },
++    {
++      label: '15 dias',
++      value: 15,
++    },
++    {
++      label: '30 dias',
++      value: 30,
++    },
++    {
++      label: '60 dias',
++      value: 60,
++    },
++    {
++      label: '90 dias',
++      value: 90,
++    },
++  ];
++
+   const getFormatDate = (iso?: string) => {
+     if (!iso) return '';
+     const date = parseISO(iso);
+     return format(date, 'dd/MM/yyyy');
+   };
+ 
+-  const getFilterGroups: FilterGroup[] = useMemo(() => {
+-    return [
+-      {
+-        label: 'Períodos',
+-        options: [
+-          {
+-            label: '7 dias',
+-            value: 0,
+-          },
+-          {
+-            label: '15 dias',
+-            value: 1,
+-          },
+-          {
+-            label: '30 dias',
+-            value: 2,
+-          },
+-          {
+-            label: '60 dias',
+-            value: 3,
+-          },
+-          {
+-            label: '90 dias',
+-            value: 4,
+-          },
+-        ],
+-      },
+-      {
+-        label: 'Tipos de lançamentos',
+-        options: [
+-          {
+-            label: 'Mais recentes',
+-            value: 'ASC',
+-          },
+-          {
+-            label: 'Mais antigas',
+-            value: 'DESC',
+-          },
+-        ],
+-      },
+-    ];
+-  }, []);
++  const filterGroups: FilterGroup[] = [
++    {
++      label: 'Períodos',
++      options: filtersPeriod,
++    },
++    {
++      label: 'Tipos de lançamentos',
++      options: [
++        {
++          value: 0,
++          label: 'Mais recentes',
++        },
++        {
++          value: 1,
++          label: 'Mais antigos',
++        },
++      ],
++    },
++  ];
+ 
+   const handleOpenFilters = () => {
+     eventSelectContent({
+@@ -94,7 +95,13 @@ const MyOrdersCashback = () => {
+     modalizeRefFilters.current?.open?.();
+   };
+ 
+-  const handleDetailsOrders = () => {
++  const handleDetailsOrders = (
++    transactionId: string,
++    type?: string,
++    icon?: string,
++    status?: string,
++    origination?: string
++  )=> {
+     eventSelectContent({
+       content_type: 'cta',
+       content_id: 'detalhe_pedido',
+@@ -102,6 +109,24 @@ const MyOrdersCashback = () => {
+       location_2: 'hub_recompensas_spmais',
+       location_3: 'meus_pedidos',
+     });
++
++    navigation.navigate('MyOrdersDetails', {
++      transactionId,
++      type,
++      icon,
++      status,
++      origination,
++      analytics: {
++        screen_name: 'detalhe_pedido',
++        screen_class: 'hub_recompensas_spmais',
++        screen_bussines: 'monetizacao',
++        screen_info: {
++          location_1: 'monetizacao',
++          location_2: 'hub_recompensas_spmais',
++          location_3: 'detalhe_pedido',
++        },
++      },
++    });
+   };
+ 
+   const myOrders = pointsExtract?.extractData?.transactions || [];
+@@ -109,11 +134,7 @@ const MyOrdersCashback = () => {
+   const isLoading = pointsExtract.status === PointsExtractStatus.LOADING;
+   const isError = pointsExtract.status === PointsExtractStatus.ERROR;
+ 
+-  const navigation = useNavigation<NavigationProp<PropsRootStack>>();
+-
+   const handleGoBack = () => {
+-    pointsExtractActions.clearTransactionsFilters();
+-    pointsExtractActions.reset();
+     navigation.goBack();
+   };
+ 
+@@ -137,15 +158,13 @@ const MyOrdersCashback = () => {
+             location_3: 'meus_pedidos',
+           },
+         );
+-        pointsExtractActions.clearTransactionsFilters();
+-        pointsExtractActions.reset();
+         getPointsExtract({ type: 'Resgate' });
+         hasFocused.current = true;
+       }
+       return () => {
+         hasFocused.current = false;
+       };
+-    }, [pointsExtractActions]),
++    }, []),
+   );
+ 
+   return (
+@@ -154,7 +173,7 @@ const MyOrdersCashback = () => {
+       emptyImage={emptyImage}
+       isLoading={isLoading}
+       isError={isError}
+-      filterGroups={getFilterGroups}
++      filterGroups={filterGroups}
+       modalizeRefFilters={modalizeRefFilters}
+       formatDate={getFormatDate}
+       handleGoBack={handleGoBack}
+diff --git a/src/screens/MyOrdersRewardProgram/models/index.ts b/src/screens/MyOrdersRewardProgram/models/index.ts
+index a6c32890..9f992dbd 100644
+--- a/src/screens/MyOrdersRewardProgram/models/index.ts
++++ b/src/screens/MyOrdersRewardProgram/models/index.ts
+@@ -30,6 +30,12 @@ export interface MyOrdersItemPropsView {
+   formatDate: (iso?: string) => string;
+   handleGoBack: () => void;
+   handleOpenFilters: () => void;
+-  handleDetailsOrders: () => void;
++  handleDetailsOrders: (
++    transactionId: string,
++    type?: string,
++    icon?: string,
++    status?: string,
++    origination?: string
++  )=> void;
+   handleRefresh: () => void;
+ }
+diff --git a/src/screens/MyOrdersRewardProgram/view.tsx b/src/screens/MyOrdersRewardProgram/view.tsx
+index 9c53d40b..2e80b269 100644
+--- a/src/screens/MyOrdersRewardProgram/view.tsx
++++ b/src/screens/MyOrdersRewardProgram/view.tsx
+@@ -100,7 +100,15 @@ const MyOrdersCashbackView: FC<MyOrdersItemPropsView> = ({
+                 statusTitle="Status do pedido"
+                 status={item.status}
+                 ghostButtonText="Exibir detalhes"
+-                onGhostButtonPress={handleDetailsOrders}
++                onGhostButtonPress={() =>
++                  handleDetailsOrders(
++                    item.id,
++                    item.type,
++                    item.icon,
++                    item.status,
++                    item.origination,
++                  )
++                }
+                 type="extended"
+                 typeTag={STATUS_COLORS[item.status] ?? 'alert'}
+                 version="2.0"
+diff --git a/src/services/api/index.ts b/src/services/api/index.ts
+index defa2b8d..e7d694e0 100644
+--- a/src/services/api/index.ts
++++ b/src/services/api/index.ts
+@@ -1,6 +1,7 @@
+ export * from './airlineMiles.api';
+ export * from './extract.api';
+ export * from './marketplace.api';
++export * from './orderDetail.api';
+ export * from './parameter.api';
+ export * from './permission.api';
+ export * from './products.api';
+diff --git a/src/services/api/orderDetail.api.ts b/src/services/api/orderDetail.api.ts
+new file mode 100644
+index 00000000..9651a566
+--- /dev/null
++++ b/src/services/api/orderDetail.api.ts
+@@ -0,0 +1,76 @@
++import { api } from '@semparar/mf-app-user';
++import type { AxiosResponse } from 'axios';
++
++export interface OrderDetailItemDto {
++  id: string;
++  unitaryValue: number;
++  quantity: number;
++  description: string;
++}
++
++export interface OrderDetailBenefitDto {
++  id: string;
++  type: string;
++  value: number;
++  description: string;
++}
++
++export interface MarketplaceItemDto {
++  name: string;
++  quantity: number;
++  valuePoints: number;
++  imageUrl?: string;
++}
++
++export interface MarketplaceOrderDto {
++  vendor?: string;
++  items?: MarketplaceItemDto[];
++}
++
++export interface MarketplacePaymentDto {
++  paymentType: string;
++}
++
++export interface MarketplaceDto {
++  orders?: MarketplaceOrderDto[];
++  payments?: MarketplacePaymentDto[];
++  shippingValuePoints?: number;
++  valuePoints?: number;
++}
++
++export interface OrderDetailDataDto {
++  id: string;
++  date: string;
++  description: string;
++  amount: number;
++  items: OrderDetailItemDto[];
++  benefits: OrderDetailBenefitDto[];
++  attributes: any[];
++  marketplace?: MarketplaceDto;
++}
++
++export interface OrderDetailRequestDto {
++  transactionId: string;
++  participantId: string;
++}
++
++export interface OrderDetailApiResponse {
++  data: OrderDetailDataDto;
++  status: {
++    returnCode: number;
++    message: string;
++    httpStatus?: number;
++  };
++}
++
++export async function getOrderDetailApi(
++  payload: OrderDetailRequestDto,
++): Promise<AxiosResponse<OrderDetailApiResponse>> {
++  return api.post<OrderDetailApiResponse>(
++    'fintech/v1/rewardProgram/extract-details',
++    {
++      transactionId: payload.transactionId,
++      participantId: payload.participantId,
++    },
++  );
++}
+diff --git a/src/services/constants.ts b/src/services/constants.ts
+index 69bbd8e8..8b992c21 100644
+--- a/src/services/constants.ts
++++ b/src/services/constants.ts
+@@ -48,4 +48,18 @@ export const ANALYTICS_EVENTS = {
+     location_2: 'spmais',
+     location_3: 'home',
+   },
++  ORDER_DETAIL_SUCCESS: {
++    content_type: 'sucesso',
++    content_id: 'rewardprogram/v1/extract-details',
++    location_1: 'monetizacao',
++    location_2: 'hub_recompensas_spmais',
++    location_3: 'detalhes_transacao',
++  },
++  ORDER_DETAIL_ERROR: {
++    content_type: 'erro',
++    content_id: 'rewardprogram/v1/extract-details',
++    location_1: 'monetizacao',
++    location_2: 'hub_recompensas_spmais',
++    location_3: 'detalhes_transacao',
++  },
+ } as const;
+diff --git a/src/services/models/extract.model.ts b/src/services/models/extract.model.ts
+index dc73f0ac..1067a033 100644
+--- a/src/services/models/extract.model.ts
++++ b/src/services/models/extract.model.ts
+@@ -31,6 +31,29 @@ export const PERIOD_DAYS_MAP: Record<number, number> = {
+   4: 90,
+ };
+ 
++export interface MarketplaceItem {
++  name: string;
++  quantity: number;
++  valuePoints: number;
++  imageUrl?: string;
++}
++
++export interface MarketplaceOrder {
++  vendor?: string;
++  items?: MarketplaceItem[];
++}
++
++export interface MarketplacePayment {
++  paymentType: string;
++}
++
++export interface Marketplace {
++  orders?: MarketplaceOrder[];
++  payments?: MarketplacePayment[];
++  shippingValuePoints?: number;
++  valuePoints?: number;
++}
++
+ export interface PointsTransaction {
+   id: string;
+   date: string;
+@@ -48,6 +71,8 @@ export interface PointsTransaction {
+     }>;
+   };
+   status: string;
++  marketplace?: Marketplace;
++  origination?: string;
+ }
+ 
+ export interface PaginationDto {
+diff --git a/src/services/models/index.ts b/src/services/models/index.ts
+index 440f788f..174a3e70 100644
+--- a/src/services/models/index.ts
++++ b/src/services/models/index.ts
+@@ -1,6 +1,7 @@
+ export * from './airlineMiles.model';
+ export * from './extract.model';
+ export * from './marketplace.model';
++export * from './orderDetail.model';
+ export * from './parameter.model';
+ export * from './permission.model';
+ export * from './products.model';
+diff --git a/src/services/models/orderDetail.model.ts b/src/services/models/orderDetail.model.ts
+new file mode 100644
+index 00000000..e42f8346
+--- /dev/null
++++ b/src/services/models/orderDetail.model.ts
+@@ -0,0 +1,17 @@
++import { PointsTransaction } from './extract.model';
++
++export type { PointsTransaction };
++
++export enum OrderDetailStatus {
++  IDLE = 'idle',
++  LOADING = 'loading',
++  SUCCESS = 'success',
++  ERROR = 'error',
++}
++
++export interface OrderDetailState {
++  orderDetail?: PointsTransaction;
++  status: OrderDetailStatus;
++  error?: string;
++  transactionId?: string;
++}
+diff --git a/src/services/repository/index.ts b/src/services/repository/index.ts
+index 02b1864c..37180aa8 100644
+--- a/src/services/repository/index.ts
++++ b/src/services/repository/index.ts
+@@ -1,4 +1,5 @@
+ export * from './extract.repository';
++export * from './orderDetail.repository';
+ export * from './parameter.repository';
+ export * from './permission.repository';
+ export * from './products.repository';
+diff --git a/src/services/repository/orderDetail.repository.ts b/src/services/repository/orderDetail.repository.ts
+new file mode 100644
+index 00000000..bc7aa337
+--- /dev/null
++++ b/src/services/repository/orderDetail.repository.ts
+@@ -0,0 +1,82 @@
++import type {
++  OrderDetailDataDto,
++  getOrderDetailApi,
++} from '../api/orderDetail.api';
++import { PointsTransaction } from '../models/extract.model';
++
++function getTransactionFromOrderDetail(
++  dto: OrderDetailDataDto,
++): PointsTransaction {
++  const items = dto.items || [];
++  const benefits = dto.benefits || [];
++
++  const totalValue = items.reduce(
++    (sum, item) => sum + item.unitaryValue * item.quantity,
++    0,
++  );
++
++  const fields: Array<{
++    label: string;
++    value: string;
++  }> = [];
++
++  if (items.length > 0) {
++    items.forEach((item, index) => {
++      fields.push({
++        label: `Item ${index + 1}`,
++        value: `${item.description} - ${item.quantity}x R$ ${item.unitaryValue.toFixed(2)}`,
++      });
++    });
++  }
++
++  if (benefits.length > 0) {
++    benefits.forEach((benefit, index) => {
++      fields.push({
++        label: `Benefício ${index + 1}`,
++        value: `${benefit.description} - R$ ${Math.abs(benefit.value).toFixed(2)}`,
++      });
++    });
++  }
++
++  return {
++    id: dto.id,
++    date: dto.date,
++    description: dto.description,
++    type: 'RESCUE',
++    amount: dto.amount,
++    currencyValue: totalValue > 0 ? totalValue : Math.abs(dto.amount),
++    icon: 'icon-cashback',
++    details: {
++      provider: 'Cashback',
++      extraInfo: '',
++      fields,
++    },
++    status: '',
++    marketplace: dto.marketplace,
++  };
++}
++
++export function getOrderDetailFromResponse(
++  response: Awaited<ReturnType<typeof getOrderDetailApi>>,
++): PointsTransaction | null {
++  const apiResponse = response?.data;
++
++  if (!apiResponse) {
++    return null;
++  }
++
++  const status = apiResponse.status;
++  const returnCode = status?.returnCode;
++
++  if (returnCode !== 200 && returnCode !== 0) {
++    return null;
++  }
++
++  const orderDetailData = apiResponse.data;
++
++  if (!orderDetailData) {
++    return null;
++  }
++
++  return getTransactionFromOrderDetail(orderDetailData);
++}
+diff --git a/src/services/services/index.ts b/src/services/services/index.ts
+index 5f217b06..96c8d9ae 100644
+--- a/src/services/services/index.ts
++++ b/src/services/services/index.ts
+@@ -1,6 +1,7 @@
+ export * from './airlineMiles.service';
+ export * from './extract.service';
+ export * from './marketplace.service';
++export * from './orderDetail.service';
+ export * from './parameter.service';
+ export * from './permission.service';
+ export * from './products.service';
+diff --git a/src/services/services/orderDetail.service.ts b/src/services/services/orderDetail.service.ts
+new file mode 100644
+index 00000000..145c5a84
+--- /dev/null
++++ b/src/services/services/orderDetail.service.ts
+@@ -0,0 +1,81 @@
++import { eventServerResponse } from '~/constants/functions';
++import { useRootStore } from '~/store';
++import {
++  getOrderDetailApi,
++  type OrderDetailRequestDto,
++} from '../api/orderDetail.api';
++import { OrderDetailStatus } from '../models/orderDetail.model';
++import { getOrderDetailFromResponse } from '../repository/orderDetail.repository';
++import { getParticipantIdFromToken } from '../utils';
++
++interface GetOrderDetailPayload {
++  transactionId: string;
++  participantId?: string;
++}
++
++function handleOrderDetailSuccess(
++  orderDetail: ReturnType<typeof getOrderDetailFromResponse>,
++  transactionId: string,
++): void {
++  const { orderDetailActions } = useRootStore.getState();
++
++  if (orderDetail) {
++    orderDetailActions.setOrderDetail(orderDetail, transactionId);
++    eventServerResponse('ORDER_DETAIL_SUCCESS' as never);
++  } else {
++    handleOrderDetailError();
++  }
++}
++
++function handleOrderDetailError(): void {
++  const { orderDetailActions } = useRootStore.getState();
++  orderDetailActions.setOrderDetailStatus(OrderDetailStatus.ERROR);
++  eventServerResponse('ORDER_DETAIL_ERROR' as never);
++}
++
++export async function getOrderDetail(
++  payload: GetOrderDetailPayload,
++): Promise<void> {
++  const { orderDetailActions, orderDetail } = useRootStore.getState();
++
++  const isDifferentTransaction =
++    orderDetail.transactionId !== payload.transactionId;
++  const isAlreadyLoading = orderDetail.status === OrderDetailStatus.LOADING;
++
++  if (isAlreadyLoading && !isDifferentTransaction) {
++    return;
++  }
++
++  if (isDifferentTransaction) {
++    orderDetailActions.reset();
++  }
++
++  orderDetailActions.setOrderDetailStatus(OrderDetailStatus.LOADING);
++
++  try {
++    const participantId =
++      payload?.participantId ?? (await getParticipantIdFromToken());
++
++    if (!participantId) {
++      handleOrderDetailError();
++      return;
++    }
++
++    const requestPayload: OrderDetailRequestDto = {
++      transactionId: payload.transactionId,
++      participantId,
++    };
++
++    const response = await getOrderDetailApi(requestPayload);
++    const orderDetailData = getOrderDetailFromResponse(response);
++
++    if (orderDetailData) {
++      handleOrderDetailSuccess(orderDetailData, payload.transactionId);
++      return;
++    }
++
++    handleOrderDetailError();
++  } catch {
++    handleOrderDetailError();
++  }
++}
+diff --git a/src/services/store/index.ts b/src/services/store/index.ts
+index e0a893b5..0fdebe2a 100644
+--- a/src/services/store/index.ts
++++ b/src/services/store/index.ts
+@@ -1,6 +1,7 @@
+ export * from './airlineMiles.store';
+ export * from './extract.store';
+ export * from './marketplace.store';
++export * from './orderDetail.store';
+ export * from './parameter.store';
+ export * from './permission.store';
+ export * from './products.store';
+diff --git a/src/services/store/orderDetail.store.ts b/src/services/store/orderDetail.store.ts
+new file mode 100644
+index 00000000..81123bc4
+--- /dev/null
++++ b/src/services/store/orderDetail.store.ts
+@@ -0,0 +1,59 @@
++import type { StateCreator } from 'zustand';
++import {
++  OrderDetailStatus,
++  type OrderDetailState,
++  type PointsTransaction,
++} from '../models/orderDetail.model';
++
++export interface OrderDetailActions {
++  setOrderDetailStatus: (status: OrderDetailStatus) => void;
++  setOrderDetail: (
++    orderDetail: PointsTransaction,
++    transactionId?: string,
++  ) => void;
++  reset: () => void;
++}
++
++export interface OrderDetailSlice {
++  orderDetail: OrderDetailState;
++  orderDetailActions: OrderDetailActions;
++}
++
++const INITIAL_ORDER_DETAIL_STATE: OrderDetailState = {
++  orderDetail: undefined,
++  status: OrderDetailStatus.IDLE,
++  error: undefined,
++  transactionId: undefined,
++};
++
++export const createOrderDetailSlice: StateCreator<
++  OrderDetailSlice,
++  [],
++  [],
++  OrderDetailSlice
++> = set => ({
++  orderDetail: INITIAL_ORDER_DETAIL_STATE,
++  orderDetailActions: {
++    setOrderDetailStatus: status =>
++      set(state => ({
++        orderDetail: {
++          ...state.orderDetail,
++          status,
++        },
++      })),
++    setOrderDetail: (orderDetail, transactionId) =>
++      set(state => ({
++        orderDetail: {
++          ...state.orderDetail,
++          orderDetail,
++          status: OrderDetailStatus.SUCCESS,
++          error: undefined,
++          transactionId,
++        },
++      })),
++    reset: () =>
++      set({
++        orderDetail: INITIAL_ORDER_DETAIL_STATE,
++      }),
++  },
++});
+diff --git a/src/services/store/slices.ts b/src/services/store/slices.ts
+index b730330f..5b0ae6ca 100644
+--- a/src/services/store/slices.ts
++++ b/src/services/store/slices.ts
+@@ -4,12 +4,14 @@ import {
+   AirlineMilesSlice,
+   createAirlineMilesSlice,
+   createMarketplaceSlice,
++  createOrderDetailSlice,
+   createParameterPointsProgramSlice,
+   createPermissionSlice,
+   createPointsExtractSlice,
+   createPointsProductsSlice,
+   createRescueSlice,
+   MarketplaceSlice,
++  OrderDetailSlice,
+   ParameterPointsProgramSlice,
+   PermissionSlice,
+   PointsExtractSlice,
+@@ -23,7 +25,8 @@ export type RewardsProgramRootStore = ParameterPointsProgramSlice &
+   PointsExtractSlice &
+   PointsProductsSlice &
+   RescueSlice &
+-  MarketplaceSlice;
++  MarketplaceSlice &
++  OrderDetailSlice;
+ 
+ type Slice<T> = StateCreator<RewardsProgramRootStore, [], [], T>;
+ const asSlice = <T>(slice: StateCreator<RewardsProgramRootStore, [], [], T>) =>
+@@ -42,5 +45,6 @@ export function setRewardsProgramSlices<T extends RewardsProgramRootStore>(
+     ...asSlice<PointsProductsSlice>(createPointsProductsSlice)(...a),
+     ...asSlice<RescueSlice>(createRescueSlice)(...a),
+     ...asSlice<MarketplaceSlice>(createMarketplaceSlice)(...a),
++    ...asSlice<OrderDetailSlice>(createOrderDetailSlice)(...a),
+   };
+ }
+diff --git a/src/services/utils/cleanup.ts b/src/services/utils/cleanup.ts
+index cb67d2b6..78aa18ca 100644
+--- a/src/services/utils/cleanup.ts
++++ b/src/services/utils/cleanup.ts
+@@ -9,6 +9,7 @@ export function clearRewardsProgramStore() {
+     pointsProductsActions,
+     rescueActions,
+     marketplaceActions,
++    orderDetailActions,
+   } = useRootStore.getState();
+ 
+   parameterPointsProgramActions.reset();
+@@ -18,4 +19,5 @@ export function clearRewardsProgramStore() {
+   pointsProductsActions.reset();
+   rescueActions.reset();
+   marketplaceActions.reset();
++  orderDetailActions.reset();
+ }

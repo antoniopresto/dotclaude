@@ -1,0 +1,1403 @@
+diff --git a/ralph/scripts/archive-completed.sh b/ralph/scripts/archive-completed.sh
+new file mode 100644
+index 0000000..6c9ae24
+--- /dev/null
++++ b/ralph/scripts/archive-completed.sh
+@@ -0,0 +1,291 @@
++#!/bin/bash
++# =============================================================================
++# archive-completed.sh - Archive completed tasks from IMPLEMENTATION_PLAN.md
++# =============================================================================
++# Archives [x] tasks and RESOLVED GAPs to dated folder to reduce file size.
++#
++# Usage:
++#   ./ralph/scripts/archive-completed.sh             # Archive completed tasks
++#   ./ralph/scripts/archive-completed.sh --dry-run   # Preview changes
++#   ./ralph/scripts/archive-completed.sh --phase 3   # Archive specific phase
++#   ./ralph/scripts/archive-completed.sh --all       # Archive everything completed
++#   ./ralph/scripts/archive-completed.sh --help      # Show help
++#
++# =============================================================================
++
++set -euo pipefail
++
++# Colors
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# Script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RALPH_DIR="$(dirname "$SCRIPT_DIR")"
++
++# Files
++PLAN_FILE="$RALPH_DIR/IMPLEMENTATION_PLAN.md"
++ARCHIVE_BASE="$RALPH_DIR/IMPLEMENTATION_ARCHIVE"
++
++# Options
++DRY_RUN=false
++PHASE=""
++ARCHIVE_ALL=false
++
++log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
++log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
++log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
++log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
++
++show_help() {
++    cat << 'EOF'
++archive-completed.sh - Archive completed tasks from IMPLEMENTATION_PLAN.md
++
++Usage:
++  ./ralph/scripts/archive-completed.sh             Archive all completed tasks
++  ./ralph/scripts/archive-completed.sh --dry-run   Preview changes without modifying files
++  ./ralph/scripts/archive-completed.sh --phase N   Archive completed tasks from phase N only
++  ./ralph/scripts/archive-completed.sh --all       Archive all completed items (tasks + resolved GAPs)
++  ./ralph/scripts/archive-completed.sh --help      Show this help
++
++Output:
++  Creates dated folder: ralph/IMPLEMENTATION_ARCHIVE/YYYY-MM-DD/
++  With files: completed-tasks.md, resolved-gaps.md, summary.txt
++EOF
++}
++
++parse_args() {
++    while [[ $# -gt 0 ]]; do
++        case $1 in
++            -h|--help)
++                show_help
++                exit 0
++                ;;
++            --dry-run)
++                DRY_RUN=true
++                shift
++                ;;
++            --phase)
++                PHASE="$2"
++                shift 2
++                ;;
++            --all)
++                ARCHIVE_ALL=true
++                shift
++                ;;
++            *)
++                log_error "Unknown option: $1"
++                show_help
++                exit 1
++                ;;
++        esac
++    done
++}
++
++extract_completed_tasks() {
++    local content="$1"
++    local phase_filter="$2"
++
++    if [[ -n "$phase_filter" ]]; then
++        # Extract tasks with [x] from specific phase section
++        echo "$content" | grep -E "^\s*-\s*\[x\].*[Pp]hase\s*$phase_filter" || true
++        echo "$content" | grep -E "^\s*-\s*\[x\].*P${phase_filter}-" || true
++    else
++        # Extract all tasks with [x]
++        echo "$content" | grep -E "^\s*-\s*\[x\]" || true
++    fi
++}
++
++extract_resolved_gaps() {
++    local content="$1"
++    local in_gap=false
++    local gap_content=""
++    local resolved_gaps=""
++
++    while IFS= read -r line; do
++        if [[ "$line" =~ ^###.*GAP-[0-9]+.*RESOLVED ]] || [[ "$line" =~ ^###.*GAP-[0-9]+.*✅ ]]; then
++            if [[ -n "$gap_content" ]]; then
++                resolved_gaps+="$gap_content"
++            fi
++            gap_content="$line"$'\n'
++            in_gap=true
++        elif [[ "$in_gap" == true ]]; then
++            if [[ "$line" =~ ^### ]] || [[ "$line" =~ ^## ]]; then
++                resolved_gaps+="$gap_content"$'\n'
++                gap_content=""
++                in_gap=false
++            else
++                gap_content+="$line"$'\n'
++            fi
++        fi
++    done <<< "$content"
++
++    if [[ -n "$gap_content" ]]; then
++        resolved_gaps+="$gap_content"
++    fi
++
++    echo "$resolved_gaps"
++}
++
++remove_archived_content() {
++    local input_file="$1"
++    local tasks_to_remove="$2"
++    local gaps_to_remove="$3"
++    local output_file="$4"
++
++    local content
++    content=$(cat "$input_file")
++
++    # Remove completed tasks line by line
++    while IFS= read -r task; do
++        [[ -z "$task" ]] && continue
++        # Use grep -v with fixed string
++        content=$(echo "$content" | grep -v -F -- "$task" 2>/dev/null || echo "$content")
++    done <<< "$tasks_to_remove"
++
++    # Remove resolved GAP sections
++    if [[ -n "$gaps_to_remove" ]]; then
++        while IFS= read -r gap_header; do
++            [[ -z "$gap_header" ]] && continue
++            if [[ "$gap_header" =~ ^###.*GAP-[0-9]+ ]]; then
++                # Remove the entire GAP section using awk
++                content=$(echo "$content" | awk -v header="$gap_header" '
++                    BEGIN { skip=0 }
++                    $0 == header { skip=1; next }
++                    /^###/ || /^## / { if(skip) skip=0 }
++                    !skip { print }
++                ')
++            fi
++        done <<< "$(echo "$gaps_to_remove" | grep -E '^###.*GAP-[0-9]+' || true)"
++    fi
++
++    echo "$content" > "$output_file"
++}
++
++main() {
++    parse_args "$@"
++
++    # Validate plan file exists
++    if [[ ! -f "$PLAN_FILE" ]]; then
++        log_error "IMPLEMENTATION_PLAN.md not found at: $PLAN_FILE"
++        exit 1
++    fi
++
++    # Get original line count
++    local original_lines
++    original_lines=$(wc -l < "$PLAN_FILE" | tr -d ' ')
++
++    # Read plan content
++    local content
++    content=$(cat "$PLAN_FILE")
++
++    # Extract completed tasks
++    local completed_tasks
++    completed_tasks=$(extract_completed_tasks "$content" "$PHASE")
++
++    # Extract resolved GAPs if --all
++    local resolved_gaps=""
++    if [[ "$ARCHIVE_ALL" == "true" ]]; then
++        resolved_gaps=$(extract_resolved_gaps "$content")
++    fi
++
++    # Count items
++    local task_count=0
++    local gap_count=0
++
++    if [[ -n "$completed_tasks" ]]; then
++        task_count=$(echo "$completed_tasks" | grep -c '^\s*-' 2>/dev/null || echo "0")
++    fi
++
++    if [[ -n "$resolved_gaps" ]]; then
++        gap_count=$(echo "$resolved_gaps" | grep -c '^###.*GAP' 2>/dev/null || echo "0")
++    fi
++
++    if [[ $task_count -eq 0 && $gap_count -eq 0 ]]; then
++        log_info "No completed tasks or resolved GAPs to archive"
++        exit 0
++    fi
++
++    log_info "Found $task_count completed tasks and $gap_count resolved GAPs"
++
++    # Prepare archive directory
++    local today
++    today=$(date +%Y-%m-%d)
++    local archive_dir="$ARCHIVE_BASE/$today"
++
++    if [[ "$DRY_RUN" == "true" ]]; then
++        echo ""
++        log_info "DRY RUN - Would create: $archive_dir/"
++        echo ""
++        if [[ -n "$completed_tasks" ]]; then
++            echo "=== Completed Tasks ==="
++            echo "$completed_tasks"
++            echo ""
++        fi
++        if [[ -n "$resolved_gaps" ]]; then
++            echo "=== Resolved GAPs ==="
++            echo "$resolved_gaps"
++        fi
++        echo ""
++        log_info "Plan would be reduced from $original_lines lines"
++        exit 0
++    fi
++
++    # Create archive directory
++    mkdir -p "$archive_dir"
++
++    # Write completed tasks
++    if [[ $task_count -gt 0 ]]; then
++        {
++            echo "# Archived Completed Tasks"
++            echo ""
++            echo "> Archived: $(date '+%Y-%m-%d %H:%M:%S')"
++            echo ""
++            echo "$completed_tasks"
++        } > "$archive_dir/completed-tasks.md"
++        log_success "Created $archive_dir/completed-tasks.md"
++    fi
++
++    # Write resolved GAPs
++    if [[ $gap_count -gt 0 ]]; then
++        {
++            echo "# Archived Resolved GAPs"
++            echo ""
++            echo "> Archived: $(date '+%Y-%m-%d %H:%M:%S')"
++            echo ""
++            echo "$resolved_gaps"
++        } > "$archive_dir/resolved-gaps.md"
++        log_success "Created $archive_dir/resolved-gaps.md"
++    fi
++
++    # Backup original
++    cp "$PLAN_FILE" "$PLAN_FILE.bak"
++
++    # Remove archived content from plan
++    remove_archived_content "$PLAN_FILE" "$completed_tasks" "$resolved_gaps" "$PLAN_FILE.tmp"
++    mv "$PLAN_FILE.tmp" "$PLAN_FILE"
++
++    # Get new line count
++    local new_lines
++    new_lines=$(wc -l < "$PLAN_FILE" | tr -d ' ')
++
++    # Write summary
++    {
++        echo "Archive Summary"
++        echo "==============="
++        echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
++        echo "Tasks archived: $task_count"
++        echo "GAPs archived: $gap_count"
++        echo "Plan reduced: $original_lines -> $new_lines lines"
++    } > "$archive_dir/summary.txt"
++
++    log_success "Archived $task_count tasks and $gap_count GAPs"
++    log_success "Plan reduced from $original_lines to $new_lines lines"
++    log_info "Archive location: $archive_dir/"
++    log_info "Backup created: $PLAN_FILE.bak"
++}
++
++main "$@"
+diff --git a/ralph/scripts/check-context.sh b/ralph/scripts/check-context.sh
+new file mode 100755
+index 0000000..d9bdc24
+--- /dev/null
++++ b/ralph/scripts/check-context.sh
+@@ -0,0 +1,147 @@
++#!/bin/bash
++# =============================================================================
++# check-context.sh - Check token budget of key Ralph files
++# =============================================================================
++# Validates that IMPLEMENTATION_PLAN.md and AGENTS.md stay within token limits.
++# Token estimation: words × 1.3
++#
++# Usage:
++#   ./ralph/scripts/check-context.sh           # Check all files
++#   ./ralph/scripts/check-context.sh --help    # Show help
++#
++# =============================================================================
++
++set -euo pipefail
++
++# Colors
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# Script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RALPH_DIR="$(dirname "$SCRIPT_DIR")"
++
++# Files and token limits
++PLAN_FILE="$RALPH_DIR/IMPLEMENTATION_PLAN.md"
++AGENTS_FILE="$RALPH_DIR/AGENTS.md"
++
++PLAN_TOKEN_LIMIT=15000
++AGENTS_TOKEN_LIMIT=2000
++
++# Token multiplier (words × 1.3)
++TOKEN_MULTIPLIER="1.3"
++
++log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
++log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
++log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
++log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
++
++show_help() {
++    cat << 'EOF'
++check-context.sh - Check token budget of key Ralph files
++
++Usage:
++  ./ralph/scripts/check-context.sh         Check all files
++  ./ralph/scripts/check-context.sh --help  Show this help
++
++Token Limits:
++  IMPLEMENTATION_PLAN.md: 15,000 tokens (max)
++  AGENTS.md: 2,000 tokens (max)
++
++Token Estimation:
++  words × 1.3 (approximate LLM tokenization)
++
++Exit Codes:
++  0  All files within limits
++  1  One or more files exceed limits
++
++Examples:
++  ./ralph/scripts/check-context.sh
++EOF
++}
++
++estimate_tokens() {
++    local file="$1"
++    if [[ ! -f "$file" ]]; then
++        echo "0"
++        return
++    fi
++    local word_count
++    word_count=$(wc -w < "$file" | tr -d ' ')
++    # Use bc for floating point, round to integer
++    echo "$word_count * $TOKEN_MULTIPLIER / 1" | bc
++}
++
++check_file() {
++    local file="$1"
++    local limit="$2"
++    local name
++    name=$(basename "$file")
++
++    if [[ ! -f "$file" ]]; then
++        log_warn "$name: File not found"
++        return 0
++    fi
++
++    local tokens
++    tokens=$(estimate_tokens "$file")
++
++    if [[ $tokens -gt $limit ]]; then
++        log_warn "$name: ~$tokens tokens (exceeds $limit)"
++        if [[ "$name" == "IMPLEMENTATION_PLAN.md" ]]; then
++            log_info "Consider running: ./ralph/scripts/archive-completed.sh"
++        elif [[ "$name" == "AGENTS.md" ]]; then
++            log_info "Consider trimming operational notes from AGENTS.md"
++        fi
++        return 1
++    else
++        log_success "$name: ~$tokens tokens (OK, max: $limit)"
++        return 0
++    fi
++}
++
++main() {
++    # Parse args
++    while [[ $# -gt 0 ]]; do
++        case $1 in
++            -h|--help)
++                show_help
++                exit 0
++                ;;
++            *)
++                log_error "Unknown option: $1"
++                show_help
++                exit 1
++                ;;
++        esac
++    done
++
++    echo "Context Budget Check:"
++    echo ""
++
++    local exit_code=0
++
++    # Check IMPLEMENTATION_PLAN.md
++    if ! check_file "$PLAN_FILE" "$PLAN_TOKEN_LIMIT"; then
++        exit_code=1
++    fi
++
++    # Check AGENTS.md
++    if ! check_file "$AGENTS_FILE" "$AGENTS_TOKEN_LIMIT"; then
++        exit_code=1
++    fi
++
++    echo ""
++    if [[ $exit_code -eq 0 ]]; then
++        log_success "All files within token budget"
++    else
++        log_warn "Some files exceed token budget"
++    fi
++
++    exit $exit_code
++}
++
++main "$@"
+diff --git a/ralph/scripts/check-plan-size.sh b/ralph/scripts/check-plan-size.sh
+new file mode 100755
+index 0000000..d0f18b2
+--- /dev/null
++++ b/ralph/scripts/check-plan-size.sh
+@@ -0,0 +1,114 @@
++#!/bin/bash
++# =============================================================================
++# check-plan-size.sh - Validate IMPLEMENTATION_PLAN.md size
++# =============================================================================
++# Warns if plan exceeds threshold, suggests archiving completed tasks.
++#
++# Usage:
++#   ./ralph/scripts/check-plan-size.sh                # Check with default threshold (400)
++#   ./ralph/scripts/check-plan-size.sh --warn-at 300  # Custom threshold
++#   ./ralph/scripts/check-plan-size.sh --fail         # Exit 1 if exceeded
++#   ./ralph/scripts/check-plan-size.sh --help         # Show help
++#
++# =============================================================================
++
++set -euo pipefail
++
++# Colors
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# Script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RALPH_DIR="$(dirname "$SCRIPT_DIR")"
++
++# Files
++PLAN_FILE="$RALPH_DIR/IMPLEMENTATION_PLAN.md"
++
++# Options
++WARN_AT=400
++FAIL_ON_EXCEED=false
++
++log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
++log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
++log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
++log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
++
++show_help() {
++    cat << 'EOF'
++check-plan-size.sh - Validate IMPLEMENTATION_PLAN.md size
++
++Usage:
++  ./ralph/scripts/check-plan-size.sh                Check with default threshold (400 lines)
++  ./ralph/scripts/check-plan-size.sh --warn-at N    Use custom warning threshold
++  ./ralph/scripts/check-plan-size.sh --fail         Exit with code 1 if threshold exceeded
++  ./ralph/scripts/check-plan-size.sh --help         Show this help
++
++Exit Codes:
++  0  Plan is under the threshold (or --fail not specified)
++  1  Plan exceeds threshold (when --fail is used)
++
++Examples:
++  ./ralph/scripts/check-plan-size.sh --warn-at 300
++  ./ralph/scripts/check-plan-size.sh --fail --warn-at 500
++EOF
++}
++
++parse_args() {
++    while [[ $# -gt 0 ]]; do
++        case $1 in
++            -h|--help)
++                show_help
++                exit 0
++                ;;
++            --warn-at)
++                if [[ -z "${2:-}" ]] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
++                    log_error "--warn-at requires a positive integer"
++                    exit 1
++                fi
++                WARN_AT="$2"
++                shift 2
++                ;;
++            --fail)
++                FAIL_ON_EXCEED=true
++                shift
++                ;;
++            *)
++                log_error "Unknown option: $1"
++                show_help
++                exit 1
++                ;;
++        esac
++    done
++}
++
++main() {
++    parse_args "$@"
++
++    # Validate plan file exists
++    if [[ ! -f "$PLAN_FILE" ]]; then
++        log_error "IMPLEMENTATION_PLAN.md not found at: $PLAN_FILE"
++        exit 1
++    fi
++
++    # Count lines
++    local line_count
++    line_count=$(wc -l < "$PLAN_FILE" | tr -d ' ')
++
++    # Check threshold
++    if [[ $line_count -gt $WARN_AT ]]; then
++        log_warn "IMPLEMENTATION_PLAN.md: $line_count lines (exceeds $WARN_AT)"
++        log_info "Suggestion: Run ./ralph/scripts/archive-completed.sh"
++
++        if [[ "$FAIL_ON_EXCEED" == "true" ]]; then
++            exit 1
++        fi
++    else
++        log_success "IMPLEMENTATION_PLAN.md: $line_count lines (OK, max: $WARN_AT)"
++    fi
++}
++
++main "$@"
+diff --git a/ralph/scripts/focus.sh b/ralph/scripts/focus.sh
+new file mode 100755
+index 0000000..5e18dd4
+--- /dev/null
++++ b/ralph/scripts/focus.sh
+@@ -0,0 +1,206 @@
++#!/bin/bash
++# =============================================================================
++# focus.sh - Add/remove session focus signposts in PROMPT_build.md
++# =============================================================================
++# Adds a session focus marker at the top of PROMPT_build.md to steer Ralph
++# toward specific work during the current session.
++#
++# Usage:
++#   ./ralph/scripts/focus.sh "Complete Phase 7.2 only"  # Add focus
++#   ./ralph/scripts/focus.sh --show                      # Show current focus
++#   ./ralph/scripts/focus.sh --remove                    # Remove focus
++#   ./ralph/scripts/focus.sh --help                      # Show help
++#
++# =============================================================================
++
++set -euo pipefail
++
++# Colors
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# Script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RALPH_DIR="$(dirname "$SCRIPT_DIR")"
++
++# Files
++PROMPT_FILE="$RALPH_DIR/PROMPT_build.md"
++BACKUP_FILE="$RALPH_DIR/.PROMPT_build.md.bak"
++
++# Signpost markers
++SIGNPOST_START="## SESSION FOCUS (Remove when complete)"
++SIGNPOST_END="---"
++
++# Options
++SHOW=false
++REMOVE=false
++FOCUS=""
++
++log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
++log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
++log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
++log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
++
++show_help() {
++    cat << 'EOF'
++focus.sh - Add/remove session focus signposts in PROMPT_build.md
++
++Usage:
++  ./ralph/scripts/focus.sh "Focus description"  Add session focus
++  ./ralph/scripts/focus.sh --show               Show current focus
++  ./ralph/scripts/focus.sh --remove             Remove current focus
++  ./ralph/scripts/focus.sh --help               Show this help
++
++Examples:
++  ./ralph/scripts/focus.sh "Complete Phase 7.2 UI components only"
++  ./ralph/scripts/focus.sh "Fix all TypeScript errors before any features"
++  ./ralph/scripts/focus.sh "Work on P1 tasks until ALL_TASKS_COMPLETE"
++
++Notes:
++  - Focus is added to the TOP of PROMPT_build.md
++  - Original file is backed up to .PROMPT_build.md.bak
++  - Only one focus can be active at a time
++  - Remove focus when the session goal is complete
++EOF
++}
++
++parse_args() {
++    while [[ $# -gt 0 ]]; do
++        case $1 in
++            -h|--help)
++                show_help
++                exit 0
++                ;;
++            --show|-s)
++                SHOW=true
++                shift
++                ;;
++            --remove|-r)
++                REMOVE=true
++                shift
++                ;;
++            *)
++                if [[ -z "$FOCUS" ]]; then
++                    FOCUS="$1"
++                else
++                    FOCUS="$FOCUS $1"
++                fi
++                shift
++                ;;
++        esac
++    done
++}
++
++has_focus() {
++    grep -q "^$SIGNPOST_START" "$PROMPT_FILE" 2>/dev/null
++}
++
++get_current_focus() {
++    if has_focus; then
++        # Extract the focus description (line after the header)
++        awk "/$SIGNPOST_START/{found=1; next} found && /^This session:/{print; exit}" "$PROMPT_FILE" | sed 's/^This session: //'
++    fi
++}
++
++show_focus() {
++    if has_focus; then
++        local focus
++        focus=$(get_current_focus)
++        log_info "Current session focus:"
++        echo ""
++        echo "  $focus"
++        echo ""
++    else
++        log_info "No session focus currently set"
++    fi
++}
++
++remove_focus() {
++    if ! has_focus; then
++        log_info "No session focus to remove"
++        return 0
++    fi
++
++    # Backup original
++    cp "$PROMPT_FILE" "$BACKUP_FILE"
++
++    # Remove signpost block (from SIGNPOST_START to first ---)
++    awk -v start="$SIGNPOST_START" '
++        BEGIN { skip=0 }
++        $0 == start { skip=1; next }
++        skip && /^---$/ { skip=0; next }
++        !skip { print }
++    ' "$BACKUP_FILE" > "$PROMPT_FILE"
++
++    # Remove leading blank lines
++    sed -i.tmp '/./,$!d' "$PROMPT_FILE" 2>/dev/null || sed -i '' '/./,$!d' "$PROMPT_FILE"
++    rm -f "$PROMPT_FILE.tmp"
++
++    log_success "Session focus removed"
++    log_info "Backup saved to: $BACKUP_FILE"
++}
++
++add_focus() {
++    local focus_text="$1"
++
++    if [[ -z "$focus_text" ]]; then
++        log_error "Focus description is required"
++        echo ""
++        show_help
++        exit 1
++    fi
++
++    # If focus already exists, remove it first
++    if has_focus; then
++        log_info "Replacing existing focus..."
++        remove_focus
++    fi
++
++    # Backup original
++    cp "$PROMPT_FILE" "$BACKUP_FILE"
++
++    # Create signpost block
++    local signpost
++    signpost=$(cat << EOF
++$SIGNPOST_START
++
++This session: $focus_text
++
++$SIGNPOST_END
++
++EOF
++)
++
++    # Prepend to file
++    echo "$signpost" | cat - "$PROMPT_FILE" > "$PROMPT_FILE.tmp"
++    mv "$PROMPT_FILE.tmp" "$PROMPT_FILE"
++
++    log_success "Session focus added"
++    log_info "Focus: $focus_text"
++    log_info "Backup saved to: $BACKUP_FILE"
++}
++
++main() {
++    parse_args "$@"
++
++    # Validate prompt file exists
++    if [[ ! -f "$PROMPT_FILE" ]]; then
++        log_error "PROMPT_build.md not found at: $PROMPT_FILE"
++        exit 1
++    fi
++
++    if [[ "$SHOW" == "true" ]]; then
++        show_focus
++    elif [[ "$REMOVE" == "true" ]]; then
++        remove_focus
++    elif [[ -n "$FOCUS" ]]; then
++        add_focus "$FOCUS"
++    else
++        show_focus
++    fi
++}
++
++main "$@"
+diff --git a/ralph/scripts/refresh-plan.sh b/ralph/scripts/refresh-plan.sh
+new file mode 100755
+index 0000000..17ed6b2
+--- /dev/null
++++ b/ralph/scripts/refresh-plan.sh
+@@ -0,0 +1,218 @@
++#!/bin/bash
++# =============================================================================
++# refresh-plan.sh - Regenerate IMPLEMENTATION_PLAN.md from specs
++# =============================================================================
++# Implements the "disposable plans philosophy" - plans can be regenerated from
++# specs at any time. Current plan is archived before regeneration.
++#
++# Usage:
++#   ./ralph/scripts/refresh-plan.sh                    # Archive and regenerate
++#   ./ralph/scripts/refresh-plan.sh --keep-learnings   # Preserve learnings section
++#   ./ralph/scripts/refresh-plan.sh --archive          # Archive only (no regeneration)
++#   ./ralph/scripts/refresh-plan.sh --help             # Show help
++#
++# =============================================================================
++
++set -euo pipefail
++
++# Colors
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# Script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RALPH_DIR="$(dirname "$SCRIPT_DIR")"
++
++# Files
++PLAN_FILE="$RALPH_DIR/IMPLEMENTATION_PLAN.md"
++LEARNINGS_FILE="$RALPH_DIR/LEARNINGS.md"
++ARCHIVE_BASE="$RALPH_DIR/IMPLEMENTATION_ARCHIVE"
++
++# Options
++KEEP_LEARNINGS=false
++ARCHIVE_ONLY=false
++ITERATIONS=3
++
++log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
++log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
++log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
++log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
++
++show_help() {
++    cat << 'EOF'
++refresh-plan.sh - Regenerate IMPLEMENTATION_PLAN.md from specs
++
++Implements the "disposable plans philosophy" - plans can be safely regenerated
++from specs because the specs are the source of truth.
++
++Usage:
++  ./ralph/scripts/refresh-plan.sh                    Archive current plan and regenerate
++  ./ralph/scripts/refresh-plan.sh --keep-learnings   Preserve the learnings section during regeneration
++  ./ralph/scripts/refresh-plan.sh --archive          Archive only (do not regenerate)
++  ./ralph/scripts/refresh-plan.sh --iterations N     Number of planning iterations (default: 3)
++  ./ralph/scripts/refresh-plan.sh --help             Show this help
++
++Process:
++  1. Archive current plan to IMPLEMENTATION_ARCHIVE/YYYY-MM-DD-pre-refresh.md
++  2. (Optional) Extract and preserve learnings section
++  3. Run ./ralph/loop.sh plan <iterations> to regenerate
++  4. (Optional) Append preserved learnings to new plan
++
++Exit Codes:
++  0  Successful refresh
++  1  Error during refresh
++EOF
++}
++
++parse_args() {
++    while [[ $# -gt 0 ]]; do
++        case $1 in
++            -h|--help)
++                show_help
++                exit 0
++                ;;
++            --keep-learnings)
++                KEEP_LEARNINGS=true
++                shift
++                ;;
++            --archive)
++                ARCHIVE_ONLY=true
++                shift
++                ;;
++            --iterations)
++                if [[ -z "${2:-}" ]] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
++                    log_error "--iterations requires a positive integer"
++                    exit 1
++                fi
++                ITERATIONS="$2"
++                shift 2
++                ;;
++            *)
++                log_error "Unknown option: $1"
++                show_help
++                exit 1
++                ;;
++        esac
++    done
++}
++
++extract_learnings() {
++    local content="$1"
++    local in_learnings=false
++    local learnings=""
++
++    while IFS= read -r line; do
++        if [[ "$line" =~ ^##[[:space:]]+Learnings ]] || [[ "$line" =~ ^##[[:space:]]+Source[[:space:]]+Research ]]; then
++            in_learnings=true
++            learnings+="$line"$'\n'
++        elif [[ "$in_learnings" == true ]]; then
++            if [[ "$line" =~ ^##[[:space:]] ]] && ! [[ "$line" =~ ^##[[:space:]]+Learnings ]] && ! [[ "$line" =~ ^##[[:space:]]+Source ]]; then
++                break
++            fi
++            learnings+="$line"$'\n'
++        fi
++    done <<< "$content"
++
++    echo "$learnings"
++}
++
++archive_plan() {
++    local today
++    today=$(date +%Y-%m-%d)
++    local timestamp
++    timestamp=$(date +%H%M%S)
++    local archive_file="$ARCHIVE_BASE/${today}-pre-refresh-${timestamp}.md"
++
++    mkdir -p "$ARCHIVE_BASE"
++
++    {
++        echo "# Pre-Refresh Archive"
++        echo ""
++        echo "> Archived: $(date '+%Y-%m-%d %H:%M:%S')"
++        echo "> Reason: Plan refresh via refresh-plan.sh"
++        echo ""
++        echo "---"
++        echo ""
++        cat "$PLAN_FILE"
++    } > "$archive_file"
++
++    log_success "Archived current plan to: $archive_file"
++    echo "$archive_file"
++}
++
++main() {
++    parse_args "$@"
++
++    # Validate plan file exists
++    if [[ ! -f "$PLAN_FILE" ]]; then
++        log_error "IMPLEMENTATION_PLAN.md not found at: $PLAN_FILE"
++        exit 1
++    fi
++
++    # Get original line count
++    local original_lines
++    original_lines=$(wc -l < "$PLAN_FILE" | tr -d ' ')
++    log_info "Current plan: $original_lines lines"
++
++    # Archive current plan
++    local archive_path
++    archive_path=$(archive_plan)
++
++    if [[ "$ARCHIVE_ONLY" == "true" ]]; then
++        log_success "Archive complete. Plan preserved at original location."
++        exit 0
++    fi
++
++    # Extract learnings if requested
++    local preserved_learnings=""
++    if [[ "$KEEP_LEARNINGS" == "true" ]]; then
++        log_info "Extracting learnings section..."
++        local content
++        content=$(cat "$PLAN_FILE")
++        preserved_learnings=$(extract_learnings "$content")
++        if [[ -n "$preserved_learnings" ]]; then
++            local learnings_lines
++            learnings_lines=$(echo "$preserved_learnings" | wc -l | tr -d ' ')
++            log_success "Preserved $learnings_lines lines of learnings"
++        else
++            log_warn "No learnings section found to preserve"
++        fi
++    fi
++
++    # Run plan mode to regenerate
++    log_info "Regenerating plan from specs (${ITERATIONS} iterations)..."
++    log_info "Running: ./ralph/loop.sh plan ${ITERATIONS}"
++    echo ""
++
++    if ! "$RALPH_DIR/loop.sh" plan "$ITERATIONS"; then
++        log_error "Plan regeneration failed"
++        log_info "Original plan preserved at: $archive_path"
++        exit 1
++    fi
++
++    echo ""
++
++    # Append preserved learnings if any
++    if [[ -n "$preserved_learnings" ]]; then
++        log_info "Appending preserved learnings..."
++        echo "" >> "$PLAN_FILE"
++        echo "---" >> "$PLAN_FILE"
++        echo "" >> "$PLAN_FILE"
++        echo "$preserved_learnings" >> "$PLAN_FILE"
++        log_success "Learnings section restored"
++    fi
++
++    # Report results
++    local new_lines
++    new_lines=$(wc -l < "$PLAN_FILE" | tr -d ' ')
++
++    echo ""
++    log_success "Plan refresh complete!"
++    log_info "Previous plan: $original_lines lines -> New plan: $new_lines lines"
++    log_info "Archive: $archive_path"
++}
++
++main "$@"
+diff --git a/ralph/scripts/request.sh b/ralph/scripts/request.sh
+new file mode 100755
+index 0000000..151686a
+--- /dev/null
++++ b/ralph/scripts/request.sh
+@@ -0,0 +1,391 @@
++#!/bin/bash
++# =============================================================================
++# request.sh - Create @fix_plan.md for immediate task injection
++# =============================================================================
++# Creates a fix plan file that Ralph will process immediately, before any other
++# work. Use this for urgent tasks, bug fixes, or mid-course corrections.
++#
++# Usage:
++#   ./ralph/scripts/request.sh "Create API documentation"
++#   ./ralph/scripts/request.sh --template docs "Application startup"
++#   ./ralph/scripts/request.sh --template test "AuthService"
++#   ./ralph/scripts/request.sh --template fix "Login timeout bug"
++#   ./ralph/scripts/request.sh --template feature "Dark mode toggle"
++#   ./ralph/scripts/request.sh --priority P1 "Critical security fix"
++#   ./ralph/scripts/request.sh --help
++#
++# =============================================================================
++
++set -euo pipefail
++
++# Colors
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# Script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RALPH_DIR="$(dirname "$SCRIPT_DIR")"
++
++# Output file
++FIX_PLAN_FILE="$RALPH_DIR/@fix_plan.md"
++
++# Options
++TEMPLATE="default"
++PRIORITY="P1"
++TITLE=""
++
++log_info() { echo -e "${CYAN}[INFO]${NC} $1"; }
++log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
++log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
++log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
++
++show_help() {
++    cat << 'EOF'
++request.sh - Create @fix_plan.md for immediate task injection
++
++Usage:
++  ./ralph/scripts/request.sh "Task description"
++  ./ralph/scripts/request.sh --template <type> "Task description"
++  ./ralph/scripts/request.sh --priority <P1|P2|P3> "Task description"
++  ./ralph/scripts/request.sh --help
++
++Templates:
++  default  - Generic task template
++  docs     - Documentation task
++  test     - Write tests for a component
++  fix      - Bug fix
++  feature  - New feature implementation
++
++Examples:
++  ./ralph/scripts/request.sh "Create API documentation"
++  ./ralph/scripts/request.sh --template docs "Application startup guide"
++  ./ralph/scripts/request.sh --template test "AuthService"
++  ./ralph/scripts/request.sh --template fix "Login timeout bug"
++  ./ralph/scripts/request.sh --template feature "Dark mode toggle"
++  ./ralph/scripts/request.sh --priority P1 "Critical security fix"
++
++Output:
++  Creates ralph/@fix_plan.md - Ralph will process this immediately
++EOF
++}
++
++parse_args() {
++    while [[ $# -gt 0 ]]; do
++        case $1 in
++            -h|--help)
++                show_help
++                exit 0
++                ;;
++            --template|-t)
++                TEMPLATE="$2"
++                shift 2
++                ;;
++            --priority|-p)
++                PRIORITY="$2"
++                shift 2
++                ;;
++            *)
++                if [[ -z "$TITLE" ]]; then
++                    TITLE="$1"
++                else
++                    TITLE="$TITLE $1"
++                fi
++                shift
++                ;;
++        esac
++    done
++
++    if [[ -z "$TITLE" ]]; then
++        log_error "Task description is required"
++        echo ""
++        show_help
++        exit 1
++    fi
++}
++
++generate_default_template() {
++    cat << EOF
++# Immediate Task: $TITLE
++
++> **Priority**: $PRIORITY - Complete before any other work
++> **Created**: $(date +%Y-%m-%d)
++
++---
++
++## Objective
++
++$TITLE
++
++---
++
++## Deliverables
++
++1. [Specify deliverable]
++
++---
++
++## Acceptance Criteria
++
++- [ ] [Criterion 1]
++
++---
++
++## When Complete
++
++1. Verify all criteria are met
++2. Delete this file (\`ralph/@fix_plan.md\`)
++3. Output the completion signal below
++
++## Completion Signal
++
++<promise>FIX_COMPLETE</promise>
++EOF
++}
++
++generate_docs_template() {
++    cat << EOF
++# Immediate Task: Documentation - $TITLE
++
++> **Priority**: $PRIORITY - Complete before any other work
++> **Created**: $(date +%Y-%m-%d)
++
++---
++
++## Objective
++
++Create comprehensive documentation for $TITLE.
++
++---
++
++## Deliverables
++
++1. Documentation file in \`docs/\` or appropriate location
++2. Update \`ralph/AGENTS.md\` if operational commands involved
++
++---
++
++## Sections Required
++
++- Overview
++- Prerequisites
++- Step-by-step instructions
++- Verification steps
++- Troubleshooting
++
++---
++
++## Acceptance Criteria
++
++- [ ] Documentation is complete and follows project style
++- [ ] Can follow docs from scratch without assumed knowledge
++- [ ] All code examples are tested
++
++---
++
++## When Complete
++
++1. Verify all criteria are met
++2. Delete this file (\`ralph/@fix_plan.md\`)
++3. Output the completion signal below
++
++## Completion Signal
++
++<promise>DOCS_COMPLETE</promise>
++EOF
++}
++
++generate_test_template() {
++    cat << EOF
++# Immediate Task: Tests - $TITLE
++
++> **Priority**: $PRIORITY - Complete before any other work
++> **Created**: $(date +%Y-%m-%d)
++
++---
++
++## Objective
++
++Write comprehensive tests for $TITLE.
++
++---
++
++## Deliverables
++
++1. Test file in appropriate \`__tests__/\` or \`*.test.ts\` location
++2. All tests passing
++
++---
++
++## Requirements
++
++- Unit tests for all public methods
++- Edge cases and error conditions
++- Integration tests if applicable
++
++---
++
++## Acceptance Criteria
++
++- [ ] All tests passing with \`bun test <path>\`
++- [ ] Coverage for main functionality
++- [ ] No regressions in existing tests
++
++---
++
++## When Complete
++
++1. Run \`bun test\` to verify all tests pass
++2. Delete this file (\`ralph/@fix_plan.md\`)
++3. Output the completion signal below
++
++## Completion Signal
++
++<promise>TESTS_COMPLETE</promise>
++EOF
++}
++
++generate_fix_template() {
++    cat << EOF
++# Immediate Task: Bug Fix - $TITLE
++
++> **Priority**: $PRIORITY - Complete before any other work
++> **Created**: $(date +%Y-%m-%d)
++
++---
++
++## Objective
++
++Fix the bug: $TITLE
++
++---
++
++## Investigation Steps
++
++1. Reproduce the issue
++2. Identify root cause
++3. Implement fix
++4. Add regression test
++
++---
++
++## Acceptance Criteria
++
++- [ ] Bug is fixed and verified
++- [ ] Regression test added
++- [ ] All existing tests still pass
++- [ ] No new warnings introduced
++
++---
++
++## When Complete
++
++1. Verify all criteria are met
++2. Delete this file (\`ralph/@fix_plan.md\`)
++3. Output the completion signal below
++
++## Completion Signal
++
++<promise>FIX_COMPLETE</promise>
++EOF
++}
++
++generate_feature_template() {
++    cat << EOF
++# Immediate Task: Feature - $TITLE
++
++> **Priority**: $PRIORITY - Complete before any other work
++> **Created**: $(date +%Y-%m-%d)
++
++---
++
++## Objective
++
++Implement feature: $TITLE
++
++---
++
++## Deliverables
++
++1. Feature implementation
++2. Tests for the feature
++3. Documentation if user-facing
++
++---
++
++## Acceptance Criteria
++
++- [ ] Feature works as specified
++- [ ] Tests passing
++- [ ] No regressions
++- [ ] Code follows project conventions
++
++---
++
++## When Complete
++
++1. Verify all criteria are met
++2. Delete this file (\`ralph/@fix_plan.md\`)
++3. Output the completion signal below
++
++## Completion Signal
++
++<promise>FEATURE_COMPLETE</promise>
++EOF
++}
++
++main() {
++    parse_args "$@"
++
++    # Check if fix plan already exists
++    if [[ -f "$FIX_PLAN_FILE" ]]; then
++        log_warn "WARNING: $FIX_PLAN_FILE already exists!"
++        log_warn "Current content will be OVERWRITTEN."
++        echo ""
++        read -p "Continue? [y/N] " -n 1 -r
++        echo ""
++        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
++            log_info "Aborted."
++            exit 0
++        fi
++    fi
++
++    # Generate template
++    local content
++    case "$TEMPLATE" in
++        default)
++            content=$(generate_default_template)
++            ;;
++        docs)
++            content=$(generate_docs_template)
++            ;;
++        test)
++            content=$(generate_test_template)
++            ;;
++        fix)
++            content=$(generate_fix_template)
++            ;;
++        feature)
++            content=$(generate_feature_template)
++            ;;
++        *)
++            log_error "Unknown template: $TEMPLATE"
++            log_info "Available templates: default, docs, test, fix, feature"
++            exit 1
++            ;;
++    esac
++
++    # Write to file
++    echo "$content" > "$FIX_PLAN_FILE"
++
++    log_success "Created $FIX_PLAN_FILE"
++    log_info "Template: $TEMPLATE"
++    log_info "Priority: $PRIORITY"
++    log_info "Title: $TITLE"
++    echo ""
++    log_info "Run ./ralph/loop.sh to execute"
++}
++
++main "$@"

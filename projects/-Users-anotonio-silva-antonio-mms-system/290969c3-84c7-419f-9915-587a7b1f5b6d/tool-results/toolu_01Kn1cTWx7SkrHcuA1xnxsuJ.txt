@@ -1,0 +1,238 @@
+     1→/**
+     2→ * Costing Routes
+     3→ *
+     4→ * REST endpoints for Total Cost of Ownership (TCO) projections and cost variance analysis.
+     5→ * Provides financial insights for the 12-year contract period.
+     6→ *
+     7→ * Key features:
+     8→ * - TCO projection with inflation and NPV calculations
+     9→ * - Budget vs. actual variance analysis
+    10→ * - Depot-level and global cost views
+    11→ *
+    12→ * @see specs/005-api.md Section 5.12
+    13→ */
+    14→
+    15→import { Hono } from 'hono';
+    16→import {
+    17→  success,
+    18→  error,
+    19→  ErrorCodes,
+    20→  type AppVariables,
+    21→} from '../types';
+    22→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    23→import { getCostingService } from '../../services';
+    24→import { isValidUuid } from '../../lib/schemas';
+    25→
+    26→// Singleton service instance
+    27→let costingService: ReturnType<typeof getCostingService> | null = null;
+    28→
+    29→function getService(): ReturnType<typeof getCostingService> {
+    30→  if (!costingService) {
+    31→    costingService = getCostingService();
+    32→  }
+    33→  return costingService;
+    34→}
+    35→
+    36→export const costingRoutes = new Hono<{ Variables: AppVariables }>();
+    37→
+    38→/**
+    39→ * GET /costing/tco-projection
+    40→ *
+    41→ * Get Total Cost of Ownership projection for the contract period.
+    42→ *
+    43→ * The projection includes:
+    44→ * - Yearly cost breakdown (labor + materials)
+    45→ * - Inflation adjustment (3% annually)
+    46→ * - NPV calculation (5% discount rate)
+    47→ * - PM count per year
+    48→ *
+    49→ * Query Parameters:
+    50→ * - horizonYears: Projection horizon in years (default: 12)
+    51→ * - scenarioId: Calculate for a specific scenario (UUID)
+    52→ * - depotId: Filter by depot (UUID)
+    53→ *
+    54→ * @returns TCO projection with yearly breakdown and summary
+    55→ */
+    56→costingRoutes.get('/costing/tco-projection', async (c) => {
+    57→  const requestId = getRequestId(c);
+    58→  const service = getService();
+    59→
+    60→  // Parse query parameters
+    61→  const horizonYearsParam = c.req.query('horizonYears');
+    62→  const scenarioId = c.req.query('scenarioId');
+    63→  const depotId = c.req.query('depotId');
+    64→
+    65→  // Validate horizon years if provided
+    66→  let horizonYears: number | undefined;
+    67→  if (horizonYearsParam) {
+    68→    horizonYears = Number(horizonYearsParam);
+    69→    if (isNaN(horizonYears) || horizonYears < 1 || horizonYears > 20) {
+    70→      return c.json(
+    71→        error(
+    72→          ErrorCodes.VALIDATION_ERROR,
+    73→          'horizonYears must be between 1 and 20',
+    74→          requestId
+    75→        ),
+    76→        400
+    77→      );
+    78→    }
+    79→  }
+    80→
+    81→  // Validate scenarioId if provided
+    82→  if (scenarioId && !isValidUuid(scenarioId)) {
+    83→    return c.json(
+    84→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenarioId format', requestId),
+    85→      400
+    86→    );
+    87→  }
+    88→
+    89→  // Validate depotId if provided
+    90→  if (depotId && !isValidUuid(depotId)) {
+    91→    return c.json(
+    92→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid depotId format', requestId),
+    93→      400
+    94→    );
+    95→  }
+    96→
+    97→  const projection = await service.projectTCO({
+    98→    horizonYears,
+    99→    scenarioId: scenarioId || undefined,
+   100→    depotId: depotId || undefined,
+   101→  });
+   102→
+   103→  // Map to API response format per spec 005.12
+   104→  return c.json(
+   105→    success(
+   106→      {
+   107→        generatedAt: projection.calculatedAt.toISOString(),
+   108→        horizonYears: projection.horizonYears,
+   109→        projections: projection.projections.map((year) => ({
+   110→          fiscalYear: year.fiscalYear,
+   111→          laborCost: Math.round(year.laborCost * 100) / 100,
+   112→          materialCost: Math.round(year.materialCost * 100) / 100,
+   113→          totalCost: Math.round(year.totalCost * 100) / 100,
+   114→          pmCount: year.pmCount,
+   115→          inflationFactor: Math.round(year.inflationFactor * 10000) / 10000,
+   116→        })),
+   117→        summary: {
+   118→          totalLaborCost: Math.round(projection.summary.totalLaborCost * 100) / 100,
+   119→          totalMaterialCost: Math.round(projection.summary.totalMaterialCost * 100) / 100,
+   120→          totalCost: Math.round(projection.summary.totalCost * 100) / 100,
+   121→          totalPMCount: projection.summary.totalPMCount,
+   122→          npv: Math.round(projection.summary.npv * 100) / 100,
+   123→          avgAnnualCost: Math.round(projection.summary.avgAnnualCost * 100) / 100,
+   124→        },
+   125→      },
+   126→      { timing: { durationMs: getRequestDuration(c) } }
+   127→    )
+   128→  );
+   129→});
+   130→
+   131→/**
+   132→ * GET /costing/variance
+   133→ *
+   134→ * Get cost variance analysis comparing budget to actual costs.
+   135→ *
+   136→ * Compares:
+   137→ * - Budget figures from cost baseline
+   138→ * - Actual costs from completed PMs
+   139→ * - Variance with percentage
+   140→ *
+   141→ * Query Parameters:
+   142→ * - fiscalYear: Year to analyze (required)
+   143→ * - depotId: Filter by depot (UUID, optional for global view)
+   144→ *
+   145→ * @returns Cost variance with budget, actual, and status
+   146→ */
+   147→costingRoutes.get('/costing/variance', async (c) => {
+   148→  const requestId = getRequestId(c);
+   149→  const service = getService();
+   150→
+   151→  // Parse query parameters
+   152→  const fiscalYearParam = c.req.query('fiscalYear');
+   153→  const depotId = c.req.query('depotId');
+   154→
+   155→  // Validate fiscal year (required)
+   156→  if (!fiscalYearParam) {
+   157→    return c.json(
+   158→      error(ErrorCodes.VALIDATION_ERROR, 'fiscalYear is required', requestId),
+   159→      400
+   160→    );
+   161→  }
+   162→
+   163→  const fiscalYear = Number(fiscalYearParam);
+   164→  if (isNaN(fiscalYear) || fiscalYear < 2000 || fiscalYear > 2100) {
+   165→    return c.json(
+   166→      error(
+   167→        ErrorCodes.VALIDATION_ERROR,
+   168→        'fiscalYear must be a valid year between 2000 and 2100',
+   169→        requestId
+   170→      ),
+   171→      400
+   172→    );
+   173→  }
+   174→
+   175→  // Validate depotId if provided
+   176→  if (depotId && !isValidUuid(depotId)) {
+   177→    return c.json(
+   178→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid depotId format', requestId),
+   179→      400
+   180→    );
+   181→  }
+   182→
+   183→  try {
+   184→    const variance = await service.calculateVariance({
+   185→      fiscalYear,
+   186→      depotId: depotId || undefined,
+   187→    });
+   188→
+   189→    // Map to API response format per spec 005.12
+   190→    return c.json(
+   191→      success(
+   192→        {
+   193→          fiscalYear: variance.fiscalYear,
+   194→          depotId: variance.depotId,
+   195→          depotCode: variance.depotCode || null,
+   196→          budget: {
+   197→            labor: Math.round(variance.budget.labor * 100) / 100,
+   198→            material: Math.round(variance.budget.material * 100) / 100,
+   199→            total: Math.round(variance.budget.total * 100) / 100,
+   200→          },
+   201→          actual: {
+   202→            labor: Math.round(variance.actual.labor * 100) / 100,
+   203→            material: Math.round(variance.actual.material * 100) / 100,
+   204→            total: Math.round(variance.actual.total * 100) / 100,
+   205→          },
+   206→          variance: {
+   207→            labor: Math.round(variance.variance.labor * 100) / 100,
+   208→            material: Math.round(variance.variance.material * 100) / 100,
+   209→            total: Math.round(variance.variance.total * 100) / 100,
+   210→            percentage: Math.round(variance.variance.percentage * 100) / 100,
+   211→          },
+   212→          status: variance.status,
+   213→          pmCompleted: variance.pmCompleted,
+   214→          calculatedAt: variance.calculatedAt.toISOString(),
+   215→        },
+   216→        { timing: { durationMs: getRequestDuration(c) } }
+   217→      )
+   218→    );
+   219→  } catch (err) {
+   220→    // Handle NotFoundError for missing cost baseline
+   221→    if (err instanceof Error && err.name === 'NotFoundError') {
+   222→      return c.json(
+   223→        error(
+   224→          ErrorCodes.NOT_FOUND,
+   225→          `Cost baseline not found for fiscal year ${fiscalYear}${depotId ? ` and depot ${depotId}` : ''}`,
+   226→          requestId
+   227→        ),
+   228→        404
+   229→      );
+   230→    }
+   231→    throw err;
+   232→  }
+   233→});
+   234→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

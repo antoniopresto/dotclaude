@@ -1,0 +1,717 @@
+     1→/**
+     2→ * Scenario Management Routes
+     3→ *
+     4→ * REST endpoints for what-if scenario analysis.
+     5→ * Scenarios enable users to explore alternative planning outcomes
+     6→ * without affecting the production schedule.
+     7→ *
+     8→ * Key features:
+     9→ * - Fork from baselines or other scenarios
+    10→ * - Apply changes (PM moves, adds, removes)
+    11→ * - Compare scenarios side-by-side
+    12→ * - Promote winning scenarios to new baselines
+    13→ *
+    14→ * @see specs/005-api.md Section 5.10
+    15→ */
+    16→
+    17→import { Hono } from 'hono';
+    18→import {
+    19→  success,
+    20→  paginatedSuccess,
+    21→  error,
+    22→  parsePaginationQuery,
+    23→  ErrorCodes,
+    24→  type AppVariables,
+    25→} from '../types';
+    26→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    27→import {
+    28→  getSimulationService,
+    29→  type ScenarioListFilters,
+    30→  type ScenarioStatus,
+    31→  type DeltaType,
+    32→  type EntityType,
+    33→} from '../../services';
+    34→import { isValidUuid } from '../../lib/schemas';
+    35→
+    36→// Singleton service instance
+    37→let simulationService: ReturnType<typeof getSimulationService> | null = null;
+    38→
+    39→function getService(): ReturnType<typeof getSimulationService> {
+    40→  if (!simulationService) {
+    41→    simulationService = getSimulationService();
+    42→  }
+    43→  return simulationService;
+    44→}
+    45→
+    46→export const scenarioRoutes = new Hono<{ Variables: AppVariables }>();
+    47→
+    48→/**
+    49→ * GET /scenarios
+    50→ *
+    51→ * List scenarios with filtering and pagination.
+    52→ *
+    53→ * Query Parameters:
+    54→ * - status: Filter by status (ACTIVE, PROMOTED, DISCARDED, EXPIRED)
+    55→ * - createdBy: Filter by creator user ID
+    56→ * - forkedFromBaselineId: Filter by source baseline
+    57→ * - forkedFromScenarioId: Filter by source scenario
+    58→ * - includeExpired: Include expired scenarios (default: false)
+    59→ * - page: Page number (default: 1)
+    60→ * - pageSize: Items per page (default: 20, max: 100)
+    61→ * - sort: Sort field (name:asc, createdAt:desc, lastModifiedAt:desc, expiresAt:asc)
+    62→ */
+    63→scenarioRoutes.get('/scenarios', async (c) => {
+    64→  const service = getService();
+    65→
+    66→  // Parse query filters
+    67→  const filters: ScenarioListFilters = {};
+    68→  const status = c.req.query('status');
+    69→  const createdBy = c.req.query('createdBy');
+    70→  const forkedFromBaselineId = c.req.query('forkedFromBaselineId');
+    71→  const forkedFromScenarioId = c.req.query('forkedFromScenarioId');
+    72→  const includeExpired = c.req.query('includeExpired') === 'true';
+    73→
+    74→  if (status) {
+    75→    const validStatuses: ScenarioStatus[] = ['ACTIVE', 'PROMOTED', 'DISCARDED', 'EXPIRED'];
+    76→    const statusValues = status.split(',').filter((s) => validStatuses.includes(s as ScenarioStatus));
+    77→    if (statusValues.length === 1) {
+    78→      filters.status = statusValues[0] as ScenarioStatus;
+    79→    } else if (statusValues.length > 1) {
+    80→      filters.status = statusValues as ScenarioStatus[];
+    81→    }
+    82→  }
+    83→
+    84→  if (createdBy) {
+    85→    filters.createdBy = createdBy;
+    86→  }
+    87→
+    88→  if (forkedFromBaselineId && isValidUuid(forkedFromBaselineId)) {
+    89→    filters.forkedFromBaselineId = forkedFromBaselineId;
+    90→  }
+    91→
+    92→  if (forkedFromScenarioId && isValidUuid(forkedFromScenarioId)) {
+    93→    filters.forkedFromScenarioId = forkedFromScenarioId;
+    94→  }
+    95→
+    96→  filters.includeExpired = includeExpired;
+    97→
+    98→  // Parse pagination
+    99→  const pagination = parsePaginationQuery({
+   100→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   101→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   102→    sort: c.req.query('sort'),
+   103→  });
+   104→
+   105→  const result = await service.listScenarios(filters, {
+   106→    page: pagination.page,
+   107→    pageSize: Math.min(pagination.pageSize, 100),
+   108→    sortBy: pagination.sort?.field as 'name' | 'createdAt' | 'lastModifiedAt' | 'expiresAt' | undefined,
+   109→    sortOrder: pagination.sort?.direction,
+   110→  });
+   111→
+   112→  // Map to API response format per spec 005.10
+   113→  const scenarios = result.data.map((scenario) => ({
+   114→    id: scenario.id,
+   115→    name: scenario.name,
+   116→    description: scenario.description,
+   117→    status: scenario.status,
+   118→    forkedFromBaselineId: scenario.forkedFromBaselineId,
+   119→    forkedFromBaselineName: scenario.forkedFromBaselineName,
+   120→    forkedFromScenarioId: scenario.forkedFromScenarioId,
+   121→    forkedFromScenarioName: scenario.forkedFromScenarioName,
+   122→    forkedAt: scenario.forkedAt,
+   123→    createdBy: scenario.createdBy
+   124→      ? { id: scenario.createdBy, displayName: scenario.createdByEmail ?? null }
+   125→      : null,
+   126→    createdAt: scenario.createdAt,
+   127→    lastModifiedAt: scenario.lastModifiedAt,
+   128→    expiresAt: scenario.expiresAt,
+   129→    deltaCount: scenario.deltaCount ?? 0,
+   130→  }));
+   131→
+   132→  return c.json(
+   133→    paginatedSuccess(
+   134→      scenarios,
+   135→      {
+   136→        page: result.page,
+   137→        pageSize: result.pageSize,
+   138→        totalItems: result.total,
+   139→      },
+   140→      { durationMs: getRequestDuration(c) }
+   141→    )
+   142→  );
+   143→});
+   144→
+   145→/**
+   146→ * GET /scenarios/:id
+   147→ *
+   148→ * Get scenario details by ID.
+   149→ */
+   150→scenarioRoutes.get('/scenarios/:id', async (c) => {
+   151→  const requestId = getRequestId(c);
+   152→  const scenarioId = c.req.param('id');
+   153→
+   154→  if (!isValidUuid(scenarioId)) {
+   155→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   156→  }
+   157→
+   158→  const service = getService();
+   159→  const scenario = await service.getScenario(scenarioId);
+   160→
+   161→  return c.json(
+   162→    success(
+   163→      {
+   164→        id: scenario.id,
+   165→        name: scenario.name,
+   166→        description: scenario.description,
+   167→        status: scenario.status,
+   168→        forkedFromBaselineId: scenario.forkedFromBaselineId,
+   169→        forkedFromBaselineName: scenario.forkedFromBaselineName,
+   170→        forkedFromScenarioId: scenario.forkedFromScenarioId,
+   171→        forkedFromScenarioName: scenario.forkedFromScenarioName,
+   172→        forkedAt: scenario.forkedAt,
+   173→        createdBy: scenario.createdBy
+   174→          ? { id: scenario.createdBy, displayName: scenario.createdByEmail ?? null }
+   175→          : null,
+   176→        createdAt: scenario.createdAt,
+   177→        lastModifiedAt: scenario.lastModifiedAt,
+   178→        expiresAt: scenario.expiresAt,
+   179→        deltaCount: scenario.deltaCount ?? 0,
+   180→        promotedToBaselineId: scenario.promotedToBaselineId,
+   181→        promotedAt: scenario.promotedAt,
+   182→        promotedBy: scenario.promotedBy,
+   183→      },
+   184→      { timing: { durationMs: getRequestDuration(c) } }
+   185→    )
+   186→  );
+   187→});
+   188→
+   189→/**
+   190→ * POST /scenarios
+   191→ *
+   192→ * Create a new scenario forked from a baseline, another scenario, or production.
+   193→ *
+   194→ * Request body:
+   195→ * - name: Scenario name (required)
+   196→ * - description: Optional description
+   197→ * - forkFrom: Fork source specification (required)
+   198→ *   - type: 'BASELINE' | 'SCENARIO' | 'PRODUCTION'
+   199→ *   - id: Source ID (required for BASELINE and SCENARIO)
+   200→ * - expirationDays: Days until expiration (default: 30)
+   201→ */
+   202→scenarioRoutes.post('/scenarios', async (c) => {
+   203→  const requestId = getRequestId(c);
+   204→  const body = await c.req.json();
+   205→
+   206→  // Validate required fields
+   207→  if (!body.name || typeof body.name !== 'string' || body.name.trim().length === 0) {
+   208→    return c.json(
+   209→      error(ErrorCodes.VALIDATION_ERROR, 'Scenario name is required', requestId),
+   210→      400
+   211→    );
+   212→  }
+   213→
+   214→  if (!body.forkFrom || typeof body.forkFrom !== 'object') {
+   215→    return c.json(
+   216→      error(ErrorCodes.VALIDATION_ERROR, 'forkFrom specification is required', requestId),
+   217→      400
+   218→    );
+   219→  }
+   220→
+   221→  const validForkTypes = ['BASELINE', 'SCENARIO', 'PRODUCTION'];
+   222→  if (!validForkTypes.includes(body.forkFrom.type)) {
+   223→    return c.json(
+   224→      error(
+   225→        ErrorCodes.VALIDATION_ERROR,
+   226→        `forkFrom.type must be one of: ${validForkTypes.join(', ')}`,
+   227→        requestId
+   228→      ),
+   229→      400
+   230→    );
+   231→  }
+   232→
+   233→  // Validate ID is provided for BASELINE and SCENARIO types
+   234→  if ((body.forkFrom.type === 'BASELINE' || body.forkFrom.type === 'SCENARIO') && !body.forkFrom.id) {
+   235→    return c.json(
+   236→      error(
+   237→        ErrorCodes.VALIDATION_ERROR,
+   238→        `forkFrom.id is required for type ${body.forkFrom.type}`,
+   239→        requestId
+   240→      ),
+   241→      400
+   242→    );
+   243→  }
+   244→
+   245→  if (body.forkFrom.id && !isValidUuid(body.forkFrom.id)) {
+   246→    return c.json(
+   247→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid forkFrom.id format', requestId),
+   248→      400
+   249→    );
+   250→  }
+   251→
+   252→  // Get user from context
+   253→  const userId = c.get('user')?.id ?? 'system';
+   254→
+   255→  const service = getService();
+   256→  const scenario = await service.createScenario({
+   257→    name: body.name.trim(),
+   258→    description: body.description?.trim(),
+   259→    forkFrom: body.forkFrom,
+   260→    userId,
+   261→    expirationDays: body.expirationDays ? Number(body.expirationDays) : undefined,
+   262→  });
+   263→
+   264→  return c.json(
+   265→    success(
+   266→      {
+   267→        id: scenario.id,
+   268→        name: scenario.name,
+   269→        description: scenario.description,
+   270→        status: scenario.status,
+   271→        forkedFromBaselineId: scenario.forkedFromBaselineId,
+   272→        forkedFromScenarioId: scenario.forkedFromScenarioId,
+   273→        forkedAt: scenario.forkedAt,
+   274→        createdAt: scenario.createdAt,
+   275→        expiresAt: scenario.expiresAt,
+   276→      },
+   277→      { timing: { durationMs: getRequestDuration(c) } }
+   278→    ),
+   279→    201
+   280→  );
+   281→});
+   282→
+   283→/**
+   284→ * DELETE /scenarios/:id
+   285→ *
+   286→ * Delete a scenario. Only ACTIVE scenarios can be deleted.
+   287→ * PROMOTED scenarios cannot be deleted as they are part of the audit trail.
+   288→ */
+   289→scenarioRoutes.delete('/scenarios/:id', async (c) => {
+   290→  const requestId = getRequestId(c);
+   291→  const scenarioId = c.req.param('id');
+   292→
+   293→  if (!isValidUuid(scenarioId)) {
+   294→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   295→  }
+   296→
+   297→  const userId = c.get('user')?.id ?? 'system';
+   298→
+   299→  const service = getService();
+   300→  await service.deleteScenario(scenarioId, userId);
+   301→
+   302→  return c.json(
+   303→    success({ deleted: true, scenarioId }, { timing: { durationMs: getRequestDuration(c) } })
+   304→  );
+   305→});
+   306→
+   307→/**
+   308→ * POST /scenarios/:id/changes
+   309→ *
+   310→ * Apply a change (delta) to a scenario.
+   311→ *
+   312→ * Request body:
+   313→ * - type: Delta type ('PM_MOVE' | 'PM_ADD' | 'PM_REMOVE' | 'CAPACITY_CHANGE' | 'TRAIN_STATUS_CHANGE')
+   314→ * - entityType: Entity being modified ('pm_schedule' | 'manhour_capacity' | 'train')
+   315→ * - entityId: ID of the entity being modified
+   316→ * - oldValues: Previous values (optional, for audit)
+   317→ * - newValues: New values (required for PM_MOVE and PM_ADD)
+   318→ * - reason: Change reason (optional)
+   319→ */
+   320→scenarioRoutes.post('/scenarios/:id/changes', async (c) => {
+   321→  const requestId = getRequestId(c);
+   322→  const scenarioId = c.req.param('id');
+   323→
+   324→  if (!isValidUuid(scenarioId)) {
+   325→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   326→  }
+   327→
+   328→  const body = await c.req.json();
+   329→
+   330→  // Validate required fields
+   331→  const validDeltaTypes: DeltaType[] = ['PM_MOVE', 'PM_ADD', 'PM_REMOVE', 'CAPACITY_CHANGE', 'TRAIN_STATUS_CHANGE'];
+   332→  if (!body.type || !validDeltaTypes.includes(body.type)) {
+   333→    return c.json(
+   334→      error(
+   335→        ErrorCodes.VALIDATION_ERROR,
+   336→        `type must be one of: ${validDeltaTypes.join(', ')}`,
+   337→        requestId
+   338→      ),
+   339→      400
+   340→    );
+   341→  }
+   342→
+   343→  const validEntityTypes: EntityType[] = ['pm_schedule', 'manhour_capacity', 'train'];
+   344→  if (!body.entityType || !validEntityTypes.includes(body.entityType)) {
+   345→    return c.json(
+   346→      error(
+   347→        ErrorCodes.VALIDATION_ERROR,
+   348→        `entityType must be one of: ${validEntityTypes.join(', ')}`,
+   349→        requestId
+   350→      ),
+   351→      400
+   352→    );
+   353→  }
+   354→
+   355→  if (!body.entityId || typeof body.entityId !== 'string') {
+   356→    return c.json(
+   357→      error(ErrorCodes.VALIDATION_ERROR, 'entityId is required', requestId),
+   358→      400
+   359→    );
+   360→  }
+   361→
+   362→  // Validate newValues for specific delta types
+   363→  if ((body.type === 'PM_MOVE' || body.type === 'PM_ADD') && !body.newValues) {
+   364→    return c.json(
+   365→      error(
+   366→        ErrorCodes.VALIDATION_ERROR,
+   367→        `newValues is required for ${body.type}`,
+   368→        requestId
+   369→      ),
+   370→      400
+   371→    );
+   372→  }
+   373→
+   374→  if (body.type === 'PM_ADD') {
+   375→    const newValues = body.newValues;
+   376→    if (!newValues.trainId || !newValues.pmTypeId || !newValues.targetDate) {
+   377→      return c.json(
+   378→        error(
+   379→          ErrorCodes.VALIDATION_ERROR,
+   380→          'PM_ADD requires trainId, pmTypeId, and targetDate in newValues',
+   381→          requestId
+   382→        ),
+   383→        400
+   384→      );
+   385→    }
+   386→  }
+   387→
+   388→  const userId = c.get('user')?.id ?? 'system';
+   389→
+   390→  const service = getService();
+   391→  const delta = await service.applyChange(
+   392→    scenarioId,
+   393→    {
+   394→      type: body.type,
+   395→      entityType: body.entityType,
+   396→      entityId: body.entityId,
+   397→      oldValues: body.oldValues,
+   398→      newValues: body.newValues,
+   399→      reason: body.reason,
+   400→    },
+   401→    userId
+   402→  );
+   403→
+   404→  return c.json(
+   405→    success(
+   406→      {
+   407→        id: delta.id,
+   408→        scenarioId: delta.scenarioId,
+   409→        sequenceNum: delta.sequenceNum,
+   410→        deltaType: delta.deltaType,
+   411→        entityType: delta.entityType,
+   412→        entityId: delta.entityId,
+   413→        createdAt: delta.createdAt,
+   414→      },
+   415→      { timing: { durationMs: getRequestDuration(c) } }
+   416→    ),
+   417→    201
+   418→  );
+   419→});
+   420→
+   421→/**
+   422→ * GET /scenarios/:id/changes
+   423→ *
+   424→ * Get all changes (deltas) applied to a scenario in order.
+   425→ */
+   426→scenarioRoutes.get('/scenarios/:id/changes', async (c) => {
+   427→  const requestId = getRequestId(c);
+   428→  const scenarioId = c.req.param('id');
+   429→
+   430→  if (!isValidUuid(scenarioId)) {
+   431→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   432→  }
+   433→
+   434→  const service = getService();
+   435→  const deltas = await service.getScenarioDeltas(scenarioId);
+   436→
+   437→  const changes = deltas.map((delta) => ({
+   438→    id: delta.id,
+   439→    sequenceNum: delta.sequenceNum,
+   440→    deltaType: delta.deltaType,
+   441→    entityType: delta.entityType,
+   442→    entityId: delta.entityId,
+   443→    oldValues: delta.oldValues,
+   444→    newValues: delta.newValues,
+   445→    changeReason: delta.changeReason,
+   446→    createdBy: delta.createdBy,
+   447→    createdAt: delta.createdAt,
+   448→  }));
+   449→
+   450→  return c.json(
+   451→    success(changes, { timing: { durationMs: getRequestDuration(c) } })
+   452→  );
+   453→});
+   454→
+   455→/**
+   456→ * POST /scenarios/:id/undo
+   457→ *
+   458→ * Undo the last change applied to a scenario.
+   459→ */
+   460→scenarioRoutes.post('/scenarios/:id/undo', async (c) => {
+   461→  const requestId = getRequestId(c);
+   462→  const scenarioId = c.req.param('id');
+   463→
+   464→  if (!isValidUuid(scenarioId)) {
+   465→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   466→  }
+   467→
+   468→  const userId = c.get('user')?.id ?? 'system';
+   469→
+   470→  const service = getService();
+   471→  await service.undoLastChange(scenarioId, userId);
+   472→
+   473→  return c.json(
+   474→    success({ undone: true, scenarioId }, { timing: { durationMs: getRequestDuration(c) } })
+   475→  );
+   476→});
+   477→
+   478→/**
+   479→ * GET /scenarios/:id/materialized
+   480→ *
+   481→ * Get the materialized (fully computed) state of a scenario.
+   482→ * This applies all deltas to the base state and returns the resulting PM schedule.
+   483→ */
+   484→scenarioRoutes.get('/scenarios/:id/materialized', async (c) => {
+   485→  const requestId = getRequestId(c);
+   486→  const scenarioId = c.req.param('id');
+   487→
+   488→  if (!isValidUuid(scenarioId)) {
+   489→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   490→  }
+   491→
+   492→  const service = getService();
+   493→  const materialized = await service.materializeScenario(scenarioId);
+   494→
+   495→  return c.json(
+   496→    success(
+   497→      {
+   498→        scenario: materialized.scenario
+   499→          ? {
+   500→              id: materialized.scenario.id,
+   501→              name: materialized.scenario.name,
+   502→              status: materialized.scenario.status,
+   503→            }
+   504→          : null,
+   505→        baselineId: materialized.baselineId,
+   506→        baselineVersion: materialized.baselineVersion,
+   507→        deltasApplied: materialized.deltasApplied,
+   508→        pmSchedule: materialized.pmSchedule.map((pm) => ({
+   509→          id: pm.id,
+   510→          trainId: pm.trainId,
+   511→          trainNumber: pm.trainNumber,
+   512→          pmTypeId: pm.pmTypeId,
+   513→          pmCode: pm.pmCode,
+   514→          targetDate: pm.targetDate,
+   515→          assignedTrackId: pm.assignedTrackId,
+   516→          assignedHours: pm.assignedHours,
+   517→          status: pm.status,
+   518→          constraintStart: pm.constraintStart,
+   519→          constraintEnd: pm.constraintEnd,
+   520→          isLocked: pm.isLocked,
+   521→        })),
+   522→        pmCount: materialized.pmSchedule.length,
+   523→      },
+   524→      { timing: { durationMs: getRequestDuration(c) } }
+   525→    )
+   526→  );
+   527→});
+   528→
+   529→/**
+   530→ * POST /scenarios/:id/compare
+   531→ *
+   532→ * Compare a scenario to a baseline or another scenario.
+   533→ *
+   534→ * Request body:
+   535→ * - compareTo: Comparison target specification
+   536→ *   - type: 'BASELINE' | 'SCENARIO'
+   537→ *   - id: Target ID (optional for BASELINE - uses latest published)
+   538→ */
+   539→scenarioRoutes.post('/scenarios/:id/compare', async (c) => {
+   540→  const requestId = getRequestId(c);
+   541→  const scenarioId = c.req.param('id');
+   542→
+   543→  if (!isValidUuid(scenarioId)) {
+   544→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   545→  }
+   546→
+   547→  const body = await c.req.json();
+   548→
+   549→  // Default to comparing with latest baseline if not specified
+   550→  let scenarioBId: string | null = null;
+   551→  let baselineId: string | undefined;
+   552→
+   553→  if (body.compareTo) {
+   554→    if (body.compareTo.type === 'SCENARIO') {
+   555→      if (!body.compareTo.id) {
+   556→        return c.json(
+   557→          error(ErrorCodes.VALIDATION_ERROR, 'compareTo.id is required for SCENARIO type', requestId),
+   558→          400
+   559→        );
+   560→      }
+   561→      if (!isValidUuid(body.compareTo.id)) {
+   562→        return c.json(
+   563→          error(ErrorCodes.VALIDATION_ERROR, 'Invalid compareTo.id format', requestId),
+   564→          400
+   565→        );
+   566→      }
+   567→      scenarioBId = body.compareTo.id;
+   568→    } else if (body.compareTo.type === 'BASELINE' && body.compareTo.id) {
+   569→      if (!isValidUuid(body.compareTo.id)) {
+   570→        return c.json(
+   571→          error(ErrorCodes.VALIDATION_ERROR, 'Invalid compareTo.id format', requestId),
+   572→          400
+   573→        );
+   574→      }
+   575→      baselineId = body.compareTo.id;
+   576→    }
+   577→  }
+   578→
+   579→  const service = getService();
+   580→  const comparison = await service.compareScenarios(scenarioId, scenarioBId, baselineId);
+   581→
+   582→  return c.json(
+   583→    success(
+   584→      {
+   585→        comparison: {
+   586→          comparisonId: comparison.comparisonId,
+   587→          scenarioA: comparison.scenarioAId,
+   588→          scenarioAName: comparison.scenarioAName,
+   589→          scenarioB: comparison.scenarioBId ?? null,
+   590→          scenarioBName: comparison.scenarioBName,
+   591→          baselineId: comparison.baselineId,
+   592→          baselineVersion: comparison.baselineVersion,
+   593→          comparisonDate: comparison.comparisonDate,
+   594→        },
+   595→        summary: {
+   596→          pmCountDelta: comparison.pmDifferences.countDelta,
+   597→          pmAdded: comparison.pmDifferences.added,
+   598→          pmRemoved: comparison.pmDifferences.removed,
+   599→          pmMoved: comparison.pmDifferences.moved,
+   600→          pmUnchanged: comparison.pmDifferences.unchanged,
+   601→          totalHoursDelta: comparison.manhourDifferences.totalDelta,
+   602→          totalCostDelta: comparison.costDifferences.totalDelta,
+   603→          overloadedWeeksDelta: comparison.manhourDifferences.overloadedWeeksDelta,
+   604→        },
+   605→        pmDifferences: comparison.pmDifferences.details.map((diff) => ({
+   606→          pmId: diff.pmId,
+   607→          trainId: diff.trainId,
+   608→          trainNumber: diff.trainNumber,
+   609→          pmTypeId: diff.pmTypeId,
+   610→          pmCode: diff.pmCode,
+   611→          changeType: diff.changeType,
+   612→          scenarioADate: diff.scenarioADate,
+   613→          scenarioBDate: diff.scenarioBDate,
+   614→          daysDifference: diff.daysDifference,
+   615→        })),
+   616→        manhourImpact: {
+   617→          scenarioATotalHours: comparison.manhourDifferences.scenarioATotalHours,
+   618→          scenarioBTotalHours: comparison.manhourDifferences.scenarioBTotalHours,
+   619→          weeklyChanges: comparison.manhourDifferences.details,
+   620→        },
+   621→        costImpact: {
+   622→          scenarioATotalCost: comparison.costDifferences.scenarioATotalCost,
+   623→          scenarioBTotalCost: comparison.costDifferences.scenarioBTotalCost,
+   624→          laborDelta: comparison.costDifferences.laborDelta,
+   625→          materialDelta: comparison.costDifferences.materialDelta,
+   626→        },
+   627→      },
+   628→      { timing: { durationMs: getRequestDuration(c) } }
+   629→    )
+   630→  );
+   631→});
+   632→
+   633→/**
+   634→ * POST /scenarios/:id/promote
+   635→ *
+   636→ * Promote a scenario to become the new production baseline.
+   637→ * This will:
+   638→ * 1. Materialize all scenario deltas
+   639→ * 2. Create a new published baseline
+   640→ * 3. Apply the deltas to the production PM schedule
+   641→ * 4. Mark the scenario as PROMOTED
+   642→ * 5. Supersede any previous published baseline
+   643→ *
+   644→ * Request body:
+   645→ * - baselineName: Name for the new baseline (required)
+   646→ * - description: Optional description
+   647→ */
+   648→scenarioRoutes.post('/scenarios/:id/promote', async (c) => {
+   649→  const requestId = getRequestId(c);
+   650→  const scenarioId = c.req.param('id');
+   651→
+   652→  if (!isValidUuid(scenarioId)) {
+   653→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid scenario ID format', requestId), 400);
+   654→  }
+   655→
+   656→  const body = await c.req.json();
+   657→
+   658→  // Validate required fields
+   659→  if (!body.baselineName || typeof body.baselineName !== 'string' || body.baselineName.trim().length === 0) {
+   660→    return c.json(
+   661→      error(ErrorCodes.VALIDATION_ERROR, 'baselineName is required', requestId),
+   662→      400
+   663→    );
+   664→  }
+   665→
+   666→  const userId = c.get('user')?.id ?? 'system';
+   667→
+   668→  const service = getService();
+   669→  const baseline = await service.promoteToBaseline({
+   670→    scenarioId,
+   671→    baselineName: body.baselineName.trim(),
+   672→    baselineDescription: body.description?.trim(),
+   673→    userId,
+   674→  });
+   675→
+   676→  return c.json(
+   677→    success(
+   678→      {
+   679→        promoted: true,
+   680→        scenarioId,
+   681→        baseline: {
+   682→          id: baseline.id,
+   683→          name: baseline.name,
+   684→          version: baseline.version,
+   685→          baselineDate: baseline.baselineDate,
+   686→          status: baseline.status,
+   687→          publishedAt: baseline.publishedAt,
+   688→        },
+   689→      },
+   690→      { timing: { durationMs: getRequestDuration(c) } }
+   691→    ),
+   692→    201
+   693→  );
+   694→});
+   695→
+   696→/**
+   697→ * POST /scenarios/cleanup
+   698→ *
+   699→ * Manually trigger cleanup of expired scenarios.
+   700→ * Normally this runs as a scheduled job.
+   701→ */
+   702→scenarioRoutes.post('/scenarios/cleanup', async (c) => {
+   703→  const service = getService();
+   704→  const expiredCount = await service.cleanupExpiredScenarios();
+   705→
+   706→  return c.json(
+   707→    success(
+   708→      { cleaned: true, expiredCount },
+   709→      { timing: { durationMs: getRequestDuration(c) } }
+   710→    )
+   711→  );
+   712→});
+   713→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

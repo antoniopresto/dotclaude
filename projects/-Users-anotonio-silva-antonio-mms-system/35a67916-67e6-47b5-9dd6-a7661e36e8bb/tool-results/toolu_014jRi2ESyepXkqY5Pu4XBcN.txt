@@ -1,0 +1,387 @@
+     1→/**
+     2→ * MMS Queue Configuration
+     3→ *
+     4→ * BullMQ queue setup for background job processing.
+     5→ * All queue operations go through Redis for distributed processing.
+     6→ *
+     7→ * Queue types:
+     8→ * - ingestion: CSV file processing and mileage data import
+     9→ * - tactical_scheduler: PM scheduling within 12-week horizon
+    10→ * - strategic_planner: Long-term (10-year) PM planning
+    11→ * - optimizer: Run assignment optimization (CP-SAT)
+    12→ * - manhour_leveling: Workload balancing across periods
+    13→ * - drift_monitor: Baseline comparison and drift detection
+    14→ * - notification: Email and alert sending
+    15→ * - report: PDF/Excel report generation
+    16→ *
+    17→ * @see specs/004-backend-specification.md Section 4.8
+    18→ */
+    19→
+    20→import { Queue, Worker, QueueEvents, type JobsOptions, type WorkerOptions } from 'bullmq';
+    21→
+    22→// =============================================================================
+    23→// Queue Names
+    24→// =============================================================================
+    25→
+    26→export const QUEUE_NAMES = {
+    27→  INGESTION: 'mms:ingestion',
+    28→  TACTICAL_SCHEDULER: 'mms:tactical-scheduler',
+    29→  STRATEGIC_PLANNER: 'mms:strategic-planner',
+    30→  OPTIMIZER: 'mms:optimizer',
+    31→  MANHOUR_LEVELING: 'mms:manhour-leveling',
+    32→  DRIFT_MONITOR: 'mms:drift-monitor',
+    33→  NOTIFICATION: 'mms:notification',
+    34→  REPORT: 'mms:report',
+    35→  MAXIMO_SYNC: 'mms:maximo-sync',
+    36→} as const;
+    37→
+    38→export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
+    39→
+    40→// =============================================================================
+    41→// Redis Configuration
+    42→// =============================================================================
+    43→
+    44→function getRedisConfig() {
+    45→  return {
+    46→    host: process.env['REDIS_HOST'] ?? 'localhost',
+    47→    port: parseInt(process.env['REDIS_PORT'] ?? '6379', 10),
+    48→    password: process.env['REDIS_PASSWORD'],
+    49→    maxRetriesPerRequest: null as null, // Required for BullMQ
+    50→  };
+    51→}
+    52→
+    53→// =============================================================================
+    54→// Job Types
+    55→// =============================================================================
+    56→
+    57→export interface IngestionJobData {
+    58→  filePath: string;
+    59→  fileName: string;
+    60→  fileSize: number;
+    61→  uploadedBy?: string;
+    62→}
+    63→
+    64→export interface TacticalSchedulerJobData {
+    65→  fleetId?: string;
+    66→  trainIds?: string[];
+    67→  horizonWeeks?: number;
+    68→  dryRun?: boolean;
+    69→}
+    70→
+    71→export interface StrategicPlannerJobData {
+    72→  fleetId?: string;
+    73→  horizonYears?: number;
+    74→  populationSize?: number;
+    75→  generations?: number;
+    76→}
+    77→
+    78→export interface OptimizerJobData {
+    79→  date: string;
+    80→  fleetId: string;
+    81→  constraints?: {
+    82→    serviceRequirements?: Record<string, number>;
+    83→    unavailableTrains?: string[];
+    84→    preferredAssignments?: Record<string, string>;
+    85→  };
+    86→  timeoutMs?: number;
+    87→}
+    88→
+    89→export interface ManhourLevelingJobData {
+    90→  depotId?: string;
+    91→  periodStart: string;
+    92→  periodEnd: string;
+    93→  strategies?: string[];
+    94→}
+    95→
+    96→export interface DriftMonitorJobData {
+    97→  baselineId: string;
+    98→  trainIds?: string[];
+    99→}
+   100→
+   101→export interface NotificationJobData {
+   102→  type: 'email' | 'webhook';
+   103→  template: string;
+   104→  recipients: string[];
+   105→  data: Record<string, unknown>;
+   106→  priority?: 'high' | 'normal' | 'low';
+   107→}
+   108→
+   109→export interface ReportJobData {
+   110→  type: 'pm_schedule' | 'fleet_status' | 'drift_report' | 'tco_projection';
+   111→  format: 'pdf' | 'excel';
+   112→  filters?: Record<string, unknown>;
+   113→  requestedBy: string;
+   114→}
+   115→
+   116→export interface MaximoSyncJobData {
+   117→  /** Sync operation: push, pull, full (both), or polling (scheduled pull) */
+   118→  operation: 'push' | 'pull' | 'full' | 'polling';
+   119→  /** Optional: specific PM schedule IDs to sync (push only) */
+   120→  pmScheduleIds?: string[];
+   121→  /** Optional: depot ID to limit sync scope */
+   122→  depotId?: string;
+   123→  /** Force sync even if recently synced */
+   124→  force?: boolean;
+   125→  /** Conflict resolution strategy (must match ConflictResolution type from maximo-sync service) */
+   126→  conflictResolution?: 'USE_MMS' | 'USE_MAXIMO';
+   127→  /** Polling-specific: triggered by webhook timeout fallback */
+   128→  isPollingFallback?: boolean;
+   129→  /** Polling-specific: modified since timestamp for incremental queries */
+   130→  modifiedSince?: string;
+   131→  /** Polling-specific: enable deduplication against recent webhooks */
+   132→  deduplicateWithWebhooks?: boolean;
+   133→}
+   134→
+   135→export type JobData =
+   136→  | IngestionJobData
+   137→  | TacticalSchedulerJobData
+   138→  | StrategicPlannerJobData
+   139→  | OptimizerJobData
+   140→  | ManhourLevelingJobData
+   141→  | DriftMonitorJobData
+   142→  | NotificationJobData
+   143→  | ReportJobData
+   144→  | MaximoSyncJobData;
+   145→
+   146→// =============================================================================
+   147→// Default Job Options
+   148→// =============================================================================
+   149→
+   150→const DEFAULT_JOB_OPTIONS: JobsOptions = {
+   151→  attempts: 3,
+   152→  backoff: {
+   153→    type: 'exponential',
+   154→    delay: 1000,
+   155→  },
+   156→  removeOnComplete: {
+   157→    age: 24 * 3600,
+   158→    count: 1000,
+   159→  },
+   160→  removeOnFail: {
+   161→    age: 7 * 24 * 3600,
+   162→  },
+   163→};
+   164→
+   165→// =============================================================================
+   166→// Queue Factory
+   167→// =============================================================================
+   168→
+   169→// eslint-disable-next-line @typescript-eslint/no-explicit-any
+   170→const queues: Map<QueueName, Queue<any>> = new Map();
+   171→const queueEvents: Map<QueueName, QueueEvents> = new Map();
+   172→
+   173→/**
+   174→ * Get or create a queue instance
+   175→ */
+   176→export function getQueue(name: QueueName): Queue {
+   177→  if (!queues.has(name)) {
+   178→    const queue = new Queue(name, {
+   179→      connection: getRedisConfig(),
+   180→      defaultJobOptions: DEFAULT_JOB_OPTIONS,
+   181→    });
+   182→    queues.set(name, queue);
+   183→  }
+   184→  return queues.get(name)!;
+   185→}
+   186→
+   187→/**
+   188→ * Get queue events for monitoring
+   189→ */
+   190→export function getQueueEvents(name: QueueName): QueueEvents {
+   191→  if (!queueEvents.has(name)) {
+   192→    const events = new QueueEvents(name, { connection: getRedisConfig() });
+   193→    queueEvents.set(name, events);
+   194→  }
+   195→  return queueEvents.get(name)!;
+   196→}
+   197→
+   198→// =============================================================================
+   199→// Worker Factory
+   200→// =============================================================================
+   201→
+   202→export interface JobContext<T = unknown> {
+   203→  id?: string;
+   204→  name: string;
+   205→  data: T;
+   206→}
+   207→
+   208→/**
+   209→ * Create a worker for processing jobs
+   210→ */
+   211→export function createWorker<T = JobData>(
+   212→  name: QueueName,
+   213→  processor: (job: JobContext<T>) => Promise<unknown>,
+   214→  options?: Partial<WorkerOptions>
+   215→): Worker {
+   216→  const workerOptions: WorkerOptions = {
+   217→    connection: getRedisConfig(),
+   218→    concurrency: 1,
+   219→    ...options,
+   220→  };
+   221→
+   222→  return new Worker(
+   223→    name,
+   224→    async (job) => {
+   225→      return processor({
+   226→        id: job.id,
+   227→        name: job.name,
+   228→        data: job.data as T,
+   229→      });
+   230→    },
+   231→    workerOptions
+   232→  );
+   233→}
+   234→
+   235→// =============================================================================
+   236→// Job Utilities
+   237→// =============================================================================
+   238→
+   239→/**
+   240→ * Add a job to a queue
+   241→ */
+   242→export async function addJob<T = JobData>(
+   243→  queueName: QueueName,
+   244→  jobName: string,
+   245→  data: T,
+   246→  options?: Partial<JobsOptions>
+   247→): Promise<{ id: string }> {
+   248→  const queue = getQueue(queueName);
+   249→  const job = await queue.add(jobName, data, options);
+   250→  return { id: job.id! };
+   251→}
+   252→
+   253→/**
+   254→ * Add multiple jobs to a queue
+   255→ */
+   256→export async function addBulkJobs<T = JobData>(
+   257→  queueName: QueueName,
+   258→  jobs: Array<{ name: string; data: T; opts?: Partial<JobsOptions> }>
+   259→): Promise<Array<{ id: string }>> {
+   260→  const queue = getQueue(queueName);
+   261→  const results = await queue.addBulk(jobs);
+   262→  return results.map((job) => ({ id: job.id! }));
+   263→}
+   264→
+   265→/**
+   266→ * Get job by ID
+   267→ */
+   268→export async function getJob<T = JobData>(
+   269→  queueName: QueueName,
+   270→  jobId: string
+   271→): Promise<{ id: string; data: T; status: string } | null> {
+   272→  const queue = getQueue(queueName);
+   273→  const job = await queue.getJob(jobId);
+   274→  if (!job) return null;
+   275→
+   276→  const state = await job.getState();
+   277→  return {
+   278→    id: job.id!,
+   279→    data: job.data as T,
+   280→    status: state,
+   281→  };
+   282→}
+   283→
+   284→/**
+   285→ * Get queue statistics
+   286→ */
+   287→export async function getQueueStats(queueName: QueueName): Promise<{
+   288→  waiting: number;
+   289→  active: number;
+   290→  completed: number;
+   291→  failed: number;
+   292→  delayed: number;
+   293→}> {
+   294→  const queue = getQueue(queueName);
+   295→  const [waiting, active, completed, failed, delayed] = await Promise.all([
+   296→    queue.getWaitingCount(),
+   297→    queue.getActiveCount(),
+   298→    queue.getCompletedCount(),
+   299→    queue.getFailedCount(),
+   300→    queue.getDelayedCount(),
+   301→  ]);
+   302→  return { waiting, active, completed, failed, delayed };
+   303→}
+   304→
+   305→// =============================================================================
+   306→// Cleanup
+   307→// =============================================================================
+   308→
+   309→/**
+   310→ * Close all queue connections
+   311→ */
+   312→export async function closeAllQueues(): Promise<void> {
+   313→  const closePromises: Promise<void>[] = [];
+   314→
+   315→  for (const queue of queues.values()) {
+   316→    closePromises.push(queue.close());
+   317→  }
+   318→
+   319→  for (const events of queueEvents.values()) {
+   320→    closePromises.push(events.close());
+   321→  }
+   322→
+   323→  await Promise.all(closePromises);
+   324→  queues.clear();
+   325→  queueEvents.clear();
+   326→}
+   327→
+   328→// =============================================================================
+   329→// Progress Streaming
+   330→// =============================================================================
+   331→
+   332→export interface JobProgress {
+   333→  percent: number;
+   334→  stage?: string;
+   335→  message?: string;
+   336→  details?: Record<string, unknown>;
+   337→}
+   338→
+   339→/**
+   340→ * Stream job progress updates via callback
+   341→ */
+   342→export function streamJobProgress(
+   343→  queueName: QueueName,
+   344→  jobId: string,
+   345→  onProgress: (progress: unknown) => void,
+   346→  onComplete: (result: unknown) => void,
+   347→  onError: (error: Error) => void
+   348→): () => void {
+   349→  const events = getQueueEvents(queueName);
+   350→
+   351→  const progressHandler = (args: { jobId: string; data: unknown }) => {
+   352→    if (args.jobId === jobId) {
+   353→      onProgress(args.data);
+   354→    }
+   355→  };
+   356→
+   357→  const completedHandler = (args: { jobId: string; returnvalue: unknown }) => {
+   358→    if (args.jobId === jobId) {
+   359→      onComplete(args.returnvalue);
+   360→      cleanup();
+   361→    }
+   362→  };
+   363→
+   364→  const failedHandler = (args: { jobId: string; failedReason: string }) => {
+   365→    if (args.jobId === jobId) {
+   366→      onError(new Error(args.failedReason));
+   367→      cleanup();
+   368→    }
+   369→  };
+   370→
+   371→  events.on('progress', progressHandler);
+   372→  events.on('completed', completedHandler);
+   373→  events.on('failed', failedHandler);
+   374→
+   375→  const cleanup = () => {
+   376→    events.off('progress', progressHandler);
+   377→    events.off('completed', completedHandler);
+   378→    events.off('failed', failedHandler);
+   379→  };
+   380→
+   381→  return cleanup;
+   382→}
+   383→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,341 @@
+     1→/**
+     2→ * Strategic Heatmap Layer
+     3→ *
+     4→ * deck.gl WebGL layer for the 12-year strategic PM density view.
+     5→ * Renders a heatmap grid where:
+     6→ * - Rows = trains
+     7→ * - Columns = years
+     8→ * - Cell color = PM density (intensity)
+     9→ *
+    10→ * Used at zoom levels 0-8 (STRATEGIC and TACTICAL_WIDE).
+    11→ *
+    12→ * @see specs/006-user-interface.md Section 6.3.2
+    13→ */
+    14→
+    15→import { ScatterplotLayer, TextLayer } from '@deck.gl/layers';
+    16→import DeckGL from '@deck.gl/react';
+    17→import { OrthographicView } from '@deck.gl/core';
+    18→
+    19→import type { StrategicCanvasData, HeatmapCell } from './types';
+    20→
+    21→// =============================================================================
+    22→// Constants
+    23→// =============================================================================
+    24→
+    25→const CELL_WIDTH = 80;
+    26→const CELL_HEIGHT = 30;
+    27→const CELL_PADDING = 4;
+    28→const LABEL_WIDTH = 100;
+    29→const HEADER_HEIGHT = 40;
+    30→
+    31→/** PM density color scale (light to dark blue) */
+    32→const PM_DENSITY_COLORS: [number, number, number, number][] = [
+    33→  [240, 249, 255, 255], // 0 PMs - very light blue
+    34→  [186, 230, 253, 255], // 1 PM - light blue
+    35→  [125, 211, 252, 255], // 2 PMs
+    36→  [56, 189, 248, 255],  // 3 PMs
+    37→  [14, 165, 233, 255],  // 4 PMs
+    38→  [2, 132, 199, 255],   // 5 PMs
+    39→  [3, 105, 161, 255],   // 6 PMs
+    40→  [7, 89, 133, 255],    // 7+ PMs - dark blue
+    41→];
+    42→
+    43→/** Fleet colors */
+    44→const FLEET_COLORS: Record<string, [number, number, number, number]> = {
+    45→  KS: [14, 165, 233, 255],   // Sky-500
+    46→  ALSTOM: [139, 92, 246, 255], // Violet-500
+    47→  DEFAULT: [100, 116, 139, 255], // Slate-500
+    48→};
+    49→
+    50→// =============================================================================
+    51→// Helper Functions
+    52→// =============================================================================
+    53→
+    54→/**
+    55→ * Transform API data into heatmap cells with positions
+    56→ */
+    57→function transformToHeatmapCells(
+    58→  data: StrategicCanvasData,
+    59→  fromYear: number,
+    60→  toYear: number
+    61→): HeatmapCell[] {
+    62→  const cells: HeatmapCell[] = [];
+    63→  const { trains, heatmapData } = data;
+    64→  const maxPmCount = heatmapData.maxPmCount || 1;
+    65→
+    66→  trains.forEach((train, trainIndex) => {
+    67→    for (let year = fromYear; year <= toYear; year++) {
+    68→      const yearIndex = year - fromYear;
+    69→      const yearData = train.years.find((y) => y.year === year);
+    70→
+    71→      const pmCount = yearData?.pmCount ?? 0;
+    72→      const totalHours = yearData?.totalHours ?? 0;
+    73→      const completedCount = yearData?.completedCount ?? 0;
+    74→      const lockedCount = yearData?.lockedCount ?? 0;
+    75→
+    76→      const intensity = Math.min(pmCount / maxPmCount, 1);
+    77→
+    78→      const x = LABEL_WIDTH + yearIndex * (CELL_WIDTH + CELL_PADDING);
+    79→      const y = HEADER_HEIGHT + trainIndex * (CELL_HEIGHT + CELL_PADDING);
+    80→
+    81→      cells.push({
+    82→        trainId: train.trainId,
+    83→        trainNumber: train.trainNumber,
+    84→        trainIndex,
+    85→        year,
+    86→        yearIndex,
+    87→        pmCount,
+    88→        totalHours,
+    89→        completedCount,
+    90→        lockedCount,
+    91→        intensity,
+    92→        position: [x + CELL_WIDTH / 2, y + CELL_HEIGHT / 2],
+    93→      });
+    94→    }
+    95→  });
+    96→
+    97→  return cells;
+    98→}
+    99→
+   100→/**
+   101→ * Get color for PM density
+   102→ */
+   103→function getDensityColor(intensity: number): [number, number, number, number] {
+   104→  const index = Math.min(
+   105→    Math.floor(intensity * (PM_DENSITY_COLORS.length - 1)),
+   106→    PM_DENSITY_COLORS.length - 1
+   107→  );
+   108→  return PM_DENSITY_COLORS[index];
+   109→}
+   110→
+   111→// =============================================================================
+   112→// Component Props
+   113→// =============================================================================
+   114→
+   115→export interface StrategicHeatmapProps {
+   116→  data: StrategicCanvasData | null;
+   117→  fromYear: number;
+   118→  toYear: number;
+   119→  width: number | string;
+   120→  height: number | string;
+   121→  onCellHover?: (cell: HeatmapCell | null) => void;
+   122→  onCellClick?: (cell: HeatmapCell) => void;
+   123→  onYearClick?: (year: number) => void;
+   124→}
+   125→
+   126→// =============================================================================
+   127→// Component
+   128→// =============================================================================
+   129→
+   130→/**
+   131→ * Strategic Heatmap View
+   132→ *
+   133→ * Renders a PM density heatmap using deck.gl WebGL layers.
+   134→ * Optimized for 60fps rendering of 100+ trains × 10 years.
+   135→ */
+   136→export function StrategicHeatmapLayer({
+   137→  data,
+   138→  fromYear,
+   139→  toYear,
+   140→  width,
+   141→  height,
+   142→  onCellHover,
+   143→  onCellClick,
+   144→  onYearClick,
+   145→}: StrategicHeatmapProps) {
+   146→  if (!data || data.trains.length === 0) {
+   147→    return (
+   148→      <div
+   149→        style={{
+   150→          width,
+   151→          height,
+   152→          display: 'flex',
+   153→          alignItems: 'center',
+   154→          justifyContent: 'center',
+   155→          color: 'var(--pt-text-muted)',
+   156→        }}
+   157→      >
+   158→        No strategic data available
+   159→      </div>
+   160→    );
+   161→  }
+   162→
+   163→  const cells = transformToHeatmapCells(data, fromYear, toYear);
+   164→  const yearCount = toYear - fromYear + 1;
+   165→  const trainCount = data.trains.length;
+   166→
+   167→  const canvasWidth = LABEL_WIDTH + yearCount * (CELL_WIDTH + CELL_PADDING) + 40;
+   168→  const canvasHeight = HEADER_HEIGHT + trainCount * (CELL_HEIGHT + CELL_PADDING) + 40;
+   169→
+   170→  const trainLabels = data.trains.map((train, index) => ({
+   171→    text: train.trainNumber,
+   172→    fleetCode: train.fleetCode,
+   173→    position: [LABEL_WIDTH / 2, HEADER_HEIGHT + index * (CELL_HEIGHT + CELL_PADDING) + CELL_HEIGHT / 2] as [number, number],
+   174→  }));
+   175→
+   176→  const yearLabels: Array<{ text: string; year: number; position: [number, number] }> = [];
+   177→  for (let year = fromYear; year <= toYear; year++) {
+   178→    const yearIndex = year - fromYear;
+   179→    yearLabels.push({
+   180→      text: String(year),
+   181→      year,
+   182→      position: [
+   183→        LABEL_WIDTH + yearIndex * (CELL_WIDTH + CELL_PADDING) + CELL_WIDTH / 2,
+   184→        HEADER_HEIGHT / 2,
+   185→      ] as [number, number],
+   186→    });
+   187→  }
+   188→
+   189→  const layers = [
+   190→    new ScatterplotLayer<HeatmapCell>({
+   191→      id: 'heatmap-cells',
+   192→      data: cells,
+   193→      pickable: true,
+   194→      opacity: 1,
+   195→      stroked: true,
+   196→      filled: true,
+   197→      radiusScale: 1,
+   198→      radiusMinPixels: 1,
+   199→      radiusMaxPixels: 100,
+   200→      lineWidthMinPixels: 1,
+   201→      getPosition: (d) => [...d.position, 0] as [number, number, number],
+   202→      getRadius: Math.min(CELL_WIDTH, CELL_HEIGHT) / 2 - 2,
+   203→      getFillColor: (d) => getDensityColor(d.intensity),
+   204→      getLineColor: [200, 200, 200, 255],
+   205→      getLineWidth: 1,
+   206→      onHover: (info) => {
+   207→        if (onCellHover) {
+   208→          onCellHover(info.object ?? null);
+   209→        }
+   210→      },
+   211→      onClick: (info) => {
+   212→        if (info.object && onCellClick) {
+   213→          onCellClick(info.object);
+   214→        }
+   215→      },
+   216→      updateTriggers: {
+   217→        getFillColor: [data],
+   218→      },
+   219→    }),
+   220→
+   221→    new TextLayer<{ text: string; fleetCode: string; position: [number, number] }>({
+   222→      id: 'train-labels',
+   223→      data: trainLabels,
+   224→      pickable: false,
+   225→      getPosition: (d) => [...d.position, 0] as [number, number, number],
+   226→      getText: (d) => d.text,
+   227→      getSize: 12,
+   228→      getAngle: 0,
+   229→      getTextAnchor: 'middle',
+   230→      getAlignmentBaseline: 'center',
+   231→      getColor: (d) => FLEET_COLORS[d.fleetCode] || FLEET_COLORS.DEFAULT,
+   232→      fontFamily: 'Inter, system-ui, sans-serif',
+   233→      fontWeight: 600,
+   234→    }),
+   235→
+   236→    new TextLayer<{ text: string; year: number; position: [number, number] }>({
+   237→      id: 'year-labels',
+   238→      data: yearLabels,
+   239→      pickable: true,
+   240→      getPosition: (d) => [...d.position, 0] as [number, number, number],
+   241→      getText: (d) => d.text,
+   242→      getSize: 14,
+   243→      getAngle: 0,
+   244→      getTextAnchor: 'middle',
+   245→      getAlignmentBaseline: 'center',
+   246→      getColor: [30, 41, 59, 255],
+   247→      fontFamily: 'Inter, system-ui, sans-serif',
+   248→      fontWeight: 700,
+   249→      onClick: (info) => {
+   250→        if (info.object && onYearClick) {
+   251→          onYearClick(info.object.year);
+   252→        }
+   253→      },
+   254→    }),
+   255→  ];
+   256→
+   257→  const initialViewState = {
+   258→    target: [canvasWidth / 2, canvasHeight / 2, 0] as [number, number, number],
+   259→    zoom: 0,
+   260→    minZoom: -2,
+   261→    maxZoom: 4,
+   262→  };
+   263→
+   264→  return (
+   265→    <DeckGL
+   266→      width={width}
+   267→      height={height}
+   268→      views={new OrthographicView({ id: 'main' })}
+   269→      initialViewState={initialViewState}
+   270→      controller={{
+   271→        scrollZoom: true,
+   272→        dragPan: true,
+   273→        dragRotate: false,
+   274→        doubleClickZoom: true,
+   275→        touchZoom: true,
+   276→        touchRotate: false,
+   277→        keyboard: true,
+   278→      }}
+   279→      layers={layers}
+   280→      getCursor={({ isHovering }) => (isHovering ? 'pointer' : 'grab')}
+   281→      style={{ position: 'absolute', top: '0', left: '0' }}
+   282→    />
+   283→  );
+   284→}
+   285→
+   286→// =============================================================================
+   287→// Tooltip Component
+   288→// =============================================================================
+   289→
+   290→export interface HeatmapTooltipProps {
+   291→  cell: HeatmapCell | null;
+   292→  x: number;
+   293→  y: number;
+   294→}
+   295→
+   296→/**
+   297→ * Tooltip for heatmap cell hover
+   298→ */
+   299→export function HeatmapTooltip({ cell, x, y }: HeatmapTooltipProps) {
+   300→  if (!cell) return null;
+   301→
+   302→  return (
+   303→    <div
+   304→      style={{
+   305→        position: 'absolute',
+   306→        left: x + 10,
+   307→        top: y + 10,
+   308→        backgroundColor: 'white',
+   309→        border: '1px solid #e2e8f0',
+   310→        borderRadius: '6px',
+   311→        padding: '8px 12px',
+   312→        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   313→        pointerEvents: 'none',
+   314→        zIndex: 100,
+   315→        fontSize: '12px',
+   316→        lineHeight: 1.5,
+   317→      }}
+   318→    >
+   319→      <div style={{ fontWeight: 600, marginBottom: '4px' }}>
+   320→        Train {cell.trainNumber} - {cell.year}
+   321→      </div>
+   322→      <div style={{ color: '#64748b' }}>
+   323→        <div>PM Count: <strong>{cell.pmCount}</strong></div>
+   324→        <div>Total Hours: <strong>{cell.totalHours.toFixed(1)}h</strong></div>
+   325→        {cell.completedCount > 0 && (
+   326→          <div>Completed: <strong>{cell.completedCount}</strong></div>
+   327→        )}
+   328→        {cell.lockedCount > 0 && (
+   329→          <div>Locked: <strong>{cell.lockedCount}</strong></div>
+   330→        )}
+   331→      </div>
+   332→    </div>
+   333→  );
+   334→}
+   335→
+   336→export default StrategicHeatmapLayer;
+   337→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

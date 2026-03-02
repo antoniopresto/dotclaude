@@ -1,0 +1,228 @@
+     1→/**
+     2→ * MMS Man-hour Leveling Worker Processor
+     3→ *
+     4→ * BullMQ job processor for workload balancing across time periods.
+     5→ * Projects workforce requirements and generates adjustment recommendations
+     6→ * to prevent overload/underutilization of depot maintenance resources.
+     7→ *
+     8→ * Leveling Strategies (priority order):
+     9→ * 1. ADVANCE_PM (1.1x cost, LOW risk)
+    10→ * 2. DEFER_PM (1.05x cost, LOW risk)
+    11→ * 3. ADD_OVERTIME (1.5x cost, NO risk)
+    12→ * 4. CROSS_DEPOT (1.3x cost, MEDIUM risk)
+    13→ * 5. ADD_CONTRACTOR (2.0x cost, MEDIUM risk)
+    14→ * 6. MANUAL_REVIEW (flagged for high unresolvable overload)
+    15→ *
+    16→ * Job Flow:
+    17→ * 1. Receive ManhourLevelingJobData from queue
+    18→ * 2. Load PM schedule and depot capacity
+    19→ * 3. Calculate raw man-hour projections
+    20→ * 4. Identify overloaded/underutilized periods
+    21→ * 5. Apply leveling strategies in priority order
+    22→ * 6. Generate proposed adjustments
+    23→ * 7. Store results and broadcast via WebSocket
+    24→ *
+    25→ * @see specs/004-domain-services.md Section 4.6
+    26→ */
+    27→
+    28→import { logger } from '../../lib/logging/logger';
+    29→import { withSpan } from '../../lib/tracing';
+    30→import { type WorkerJobContext } from '../index';
+    31→import { type ManhourLevelingJobData } from '../../lib/queue';
+    32→import { getManHourLevelingService, type LevelingResult } from '../../services';
+    33→
+    34→// =============================================================================
+    35→// Worker Configuration
+    36→// =============================================================================
+    37→
+    38→const log = logger.child({ worker: 'manhour-leveling' });
+    39→
+    40→// =============================================================================
+    41→// Job Processor
+    42→// =============================================================================
+    43→
+    44→/**
+    45→ * Process man-hour leveling job
+    46→ *
+    47→ * Projects workforce requirements and generates leveling recommendations.
+    48→ * Applies multi-strategy workload balancing to achieve optimal utilization.
+    49→ */
+    50→export async function processManhourLevelingJob(
+    51→  context: WorkerJobContext<ManhourLevelingJobData>
+    52→): Promise<LevelingResult> {
+    53→  return withSpan('worker.manhour_leveling.process', async (span) => {
+    54→    const { id, data } = context;
+    55→    const { depotId, periodStart, periodEnd, strategies } = data;
+    56→
+    57→    span.setAttribute('jobId', id);
+    58→    span.setAttribute('periodStart', periodStart);
+    59→    span.setAttribute('periodEnd', periodEnd);
+    60→    if (depotId) {
+    61→      span.setAttribute('depotId', depotId);
+    62→    }
+    63→    if (strategies) {
+    64→      span.setAttribute('strategies', strategies.join(','));
+    65→    }
+    66→
+    67→    log.info(
+    68→      {
+    69→        jobId: id,
+    70→        depotId: depotId ?? 'all',
+    71→        periodStart,
+    72→        periodEnd,
+    73→        strategies: strategies ?? 'default',
+    74→      },
+    75→      'Processing man-hour leveling job'
+    76→    );
+    77→
+    78→    // Calculate horizon weeks from period
+    79→    const startDate = new Date(periodStart);
+    80→    const endDate = new Date(periodEnd);
+    81→    const horizonWeeks = Math.ceil((endDate.getTime() - startDate.getTime()) / (7 * 24 * 60 * 60 * 1000));
+    82→
+    83→    span.setAttribute('horizonWeeks', horizonWeeks);
+    84→
+    85→    // Update progress: initializing
+    86→    await context.updateProgress({ stage: 'INITIALIZING', percent: 5 });
+    87→    await context.log('Initializing man-hour leveling');
+    88→
+    89→    // Get man-hour leveling service
+    90→    const levelingService = getManHourLevelingService();
+    91→
+    92→    // Update progress: loading data
+    93→    await context.updateProgress({ stage: 'LOADING_DATA', percent: 15 });
+    94→    await context.log(`Loading PM schedule and capacity data for ${horizonWeeks} weeks`);
+    95→
+    96→    // Update progress: projecting workload
+    97→    await context.updateProgress({ stage: 'PROJECTING', percent: 30 });
+    98→    await context.log('Calculating raw man-hour projections');
+    99→
+   100→    // Update progress: identifying imbalances
+   101→    await context.updateProgress({ stage: 'ANALYZING', percent: 45 });
+   102→    await context.log('Identifying overloaded and underutilized periods');
+   103→
+   104→    // Update progress: applying strategies
+   105→    await context.updateProgress({ stage: 'LEVELING', percent: 60 });
+   106→    await context.log('Applying leveling strategies');
+   107→
+   108→    // Run projection and leveling
+   109→    // The service handles:
+   110→    // - Loading PM schedule within horizon
+   111→    // - Calculating raw man-hour requirements
+   112→    // - Loading depot capacity configurations
+   113→    // - Identifying imbalances (overload >100%, underutilized <70%)
+   114→    // - Applying strategies in priority order
+   115→    // - Generating proposed adjustments
+   116→    const result = await levelingService.generateProjections({
+   117→      horizonWeeks,
+   118→      depotIds: depotId ? [depotId] : undefined,
+   119→      granularity: 'WEEKLY',
+   120→    });
+   121→
+   122→    // Update progress: finalizing
+   123→    await context.updateProgress({ stage: 'FINALIZING', percent: 90 });
+   124→
+   125→    // Calculate summary metrics
+   126→    const { original, leveled, adjustments, improvement } = result;
+   127→    const overloadedBefore = original.projections.filter((p) => p.isOverloaded).length;
+   128→    const overloadedAfter = leveled.projections.filter((p) => p.isOverloaded).length;
+   129→    const underutilizedBefore = original.projections.filter((p) => p.isUnderutilized).length;
+   130→    const underutilizedAfter = leveled.projections.filter((p) => p.isUnderutilized).length;
+   131→
+   132→    log.info(
+   133→      {
+   134→        jobId: id,
+   135→        projectionRunId: result.projectionRunId,
+   136→        horizonWeeks: result.horizonWeeks,
+   137→        depots: result.depotIds.length,
+   138→        overloadedBefore,
+   139→        overloadedAfter,
+   140→        underutilizedBefore,
+   141→        underutilizedAfter,
+   142→        adjustments: adjustments.length,
+   143→        utilizationDelta: improvement.utilizationDelta,
+   144→        totalCostImpact: improvement.totalCostImpact,
+   145→      },
+   146→      'Man-hour leveling complete'
+   147→    );
+   148→
+   149→    await context.log(
+   150→      `Leveling complete: ${overloadedBefore} → ${overloadedAfter} overloaded periods, ` +
+   151→        `${underutilizedBefore} → ${underutilizedAfter} underutilized periods`
+   152→    );
+   153→
+   154→    await context.log(
+   155→      `Generated ${adjustments.length} adjustments, ` +
+   156→        `utilization improved by ${improvement.utilizationDelta.toFixed(1)}%`
+   157→    );
+   158→
+   159→    // Log proposed adjustments by type
+   160→    const adjustmentsByType: Record<string, number> = {};
+   161→    for (const adj of adjustments) {
+   162→      adjustmentsByType[adj.type] = (adjustmentsByType[adj.type] ?? 0) + 1;
+   163→    }
+   164→
+   165→    if (Object.keys(adjustmentsByType).length > 0) {
+   166→      const typeSummary = Object.entries(adjustmentsByType)
+   167→        .map(([type, count]) => `${type}: ${count}`)
+   168→        .join(', ');
+   169→      await context.log(`Adjustment breakdown: ${typeSummary}`);
+   170→    }
+   171→
+   172→    // Log high-risk adjustments that need attention
+   173→    const highRiskAdjustments = adjustments.filter((a) => a.riskLevel === 'MEDIUM' || a.riskLevel === 'HIGH');
+   174→    if (highRiskAdjustments.length > 0) {
+   175→      log.warn(
+   176→        {
+   177→          jobId: id,
+   178→          count: highRiskAdjustments.length,
+   179→        },
+   180→        'High-risk adjustments require review'
+   181→      );
+   182→      await context.log(`⚠️ ${highRiskAdjustments.length} adjustments require supervisor review`);
+   183→
+   184→      for (const adj of highRiskAdjustments.slice(0, 3)) {
+   185→        await context.log(`  - ${adj.type}: ${adj.reason}`);
+   186→      }
+   187→    }
+   188→
+   189→    // Log manual review items
+   190→    const manualReview = adjustments.filter((a) => a.type === 'MANUAL_REVIEW');
+   191→    if (manualReview.length > 0) {
+   192→      log.warn(
+   193→        {
+   194→          jobId: id,
+   195→          count: manualReview.length,
+   196→        },
+   197→        'Unresolvable overloads flagged for manual review'
+   198→      );
+   199→      await context.log(`🔴 ${manualReview.length} periods flagged for MANUAL_REVIEW - capacity insufficient`);
+   200→    }
+   201→
+   202→    // Record metrics for Prometheus
+   203→    span.setAttribute('leveling.projectionRunId', result.projectionRunId);
+   204→    span.setAttribute('leveling.depotCount', result.depotIds.length);
+   205→    span.setAttribute('leveling.overloadedBefore', overloadedBefore);
+   206→    span.setAttribute('leveling.overloadedAfter', overloadedAfter);
+   207→    span.setAttribute('leveling.adjustments', adjustments.length);
+   208→    span.setAttribute('leveling.utilizationDelta', improvement.utilizationDelta);
+   209→    span.setAttribute('leveling.totalCostImpact', improvement.totalCostImpact);
+   210→
+   211→    // Update progress: complete
+   212→    await context.updateProgress({ stage: 'COMPLETE', percent: 100 });
+   213→
+   214→    return result;
+   215→  });
+   216→}
+   217→
+   218→/**
+   219→ * Register the man-hour leveling worker
+   220→ */
+   221→export function registerManhourLevelingWorker(): void {
+   222→  log.info('Man-hour leveling worker processor available for registration');
+   223→}
+   224→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

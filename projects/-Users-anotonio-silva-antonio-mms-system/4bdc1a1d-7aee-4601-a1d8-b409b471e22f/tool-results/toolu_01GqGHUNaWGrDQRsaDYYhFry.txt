@@ -1,0 +1,258 @@
+     1→/**
+     2→ * MMS PM Management Tables
+     3→ *
+     4→ * Preventive maintenance scheduling: PM types, material requirements, and schedules.
+     5→ * Core tables for the maintenance planning workflow.
+     6→ *
+     7→ * PM Hierarchy: Higher-level PMs satisfy lower-level requirements
+     8→ * - C4 satisfies C1, C2, C3 (resets their counters)
+     9→ * - Overhaul satisfies all PM types
+    10→ *
+    11→ * @see specs/003-database-schema.md Sections 3.5
+    12→ */
+    13→
+    14→import { relations, sql } from 'drizzle-orm';
+    15→import {
+    16→  boolean,
+    17→  date,
+    18→  decimal,
+    19→  index,
+    20→  integer,
+    21→  pgTable,
+    22→  text,
+    23→  timestamp,
+    24→  uniqueIndex,
+    25→  uuid,
+    26→  varchar,
+    27→} from 'drizzle-orm/pg-core';
+    28→import { depots, fleets, tracks, trains } from './core-fleet';
+    29→import { materialCriticalityEnum, pmStatusEnum, shiftTypeEnum, trackTypeEnum } from './enums';
+    30→import { users } from './users';
+    31→
+    32→/**
+    33→ * PM Types - Maintenance task definitions
+    34→ *
+    35→ * Defines the maintenance tasks for each fleet with their intervals
+    36→ * and resource requirements.
+    37→ *
+    38→ * Key concepts:
+    39→ * - interval_km / interval_months: Whichever triggers first
+    40→ * - satisfies_codes: PM hierarchy (C4 satisfies C1/C2/C3)
+    41→ * - early/late tolerance: Compliance window (default ±10%)
+    42→ *
+    43→ * Version management: PM intervals can change over the 12-year contract.
+    44→ * The effective_from/effective_to fields support versioning.
+    45→ */
+    46→export const pmTypes = pgTable(
+    47→  'pm_types',
+    48→  {
+    49→    id: uuid('id').primaryKey().defaultRandom(),
+    50→    fleetId: uuid('fleet_id')
+    51→      .notNull()
+    52→      .references(() => fleets.id),
+    53→    pmCode: varchar('pm_code', { length: 20 }).notNull(), // 'C1', 'C2', 'C3', 'C4', 'OVERHAUL'
+    54→    pmName: varchar('pm_name', { length: 100 }).notNull(),
+    55→    version: integer('version').default(1),
+    56→
+    57→    // Interval thresholds (whichever comes first)
+    58→    intervalKm: integer('interval_km'),
+    59→    intervalMonths: integer('interval_months'),
+    60→
+    61→    // PM Hierarchy: which lower-level PMs does this PM satisfy?
+    62→    // When a C4 is completed, it satisfies C1/C2/C3 requirements
+    63→    // Example: C4 row has satisfies_codes = ['C1', 'C2', 'C3']
+    64→    satisfiesCodes: text('satisfies_codes').array(),
+    65→
+    66→    // Resource requirements
+    67→    estimatedHours: decimal('estimated_hours', { precision: 6, scale: 2 }).notNull(),
+    68→    trackType: trackTypeEnum('track_type').notNull(),
+    69→    minTrackDays: integer('min_track_days').default(1), // How many days track is occupied
+    70→
+    71→    // Compliance window tolerance (percentage)
+    72→    earlyTolerancePct: decimal('early_tolerance_pct', { precision: 5, scale: 2 }).default('10.0'),
+    73→    lateTolerancePct: decimal('late_tolerance_pct', { precision: 5, scale: 2 }).default('10.0'),
+    74→
+    75→    // Certification requirements
+    76→    requiredCertifications: text('required_certifications').array(),
+    77→
+    78→    // v2.1: PM type versioning for interval changes over contract life
+    79→    effectiveFrom: date('effective_from').notNull().default(sql`CURRENT_DATE`),
+    80→    effectiveTo: date('effective_to'), // NULL = current version
+    81→    supersededBy: uuid('superseded_by'), // Link to newer version
+    82→
+    83→    // Canvas display properties
+    84→    displayColor: varchar('display_color', { length: 7 }),
+    85→    displayPriority: integer('display_priority').default(50),
+    86→
+    87→    active: boolean('active').default(true),
+    88→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    89→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+    90→  },
+    91→  (table) => [
+    92→    uniqueIndex('idx_pm_types_unique').on(table.fleetId, table.pmCode, table.version),
+    93→    index('idx_pm_types_current').on(table.fleetId, table.pmCode, table.effectiveFrom),
+    94→  ]
+    95→);
+    96→
+    97→/**
+    98→ * PM Material Requirements - Bill of Materials
+    99→ *
+   100→ * Links PM types to required parts with quantities and criticality.
+   101→ *
+   102→ * Criticality levels determine scheduling constraints:
+   103→ * - BLOCKING: Cannot start PM without part (14-day hard constraint)
+   104→ * - DEFERRABLE: Can start, must have within X days
+   105→ * - CONSUMABLE: Nice-to-have, can substitute
+   106→ */
+   107→export const pmMaterialRequirements = pgTable(
+   108→  'pm_material_requirements',
+   109→  {
+   110→    id: uuid('id').primaryKey().defaultRandom(),
+   111→    pmTypeId: uuid('pm_type_id')
+   112→      .notNull()
+   113→      .references(() => pmTypes.id),
+   114→    partNumber: varchar('part_number', { length: 50 }).notNull(),
+   115→    partDescription: text('part_description'),
+   116→
+   117→    quantityPerPm: integer('quantity_per_pm').notNull().default(1),
+   118→    criticality: materialCriticalityEnum('criticality').notNull().default('BLOCKING'),
+   119→
+   120→    leadTimeDays: integer('lead_time_days').default(14),
+   121→    substituteParts: text('substitute_parts').array(), // Alternative part numbers
+   122→
+   123→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   124→  },
+   125→  (table) => [
+   126→    uniqueIndex('idx_pm_materials_unique').on(table.pmTypeId, table.partNumber),
+   127→    index('idx_pm_materials_type').on(table.pmTypeId),
+   128→  ]
+   129→);
+   130→
+   131→/**
+   132→ * PM Schedule - Planned and executed maintenance
+   133→ *
+   134→ * The core scheduling table. Each row represents a planned or completed PM.
+   135→ *
+   136→ * Key fields:
+   137→ * - constraint_start/end: Compliance window (calculated from PM type tolerances)
+   138→ * - is_locked: When true, optimizer cannot move this PM
+   139→ * - maximo_wo_id: Link to Maximo work order (when INPRG, PM is locked)
+   140→ * - scenario_id: NULL for production, non-NULL for what-if scenarios
+   141→ *
+   142→ * Status transitions:
+   143→ * SCHEDULED -> IN_PROGRESS -> COMPLETED
+   144→ * SCHEDULED -> DEFERRED -> SCHEDULED (new date)
+   145→ * SCHEDULED -> CANCELLED
+   146→ */
+   147→export const pmSchedule = pgTable(
+   148→  'pm_schedule',
+   149→  {
+   150→    id: uuid('id').primaryKey().defaultRandom(),
+   151→    trainId: uuid('train_id')
+   152→      .notNull()
+   153→      .references(() => trains.id),
+   154→    pmTypeId: uuid('pm_type_id')
+   155→      .notNull()
+   156→      .references(() => pmTypes.id),
+   157→
+   158→    // Scheduling
+   159→    targetDate: date('target_date').notNull(),
+   160→    targetMileageKm: integer('target_mileage_km'),
+   161→    status: pmStatusEnum('status').default('SCHEDULED'),
+   162→
+   163→    // Compliance window
+   164→    constraintStart: date('constraint_start').notNull(), // Earliest allowed date
+   165→    constraintEnd: date('constraint_end').notNull(), // Latest allowed date
+   166→
+   167→    // Resource assignment
+   168→    assignedDepotId: uuid('assigned_depot_id').references(() => depots.id),
+   169→    assignedTrackId: uuid('assigned_track_id').references(() => tracks.id),
+   170→    assignedHours: decimal('assigned_hours', { precision: 6, scale: 2 }),
+   171→    assignedShift: shiftTypeEnum('assigned_shift'),
+   172→
+   173→    // Execution
+   174→    actualStartDate: date('actual_start_date'),
+   175→    actualEndDate: date('actual_end_date'),
+   176→    actualHours: decimal('actual_hours', { precision: 6, scale: 2 }),
+   177→    completedAt: timestamp('completed_at', { withTimezone: true }),
+   178→    completedMileageKm: integer('completed_mileage_km'),
+   179→
+   180→    // Work order integration (Maximo)
+   181→    maximoWoId: varchar('maximo_wo_id', { length: 50 }),
+   182→
+   183→    // Locking - prevents optimizer from moving
+   184→    isLocked: boolean('is_locked').default(false),
+   185→    lockedReason: varchar('locked_reason', { length: 100 }),
+   186→    lockedBy: uuid('locked_by').references(() => users.id),
+   187→    lockedAt: timestamp('locked_at', { withTimezone: true }),
+   188→
+   189→    // Scenario support (NULL = production schedule)
+   190→    scenarioId: uuid('scenario_id'),
+   191→
+   192→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   193→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+   194→    createdBy: uuid('created_by').references(() => users.id),
+   195→  },
+   196→  (table) => [
+   197→    index('idx_pm_schedule_train').on(table.trainId, table.targetDate),
+   198→    index('idx_pm_schedule_date').on(table.targetDate, table.status),
+   199→    index('idx_pm_schedule_depot').on(table.assignedDepotId, table.targetDate),
+   200→    index('idx_pm_schedule_scenario').on(table.scenarioId),
+   201→    index('idx_pm_schedule_canvas').on(table.targetDate, table.trainId),
+   202→    index('idx_pm_schedule_maximo').on(table.maximoWoId),
+   203→  ]
+   204→);
+   205→
+   206→// ============================================================================
+   207→// Relations
+   208→// ============================================================================
+   209→
+   210→export const pmTypesRelations = relations(pmTypes, ({ one, many }) => ({
+   211→  fleet: one(fleets, {
+   212→    fields: [pmTypes.fleetId],
+   213→    references: [fleets.id],
+   214→  }),
+   215→  materialRequirements: many(pmMaterialRequirements),
+   216→  schedules: many(pmSchedule),
+   217→}));
+   218→
+   219→export const pmMaterialRequirementsRelations = relations(pmMaterialRequirements, ({ one }) => ({
+   220→  pmType: one(pmTypes, {
+   221→    fields: [pmMaterialRequirements.pmTypeId],
+   222→    references: [pmTypes.id],
+   223→  }),
+   224→}));
+   225→
+   226→export const pmScheduleRelations = relations(pmSchedule, ({ one }) => ({
+   227→  train: one(trains, {
+   228→    fields: [pmSchedule.trainId],
+   229→    references: [trains.id],
+   230→  }),
+   231→  pmType: one(pmTypes, {
+   232→    fields: [pmSchedule.pmTypeId],
+   233→    references: [pmTypes.id],
+   234→  }),
+   235→  assignedDepot: one(depots, {
+   236→    fields: [pmSchedule.assignedDepotId],
+   237→    references: [depots.id],
+   238→  }),
+   239→  assignedTrack: one(tracks, {
+   240→    fields: [pmSchedule.assignedTrackId],
+   241→    references: [tracks.id],
+   242→  }),
+   243→  lockedByUser: one(users, {
+   244→    fields: [pmSchedule.lockedBy],
+   245→    references: [users.id],
+   246→    relationName: 'lockedBy',
+   247→  }),
+   248→  createdByUser: one(users, {
+   249→    fields: [pmSchedule.createdBy],
+   250→    references: [users.id],
+   251→    relationName: 'createdBy',
+   252→  }),
+   253→}));
+   254→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

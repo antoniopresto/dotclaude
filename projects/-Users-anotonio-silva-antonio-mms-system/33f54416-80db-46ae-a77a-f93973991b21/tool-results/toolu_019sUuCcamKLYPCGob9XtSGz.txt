@@ -1,0 +1,174 @@
+     1→/**
+     2→ * MMS Run Assignment Optimizer
+     3→ *
+     4→ * Entry point for the C++ OR-Tools CP-SAT optimizer.
+     5→ * Communicates with TypeScript wrapper via NDJSON on stdin/stdout.
+     6→ *
+     7→ * Usage:
+     8→ *   echo '{"request_id":"...", "trains":[...], "routes":[...]}' | ./mms-optimizer
+     9→ *
+    10→ * Protocol:
+    11→ *   - Input: Single JSON object on stdin (newline-terminated)
+    12→ *   - Output: NDJSON stream on stdout (HEARTBEAT, PROGRESS, ERROR, RESULT)
+    13→ *
+    14→ * @see specs/004-domain-services.md Section 4.3
+    15→ */
+    16→
+    17→#include "ipc.h"
+    18→#include "solver.h"
+    19→#include <iostream>
+    20→#include <csignal>
+    21→#include <cstdlib>
+    22→
+    23→// Global IPC handler for signal handling
+    24→static mms::IpcHandler* g_ipc = nullptr;
+    25→static std::string g_requestId;
+    26→
+    27→/**
+    28→ * Signal handler for SIGSEGV, SIGABRT, SIGFPE
+    29→ */
+    30→void signalHandler(int signal) {
+    31→    if (g_ipc) {
+    32→        mms::ErrorCode code = mms::ErrorCode::INTERNAL_ERROR;
+    33→        std::string message;
+    34→
+    35→        switch (signal) {
+    36→            case SIGSEGV:
+    37→                code = mms::ErrorCode::SEGFAULT;
+    38→                message = "Segmentation fault in optimizer";
+    39→                break;
+    40→            case SIGABRT:
+    41→                code = mms::ErrorCode::INTERNAL_ERROR;
+    42→                message = "Abort signal received";
+    43→                break;
+    44→            case SIGFPE:
+    45→                code = mms::ErrorCode::INTERNAL_ERROR;
+    46→                message = "Floating point exception";
+    47→                break;
+    48→            default:
+    49→                message = "Unknown signal received: " + std::to_string(signal);
+    50→                break;
+    51→        }
+    52→
+    53→        // Try to send error before exiting
+    54→        try {
+    55→            g_ipc->sendError(g_requestId, code, message);
+    56→        } catch (...) {
+    57→            // Can't do much if error reporting fails
+    58→            std::cerr << "FATAL: " << message << std::endl;
+    59→            std::exit(128 + signal);
+    60→        }
+    61→    }
+    62→
+    63→    std::exit(128 + signal);
+    64→}
+    65→
+    66→/**
+    67→ * Setup signal handlers
+    68→ */
+    69→void setupSignalHandlers() {
+    70→    std::signal(SIGSEGV, signalHandler);
+    71→    std::signal(SIGABRT, signalHandler);
+    72→    std::signal(SIGFPE, signalHandler);
+    73→
+    74→    // Ignore SIGPIPE (broken pipe when parent dies)
+    75→    std::signal(SIGPIPE, SIG_IGN);
+    76→}
+    77→
+    78→/**
+    79→ * Main entry point
+    80→ */
+    81→int main(int argc, char* argv[]) {
+    82→    // Handle --version flag
+    83→    if (argc > 1 && std::string(argv[1]) == "--version") {
+    84→        std::cout << "mms-optimizer 1.0.0" << std::endl;
+    85→        std::cout << "OR-Tools CP-SAT Solver" << std::endl;
+    86→        return 0;
+    87→    }
+    88→
+    89→    // Handle --help flag
+    90→    if (argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+    91→        std::cout << "MMS Run Assignment Optimizer" << std::endl;
+    92→        std::cout << std::endl;
+    93→        std::cout << "Usage: " << argv[0] << " < input.json" << std::endl;
+    94→        std::cout << std::endl;
+    95→        std::cout << "Reads JSON input from stdin, outputs NDJSON to stdout." << std::endl;
+    96→        std::cout << std::endl;
+    97→        std::cout << "Options:" << std::endl;
+    98→        std::cout << "  --version    Show version information" << std::endl;
+    99→        std::cout << "  --help, -h   Show this help message" << std::endl;
+   100→        return 0;
+   101→    }
+   102→
+   103→    // Create IPC handler
+   104→    mms::IpcHandler ipc;
+   105→    g_ipc = &ipc;
+   106→
+   107→    // Setup signal handlers
+   108→    setupSignalHandlers();
+   109→
+   110→    try {
+   111→        // Read input from stdin
+   112→        mms::json input = ipc.readInput();
+   113→
+   114→        // Extract request ID for error handling
+   115→        if (input.contains("request_id")) {
+   116→            g_requestId = input["request_id"].get<std::string>();
+   117→        } else {
+   118→            g_requestId = "unknown";
+   119→        }
+   120→
+   121→        // Start heartbeat thread
+   122→        ipc.startHeartbeatThread(g_requestId, 5000);
+   123→
+   124→        // Create solver
+   125→        mms::MmsSolver solver;
+   126→
+   127→        // Validate input
+   128→        std::string validationError = solver.validateInput(input);
+   129→        if (!validationError.empty()) {
+   130→            ipc.sendError(
+   131→                g_requestId,
+   132→                mms::ErrorCode::INVALID_INPUT,
+   133→                validationError,
+   134→                "",
+   135→                "Check input JSON structure matches expected schema"
+   136→            );
+   137→            // sendError exits, so this is unreachable
+   138→        }
+   139→
+   140→        // Solve with progress callback
+   141→        mms::SolverResult result = solver.solve(input,
+   142→            [&ipc, &g_requestId](double percent, double objective, bool feasible) {
+   143→                ipc.sendProgress(g_requestId, percent, objective, feasible, ipc.getElapsedMs());
+   144→            }
+   145→        );
+   146→
+   147→        // Send result
+   148→        ipc.sendResult(result.toJson());
+   149→
+   150→        return 0;
+   151→
+   152→    } catch (const std::exception& e) {
+   153→        ipc.sendError(
+   154→            g_requestId,
+   155→            mms::ErrorCode::INTERNAL_ERROR,
+   156→            std::string("Exception: ") + e.what()
+   157→        );
+   158→        // sendError exits, so this is unreachable
+   159→    } catch (...) {
+   160→        ipc.sendError(
+   161→            g_requestId,
+   162→            mms::ErrorCode::INTERNAL_ERROR,
+   163→            "Unknown exception occurred"
+   164→        );
+   165→        // sendError exits, so this is unreachable
+   166→    }
+   167→
+   168→    return 1;
+   169→}
+   170→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

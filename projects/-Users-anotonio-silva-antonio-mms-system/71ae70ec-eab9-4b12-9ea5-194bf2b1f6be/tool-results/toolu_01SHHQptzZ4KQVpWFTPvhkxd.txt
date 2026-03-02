@@ -1,0 +1,1586 @@
+     1→/**
+     2→ * Integration Routes
+     3→ *
+     4→ * REST endpoints for Maximo integration, including:
+     5→ * - Webhook receiver for CM status updates from Maximo
+     6→ * - Sync operations (push, pull, full)
+     7→ * - Conflict management
+     8→ * - Sync statistics
+     9→ *
+    10→ * Integration flow:
+    11→ * 1. Maximo sends webhook on WO status change → POST /integration/webhooks/maximo
+    12→ * 2. MMS updates shadow record and PM status
+    13→ * 3. For proactive sync: POST /integration/sync/pull
+    14→ * 4. Conflicts are resolved via POST /integration/conflicts/:id/resolve
+    15→ *
+    16→ * @see specs/007-integration.md
+    17→ */
+    18→
+    19→import { Hono } from 'hono';
+    20→import {
+    21→  success,
+    22→  paginatedSuccess,
+    23→  error,
+    24→  ErrorCodes,
+    25→  parsePaginationQuery,
+    26→  type AppVariables,
+    27→} from '../types';
+    28→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    29→import {
+    30→  getMaximoSyncService,
+    31→  getMaximoPollingService,
+    32→  type ConflictResolution,
+    33→  type MaximoWoStatus,
+    34→  MAXIMO_TO_MMS_STATUS,
+    35→  MAXIMO_STATUS_LABELS,
+    36→  LOCKED_MAXIMO_STATUSES,
+    37→} from '../../services';
+    38→import { isValidUuid } from '../../lib/schemas';
+    39→import { NotFoundError, ValidationError } from '../../lib/errors';
+    40→import { logger } from '../../lib/logging/logger';
+    41→import { eq } from 'drizzle-orm';
+    42→import { maximoShadowRecords, pmSchedule } from '../../lib/db/schema';
+    43→import { db } from '../../lib/db/connection';
+    44→
+    45→// Singleton service instances
+    46→let maximoSyncService: ReturnType<typeof getMaximoSyncService> | null = null;
+    47→let maximoPollingService: ReturnType<typeof getMaximoPollingService> | null = null;
+    48→
+    49→function getService(): ReturnType<typeof getMaximoSyncService> {
+    50→  if (!maximoSyncService) {
+    51→    maximoSyncService = getMaximoSyncService();
+    52→  }
+    53→  return maximoSyncService;
+    54→}
+    55→
+    56→function getPollingService(): ReturnType<typeof getMaximoPollingService> {
+    57→  if (!maximoPollingService) {
+    58→    maximoPollingService = getMaximoPollingService();
+    59→  }
+    60→  return maximoPollingService;
+    61→}
+    62→
+    63→export const integrationRoutes = new Hono<{ Variables: AppVariables }>();
+    64→
+    65→// =============================================================================
+    66→// Webhook Endpoints
+    67→// =============================================================================
+    68→
+    69→/**
+    70→ * Maximo Webhook Event Types
+    71→ */
+    72→type MaximoWebhookEventType =
+    73→  | 'wo_status_changed'
+    74→  | 'wo_created'
+    75→  | 'wo_updated'
+    76→  | 'wo_cancelled';
+    77→
+    78→/**
+    79→ * Maximo Webhook Payload
+    80→ *
+    81→ * Payload sent by Maximo when a work order status changes.
+    82→ */
+    83→interface MaximoWebhookPayload {
+    84→  /** Event type */
+    85→  event: MaximoWebhookEventType;
+    86→  /** Work order number (e.g., "WO-2026-ABC123") */
+    87→  wonum: string;
+    88→  /** New status (e.g., "INPRG", "COMP") */
+    89→  status?: MaximoWoStatus;
+    90→  /** Timestamp of the change (ISO 8601) */
+    91→  changedate: string;
+    92→  /** Optional: Site ID */
+    93→  siteid?: string;
+    94→  /** Optional: Asset number (train number) */
+    95→  assetnum?: string;
+    96→  /** Optional: Actual start date */
+    97→  actstart?: string;
+    98→  /** Optional: Actual finish date */
+    99→  actfinish?: string;
+   100→  /** Optional: Actual labor hours */
+   101→  actlabhrs?: number;
+   102→  /** Optional: MMS schedule ID backreference */
+   103→  mms_schedule_id?: string;
+   104→}
+   105→
+   106→/**
+   107→ * Validate Maximo webhook payload
+   108→ */
+   109→function validateWebhookPayload(
+   110→  payload: unknown
+   111→): { valid: true; data: MaximoWebhookPayload } | { valid: false; error: string } {
+   112→  if (typeof payload !== 'object' || payload === null) {
+   113→    return { valid: false, error: 'Payload must be an object' };
+   114→  }
+   115→
+   116→  const p = payload as Record<string, unknown>;
+   117→
+   118→  // Required: event
+   119→  if (!p.event || typeof p.event !== 'string') {
+   120→    return { valid: false, error: 'Missing or invalid event field' };
+   121→  }
+   122→
+   123→  const validEvents: MaximoWebhookEventType[] = [
+   124→    'wo_status_changed',
+   125→    'wo_created',
+   126→    'wo_updated',
+   127→    'wo_cancelled',
+   128→  ];
+   129→  if (!validEvents.includes(p.event as MaximoWebhookEventType)) {
+   130→    return { valid: false, error: `Invalid event type: ${p.event}` };
+   131→  }
+   132→
+   133→  // Required: wonum
+   134→  if (!p.wonum || typeof p.wonum !== 'string') {
+   135→    return { valid: false, error: 'Missing or invalid wonum field' };
+   136→  }
+   137→
+   138→  // Required: changedate
+   139→  if (!p.changedate || typeof p.changedate !== 'string') {
+   140→    return { valid: false, error: 'Missing or invalid changedate field' };
+   141→  }
+   142→
+   143→  // Validate changedate is valid ISO 8601
+   144→  const changeDate = new Date(p.changedate);
+   145→  if (isNaN(changeDate.getTime())) {
+   146→    return { valid: false, error: 'changedate must be valid ISO 8601 format' };
+   147→  }
+   148→
+   149→  // Optional: status (required for wo_status_changed)
+   150→  if (p.event === 'wo_status_changed') {
+   151→    if (!p.status || typeof p.status !== 'string') {
+   152→      return { valid: false, error: 'status is required for wo_status_changed event' };
+   153→    }
+   154→
+   155→    const validStatuses: MaximoWoStatus[] = ['WAPPR', 'APPR', 'INPRG', 'COMP', 'CLOSE', 'CAN'];
+   156→    if (!validStatuses.includes(p.status as MaximoWoStatus)) {
+   157→      return { valid: false, error: `Invalid status: ${p.status}` };
+   158→    }
+   159→  }
+   160→
+   161→  return {
+   162→    valid: true,
+   163→    data: {
+   164→      event: p.event as MaximoWebhookEventType,
+   165→      wonum: p.wonum as string,
+   166→      status: p.status as MaximoWoStatus | undefined,
+   167→      changedate: p.changedate as string,
+   168→      siteid: typeof p.siteid === 'string' ? p.siteid : undefined,
+   169→      assetnum: typeof p.assetnum === 'string' ? p.assetnum : undefined,
+   170→      actstart: typeof p.actstart === 'string' ? p.actstart : undefined,
+   171→      actfinish: typeof p.actfinish === 'string' ? p.actfinish : undefined,
+   172→      actlabhrs: typeof p.actlabhrs === 'number' ? p.actlabhrs : undefined,
+   173→      mms_schedule_id: typeof p.mms_schedule_id === 'string' ? p.mms_schedule_id : undefined,
+   174→    },
+   175→  };
+   176→}
+   177→
+   178→/**
+   179→ * POST /integration/webhooks/maximo
+   180→ *
+   181→ * Receive CM/WO status updates from Maximo.
+   182→ *
+   183→ * This endpoint is called by Maximo when:
+   184→ * - Work order status changes (WAPPR → APPR → INPRG → COMP → CLOSE)
+   185→ * - Work order is cancelled (CAN)
+   186→ * - Actual labor hours are recorded
+   187→ *
+   188→ * The webhook updates the shadow record and locks the PM if necessary.
+   189→ *
+   190→ * @security This endpoint should be protected by Maximo webhook authentication
+   191→ * (e.g., shared secret, IP allowlist, or mutual TLS)
+   192→ *
+   193→ * @see specs/007-integration.md Section 7.4.7
+   194→ */
+   195→integrationRoutes.post('/integration/webhooks/maximo', async (c) => {
+   196→  const requestId = getRequestId(c);
+   197→  const startTime = Date.now();
+   198→
+   199→  let payload: MaximoWebhookPayload;
+   200→
+   201→  try {
+   202→    const body = await c.req.json();
+   203→    const validation = validateWebhookPayload(body);
+   204→
+   205→    if (!validation.valid) {
+   206→      logger.warn({ requestId, error: validation.error }, 'Invalid Maximo webhook payload');
+   207→      return c.json(
+   208→        error(ErrorCodes.VALIDATION_ERROR, validation.error, requestId),
+   209→        400
+   210→      );
+   211→    }
+   212→
+   213→    payload = validation.data;
+   214→  } catch (err) {
+   215→    logger.warn({ requestId, error: err }, 'Failed to parse Maximo webhook payload');
+   216→    return c.json(
+   217→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid JSON payload', requestId),
+   218→      400
+   219→    );
+   220→  }
+   221→
+   222→  logger.info(
+   223→    { requestId, event: payload.event, wonum: payload.wonum, status: payload.status },
+   224→    'Received Maximo webhook'
+   225→  );
+   226→
+   227→  // Using imported db singleton
+   228→
+   229→  // Find shadow record by Maximo WO number
+   230→  const shadowRecord = await db.query.maximoShadowRecords.findFirst({
+   231→    where: eq(maximoShadowRecords.maximoWoNum, payload.wonum),
+   232→  });
+   233→
+   234→  if (!shadowRecord) {
+   235→    // Check if we have an mms_schedule_id backreference
+   236→    if (payload.mms_schedule_id && isValidUuid(payload.mms_schedule_id)) {
+   237→      // Try to find shadow record by PM schedule ID
+   238→      const shadowByPm = await db.query.maximoShadowRecords.findFirst({
+   239→        where: eq(maximoShadowRecords.pmScheduleId, payload.mms_schedule_id),
+   240→      });
+   241→
+   242→      if (shadowByPm) {
+   243→        // Update shadow record with WO number
+   244→        await db
+   245→          .update(maximoShadowRecords)
+   246→          .set({
+   247→            maximoWoNum: payload.wonum,
+   248→            updatedAt: new Date(),
+   249→          })
+   250→          .where(eq(maximoShadowRecords.id, shadowByPm.id));
+   251→
+   252→        logger.info(
+   253→          { requestId, shadowRecordId: shadowByPm.id, wonum: payload.wonum },
+   254→          'Associated Maximo WO number with existing shadow record'
+   255→        );
+   256→      }
+   257→    }
+   258→
+   259→    // If still no shadow record, log and return success (idempotent)
+   260→    if (!shadowRecord) {
+   261→      logger.info(
+   262→        { requestId, wonum: payload.wonum },
+   263→        'No shadow record found for Maximo WO - may be untracked in MMS'
+   264→      );
+   265→
+   266→      return c.json(
+   267→        success({
+   268→          received: true,
+   269→          processed: false,
+   270→          reason: 'No matching shadow record found',
+   271→          wonum: payload.wonum,
+   272→        }),
+   273→        200
+   274→      );
+   275→    }
+   276→  }
+   277→
+   278→  // Process based on event type
+   279→  try {
+   280→    let action = 'none';
+   281→    let mmsStatusUpdated = false;
+   282→    let pmLocked = false;
+   283→
+   284→    if (payload.event === 'wo_status_changed' && payload.status) {
+   285→      // Get the current shadow record (refreshed)
+   286→      const currentShadow = await db.query.maximoShadowRecords.findFirst({
+   287→        where: eq(maximoShadowRecords.maximoWoNum, payload.wonum),
+   288→      });
+   289→
+   290→      if (currentShadow) {
+   291→        const previousMaximoData = currentShadow.maximoData as { status?: string } | null;
+   292→        const previousStatus = previousMaximoData?.status;
+   293→
+   294→        // Update shadow record with new Maximo data
+   295→        await db
+   296→          .update(maximoShadowRecords)
+   297→          .set({
+   298→            maximoData: {
+   299→              status: payload.status,
+   300→              actualStart: payload.actstart,
+   301→              actualFinish: payload.actfinish,
+   302→              actualLabor: payload.actlabhrs,
+   303→              changeDate: payload.changedate,
+   304→            },
+   305→            lastSyncAt: new Date(),
+   306→            syncStatus: 'SYNCED',
+   307→            updatedAt: new Date(),
+   308→          })
+   309→          .where(eq(maximoShadowRecords.id, currentShadow.id));
+   310→
+   311→        // Map Maximo status to MMS status
+   312→        const mmsStatus = MAXIMO_TO_MMS_STATUS[payload.status];
+   313→
+   314→        // Update PM schedule status
+   315→        const pmRecord = await db.query.pmSchedule.findFirst({
+   316→          where: eq(pmSchedule.id, currentShadow.pmScheduleId),
+   317→        });
+   318→
+   319→        if (pmRecord) {
+   320→          const isLocked = LOCKED_MAXIMO_STATUSES.includes(payload.status);
+   321→
+   322→          // Update PM schedule
+   323→          await db
+   324→            .update(pmSchedule)
+   325→            .set({
+   326→              status: mmsStatus,
+   327→              isLocked: isLocked,
+   328→              actualStartDate: payload.actstart ? payload.actstart.split('T')[0] : pmRecord.actualStartDate,
+   329→              actualEndDate: payload.actfinish ? payload.actfinish.split('T')[0] : pmRecord.actualEndDate,
+   330→              actualHours: payload.actlabhrs !== undefined
+   331→                ? payload.actlabhrs.toString()
+   332→                : pmRecord.actualHours,
+   333→              updatedAt: new Date(),
+   334→            })
+   335→            .where(eq(pmSchedule.id, pmRecord.id));
+   336→
+   337→          mmsStatusUpdated = true;
+   338→          pmLocked = isLocked;
+   339→
+   340→          logger.info(
+   341→            {
+   342→              requestId,
+   343→              pmScheduleId: pmRecord.id,
+   344→              previousStatus,
+   345→              newStatus: payload.status,
+   346→              mmsStatus,
+   347→              isLocked,
+   348→            },
+   349→            'Updated PM schedule from Maximo webhook'
+   350→          );
+   351→        }
+   352→
+   353→        action = 'status_updated';
+   354→      }
+   355→    } else if (payload.event === 'wo_cancelled') {
+   356→      // Handle work order cancellation
+   357→      const currentShadow = await db.query.maximoShadowRecords.findFirst({
+   358→        where: eq(maximoShadowRecords.maximoWoNum, payload.wonum),
+   359→      });
+   360→
+   361→      if (currentShadow) {
+   362→        await db
+   363→          .update(maximoShadowRecords)
+   364→          .set({
+   365→            maximoData: {
+   366→              status: 'CAN',
+   367→              changeDate: payload.changedate,
+   368→            },
+   369→            syncStatus: 'SYNCED',
+   370→            updatedAt: new Date(),
+   371→          })
+   372→          .where(eq(maximoShadowRecords.id, currentShadow.id));
+   373→
+   374→        // Update PM schedule to CANCELLED and locked
+   375→        await db
+   376→          .update(pmSchedule)
+   377→          .set({
+   378→            status: 'CANCELLED',
+   379→            isLocked: true,
+   380→            updatedAt: new Date(),
+   381→          })
+   382→          .where(eq(pmSchedule.id, currentShadow.pmScheduleId));
+   383→
+   384→        action = 'wo_cancelled';
+   385→        mmsStatusUpdated = true;
+   386→        pmLocked = true;
+   387→
+   388→        logger.info(
+   389→          { requestId, pmScheduleId: currentShadow.pmScheduleId, wonum: payload.wonum },
+   390→          'PM cancelled from Maximo webhook'
+   391→        );
+   392→      }
+   393→    }
+   394→
+   395→    const durationMs = Date.now() - startTime;
+   396→
+   397→    return c.json(
+   398→      success({
+   399→        received: true,
+   400→        processed: true,
+   401→        action,
+   402→        wonum: payload.wonum,
+   403→        event: payload.event,
+   404→        mmsStatusUpdated,
+   405→        pmLocked,
+   406→        durationMs,
+   407→      }),
+   408→      200
+   409→    );
+   410→  } catch (err) {
+   411→    logger.error({ requestId, error: err, wonum: payload.wonum }, 'Failed to process Maximo webhook');
+   412→    return c.json(
+   413→      error(
+   414→        ErrorCodes.INTERNAL_ERROR,
+   415→        'Failed to process webhook',
+   416→        requestId,
+   417→        { wonum: payload.wonum }
+   418→      ),
+   419→      500
+   420→    );
+   421→  }
+   422→});
+   423→
+   424→// =============================================================================
+   425→// Sync Operations
+   426→// =============================================================================
+   427→
+   428→/**
+   429→ * GET /integration/sync/stats
+   430→ *
+   431→ * Get Maximo sync statistics.
+   432→ *
+   433→ * Returns counts of shadow records by status, last sync timestamps,
+   434→ * and circuit breaker state.
+   435→ */
+   436→integrationRoutes.get('/integration/sync/stats', async (c) => {
+   437→  const requestId = getRequestId(c);
+   438→  const service = getService();
+   439→
+   440→  try {
+   441→    const stats = await service.getSyncStats();
+   442→
+   443→    return c.json(
+   444→      success({
+   445→        pendingRecords: stats.pendingRecords,
+   446→        syncedRecords: stats.syncedRecords,
+   447→        conflictRecords: stats.conflictRecords,
+   448→        errorRecords: stats.errorRecords,
+   449→        totalRecords:
+   450→          stats.pendingRecords + stats.syncedRecords + stats.conflictRecords + stats.errorRecords,
+   451→        lastSyncAt: stats.lastSyncAt?.toISOString() ?? null,
+   452→        lastPullAt: stats.lastPullAt?.toISOString() ?? null,
+   453→        circuitBreakerState: stats.circuitBreakerState,
+   454→        isHealthy: stats.circuitBreakerState === 'CLOSED',
+   455→      }, { timing: { durationMs: getRequestDuration(c) } })
+   456→    );
+   457→  } catch (err) {
+   458→    logger.error({ requestId, error: err }, 'Failed to get sync stats');
+   459→    return c.json(
+   460→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to get sync statistics', requestId),
+   461→      500
+   462→    );
+   463→  }
+   464→});
+   465→
+   466→/**
+   467→ * POST /integration/sync/push
+   468→ *
+   469→ * Trigger push sync (MMS → Maximo).
+   470→ *
+   471→ * Pushes all pending shadow records to Maximo, creating or updating
+   472→ * work orders as needed.
+   473→ *
+   474→ * @returns Summary of push results
+   475→ */
+   476→integrationRoutes.post('/integration/sync/push', async (c) => {
+   477→  const requestId = getRequestId(c);
+   478→  const service = getService();
+   479→
+   480→  try {
+   481→    logger.info({ requestId }, 'Starting push sync to Maximo');
+   482→
+   483→    const result = await service.pushAllPending();
+   484→
+   485→    logger.info(
+   486→      { requestId, pushed: result.pushed, errors: result.errors },
+   487→      'Push sync completed'
+   488→    );
+   489→
+   490→    return c.json(
+   491→      success({
+   492→        operation: 'push',
+   493→        pushed: result.pushed,
+   494→        errors: result.errors,
+   495→        success: result.errors === 0,
+   496→      }, { timing: { durationMs: getRequestDuration(c) } })
+   497→    );
+   498→  } catch (err) {
+   499→    logger.error({ requestId, error: err }, 'Push sync failed');
+   500→    return c.json(
+   501→      error(ErrorCodes.INTERNAL_ERROR, 'Push sync failed', requestId),
+   502→      500
+   503→    );
+   504→  }
+   505→});
+   506→
+   507→/**
+   508→ * POST /integration/sync/pull
+   509→ *
+   510→ * Trigger pull sync (Maximo → MMS).
+   511→ *
+   512→ * Queries Maximo for work order status changes and updates MMS
+   513→ * PM schedules accordingly.
+   514→ *
+   515→ * @returns Summary of pull results
+   516→ */
+   517→integrationRoutes.post('/integration/sync/pull', async (c) => {
+   518→  const requestId = getRequestId(c);
+   519→  const service = getService();
+   520→
+   521→  try {
+   522→    logger.info({ requestId }, 'Starting pull sync from Maximo');
+   523→
+   524→    const result = await service.pullFromMaximo();
+   525→
+   526→    logger.info(
+   527→      {
+   528→        requestId,
+   529→        processed: result.processed,
+   530→        updated: result.updated,
+   531→        conflicts: result.conflicts,
+   532→        errors: result.errors,
+   533→      },
+   534→      'Pull sync completed'
+   535→    );
+   536→
+   537→    return c.json(
+   538→      success({
+   539→        operation: 'pull',
+   540→        processed: result.processed,
+   541→        updated: result.updated,
+   542→        conflicts: result.conflicts,
+   543→        errors: result.errors,
+   544→        success: result.errors === 0,
+   545→        details: result.details,
+   546→      }, { timing: { durationMs: getRequestDuration(c) } })
+   547→    );
+   548→  } catch (err) {
+   549→    logger.error({ requestId, error: err }, 'Pull sync failed');
+   550→    return c.json(
+   551→      error(ErrorCodes.INTERNAL_ERROR, 'Pull sync failed', requestId),
+   552→      500
+   553→    );
+   554→  }
+   555→});
+   556→
+   557→/**
+   558→ * POST /integration/sync/full
+   559→ *
+   560→ * Trigger full bidirectional sync.
+   561→ *
+   562→ * Performs both push (MMS → Maximo) and pull (Maximo → MMS) operations.
+   563→ *
+   564→ * @returns Combined sync results
+   565→ */
+   566→integrationRoutes.post('/integration/sync/full', async (c) => {
+   567→  const requestId = getRequestId(c);
+   568→  const service = getService();
+   569→
+   570→  try {
+   571→    logger.info({ requestId }, 'Starting full bidirectional sync');
+   572→
+   573→    // Push first, then pull
+   574→    const pushResult = await service.pushAllPending();
+   575→    const pullResult = await service.pullFromMaximo();
+   576→
+   577→    logger.info(
+   578→      {
+   579→        requestId,
+   580→        push: { pushed: pushResult.pushed, errors: pushResult.errors },
+   581→        pull: {
+   582→          processed: pullResult.processed,
+   583→          updated: pullResult.updated,
+   584→          conflicts: pullResult.conflicts,
+   585→          errors: pullResult.errors,
+   586→        },
+   587→      },
+   588→      'Full sync completed'
+   589→    );
+   590→
+   591→    return c.json(
+   592→      success({
+   593→        operation: 'full',
+   594→        push: {
+   595→          pushed: pushResult.pushed,
+   596→          errors: pushResult.errors,
+   597→        },
+   598→        pull: {
+   599→          processed: pullResult.processed,
+   600→          updated: pullResult.updated,
+   601→          conflicts: pullResult.conflicts,
+   602→          errors: pullResult.errors,
+   603→        },
+   604→        success: pushResult.errors === 0 && pullResult.errors === 0,
+   605→      }, { timing: { durationMs: getRequestDuration(c) } })
+   606→    );
+   607→  } catch (err) {
+   608→    logger.error({ requestId, error: err }, 'Full sync failed');
+   609→    return c.json(
+   610→      error(ErrorCodes.INTERNAL_ERROR, 'Full sync failed', requestId),
+   611→      500
+   612→    );
+   613→  }
+   614→});
+   615→
+   616→// =============================================================================
+   617→// Conflict Management
+   618→// =============================================================================
+   619→
+   620→/**
+   621→ * GET /integration/conflicts
+   622→ *
+   623→ * List all shadow records with sync conflicts.
+   624→ *
+   625→ * Query Parameters:
+   626→ * - page: Page number (default: 1)
+   627→ * - pageSize: Items per page (default: 50, max: 200)
+   628→ *
+   629→ * @returns Paginated list of conflicts with PM details
+   630→ */
+   631→integrationRoutes.get('/integration/conflicts', async (c) => {
+   632→  const requestId = getRequestId(c);
+   633→  const service = getService();
+   634→
+   635→  const pagination = parsePaginationQuery({
+   636→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   637→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   638→  });
+   639→
+   640→  try {
+   641→    const result = await service.listShadowRecords(
+   642→      { syncStatus: 'CONFLICT' },
+   643→      { page: pagination.page, pageSize: pagination.pageSize }
+   644→    );
+   645→
+   646→    // Transform to API response format
+   647→    const conflicts = result.data.map((item) => ({
+   648→      id: item.shadowRecord.id,
+   649→      pmScheduleId: item.shadowRecord.pmScheduleId,
+   650→      maximoWoNum: item.shadowRecord.maximoWoNum,
+   651→      syncStatus: item.shadowRecord.syncStatus,
+   652→      lastSyncAt: item.shadowRecord.lastSyncAt?.toISOString() ?? null,
+   653→      lastSyncError: item.shadowRecord.lastSyncError,
+   654→      mmsData: item.shadowRecord.mmsDataSnapshot,
+   655→      maximoData: item.shadowRecord.maximoData,
+   656→      pmSchedule: {
+   657→        id: item.pmSchedule.id,
+   658→        trainId: item.pmSchedule.trainId,
+   659→        trainNumber: item.pmSchedule.train?.trainNumber,
+   660→        pmTypeCode: item.pmSchedule.pmType?.pmCode,
+   661→        pmTypeName: item.pmSchedule.pmType?.pmName,
+   662→        targetDate: item.pmSchedule.targetDate,
+   663→        status: item.pmSchedule.status,
+   664→        depotCode: item.pmSchedule.depot?.code,
+   665→      },
+   666→      createdAt: item.shadowRecord.createdAt?.toISOString() ?? new Date().toISOString(),
+   667→      updatedAt: item.shadowRecord.updatedAt?.toISOString() ?? new Date().toISOString(),
+   668→    }));
+   669→
+   670→    return c.json(
+   671→      paginatedSuccess(conflicts, {
+   672→        page: result.page,
+   673→        pageSize: result.pageSize,
+   674→        totalItems: result.total,
+   675→      }, { durationMs: getRequestDuration(c) })
+   676→    );
+   677→  } catch (err) {
+   678→    logger.error({ requestId, error: err }, 'Failed to list conflicts');
+   679→    return c.json(
+   680→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to list conflicts', requestId),
+   681→      500
+   682→    );
+   683→  }
+   684→});
+   685→
+   686→/**
+   687→ * GET /integration/conflicts/:id
+   688→ *
+   689→ * Get details of a specific conflict.
+   690→ *
+   691→ * @param id - Shadow record ID
+   692→ * @returns Conflict details with MMS and Maximo data comparison
+   693→ */
+   694→integrationRoutes.get('/integration/conflicts/:id', async (c) => {
+   695→  const requestId = getRequestId(c);
+   696→  const id = c.req.param('id');
+   697→
+   698→  if (!isValidUuid(id)) {
+   699→    return c.json(
+   700→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid conflict ID format', requestId),
+   701→      400
+   702→    );
+   703→  }
+   704→
+   705→  // Using imported db singleton
+   706→
+   707→  try {
+   708→    const shadowRecord = await db.query.maximoShadowRecords.findFirst({
+   709→      where: eq(maximoShadowRecords.id, id),
+   710→      with: {
+   711→        pmScheduleEntry: {
+   712→          with: {
+   713→            train: true,
+   714→            pmType: true,
+   715→            assignedDepot: true,
+   716→          },
+   717→        },
+   718→      },
+   719→    });
+   720→
+   721→    if (!shadowRecord) {
+   722→      return c.json(
+   723→        error(ErrorCodes.NOT_FOUND, 'Conflict not found', requestId),
+   724→        404
+   725→      );
+   726→    }
+   727→
+   728→    if (shadowRecord.syncStatus !== 'CONFLICT') {
+   729→      return c.json(
+   730→        error(ErrorCodes.VALIDATION_ERROR, 'Record is not in conflict state', requestId, {
+   731→          currentStatus: shadowRecord.syncStatus,
+   732→        }),
+   733→        400
+   734→      );
+   735→    }
+   736→
+   737→    const mmsData = shadowRecord.mmsDataSnapshot as {
+   738→      trainId: string;
+   739→      pmTypeCode: string;
+   740→      targetDate: string;
+   741→      status: string;
+   742→      assignedDepotId?: string;
+   743→      assignedHours?: string;
+   744→    } | null;
+   745→
+   746→    const maximoData = shadowRecord.maximoData as {
+   747→      status?: string;
+   748→      schedStart?: string;
+   749→      schedFinish?: string;
+   750→      actualStart?: string;
+   751→      actualFinish?: string;
+   752→      actualLabor?: number;
+   753→      changeDate?: string;
+   754→    } | null;
+   755→
+   756→    return c.json(
+   757→      success({
+   758→        id: shadowRecord.id,
+   759→        pmScheduleId: shadowRecord.pmScheduleId,
+   760→        maximoWoNum: shadowRecord.maximoWoNum,
+   761→        syncStatus: shadowRecord.syncStatus,
+   762→        lastSyncAt: shadowRecord.lastSyncAt?.toISOString() ?? null,
+   763→        mmsData: mmsData ? {
+   764→          targetDate: mmsData.targetDate,
+   765→          status: mmsData.status,
+   766→          assignedHours: mmsData.assignedHours,
+   767→        } : null,
+   768→        maximoData: maximoData ? {
+   769→          status: maximoData.status,
+   770→          statusLabel: maximoData.status
+   771→            ? MAXIMO_STATUS_LABELS[maximoData.status as MaximoWoStatus]
+   772→            : null,
+   773→          schedStart: maximoData.schedStart,
+   774→          schedFinish: maximoData.schedFinish,
+   775→          actualStart: maximoData.actualStart,
+   776→          actualFinish: maximoData.actualFinish,
+   777→          actualLabor: maximoData.actualLabor,
+   778→          changeDate: maximoData.changeDate,
+   779→        } : null,
+   780→        pmSchedule: {
+   781→          id: shadowRecord.pmScheduleEntry.id,
+   782→          trainId: shadowRecord.pmScheduleEntry.trainId,
+   783→          trainNumber: shadowRecord.pmScheduleEntry.train?.trainNumber,
+   784→          pmTypeCode: shadowRecord.pmScheduleEntry.pmType?.pmCode,
+   785→          pmTypeName: shadowRecord.pmScheduleEntry.pmType?.pmName,
+   786→          targetDate: shadowRecord.pmScheduleEntry.targetDate,
+   787→          currentStatus: shadowRecord.pmScheduleEntry.status,
+   788→          depotCode: shadowRecord.pmScheduleEntry.assignedDepot?.code,
+   789→        },
+   790→        resolutionOptions: [
+   791→          {
+   792→            strategy: 'USE_MMS',
+   793→            description: 'Overwrite Maximo with MMS data (force push)',
+   794→          },
+   795→          {
+   796→            strategy: 'USE_MAXIMO',
+   797→            description: 'Apply Maximo data to MMS (accept Maximo changes)',
+   798→          },
+   799→        ],
+   800→        createdAt: shadowRecord.createdAt?.toISOString() ?? new Date().toISOString(),
+   801→        updatedAt: shadowRecord.updatedAt?.toISOString() ?? new Date().toISOString(),
+   802→      }, { timing: { durationMs: getRequestDuration(c) } })
+   803→    );
+   804→  } catch (err) {
+   805→    logger.error({ requestId, error: err }, 'Failed to get conflict details');
+   806→    return c.json(
+   807→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to get conflict details', requestId),
+   808→      500
+   809→    );
+   810→  }
+   811→});
+   812→
+   813→/**
+   814→ * Conflict resolution request body
+   815→ */
+   816→interface ResolveConflictRequest {
+   817→  /** Resolution strategy: USE_MMS or USE_MAXIMO */
+   818→  resolution: ConflictResolution;
+   819→}
+   820→
+   821→/**
+   822→ * POST /integration/conflicts/:id/resolve
+   823→ *
+   824→ * Resolve a sync conflict.
+   825→ *
+   826→ * @param id - PM schedule ID (not shadow record ID)
+   827→ * @body resolution - Strategy: "USE_MMS" or "USE_MAXIMO"
+   828→ *
+   829→ * - USE_MMS: Force push MMS data to Maximo (overwrite)
+   830→ * - USE_MAXIMO: Apply Maximo data to MMS (accept Maximo's truth)
+   831→ */
+   832→integrationRoutes.post('/integration/conflicts/:id/resolve', async (c) => {
+   833→  const requestId = getRequestId(c);
+   834→  const id = c.req.param('id');
+   835→  const service = getService();
+   836→
+   837→  if (!isValidUuid(id)) {
+   838→    return c.json(
+   839→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid conflict ID format', requestId),
+   840→      400
+   841→    );
+   842→  }
+   843→
+   844→  let body: ResolveConflictRequest;
+   845→
+   846→  try {
+   847→    body = await c.req.json();
+   848→  } catch {
+   849→    return c.json(
+   850→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid JSON body', requestId),
+   851→      400
+   852→    );
+   853→  }
+   854→
+   855→  // Validate resolution
+   856→  if (!body.resolution || !['USE_MMS', 'USE_MAXIMO'].includes(body.resolution)) {
+   857→    return c.json(
+   858→      error(
+   859→        ErrorCodes.VALIDATION_ERROR,
+   860→        'resolution must be "USE_MMS" or "USE_MAXIMO"',
+   861→        requestId
+   862→      ),
+   863→      400
+   864→    );
+   865→  }
+   866→
+   867→  // First, check if this is a shadow record ID or PM schedule ID
+   868→  // Using imported db singleton
+   869→  let pmScheduleId = id;
+   870→
+   871→  // Try to find shadow record by ID first
+   872→  const shadowById = await db.query.maximoShadowRecords.findFirst({
+   873→    where: eq(maximoShadowRecords.id, id),
+   874→  });
+   875→
+   876→  if (shadowById) {
+   877→    pmScheduleId = shadowById.pmScheduleId;
+   878→  }
+   879→
+   880→  try {
+   881→    // Get user ID from context if available (for audit)
+   882→    const user = c.get('user');
+   883→    const userId = user?.id;
+   884→
+   885→    await service.resolveConflict(pmScheduleId, body.resolution, userId);
+   886→
+   887→    logger.info(
+   888→      { requestId, pmScheduleId, resolution: body.resolution, userId },
+   889→      'Conflict resolved'
+   890→    );
+   891→
+   892→    return c.json(
+   893→      success({
+   894→        resolved: true,
+   895→        pmScheduleId,
+   896→        resolution: body.resolution,
+   897→        message:
+   898→          body.resolution === 'USE_MMS'
+   899→            ? 'MMS data pushed to Maximo'
+   900→            : 'Maximo data applied to MMS',
+   901→      }, { timing: { durationMs: getRequestDuration(c) } })
+   902→    );
+   903→  } catch (err) {
+   904→    if (err instanceof NotFoundError) {
+   905→      return c.json(
+   906→        error(ErrorCodes.NOT_FOUND, err.message, requestId),
+   907→        404
+   908→      );
+   909→    }
+   910→
+   911→    if (err instanceof ValidationError) {
+   912→      return c.json(
+   913→        error(ErrorCodes.VALIDATION_ERROR, err.message, requestId),
+   914→        400
+   915→      );
+   916→    }
+   917→
+   918→    logger.error({ requestId, pmScheduleId, error: err }, 'Failed to resolve conflict');
+   919→    return c.json(
+   920→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to resolve conflict', requestId),
+   921→      500
+   922→    );
+   923→  }
+   924→});
+   925→
+   926→// =============================================================================
+   927→// Shadow Records (Advanced)
+   928→// =============================================================================
+   929→
+   930→/**
+   931→ * GET /integration/shadow-records
+   932→ *
+   933→ * List shadow records with filtering.
+   934→ *
+   935→ * Query Parameters:
+   936→ * - syncStatus: Filter by status (PENDING, SYNCED, CONFLICT, ERROR)
+   937→ * - pmScheduleId: Filter by PM schedule ID
+   938→ * - maximoWoNum: Filter by Maximo WO number
+   939→ * - needsSync: Only show records needing sync (boolean)
+   940→ * - page: Page number (default: 1)
+   941→ * - pageSize: Items per page (default: 50, max: 200)
+   942→ *
+   943→ * @returns Paginated list of shadow records
+   944→ */
+   945→integrationRoutes.get('/integration/shadow-records', async (c) => {
+   946→  const requestId = getRequestId(c);
+   947→  const service = getService();
+   948→
+   949→  // Parse query parameters
+   950→  const syncStatus = c.req.query('syncStatus');
+   951→  const pmScheduleId = c.req.query('pmScheduleId');
+   952→  const maximoWoNum = c.req.query('maximoWoNum');
+   953→  const needsSyncParam = c.req.query('needsSync');
+   954→
+   955→  // Validate pmScheduleId if provided
+   956→  if (pmScheduleId && !isValidUuid(pmScheduleId)) {
+   957→    return c.json(
+   958→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid pmScheduleId format', requestId),
+   959→      400
+   960→    );
+   961→  }
+   962→
+   963→  // Validate syncStatus if provided
+   964→  const validStatuses = ['PENDING', 'SYNCED', 'CONFLICT', 'ERROR'];
+   965→  if (syncStatus && !validStatuses.includes(syncStatus)) {
+   966→    return c.json(
+   967→      error(
+   968→        ErrorCodes.VALIDATION_ERROR,
+   969→        `Invalid syncStatus. Must be one of: ${validStatuses.join(', ')}`,
+   970→        requestId
+   971→      ),
+   972→      400
+   973→    );
+   974→  }
+   975→
+   976→  const pagination = parsePaginationQuery({
+   977→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   978→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   979→  });
+   980→
+   981→  try {
+   982→    const result = await service.listShadowRecords(
+   983→      {
+   984→        syncStatus: syncStatus as 'PENDING' | 'SYNCED' | 'CONFLICT' | 'ERROR' | undefined,
+   985→        pmScheduleId: pmScheduleId || undefined,
+   986→        maximoWoNum: maximoWoNum || undefined,
+   987→        needsSync: needsSyncParam === 'true',
+   988→      },
+   989→      { page: pagination.page, pageSize: pagination.pageSize }
+   990→    );
+   991→
+   992→    // Transform to API response format
+   993→    const records = result.data.map((item) => ({
+   994→      id: item.shadowRecord.id,
+   995→      pmScheduleId: item.shadowRecord.pmScheduleId,
+   996→      maximoWoNum: item.shadowRecord.maximoWoNum,
+   997→      maximoWoId: item.shadowRecord.maximoWoId,
+   998→      syncStatus: item.shadowRecord.syncStatus,
+   999→      syncAttempts: item.shadowRecord.syncAttempts,
+  1000→      lastSyncAt: item.shadowRecord.lastSyncAt?.toISOString() ?? null,
+  1001→      lastSyncError: item.shadowRecord.lastSyncError,
+  1002→      nextSyncAt: item.shadowRecord.nextSyncAt?.toISOString() ?? null,
+  1003→      pmSchedule: {
+  1004→        id: item.pmSchedule.id,
+  1005→        trainNumber: item.pmSchedule.train?.trainNumber,
+  1006→        pmTypeCode: item.pmSchedule.pmType?.pmCode,
+  1007→        targetDate: item.pmSchedule.targetDate,
+  1008→        status: item.pmSchedule.status,
+  1009→        depotCode: item.pmSchedule.depot?.code,
+  1010→      },
+  1011→      createdAt: item.shadowRecord.createdAt?.toISOString() ?? new Date().toISOString(),
+  1012→      updatedAt: item.shadowRecord.updatedAt?.toISOString() ?? new Date().toISOString(),
+  1013→    }));
+  1014→
+  1015→    return c.json(
+  1016→      paginatedSuccess(records, {
+  1017→        page: result.page,
+  1018→        pageSize: result.pageSize,
+  1019→        totalItems: result.total,
+  1020→      }, { durationMs: getRequestDuration(c) })
+  1021→    );
+  1022→  } catch (err) {
+  1023→    logger.error({ requestId, error: err }, 'Failed to list shadow records');
+  1024→    return c.json(
+  1025→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to list shadow records', requestId),
+  1026→      500
+  1027→    );
+  1028→  }
+  1029→});
+  1030→
+  1031→/**
+  1032→ * POST /integration/shadow-records
+  1033→ *
+  1034→ * Create a shadow record for a PM schedule.
+  1035→ *
+  1036→ * This initiates Maximo sync tracking for a PM. Called automatically
+  1037→ * when a PM is scheduled, but can be manually triggered for existing PMs.
+  1038→ *
+  1039→ * @body pmScheduleId - PM schedule ID to create shadow record for
+  1040→ */
+  1041→integrationRoutes.post('/integration/shadow-records', async (c) => {
+  1042→  const requestId = getRequestId(c);
+  1043→  const service = getService();
+  1044→
+  1045→  let body: { pmScheduleId: string };
+  1046→
+  1047→  try {
+  1048→    body = await c.req.json();
+  1049→  } catch {
+  1050→    return c.json(
+  1051→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid JSON body', requestId),
+  1052→      400
+  1053→    );
+  1054→  }
+  1055→
+  1056→  if (!body.pmScheduleId || !isValidUuid(body.pmScheduleId)) {
+  1057→    return c.json(
+  1058→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid or missing pmScheduleId', requestId),
+  1059→      400
+  1060→    );
+  1061→  }
+  1062→
+  1063→  try {
+  1064→    const shadowRecord = await service.createShadowRecord(body.pmScheduleId);
+  1065→
+  1066→    logger.info(
+  1067→      { requestId, pmScheduleId: body.pmScheduleId, shadowRecordId: shadowRecord.id },
+  1068→      'Shadow record created'
+  1069→    );
+  1070→
+  1071→    return c.json(
+  1072→      success({
+  1073→        id: shadowRecord.id,
+  1074→        pmScheduleId: shadowRecord.pmScheduleId,
+  1075→        syncStatus: shadowRecord.syncStatus,
+  1076→        createdAt: shadowRecord.createdAt?.toISOString() ?? new Date().toISOString(),
+  1077→      }, { timing: { durationMs: getRequestDuration(c) } }),
+  1078→      201
+  1079→    );
+  1080→  } catch (err) {
+  1081→    if (err instanceof NotFoundError) {
+  1082→      return c.json(
+  1083→        error(ErrorCodes.NOT_FOUND, err.message, requestId),
+  1084→        404
+  1085→      );
+  1086→    }
+  1087→
+  1088→    logger.error({ requestId, error: err }, 'Failed to create shadow record');
+  1089→    return c.json(
+  1090→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to create shadow record', requestId),
+  1091→      500
+  1092→    );
+  1093→  }
+  1094→});
+  1095→
+  1096→/**
+  1097→ * POST /integration/shadow-records/:id/push
+  1098→ *
+  1099→ * Manually trigger push sync for a specific shadow record.
+  1100→ *
+  1101→ * @param id - Shadow record ID
+  1102→ */
+  1103→integrationRoutes.post('/integration/shadow-records/:id/push', async (c) => {
+  1104→  const requestId = getRequestId(c);
+  1105→  const id = c.req.param('id');
+  1106→  const service = getService();
+  1107→
+  1108→  if (!isValidUuid(id)) {
+  1109→    return c.json(
+  1110→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid shadow record ID format', requestId),
+  1111→      400
+  1112→    );
+  1113→  }
+  1114→
+  1115→  // Using imported db singleton
+  1116→
+  1117→  // Get PM schedule ID from shadow record
+  1118→  const shadowRecord = await db.query.maximoShadowRecords.findFirst({
+  1119→    where: eq(maximoShadowRecords.id, id),
+  1120→  });
+  1121→
+  1122→  if (!shadowRecord) {
+  1123→    return c.json(
+  1124→      error(ErrorCodes.NOT_FOUND, 'Shadow record not found', requestId),
+  1125→      404
+  1126→    );
+  1127→  }
+  1128→
+  1129→  try {
+  1130→    const result = await service.pushToMaximo(shadowRecord.pmScheduleId);
+  1131→
+  1132→    logger.info(
+  1133→      { requestId, shadowRecordId: id, pmScheduleId: shadowRecord.pmScheduleId, result },
+  1134→      'Manual push sync completed'
+  1135→    );
+  1136→
+  1137→    return c.json(
+  1138→      success({
+  1139→        shadowRecordId: id,
+  1140→        pmScheduleId: shadowRecord.pmScheduleId,
+  1141→        action: result.action,
+  1142→        woNum: result.woNum,
+  1143→        reason: result.reason,
+  1144→        error: result.error,
+  1145→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1146→    );
+  1147→  } catch (err) {
+  1148→    logger.error({ requestId, shadowRecordId: id, error: err }, 'Manual push sync failed');
+  1149→    return c.json(
+  1150→      error(ErrorCodes.INTERNAL_ERROR, 'Push sync failed', requestId),
+  1151→      500
+  1152→    );
+  1153→  }
+  1154→});
+  1155→
+  1156→// =============================================================================
+  1157→// Edit Validation
+  1158→// =============================================================================
+  1159→
+  1160→/**
+  1161→ * POST /integration/validate-edit
+  1162→ *
+  1163→ * Validate if a PM can be edited (not locked by Maximo).
+  1164→ *
+  1165→ * This should be called before any PM modification operation to check:
+  1166→ * 1. Maximo status lock (INPRG, COMP, CLOSE, CAN → read-only)
+  1167→ * 2. Sync conflict (unresolved conflict → must resolve first)
+  1168→ * 3. Baseline lock (locked in published baseline → needs scenario)
+  1169→ *
+  1170→ * @body pmScheduleId - PM schedule ID to validate
+  1171→ * @returns Validation result with reason if invalid
+  1172→ */
+  1173→integrationRoutes.post('/integration/validate-edit', async (c) => {
+  1174→  const requestId = getRequestId(c);
+  1175→  const service = getService();
+  1176→
+  1177→  let body: { pmScheduleId: string };
+  1178→
+  1179→  try {
+  1180→    body = await c.req.json();
+  1181→  } catch {
+  1182→    return c.json(
+  1183→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid JSON body', requestId),
+  1184→      400
+  1185→    );
+  1186→  }
+  1187→
+  1188→  if (!body.pmScheduleId || !isValidUuid(body.pmScheduleId)) {
+  1189→    return c.json(
+  1190→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid or missing pmScheduleId', requestId),
+  1191→      400
+  1192→    );
+  1193→  }
+  1194→
+  1195→  try {
+  1196→    const validation = await service.validateEdit(body.pmScheduleId);
+  1197→
+  1198→    if (!validation.valid) {
+  1199→      // Return 423 Locked for Maximo status lock
+  1200→      if (validation.reason === 'MAXIMO_STATUS_LOCK') {
+  1201→        return c.json(
+  1202→          error(
+  1203→            ErrorCodes.MAXIMO_LOCK,
+  1204→            validation.message ?? 'PM is locked by Maximo',
+  1205→            requestId,
+  1206→            {
+  1207→              reason: validation.reason,
+  1208→              maximoStatus: validation.maximoStatus,
+  1209→              maximoWoNum: validation.maximoWoNum,
+  1210→              suggestion: validation.suggestion,
+  1211→            }
+  1212→          ),
+  1213→          423
+  1214→        );
+  1215→      }
+  1216→
+  1217→      // Return 409 Conflict for sync conflict
+  1218→      if (validation.reason === 'SYNC_CONFLICT') {
+  1219→        return c.json(
+  1220→          error(
+  1221→            ErrorCodes.CONFLICT,
+  1222→            validation.message ?? 'Unresolved sync conflict',
+  1223→            requestId,
+  1224→            {
+  1225→              reason: validation.reason,
+  1226→              suggestion: validation.suggestion,
+  1227→            }
+  1228→          ),
+  1229→          409
+  1230→        );
+  1231→      }
+  1232→
+  1233→      // Return 423 for baseline lock
+  1234→      if (validation.reason === 'BASELINE_LOCK') {
+  1235→        return c.json(
+  1236→          error(
+  1237→            ErrorCodes.BASELINE_LOCK,
+  1238→            validation.message ?? 'PM is locked in published baseline',
+  1239→            requestId,
+  1240→            {
+  1241→              reason: validation.reason,
+  1242→              suggestion: validation.suggestion,
+  1243→            }
+  1244→          ),
+  1245→          423
+  1246→        );
+  1247→      }
+  1248→
+  1249→      // Return 404 for not found
+  1250→      return c.json(
+  1251→        error(ErrorCodes.NOT_FOUND, validation.message ?? 'PM not found', requestId),
+  1252→        404
+  1253→      );
+  1254→    }
+  1255→
+  1256→    return c.json(
+  1257→      success({
+  1258→        valid: true,
+  1259→        pmScheduleId: body.pmScheduleId,
+  1260→        message: 'PM can be edited',
+  1261→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1262→    );
+  1263→  } catch (err) {
+  1264→    logger.error({ requestId, error: err }, 'Failed to validate edit');
+  1265→    return c.json(
+  1266→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to validate edit', requestId),
+  1267→      500
+  1268→    );
+  1269→  }
+  1270→});
+  1271→
+  1272→// =============================================================================
+  1273→// Polling Fallback Endpoints
+  1274→// =============================================================================
+  1275→
+  1276→/**
+  1277→ * GET /integration/polling/health
+  1278→ *
+  1279→ * Get webhook health status and current sync mode.
+  1280→ * Used to monitor if polling fallback is active.
+  1281→ *
+  1282→ * @query depotId - Optional depot filter
+  1283→ *
+  1284→ * @see specs/007-integration.md Section 7.4.7
+  1285→ */
+  1286→integrationRoutes.get('/integration/polling/health', async (c) => {
+  1287→  const requestId = getRequestId(c);
+  1288→  const depotId = c.req.query('depotId');
+  1289→
+  1290→  try {
+  1291→    const pollingService = getPollingService();
+  1292→    const health = await pollingService.getWebhookHealth(depotId);
+  1293→
+  1294→    return c.json(
+  1295→      success({
+  1296→        ...health,
+  1297→        lastReceivedAt: health.lastReceivedAt?.toISOString() ?? null,
+  1298→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1299→    );
+  1300→  } catch (err) {
+  1301→    logger.error({ requestId, error: err }, 'Failed to get webhook health');
+  1302→    return c.json(
+  1303→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to get webhook health', requestId),
+  1304→      500
+  1305→    );
+  1306→  }
+  1307→});
+  1308→
+  1309→/**
+  1310→ * GET /integration/polling/stats
+  1311→ *
+  1312→ * Get detailed polling statistics including configuration and history.
+  1313→ *
+  1314→ * @query depotId - Optional depot filter
+  1315→ *
+  1316→ * @see specs/007-integration.md Section 7.4.7
+  1317→ */
+  1318→integrationRoutes.get('/integration/polling/stats', async (c) => {
+  1319→  const requestId = getRequestId(c);
+  1320→  const depotId = c.req.query('depotId');
+  1321→
+  1322→  try {
+  1323→    const pollingService = getPollingService();
+  1324→    const stats = await pollingService.getPollingStats(depotId);
+  1325→
+  1326→    return c.json(
+  1327→      success({
+  1328→        webhookHealth: {
+  1329→          ...stats.webhookHealth,
+  1330→          lastReceivedAt: stats.webhookHealth.lastReceivedAt?.toISOString() ?? null,
+  1331→        },
+  1332→        config: stats.config,
+  1333→        metrics: {
+  1334→          totalPollsExecuted: stats.totalPollsExecuted,
+  1335→          totalDuplicatesPrevented: stats.totalDuplicatesPrevented,
+  1336→          totalFallbackActivations: stats.totalFallbackActivations,
+  1337→        },
+  1338→        lastPollResult: stats.lastPollResult,
+  1339→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1340→    );
+  1341→  } catch (err) {
+  1342→    logger.error({ requestId, error: err }, 'Failed to get polling stats');
+  1343→    return c.json(
+  1344→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to get polling stats', requestId),
+  1345→      500
+  1346→    );
+  1347→  }
+  1348→});
+  1349→
+  1350→/**
+  1351→ * GET /integration/polling/config
+  1352→ *
+  1353→ * Get current polling configuration.
+  1354→ *
+  1355→ * @query depotId - Optional depot filter
+  1356→ */
+  1357→integrationRoutes.get('/integration/polling/config', async (c) => {
+  1358→  const requestId = getRequestId(c);
+  1359→  const depotId = c.req.query('depotId');
+  1360→
+  1361→  try {
+  1362→    const pollingService = getPollingService();
+  1363→    const config = await pollingService.getPollingConfig(depotId);
+  1364→
+  1365→    return c.json(
+  1366→      success(config, { timing: { durationMs: getRequestDuration(c) } })
+  1367→    );
+  1368→  } catch (err) {
+  1369→    logger.error({ requestId, error: err }, 'Failed to get polling config');
+  1370→    return c.json(
+  1371→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to get polling config', requestId),
+  1372→      500
+  1373→    );
+  1374→  }
+  1375→});
+  1376→
+  1377→/**
+  1378→ * PUT /integration/polling/config
+  1379→ *
+  1380→ * Update polling configuration.
+  1381→ *
+  1382→ * @body intervalMinutes - Polling interval in minutes (default: 15)
+  1383→ * @body webhookTimeoutMinutes - Minutes without webhook before fallback (default: 30)
+  1384→ * @body gracePeriodMinutes - Minutes to keep polling after webhook recovery (default: 5)
+  1385→ * @body deduplicationWindowMs - Deduplication window in milliseconds (default: 5000)
+  1386→ * @query depotId - Optional depot to configure
+  1387→ */
+  1388→integrationRoutes.put('/integration/polling/config', async (c) => {
+  1389→  const requestId = getRequestId(c);
+  1390→  const depotId = c.req.query('depotId');
+  1391→
+  1392→  try {
+  1393→    const body = await c.req.json();
+  1394→
+  1395→    // Validate input
+  1396→    const validFields = ['intervalMinutes', 'webhookTimeoutMinutes', 'gracePeriodMinutes', 'deduplicationWindowMs'];
+  1397→    const config: Record<string, number> = {};
+  1398→
+  1399→    for (const field of validFields) {
+  1400→      if (field in body) {
+  1401→        const value = body[field];
+  1402→        if (typeof value !== 'number' || value < 1) {
+  1403→          return c.json(
+  1404→            error(ErrorCodes.VALIDATION_ERROR, `${field} must be a positive number`, requestId),
+  1405→            400
+  1406→          );
+  1407→        }
+  1408→        config[field] = value;
+  1409→      }
+  1410→    }
+  1411→
+  1412→    const pollingService = getPollingService();
+  1413→    await pollingService.updatePollingConfig(config, depotId);
+  1414→
+  1415→    const updatedConfig = await pollingService.getPollingConfig(depotId);
+  1416→
+  1417→    logger.info({ requestId, depotId, config }, 'Updated polling configuration');
+  1418→
+  1419→    return c.json(
+  1420→      success(updatedConfig, { timing: { durationMs: getRequestDuration(c) } })
+  1421→    );
+  1422→  } catch (err) {
+  1423→    logger.error({ requestId, error: err }, 'Failed to update polling config');
+  1424→    return c.json(
+  1425→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to update polling config', requestId),
+  1426→      500
+  1427→    );
+  1428→  }
+  1429→});
+  1430→
+  1431→/**
+  1432→ * POST /integration/polling/activate
+  1433→ *
+  1434→ * Manually activate polling fallback mode.
+  1435→ * Use this when webhooks are known to be unavailable.
+  1436→ *
+  1437→ * @query depotId - Optional depot to activate
+  1438→ *
+  1439→ * @see specs/007-integration.md Section 7.4.7
+  1440→ */
+  1441→integrationRoutes.post('/integration/polling/activate', async (c) => {
+  1442→  const requestId = getRequestId(c);
+  1443→  const depotId = c.req.query('depotId');
+  1444→
+  1445→  try {
+  1446→    const pollingService = getPollingService();
+  1447→
+  1448→    await pollingService.activatePolling(depotId, 'manual');
+  1449→
+  1450→    const health = await pollingService.getWebhookHealth(depotId);
+  1451→
+  1452→    logger.info({ requestId, depotId }, 'Manually activated polling fallback');
+  1453→
+  1454→    return c.json(
+  1455→      success({
+  1456→        activated: true,
+  1457→        syncMode: health.syncMode,
+  1458→        message: 'Polling fallback activated',
+  1459→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1460→    );
+  1461→  } catch (err) {
+  1462→    logger.error({ requestId, error: err }, 'Failed to activate polling');
+  1463→    return c.json(
+  1464→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to activate polling', requestId),
+  1465→      500
+  1466→    );
+  1467→  }
+  1468→});
+  1469→
+  1470→/**
+  1471→ * POST /integration/polling/deactivate
+  1472→ *
+  1473→ * Manually deactivate polling fallback mode.
+  1474→ * Use this when webhooks are restored and working.
+  1475→ *
+  1476→ * @query depotId - Optional depot to deactivate
+  1477→ */
+  1478→integrationRoutes.post('/integration/polling/deactivate', async (c) => {
+  1479→  const requestId = getRequestId(c);
+  1480→  const depotId = c.req.query('depotId');
+  1481→
+  1482→  try {
+  1483→    const pollingService = getPollingService();
+  1484→
+  1485→    await pollingService.deactivatePolling(depotId);
+  1486→
+  1487→    const health = await pollingService.getWebhookHealth(depotId);
+  1488→
+  1489→    logger.info({ requestId, depotId }, 'Manually deactivated polling fallback');
+  1490→
+  1491→    return c.json(
+  1492→      success({
+  1493→        deactivated: true,
+  1494→        syncMode: health.syncMode,
+  1495→        message: 'Polling fallback deactivated',
+  1496→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1497→    );
+  1498→  } catch (err) {
+  1499→    logger.error({ requestId, error: err }, 'Failed to deactivate polling');
+  1500→    return c.json(
+  1501→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to deactivate polling', requestId),
+  1502→      500
+  1503→    );
+  1504→  }
+  1505→});
+  1506→
+  1507→/**
+  1508→ * POST /integration/polling/execute
+  1509→ *
+  1510→ * Manually execute a polling sync operation.
+  1511→ * Useful for testing or forcing an immediate sync.
+  1512→ *
+  1513→ * @query depotId - Optional depot to poll
+  1514→ */
+  1515→integrationRoutes.post('/integration/polling/execute', async (c) => {
+  1516→  const requestId = getRequestId(c);
+  1517→  const depotId = c.req.query('depotId');
+  1518→
+  1519→  try {
+  1520→    const pollingService = getPollingService();
+  1521→
+  1522→    const result = await pollingService.executePolling(depotId);
+  1523→
+  1524→    logger.info(
+  1525→      {
+  1526→        requestId,
+  1527→        depotId,
+  1528→        processed: result.processed,
+  1529→        updated: result.updated,
+  1530→        duplicatesPrevented: result.duplicatesPrevented,
+  1531→      },
+  1532→      'Executed manual polling sync'
+  1533→    );
+  1534→
+  1535→    return c.json(
+  1536→      success(result, { timing: { durationMs: getRequestDuration(c) } })
+  1537→    );
+  1538→  } catch (err) {
+  1539→    logger.error({ requestId, error: err }, 'Failed to execute polling');
+  1540→    return c.json(
+  1541→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to execute polling', requestId),
+  1542→      500
+  1543→    );
+  1544→  }
+  1545→});
+  1546→
+  1547→/**
+  1548→ * POST /integration/polling/check
+  1549→ *
+  1550→ * Check webhook health and activate polling if needed.
+  1551→ * This can be called periodically to ensure failover happens automatically.
+  1552→ *
+  1553→ * @query depotId - Optional depot to check
+  1554→ */
+  1555→integrationRoutes.post('/integration/polling/check', async (c) => {
+  1556→  const requestId = getRequestId(c);
+  1557→  const depotId = c.req.query('depotId');
+  1558→
+  1559→  try {
+  1560→    const pollingService = getPollingService();
+  1561→
+  1562→    const activated = await pollingService.checkAndActivatePollingIfNeeded(depotId);
+  1563→    const health = await pollingService.getWebhookHealth(depotId);
+  1564→
+  1565→    return c.json(
+  1566→      success({
+  1567→        checked: true,
+  1568→        pollingActivated: activated,
+  1569→        syncMode: health.syncMode,
+  1570→        webhookHealthy: health.isHealthy,
+  1571→        minutesSinceLastWebhook: health.minutesSinceLastWebhook,
+  1572→      }, { timing: { durationMs: getRequestDuration(c) } })
+  1573→    );
+  1574→  } catch (err) {
+  1575→    logger.error({ requestId, error: err }, 'Failed to check webhook health');
+  1576→    return c.json(
+  1577→      error(ErrorCodes.INTERNAL_ERROR, 'Failed to check webhook health', requestId),
+  1578→      500
+  1579→    );
+  1580→  }
+  1581→});
+  1582→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

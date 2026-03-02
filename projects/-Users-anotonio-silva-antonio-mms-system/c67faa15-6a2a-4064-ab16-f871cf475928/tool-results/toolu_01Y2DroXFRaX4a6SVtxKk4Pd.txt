@@ -1,0 +1,1228 @@
+     1→# Metro Fleet Mileage Management System
+     2→# Part 3: Database Schema
+     3→
+     4→**Document Version:** 2.0  
+     5→**Status:** APPROVED FOR DEVELOPMENT
+     6→
+     7→---
+     8→
+     9→## 3.1 Schema Overview
+    10→
+    11→The database schema is organized into the following domains:
+    12→
+    13→| Domain | Tables | Purpose |
+    14→|--------|--------|---------|
+    15→| Core Fleet | `fleets`, `trains`, `depots`, `routes` | Asset master data |
+    16→| Mileage Tracking | `mileage_readings`, `meter_events` | Time-series odometer data |
+    17→| Component Tracking | `train_components`, `component_mileage` | Component-level lifecycle |
+    18→| PM Management | `pm_types`, `pm_schedule`, `pm_material_requirements` | Maintenance planning |
+    19→| Material Management | `inventory_positions`, `material_reservations` | Parts availability |
+    20→| Man-hour Planning | `manhour_capacity`, `manhour_projections`, `manhour_adjustments` | Workforce balancing |
+    21→| Baseline & Drift | `plan_baselines`, `baseline_pm_schedule`, `baseline_mileage_projection` | Plan stability |
+    22→| Scenario Management | `scenarios`, `scenario_deltas` | What-if analysis |
+    23→| Costing | `labor_rates`, `material_costs`, `cost_baselines` | Financial tracking |
+    24→| Audit & History | `pm_schedule_history`, `audit_log` | Change tracking |
+    25→| Users & Auth | `users`, `roles`, `sessions` | Access control |
+    26→
+    27→---
+    28→
+    29→## 3.2 Core Fleet Tables
+    30→
+    31→```sql
+    32→-- Enable required extensions
+    33→CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    34→CREATE EXTENSION IF NOT EXISTS timescaledb;
+    35→
+    36→-- Enumerated types
+    37→CREATE TYPE fitness_status AS ENUM ('FIT', 'RESTRICTED', 'GROUNDED');
+    38→CREATE TYPE pm_status AS ENUM ('SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'DEFERRED');
+    39→CREATE TYPE track_type AS ENUM ('LIGHT', 'HEAVY', 'OVERHAUL', 'STABLING');
+    40→CREATE TYPE shift_type AS ENUM ('DAY', 'NIGHT', 'WEEKEND', 'HOLIDAY');
+    41→CREATE TYPE adjustment_status AS ENUM ('PROPOSED', 'APPROVED', 'REJECTED', 'APPLIED');
+    42→CREATE TYPE baseline_status AS ENUM ('DRAFT', 'PUBLISHED', 'SUPERSEDED', 'ARCHIVED');
+    43→CREATE TYPE scenario_status AS ENUM ('ACTIVE', 'PROMOTED', 'DISCARDED', 'EXPIRED');
+    44→CREATE TYPE material_criticality AS ENUM ('BLOCKING', 'DEFERRABLE', 'CONSUMABLE');
+    45→CREATE TYPE reservation_type AS ENUM ('SOFT', 'HARD');
+    46→
+    47→-- Depots
+    48→CREATE TABLE depots (
+    49→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    50→    code VARCHAR(10) NOT NULL UNIQUE,
+    51→    name VARCHAR(100) NOT NULL,
+    52→    location VARCHAR(200),
+    53→    timezone VARCHAR(50) DEFAULT 'Asia/Singapore',
+    54→    active BOOLEAN DEFAULT TRUE,
+    55→    created_at TIMESTAMPTZ DEFAULT NOW(),
+    56→    updated_at TIMESTAMPTZ DEFAULT NOW()
+    57→);
+    58→
+    59→-- Fleets (train types/manufacturers)
+    60→CREATE TABLE fleets (
+    61→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    62→    code VARCHAR(10) NOT NULL UNIQUE,  -- 'KS', 'ALSTOM'
+    63→    name VARCHAR(100) NOT NULL,
+    64→    manufacturer VARCHAR(100) NOT NULL,
+    65→    model VARCHAR(100),
+    66→    base_depot_id UUID REFERENCES depots(id),
+    67→    cars_per_train INTEGER DEFAULT 6,
+    68→    active BOOLEAN DEFAULT TRUE,
+    69→    created_at TIMESTAMPTZ DEFAULT NOW(),
+    70→    updated_at TIMESTAMPTZ DEFAULT NOW()
+    71→);
+    72→
+    73→-- Trains
+    74→CREATE TABLE trains (
+    75→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    76→    fleet_id UUID NOT NULL REFERENCES fleets(id),
+    77→    train_number VARCHAR(20) NOT NULL UNIQUE,
+    78→    commissioning_date DATE,
+    79→    current_mileage_km INTEGER NOT NULL DEFAULT 0,
+    80→    fitness_status fitness_status DEFAULT 'FIT',
+    81→    fitness_notes TEXT,
+    82→    current_depot_id UUID REFERENCES depots(id),
+    83→    home_depot_id UUID REFERENCES depots(id),
+    84→    active BOOLEAN DEFAULT TRUE,
+    85→    
+    86→    -- For mileage balancing
+    87→    target_mileage_km INTEGER,  -- Calculated target for fleet balance
+    88→    mileage_variance_km INTEGER GENERATED ALWAYS AS 
+    89→        (current_mileage_km - COALESCE(target_mileage_km, current_mileage_km)) STORED,
+    90→    
+    91→    -- Canvas display properties
+    92→    display_color VARCHAR(7),
+    93→    display_order INTEGER,
+    94→    
+    95→    created_at TIMESTAMPTZ DEFAULT NOW(),
+    96→    updated_at TIMESTAMPTZ DEFAULT NOW()
+    97→);
+    98→
+    99→CREATE INDEX idx_trains_fleet ON trains(fleet_id);
+   100→CREATE INDEX idx_trains_fitness ON trains(fitness_status) WHERE active = TRUE;
+   101→CREATE INDEX idx_trains_depot ON trains(current_depot_id);
+   102→
+   103→-- Routes
+   104→CREATE TABLE routes (
+   105→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   106→    route_code VARCHAR(20) NOT NULL UNIQUE,
+   107→    route_name VARCHAR(100) NOT NULL,
+   108→    line_id VARCHAR(20),
+   109→    expected_km_per_day INTEGER NOT NULL,
+   110→    required_trains INTEGER NOT NULL,
+   111→    
+   112→    -- Restrictions
+   113→    allowed_fleet_ids UUID[],
+   114→    requires_ato BOOLEAN DEFAULT FALSE,
+   115→    min_cars INTEGER,
+   116→    max_cars INTEGER,
+   117→    
+   118→    active BOOLEAN DEFAULT TRUE,
+   119→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   120→    updated_at TIMESTAMPTZ DEFAULT NOW()
+   121→);
+   122→
+   123→-- Tracks (maintenance bays)
+   124→CREATE TABLE tracks (
+   125→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   126→    depot_id UUID NOT NULL REFERENCES depots(id),
+   127→    track_number VARCHAR(20) NOT NULL,
+   128→    track_type track_type NOT NULL,
+   129→    max_train_length_m DECIMAL(5,2),
+   130→    has_overhead_crane BOOLEAN DEFAULT FALSE,
+   131→    has_pit_access BOOLEAN DEFAULT FALSE,
+   132→    
+   133→    active BOOLEAN DEFAULT TRUE,
+   134→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   135→    
+   136→    UNIQUE(depot_id, track_number)
+   137→);
+   138→
+   139→CREATE INDEX idx_tracks_depot_type ON tracks(depot_id, track_type) WHERE active = TRUE;
+   140→```
+   141→
+   142→---
+   143→
+   144→## 3.3 Mileage Tracking Tables
+   145→
+   146→```sql
+   147→-- Meter events (odometer replacements, resets, swaps)
+   148→CREATE TABLE meter_events (
+   149→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   150→    train_id UUID NOT NULL REFERENCES trains(id),
+   151→    event_date DATE NOT NULL,
+   152→    event_type VARCHAR(30) NOT NULL,  -- 'REPLACEMENT', 'RESET', 'CALIBRATION', 'SWAP'
+   153→    
+   154→    old_meter_serial VARCHAR(50),
+   155→    new_meter_serial VARCHAR(50),
+   156→    old_meter_reading INTEGER,
+   157→    new_meter_reading INTEGER,
+   158→    adjustment_km INTEGER,  -- Cumulative mileage adjustment to apply
+   159→    
+   160→    reason TEXT,
+   161→    approved_by UUID REFERENCES users(id),
+   162→    approved_at TIMESTAMPTZ,
+   163→    
+   164→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   165→    created_by UUID REFERENCES users(id)
+   166→);
+   167→
+   168→CREATE INDEX idx_meter_events_train ON meter_events(train_id, event_date DESC);
+   169→
+   170→-- Daily mileage readings (TimescaleDB hypertable)
+   171→CREATE TABLE mileage_readings (
+   172→    train_id UUID NOT NULL REFERENCES trains(id),
+   173→    reading_date DATE NOT NULL,
+   174→    
+   175→    -- Raw and adjusted values
+   176→    raw_reading INTEGER NOT NULL,        -- Odometer value from CSV
+   177→    adjusted_reading INTEGER NOT NULL,   -- After meter event adjustments
+   178→    daily_km INTEGER,                    -- Calculated: today - yesterday
+   179→    
+   180→    -- Validation
+   181→    validation_status VARCHAR(20) DEFAULT 'PENDING',  -- 'PENDING', 'VALID', 'ANOMALY', 'CORRECTED'
+   182→    anomaly_type VARCHAR(30),            -- 'NEGATIVE', 'SPIKE', 'MISSING', 'DUPLICATE'
+   183→    anomaly_notes TEXT,
+   184→    
+   185→    -- Source tracking
+   186→    source_file VARCHAR(255),
+   187→    meter_event_id UUID REFERENCES meter_events(id),
+   188→    
+   189→    ingested_at TIMESTAMPTZ DEFAULT NOW(),
+   190→    
+   191→    PRIMARY KEY (train_id, reading_date)
+   192→);
+   193→
+   194→-- Convert to TimescaleDB hypertable
+   195→SELECT create_hypertable('mileage_readings', 'reading_date', 
+   196→    chunk_time_interval => INTERVAL '7 days',
+   197→    if_not_exists => TRUE
+   198→);
+   199→
+   200→-- Compression policy (compress data older than 30 days)
+   201→SELECT add_compression_policy('mileage_readings', INTERVAL '30 days');
+   202→
+   203→-- Retention policy (keep 13 years for contract + buffer)
+   204→SELECT add_retention_policy('mileage_readings', INTERVAL '13 years');
+   205→
+   206→-- Indexes for common queries
+   207→CREATE INDEX idx_mileage_train_date ON mileage_readings (train_id, reading_date DESC);
+   208→CREATE INDEX idx_mileage_validation ON mileage_readings (validation_status, reading_date DESC) 
+   209→    WHERE validation_status != 'VALID';
+   210→
+   211→-- Continuous aggregate for dashboard queries
+   212→CREATE MATERIALIZED VIEW daily_fleet_mileage
+   213→WITH (timescaledb.continuous) AS
+   214→SELECT 
+   215→    time_bucket('1 day', reading_date) AS bucket,
+   216→    t.fleet_id,
+   217→    COUNT(*) as train_count,
+   218→    SUM(daily_km) as total_daily_km,
+   219→    AVG(daily_km) as avg_daily_km,
+   220→    MIN(daily_km) as min_daily_km,
+   221→    MAX(daily_km) as max_daily_km,
+   222→    STDDEV(daily_km) as stddev_daily_km
+   223→FROM mileage_readings mr
+   224→JOIN trains t ON mr.train_id = t.id
+   225→WHERE mr.validation_status = 'VALID'
+   226→GROUP BY bucket, t.fleet_id
+   227→WITH NO DATA;
+   228→
+   229→SELECT add_continuous_aggregate_policy('daily_fleet_mileage',
+   230→    start_offset => INTERVAL '3 days',
+   231→    end_offset => INTERVAL '1 hour',
+   232→    schedule_interval => INTERVAL '1 hour'
+   233→);
+   234→```
+   235→
+   236→---
+   237→
+   238→## 3.4 Component Tracking Tables
+   239→
+   240→```sql
+   241→-- Train components (bogies, motors, pantographs, etc.)
+   242→CREATE TABLE train_components (
+   243→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   244→    component_type VARCHAR(50) NOT NULL,  -- 'BOGIE', 'TRACTION_MOTOR', 'PANTOGRAPH', 'BRAKE_UNIT'
+   245→    serial_number VARCHAR(100) NOT NULL UNIQUE,
+   246→    manufacturer VARCHAR(100),
+   247→    model VARCHAR(100),
+   248→    
+   249→    -- Current installation
+   250→    current_train_id UUID REFERENCES trains(id),
+   251→    current_position VARCHAR(50),  -- e.g., 'CAR_1_BOGIE_A', 'CAR_3_MOTOR_L'
+   252→    installed_date DATE,
+   253→    installed_mileage_km INTEGER,  -- Train mileage at installation
+   254→    
+   255→    -- Component lifecycle
+   256→    commissioning_date DATE,
+   257→    component_mileage_km INTEGER NOT NULL DEFAULT 0,  -- Cumulative mileage on this component
+   258→    last_overhaul_date DATE,
+   259→    last_overhaul_mileage_km INTEGER,
+   260→    
+   261→    -- Status
+   262→    status VARCHAR(20) DEFAULT 'IN_SERVICE',  -- 'IN_SERVICE', 'SPARE', 'IN_OVERHAUL', 'CONDEMNED'
+   263→    condition_score INTEGER,  -- 1-100 condition rating
+   264→    
+   265→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   266→    updated_at TIMESTAMPTZ DEFAULT NOW()
+   267→);
+   268→
+   269→CREATE INDEX idx_components_train ON train_components(current_train_id) WHERE status = 'IN_SERVICE';
+   270→CREATE INDEX idx_components_type ON train_components(component_type, status);
+   271→
+   272→-- Component installation history
+   273→CREATE TABLE component_installations (
+   274→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   275→    component_id UUID NOT NULL REFERENCES train_components(id),
+   276→    train_id UUID NOT NULL REFERENCES trains(id),
+   277→    position VARCHAR(50),
+   278→    
+   279→    installed_date DATE NOT NULL,
+   280→    installed_train_mileage_km INTEGER NOT NULL,
+   281→    installed_component_mileage_km INTEGER NOT NULL,
+   282→    
+   283→    removed_date DATE,
+   284→    removed_train_mileage_km INTEGER,
+   285→    removed_component_mileage_km INTEGER,
+   286→    
+   287→    removal_reason VARCHAR(50),  -- 'SCHEDULED_OVERHAUL', 'FAILURE', 'SWAP', 'UPGRADE'
+   288→    work_order_id VARCHAR(50),   -- Link to Maximo
+   289→    
+   290→    created_at TIMESTAMPTZ DEFAULT NOW()
+   291→);
+   292→
+   293→CREATE INDEX idx_installations_component ON component_installations(component_id, installed_date DESC);
+   294→CREATE INDEX idx_installations_train ON component_installations(train_id, installed_date DESC);
+   295→
+   296→-- Component-based mileage adjustments
+   297→-- When a component is swapped, PM thresholds follow the component, not the train
+   298→CREATE TABLE component_pm_tracking (
+   299→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   300→    component_id UUID NOT NULL REFERENCES train_components(id),
+   301→    pm_type_id UUID NOT NULL REFERENCES pm_types(id),
+   302→    
+   303→    last_pm_date DATE,
+   304→    last_pm_mileage_km INTEGER,
+   305→    next_pm_due_mileage_km INTEGER,
+   306→    next_pm_due_date DATE,
+   307→    
+   308→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   309→    
+   310→    UNIQUE(component_id, pm_type_id)
+   311→);
+   312→```
+   313→
+   314→---
+   315→
+   316→## 3.5 PM Management Tables
+   317→
+   318→```sql
+   319→-- PM types (maintenance task definitions)
+   320→CREATE TABLE pm_types (
+   321→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   322→    fleet_id UUID NOT NULL REFERENCES fleets(id),
+   323→    pm_code VARCHAR(20) NOT NULL,      -- 'C1', 'C2', 'C3', 'C4', 'OVERHAUL'
+   324→    pm_name VARCHAR(100) NOT NULL,
+   325→    version INTEGER DEFAULT 1,
+   326→    
+   327→    -- Interval thresholds (whichever comes first)
+   328→    interval_km INTEGER,               -- Mileage-based trigger
+   329→    interval_months INTEGER,           -- Time-based trigger (industry standard)
+   330→    
+   331→    -- PM Hierarchy: which lower-level PMs does this PM satisfy?
+   332→    -- When a C4 is completed, it satisfies C1/C2/C3 requirements
+   333→    -- This resets their mileage counters from the C4 completion point
+   334→    -- Example: C4 row has satisfies_codes = ['C1', 'C2', 'C3']
+   335→    satisfies_codes VARCHAR(20)[],
+   336→    
+   337→    -- Resource requirements
+   338→    estimated_hours DECIMAL(6,2) NOT NULL,
+   339→    track_type track_type NOT NULL,
+   340→    min_track_days INTEGER DEFAULT 1,  -- How many days track is occupied
+   341→    
+   342→    -- Compliance window (tolerance for scheduling)
+   343→    early_tolerance_pct DECIMAL(5,2) DEFAULT 10.0,   -- Can do 10% early
+   344→    late_tolerance_pct DECIMAL(5,2) DEFAULT 10.0,    -- Can do 10% late
+   345→    
+   346→    -- Certification requirements
+   347→    required_certifications VARCHAR(50)[],
+   348→    
+   349→    -- Canvas display
+   350→    display_color VARCHAR(7),
+   351→    display_priority INTEGER DEFAULT 50,
+   352→    
+   353→    active BOOLEAN DEFAULT TRUE,
+   354→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   355→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   356→    
+   357→    UNIQUE(fleet_id, pm_code, version)
+   358→);
+   359→
+   360→-- Example PM hierarchy data:
+   361→-- INSERT INTO pm_types (fleet_id, pm_code, pm_name, interval_km, interval_months, satisfies_codes, ...)
+   362→-- KS Fleet:
+   363→--   C1: interval_km=12500, interval_months=6,  satisfies_codes=NULL
+   364→--   C2: interval_km=50000, interval_months=24, satisfies_codes=['C1']
+   365→--   C3: interval_km=100000, interval_months=48, satisfies_codes=['C1','C2']
+   366→--   C4: interval_km=200000, interval_months=96, satisfies_codes=['C1','C2','C3']
+   367→--   OH: interval_km=800000, interval_months=NULL, satisfies_codes=['C1','C2','C3','C4']
+   368→
+   369→-- PM material requirements (Bill of Materials)
+   370→CREATE TABLE pm_material_requirements (
+   371→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   372→    pm_type_id UUID NOT NULL REFERENCES pm_types(id),
+   373→    part_number VARCHAR(50) NOT NULL,
+   374→    part_description TEXT,
+   375→    
+   376→    quantity_per_pm INTEGER NOT NULL DEFAULT 1,
+   377→    criticality material_criticality NOT NULL DEFAULT 'BLOCKING',
+   378→    -- BLOCKING = cannot start PM without part
+   379→    -- DEFERRABLE = can start, must have within X days
+   380→    -- CONSUMABLE = nice-to-have, can substitute
+   381→    
+   382→    lead_time_days INTEGER DEFAULT 14,
+   383→    substitute_parts VARCHAR(50)[],    -- Alternative part numbers
+   384→    
+   385→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   386→    
+   387→    UNIQUE(pm_type_id, part_number)
+   388→);
+   389→
+   390→CREATE INDEX idx_pm_materials_type ON pm_material_requirements(pm_type_id);
+   391→
+   392→-- PM schedule (planned and executed maintenance)
+   393→CREATE TABLE pm_schedule (
+   394→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   395→    train_id UUID NOT NULL REFERENCES trains(id),
+   396→    pm_type_id UUID NOT NULL REFERENCES pm_types(id),
+   397→    
+   398→    -- Scheduling
+   399→    target_date DATE NOT NULL,
+   400→    target_mileage_km INTEGER,
+   401→    status pm_status DEFAULT 'SCHEDULED',
+   402→    
+   403→    -- Compliance window (calculated from pm_types tolerances)
+   404→    constraint_start DATE NOT NULL,    -- Earliest allowed date
+   405→    constraint_end DATE NOT NULL,      -- Latest allowed date (statutory lock after this)
+   406→    
+   407→    -- Resource assignment
+   408→    assigned_depot_id UUID REFERENCES depots(id),
+   409→    assigned_track_id UUID REFERENCES tracks(id),
+   410→    assigned_hours DECIMAL(6,2),
+   411→    assigned_shift shift_type,
+   412→    
+   413→    -- Execution
+   414→    actual_start_date DATE,
+   415→    actual_end_date DATE,
+   416→    actual_hours DECIMAL(6,2),
+   417→    completed_at TIMESTAMPTZ,
+   418→    completed_mileage_km INTEGER,
+   419→    
+   420→    -- Work order integration
+   421→    maximo_wo_id VARCHAR(50),
+   422→    
+   423→    -- Locking
+   424→    is_locked BOOLEAN DEFAULT FALSE,   -- Cannot be moved by optimizer
+   425→    locked_reason VARCHAR(100),
+   426→    locked_by UUID REFERENCES users(id),
+   427→    locked_at TIMESTAMPTZ,
+   428→    
+   429→    -- Scenario support (NULL = production schedule)
+   430→    scenario_id UUID REFERENCES scenarios(id),
+   431→    
+   432→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   433→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   434→    created_by UUID REFERENCES users(id)
+   435→);
+   436→
+   437→CREATE INDEX idx_pm_schedule_train ON pm_schedule(train_id, target_date);
+   438→CREATE INDEX idx_pm_schedule_date ON pm_schedule(target_date, status);
+   439→CREATE INDEX idx_pm_schedule_depot ON pm_schedule(assigned_depot_id, target_date) 
+   440→    WHERE status IN ('SCHEDULED', 'IN_PROGRESS');
+   441→CREATE INDEX idx_pm_schedule_scenario ON pm_schedule(scenario_id) WHERE scenario_id IS NOT NULL;
+   442→CREATE INDEX idx_pm_schedule_canvas ON pm_schedule(target_date, train_id)
+   443→    WHERE status IN ('SCHEDULED', 'IN_PROGRESS') AND scenario_id IS NULL;
+   444→```
+   445→
+   446→---
+   447→
+   448→## 3.6 Material Management Tables
+   449→
+   450→```sql
+   451→-- Inventory positions (snapshot from ERP/Maximo)
+   452→CREATE TABLE inventory_positions (
+   453→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   454→    depot_id UUID NOT NULL REFERENCES depots(id),
+   455→    part_number VARCHAR(50) NOT NULL,
+   456→    part_description TEXT,
+   457→    
+   458→    -- Quantities
+   459→    quantity_on_hand INTEGER NOT NULL DEFAULT 0,
+   460→    quantity_reserved INTEGER NOT NULL DEFAULT 0,  -- Soft + hard reservations
+   461→    quantity_on_order INTEGER DEFAULT 0,
+   462→    quantity_available INTEGER GENERATED ALWAYS AS 
+   463→        (quantity_on_hand - quantity_reserved) STORED,
+   464→    
+   465→    -- Replenishment
+   466→    reorder_point INTEGER,
+   467→    reorder_quantity INTEGER,
+   468→    next_delivery_date DATE,
+   469→    next_delivery_quantity INTEGER,
+   470→    
+   471→    -- Cost
+   472→    unit_cost DECIMAL(12,2),
+   473→    currency VARCHAR(3) DEFAULT 'SGD',
+   474→    
+   475→    -- Sync tracking
+   476→    last_sync_at TIMESTAMPTZ,
+   477→    source_system VARCHAR(50) DEFAULT 'MAXIMO',
+   478→    
+   479→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   480→    
+   481→    UNIQUE(depot_id, part_number)
+   482→);
+   483→
+   484→CREATE INDEX idx_inventory_depot ON inventory_positions(depot_id);
+   485→CREATE INDEX idx_inventory_part ON inventory_positions(part_number);
+   486→CREATE INDEX idx_inventory_low_stock ON inventory_positions(depot_id, part_number) 
+   487→    WHERE quantity_available <= reorder_point;
+   488→
+   489→-- Material reservations (link inventory to PM schedule)
+   490→CREATE TABLE material_reservations (
+   491→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   492→    pm_schedule_id UUID NOT NULL REFERENCES pm_schedule(id) ON DELETE CASCADE,
+   493→    inventory_position_id UUID NOT NULL REFERENCES inventory_positions(id),
+   494→    part_number VARCHAR(50) NOT NULL,
+   495→    
+   496→    quantity_reserved INTEGER NOT NULL,
+   497→    reservation_type reservation_type DEFAULT 'SOFT',
+   498→    -- SOFT = tentative, can be released if PM moves
+   499→    -- HARD = committed, parts allocated
+   500→    
+   501→    reserved_at TIMESTAMPTZ DEFAULT NOW(),
+   502→    reserved_by UUID REFERENCES users(id),
+   503→    expires_at TIMESTAMPTZ,  -- SOFT reservations auto-expire
+   504→    
+   505→    -- Fulfillment
+   506→    fulfilled_at TIMESTAMPTZ,
+   507→    fulfilled_quantity INTEGER,
+   508→    
+   509→    UNIQUE(pm_schedule_id, part_number)
+   510→);
+   511→
+   512→CREATE INDEX idx_reservations_pm ON material_reservations(pm_schedule_id);
+   513→CREATE INDEX idx_reservations_inventory ON material_reservations(inventory_position_id);
+   514→CREATE INDEX idx_reservations_expiring ON material_reservations(expires_at) 
+   515→    WHERE reservation_type = 'SOFT' AND fulfilled_at IS NULL;
+   516→```
+   517→
+   518→---
+   519→
+   520→## 3.7 Man-hour Planning Tables
+   521→
+   522→```sql
+   523→-- Man-hour capacity (resource availability by depot)
+   524→CREATE TABLE manhour_capacity (
+   525→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   526→    depot_id UUID NOT NULL REFERENCES depots(id),
+   527→    effective_from DATE NOT NULL,
+   528→    effective_to DATE,
+   529→    
+   530→    -- Base capacity per shift type
+   531→    day_shift_hours DECIMAL(8,2) NOT NULL,
+   532→    night_shift_hours DECIMAL(8,2) DEFAULT 0,
+   533→    weekend_hours DECIMAL(8,2) DEFAULT 0,
+   534→    
+   535→    -- Staff counts
+   536→    technicians_day INTEGER NOT NULL,
+   537→    technicians_night INTEGER DEFAULT 0,
+   538→    specialists INTEGER DEFAULT 0,
+   539→    
+   540→    -- Constraints
+   541→    max_overtime_pct DECIMAL(5,2) DEFAULT 20.0,
+   542→    min_utilization_pct DECIMAL(5,2) DEFAULT 70.0,
+   543→    target_utilization_pct DECIMAL(5,2) DEFAULT 85.0,
+   544→    
+   545→    notes TEXT,
+   546→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   547→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   548→    
+   549→    UNIQUE(depot_id, effective_from)
+   550→);
+   551→
+   552→-- Man-hour projections (generated by leveling engine)
+   553→CREATE TABLE manhour_projections (
+   554→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   555→    projection_run_id UUID NOT NULL,
+   556→    depot_id UUID NOT NULL REFERENCES depots(id),
+   557→    
+   558→    period_start DATE NOT NULL,
+   559→    period_end DATE NOT NULL,
+   560→    granularity VARCHAR(20) NOT NULL,  -- 'WEEKLY', 'MONTHLY'
+   561→    
+   562→    -- Required hours breakdown
+   563→    required_pm_hours DECIMAL(10,2) NOT NULL,
+   564→    required_corrective_hours DECIMAL(10,2) DEFAULT 0,
+   565→    required_overhaul_hours DECIMAL(10,2) DEFAULT 0,
+   566→    required_total_hours DECIMAL(10,2) NOT NULL,
+   567→    
+   568→    -- Available hours
+   569→    available_regular_hours DECIMAL(10,2) NOT NULL,
+   570→    available_overtime_hours DECIMAL(10,2) NOT NULL,
+   571→    available_total_hours DECIMAL(10,2) NOT NULL,
+   572→    
+   573→    -- Computed metrics
+   574→    variance_hours DECIMAL(10,2) GENERATED ALWAYS AS 
+   575→        (available_total_hours - required_total_hours) STORED,
+   576→    utilization_pct DECIMAL(5,2) GENERATED ALWAYS AS 
+   577→        (CASE WHEN available_total_hours > 0 
+   578→              THEN (required_total_hours / available_total_hours * 100)
+   579→              ELSE 0 END) STORED,
+   580→    is_overloaded BOOLEAN GENERATED ALWAYS AS 
+   581→        (required_total_hours > available_total_hours) STORED,
+   582→    is_underutilized BOOLEAN GENERATED ALWAYS AS 
+   583→        (required_total_hours < available_total_hours * 0.7) STORED,
+   584→    
+   585→    created_at TIMESTAMPTZ DEFAULT NOW()
+   586→);
+   587→
+   588→CREATE INDEX idx_manhour_proj_depot ON manhour_projections(depot_id, period_start);
+   589→CREATE INDEX idx_manhour_proj_run ON manhour_projections(projection_run_id);
+   590→
+   591→-- Man-hour adjustments (proposed changes to level workload)
+   592→CREATE TABLE manhour_adjustments (
+   593→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   594→    projection_id UUID NOT NULL REFERENCES manhour_projections(id),
+   595→    
+   596→    adjustment_type VARCHAR(50) NOT NULL,
+   597→    -- 'ADD_OVERTIME', 'DEFER_PM', 'ADVANCE_PM', 'CROSS_DEPOT', 'ADD_CONTRACTOR'
+   598→    
+   599→    source_period_start DATE,
+   600→    source_period_end DATE,
+   601→    target_period_start DATE,
+   602→    target_period_end DATE,
+   603→    hours_adjusted DECIMAL(10,2) NOT NULL,
+   604→    
+   605→    affected_pm_ids UUID[] DEFAULT '{}',
+   606→    affected_train_ids UUID[] DEFAULT '{}',
+   607→    
+   608→    -- Impact assessment
+   609→    cost_impact DECIMAL(12,2),
+   610→    risk_impact VARCHAR(20),  -- 'NONE', 'LOW', 'MEDIUM', 'HIGH'
+   611→    risk_description TEXT,
+   612→    
+   613→    -- Workflow
+   614→    status adjustment_status DEFAULT 'PROPOSED',
+   615→    proposed_by UUID REFERENCES users(id),
+   616→    proposed_at TIMESTAMPTZ DEFAULT NOW(),
+   617→    approved_by UUID REFERENCES users(id),
+   618→    approved_at TIMESTAMPTZ,
+   619→    rejection_reason TEXT,
+   620→    
+   621→    -- Explanation
+   622→    reason TEXT NOT NULL,
+   623→    
+   624→    created_at TIMESTAMPTZ DEFAULT NOW()
+   625→);
+   626→
+   627→CREATE INDEX idx_manhour_adj_projection ON manhour_adjustments(projection_id);
+   628→CREATE INDEX idx_manhour_adj_status ON manhour_adjustments(status) WHERE status = 'PROPOSED';
+   629→```
+   630→
+   631→---
+   632→
+   633→## 3.8 Baseline & Drift Tables
+   634→
+   635→```sql
+   636→-- Plan baselines (immutable snapshots)
+   637→CREATE TABLE plan_baselines (
+   638→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   639→    name VARCHAR(100) NOT NULL,
+   640→    description TEXT,
+   641→    version VARCHAR(20) NOT NULL,  -- e.g., 'v3.2'
+   642→    
+   643→    baseline_date DATE NOT NULL,   -- "As of" date
+   644→    horizon_end DATE NOT NULL,     -- How far into future
+   645→    
+   646→    -- Workflow
+   647→    status baseline_status DEFAULT 'DRAFT',
+   648→    created_by UUID NOT NULL REFERENCES users(id),
+   649→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   650→    
+   651→    published_by UUID REFERENCES users(id),
+   652→    published_at TIMESTAMPTZ,
+   653→    
+   654→    superseded_by UUID REFERENCES plan_baselines(id),
+   655→    superseded_at TIMESTAMPTZ,
+   656→    
+   657→    -- Metrics at baseline time
+   658→    fleet_count INTEGER,
+   659→    total_pm_scheduled INTEGER,
+   660→    total_manhours_projected DECIMAL(12,2)
+   661→);
+   662→
+   663→CREATE INDEX idx_baselines_status ON plan_baselines(status);
+   664→CREATE INDEX idx_baselines_date ON plan_baselines(baseline_date DESC);
+   665→
+   666→-- Baseline PM schedule snapshot
+   667→CREATE TABLE baseline_pm_schedule (
+   668→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   669→    baseline_id UUID NOT NULL REFERENCES plan_baselines(id) ON DELETE CASCADE,
+   670→    
+   671→    train_id UUID NOT NULL REFERENCES trains(id),
+   672→    pm_type_id UUID NOT NULL REFERENCES pm_types(id),
+   673→    projected_date DATE NOT NULL,
+   674→    projected_mileage_km INTEGER,
+   675→    
+   676→    assigned_depot_id UUID REFERENCES depots(id),
+   677→    assigned_hours DECIMAL(6,2),
+   678→    
+   679→    UNIQUE(baseline_id, train_id, pm_type_id, projected_date)
+   680→);
+   681→
+   682→CREATE INDEX idx_baseline_pm_baseline ON baseline_pm_schedule(baseline_id);
+   683→CREATE INDEX idx_baseline_pm_train ON baseline_pm_schedule(train_id, projected_date);
+   684→
+   685→-- Baseline mileage projections
+   686→CREATE TABLE baseline_mileage_projection (
+   687→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   688→    baseline_id UUID NOT NULL REFERENCES plan_baselines(id) ON DELETE CASCADE,
+   689→    
+   690→    train_id UUID NOT NULL REFERENCES trains(id),
+   691→    projection_date DATE NOT NULL,
+   692→    projected_cumulative_km INTEGER NOT NULL,
+   693→    daily_rate_km INTEGER,  -- Assumed daily accrual rate
+   694→    
+   695→    UNIQUE(baseline_id, train_id, projection_date)
+   696→);
+   697→
+   698→CREATE INDEX idx_baseline_mileage ON baseline_mileage_projection(baseline_id, train_id);
+   699→
+   700→-- Drift analysis results (generated by drift monitor)
+   701→CREATE TABLE drift_analysis (
+   702→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   703→    baseline_id UUID NOT NULL REFERENCES plan_baselines(id),
+   704→    analysis_date DATE NOT NULL,
+   705→    
+   706→    train_id UUID NOT NULL REFERENCES trains(id),
+   707→    
+   708→    -- Mileage drift
+   709→    baseline_projected_km INTEGER NOT NULL,
+   710→    actual_km INTEGER NOT NULL,
+   711→    mileage_drift_km INTEGER GENERATED ALWAYS AS (actual_km - baseline_projected_km) STORED,
+   712→    mileage_drift_pct DECIMAL(5,2),
+   713→    
+   714→    -- Schedule drift (days)
+   715→    avg_pm_drift_days DECIMAL(5,1),
+   716→    max_pm_drift_days INTEGER,
+   717→    
+   718→    -- Threshold breach
+   719→    requires_replan BOOLEAN DEFAULT FALSE,
+   720→    replan_reason TEXT,
+   721→    
+   722→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   723→    
+   724→    UNIQUE(baseline_id, train_id, analysis_date)
+   725→);
+   726→
+   727→CREATE INDEX idx_drift_baseline ON drift_analysis(baseline_id, analysis_date);
+   728→CREATE INDEX idx_drift_replan ON drift_analysis(requires_replan, analysis_date) 
+   729→    WHERE requires_replan = TRUE;
+   730→```
+   731→
+   732→---
+   733→
+   734→## 3.9 Scenario Management Tables
+   735→
+   736→```sql
+   737→-- Scenarios (what-if analysis containers)
+   738→CREATE TABLE scenarios (
+   739→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   740→    name VARCHAR(100) NOT NULL,
+   741→    description TEXT,
+   742→    
+   743→    -- Fork point
+   744→    forked_from_baseline_id UUID REFERENCES plan_baselines(id),
+   745→    forked_from_scenario_id UUID REFERENCES scenarios(id),
+   746→    forked_at TIMESTAMPTZ DEFAULT NOW(),
+   747→    
+   748→    -- Metadata
+   749→    status scenario_status DEFAULT 'ACTIVE',
+   750→    created_by UUID NOT NULL REFERENCES users(id),
+   751→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   752→    
+   753→    -- Expiration (scenarios auto-expire after 30 days of inactivity)
+   754→    last_modified_at TIMESTAMPTZ DEFAULT NOW(),
+   755→    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '30 days'),
+   756→    
+   757→    -- Promotion
+   758→    promoted_to_baseline_id UUID REFERENCES plan_baselines(id),
+   759→    promoted_at TIMESTAMPTZ,
+   760→    promoted_by UUID REFERENCES users(id)
+   761→);
+   762→
+   763→CREATE INDEX idx_scenarios_status ON scenarios(status);
+   764→CREATE INDEX idx_scenarios_user ON scenarios(created_by, status);
+   765→CREATE INDEX idx_scenarios_expiring ON scenarios(expires_at) WHERE status = 'ACTIVE';
+   766→
+   767→-- Scenario deltas (event-sourced changes)
+   768→CREATE TABLE scenario_deltas (
+   769→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   770→    scenario_id UUID NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+   771→    sequence_num INTEGER NOT NULL,  -- Order of application
+   772→    
+   773→    delta_type VARCHAR(50) NOT NULL,
+   774→    -- 'PM_MOVE', 'PM_ADD', 'PM_REMOVE', 'CAPACITY_CHANGE', 'TRAIN_STATUS_CHANGE'
+   775→    
+   776→    -- Reference to affected entity
+   777→    entity_type VARCHAR(50) NOT NULL,  -- 'pm_schedule', 'manhour_capacity', 'trains'
+   778→    entity_id UUID NOT NULL,
+   779→    
+   780→    -- Change details (JSON)
+   781→    old_values JSONB,
+   782→    new_values JSONB,
+   783→    
+   784→    -- Explanation
+   785→    change_reason TEXT,
+   786→    
+   787→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   788→    created_by UUID REFERENCES users(id),
+   789→    
+   790→    UNIQUE(scenario_id, sequence_num)
+   791→);
+   792→
+   793→CREATE INDEX idx_scenario_deltas_scenario ON scenario_deltas(scenario_id, sequence_num);
+   794→
+   795→-- Scenario comparison results (materialized for performance)
+   796→CREATE TABLE scenario_comparisons (
+   797→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   798→    scenario_a_id UUID NOT NULL REFERENCES scenarios(id),
+   799→    scenario_b_id UUID REFERENCES scenarios(id),  -- NULL = compare to baseline
+   800→    baseline_id UUID REFERENCES plan_baselines(id),
+   801→    
+   802→    comparison_date DATE NOT NULL,
+   803→    
+   804→    -- Summary metrics
+   805→    pm_count_delta INTEGER,
+   806→    total_hours_delta DECIMAL(10,2),
+   807→    total_cost_delta DECIMAL(12,2),
+   808→    overloaded_weeks_delta INTEGER,
+   809→    
+   810→    -- Detailed differences (JSON)
+   811→    pm_differences JSONB,
+   812→    manhour_differences JSONB,
+   813→    
+   814→    created_at TIMESTAMPTZ DEFAULT NOW()
+   815→);
+   816→```
+   817→
+   818→---
+   819→
+   820→## 3.10 Costing Tables
+   821→
+   822→```sql
+   823→-- Labor rates
+   824→CREATE TABLE labor_rates (
+   825→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   826→    depot_id UUID REFERENCES depots(id),  -- NULL = global default
+   827→    effective_from DATE NOT NULL,
+   828→    effective_to DATE,
+   829→    
+   830→    -- Rate types
+   831→    regular_hourly_rate DECIMAL(10,2) NOT NULL,
+   832→    overtime_multiplier DECIMAL(3,2) DEFAULT 1.5,
+   833→    weekend_multiplier DECIMAL(3,2) DEFAULT 2.0,
+   834→    holiday_multiplier DECIMAL(3,2) DEFAULT 2.5,
+   835→    
+   836→    -- Shop rate (fully loaded)
+   837→    shop_rate_hourly DECIMAL(10,2),  -- Includes overhead, benefits
+   838→    
+   839→    currency VARCHAR(3) DEFAULT 'SGD',
+   840→    
+   841→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   842→    
+   843→    UNIQUE(depot_id, effective_from)
+   844→);
+   845→
+   846→-- Material cost history
+   847→CREATE TABLE material_costs (
+   848→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   849→    part_number VARCHAR(50) NOT NULL,
+   850→    effective_from DATE NOT NULL,
+   851→    effective_to DATE,
+   852→    
+   853→    unit_cost DECIMAL(12,2) NOT NULL,
+   854→    currency VARCHAR(3) DEFAULT 'SGD',
+   855→    supplier VARCHAR(100),
+   856→    
+   857→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   858→    
+   859→    UNIQUE(part_number, effective_from)
+   860→);
+   861→
+   862→-- Cost baselines (for variance analysis)
+   863→CREATE TABLE cost_baselines (
+   864→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   865→    fiscal_year INTEGER NOT NULL,
+   866→    depot_id UUID REFERENCES depots(id),
+   867→    
+   868→    budget_labor_hours DECIMAL(12,2),
+   869→    budget_labor_cost DECIMAL(14,2),
+   870→    budget_material_cost DECIMAL(14,2),
+   871→    budget_total DECIMAL(14,2),
+   872→    
+   873→    -- Actuals (updated monthly)
+   874→    actual_labor_hours DECIMAL(12,2),
+   875→    actual_labor_cost DECIMAL(14,2),
+   876→    actual_material_cost DECIMAL(14,2),
+   877→    actual_total DECIMAL(14,2),
+   878→    
+   879→    variance_pct DECIMAL(5,2) GENERATED ALWAYS AS 
+   880→        (CASE WHEN budget_total > 0 
+   881→              THEN ((actual_total - budget_total) / budget_total * 100)
+   882→              ELSE 0 END) STORED,
+   883→    
+   884→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   885→    
+   886→    UNIQUE(fiscal_year, depot_id)
+   887→);
+   888→```
+   889→
+   890→---
+   891→
+   892→## 3.11 Audit & History Tables
+   893→
+   894→```sql
+   895→-- PM schedule change history (immutable audit trail)
+   896→CREATE TABLE pm_schedule_history (
+   897→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   898→    pm_schedule_id UUID NOT NULL REFERENCES pm_schedule(id),
+   899→    
+   900→    change_type VARCHAR(30) NOT NULL,
+   901→    -- 'CREATED', 'DATE_CHANGED', 'STATUS_CHANGED', 'TRACK_ASSIGNED', 
+   902→    -- 'LOCKED', 'UNLOCKED', 'COMPLETED', 'CANCELLED', 'DEFERRED'
+   903→    
+   904→    -- Previous values
+   905→    old_target_date DATE,
+   906→    old_status pm_status,
+   907→    old_assigned_track_id UUID,
+   908→    old_assigned_hours DECIMAL(6,2),
+   909→    
+   910→    -- New values
+   911→    new_target_date DATE,
+   912→    new_status pm_status,
+   913→    new_assigned_track_id UUID,
+   914→    new_assigned_hours DECIMAL(6,2),
+   915→    
+   916→    -- Attribution
+   917→    changed_by UUID NOT NULL REFERENCES users(id),
+   918→    changed_at TIMESTAMPTZ DEFAULT NOW(),
+   919→    change_reason TEXT,
+   920→    change_source VARCHAR(30) DEFAULT 'USER',  -- 'USER', 'OPTIMIZER', 'SYSTEM', 'IMPORT'
+   921→    
+   922→    -- Optimizer context (if change was suggested by optimizer)
+   923→    optimizer_request_id UUID,
+   924→    optimizer_explanation JSONB
+   925→);
+   926→
+   927→CREATE INDEX idx_pm_history_schedule ON pm_schedule_history(pm_schedule_id, changed_at DESC);
+   928→CREATE INDEX idx_pm_history_date ON pm_schedule_history(changed_at DESC);
+   929→CREATE INDEX idx_pm_history_user ON pm_schedule_history(changed_by, changed_at DESC);
+   930→
+   931→-- General audit log
+   932→CREATE TABLE audit_log (
+   933→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   934→    
+   935→    -- What
+   936→    entity_type VARCHAR(50) NOT NULL,
+   937→    entity_id UUID NOT NULL,
+   938→    action VARCHAR(30) NOT NULL,  -- 'CREATE', 'UPDATE', 'DELETE', 'APPROVE', 'REJECT', 'PUBLISH'
+   939→    
+   940→    -- Who
+   941→    user_id UUID NOT NULL REFERENCES users(id),
+   942→    user_email VARCHAR(255),
+   943→    user_ip_address INET,
+   944→    
+   945→    -- When
+   946→    occurred_at TIMESTAMPTZ DEFAULT NOW(),
+   947→    
+   948→    -- Details
+   949→    old_values JSONB,
+   950→    new_values JSONB,
+   951→    metadata JSONB,  -- Additional context
+   952→    
+   953→    -- Compliance
+   954→    compliance_flags VARCHAR(50)[]  -- e.g., ['SAFETY_CRITICAL', 'FINANCIAL']
+   955→);
+   956→
+   957→CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id, occurred_at DESC);
+   958→CREATE INDEX idx_audit_user ON audit_log(user_id, occurred_at DESC);
+   959→CREATE INDEX idx_audit_date ON audit_log(occurred_at DESC);
+   960→```
+   961→
+   962→---
+   963→
+   964→## 3.12 Users & Authentication Tables
+   965→
+   966→```sql
+   967→-- Users
+   968→CREATE TABLE users (
+   969→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   970→    email VARCHAR(255) NOT NULL UNIQUE,
+   971→    password_hash VARCHAR(255) NOT NULL,
+   972→    
+   973→    first_name VARCHAR(100),
+   974→    last_name VARCHAR(100),
+   975→    display_name VARCHAR(200),
+   976→    
+   977→    -- Assignment
+   978→    primary_depot_id UUID REFERENCES depots(id),
+   979→    role_ids UUID[] NOT NULL DEFAULT '{}',
+   980→    
+   981→    -- Certifications (for technician constraint matching)
+   982→    certifications VARCHAR(50)[],
+   983→    
+   984→    -- Status
+   985→    is_active BOOLEAN DEFAULT TRUE,
+   986→    last_login_at TIMESTAMPTZ,
+   987→    failed_login_attempts INTEGER DEFAULT 0,
+   988→    locked_until TIMESTAMPTZ,
+   989→    
+   990→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   991→    updated_at TIMESTAMPTZ DEFAULT NOW()
+   992→);
+   993→
+   994→CREATE INDEX idx_users_email ON users(email);
+   995→CREATE INDEX idx_users_depot ON users(primary_depot_id) WHERE is_active = TRUE;
+   996→
+   997→-- Roles
+   998→CREATE TABLE roles (
+   999→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  1000→    name VARCHAR(50) NOT NULL UNIQUE,
+  1001→    description TEXT,
+  1002→    permissions JSONB NOT NULL,  -- e.g., {"pm_schedule": ["read", "write"], "baseline": ["read"]}
+  1003→    created_at TIMESTAMPTZ DEFAULT NOW()
+  1004→);
+  1005→
+  1006→-- Sessions (Redis-backed, but schema for reference)
+  1007→CREATE TABLE sessions (
+  1008→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  1009→    user_id UUID NOT NULL REFERENCES users(id),
+  1010→    token_hash VARCHAR(255) NOT NULL,
+  1011→    
+  1012→    created_at TIMESTAMPTZ DEFAULT NOW(),
+  1013→    expires_at TIMESTAMPTZ NOT NULL,
+  1014→    last_activity_at TIMESTAMPTZ DEFAULT NOW(),
+  1015→    
+  1016→    ip_address INET,
+  1017→    user_agent TEXT
+  1018→);
+  1019→
+  1020→CREATE INDEX idx_sessions_user ON sessions(user_id);
+  1021→CREATE INDEX idx_sessions_expiry ON sessions(expires_at);
+  1022→```
+  1023→
+  1024→---
+  1025→
+  1026→## 3.13 Canvas-Optimized Views
+  1027→
+  1028→```sql
+  1029→-- Strategic zoom level (yearly aggregates)
+  1030→CREATE MATERIALIZED VIEW v_canvas_strategic AS
+  1031→SELECT 
+  1032→    t.id as train_id,
+  1033→    t.train_number,
+  1034→    t.fleet_id,
+  1035→    date_trunc('year', ps.target_date) as year,
+  1036→    COUNT(*) as pm_count,
+  1037→    SUM(pt.estimated_hours) as total_hours,
+  1038→    COUNT(*) FILTER (WHERE ps.status = 'COMPLETED') as completed_count,
+  1039→    COUNT(*) FILTER (WHERE ps.is_locked) as locked_count,
+  1040→    SUM(pt.estimated_hours) FILTER (WHERE ps.status = 'SCHEDULED') as pending_hours
+  1041→FROM trains t
+  1042→LEFT JOIN pm_schedule ps ON t.id = ps.train_id AND ps.scenario_id IS NULL
+  1043→LEFT JOIN pm_types pt ON ps.pm_type_id = pt.id
+  1044→WHERE t.active = TRUE
+  1045→GROUP BY t.id, t.train_number, t.fleet_id, date_trunc('year', ps.target_date);
+  1046→
+  1047→CREATE INDEX idx_v_canvas_strategic_train ON v_canvas_strategic(train_id, year);
+  1048→
+  1049→-- Tactical zoom level (weekly aggregates with PM details)
+  1050→CREATE MATERIALIZED VIEW v_canvas_tactical AS
+  1051→SELECT 
+  1052→    t.id as train_id,
+  1053→    t.train_number,
+  1054→    date_trunc('week', ps.target_date) as week_start,
+  1055→    ps.id as pm_id,
+  1056→    ps.target_date,
+  1057→    ps.status,
+  1058→    ps.constraint_start,
+  1059→    ps.constraint_end,
+  1060→    ps.is_locked,
+  1061→    pt.pm_code,
+  1062→    pt.estimated_hours,
+  1063→    pt.display_color,
+  1064→    tr.track_number,
+  1065→    d.code as depot_code
+  1066→FROM trains t
+  1067→JOIN pm_schedule ps ON t.id = ps.train_id AND ps.scenario_id IS NULL
+  1068→JOIN pm_types pt ON ps.pm_type_id = pt.id
+  1069→LEFT JOIN tracks tr ON ps.assigned_track_id = tr.id
+  1070→LEFT JOIN depots d ON ps.assigned_depot_id = d.id
+  1071→WHERE t.active = TRUE
+  1072→  AND ps.status IN ('SCHEDULED', 'IN_PROGRESS');
+  1073→
+  1074→CREATE INDEX idx_v_canvas_tactical_train ON v_canvas_tactical(train_id, week_start);
+  1075→CREATE INDEX idx_v_canvas_tactical_date ON v_canvas_tactical(target_date);
+  1076→
+  1077→-- Man-hour canvas overlay
+  1078→CREATE VIEW v_manhour_canvas AS
+  1079→SELECT 
+  1080→    mp.depot_id,
+  1081→    d.code as depot_code,
+  1082→    mp.period_start,
+  1083→    mp.period_end,
+  1084→    mp.required_total_hours,
+  1085→    mp.available_total_hours,
+  1086→    mp.variance_hours,
+  1087→    mp.utilization_pct,
+  1088→    mp.is_overloaded,
+  1089→    mp.is_underutilized,
+  1090→    COALESCE(adj.adjustment_count, 0) as pending_adjustments,
+  1091→    COALESCE(adj.total_adjustment_hours, 0) as proposed_adjustment_hours
+  1092→FROM manhour_projections mp
+  1093→JOIN depots d ON mp.depot_id = d.id
+  1094→LEFT JOIN (
+  1095→    SELECT 
+  1096→        projection_id,
+  1097→        COUNT(*) as adjustment_count,
+  1098→        SUM(hours_adjusted) as total_adjustment_hours
+  1099→    FROM manhour_adjustments
+  1100→    WHERE status = 'PROPOSED'
+  1101→    GROUP BY projection_id
+  1102→) adj ON mp.id = adj.projection_id
+  1103→WHERE mp.projection_run_id = (
+  1104→    SELECT projection_run_id 
+  1105→    FROM manhour_projections 
+  1106→    ORDER BY created_at DESC 
+  1107→    LIMIT 1
+  1108→);
+  1109→
+  1110→-- Drift overlay (comparison to baseline)
+  1111→CREATE VIEW v_drift_canvas AS
+  1112→SELECT 
+  1113→    da.train_id,
+  1114→    t.train_number,
+  1115→    da.baseline_id,
+  1116→    pb.name as baseline_name,
+  1117→    da.analysis_date,
+  1118→    da.mileage_drift_km,
+  1119→    da.mileage_drift_pct,
+  1120→    da.avg_pm_drift_days,
+  1121→    da.requires_replan,
+  1122→    da.replan_reason,
+  1123→    -- Color coding for canvas
+  1124→    CASE 
+  1125→        WHEN da.requires_replan THEN 'RED'
+  1126→        WHEN ABS(da.mileage_drift_pct) > 3 THEN 'YELLOW'
+  1127→        ELSE 'GREEN'
+  1128→    END as drift_severity
+  1129→FROM drift_analysis da
+  1130→JOIN trains t ON da.train_id = t.id
+  1131→JOIN plan_baselines pb ON da.baseline_id = pb.id
+  1132→WHERE pb.status = 'PUBLISHED'
+  1133→  AND da.analysis_date = (
+  1134→      SELECT MAX(analysis_date) 
+  1135→      FROM drift_analysis 
+  1136→      WHERE baseline_id = da.baseline_id
+  1137→  );
+  1138→
+  1139→-- Refresh materialized views (scheduled job)
+  1140→-- REFRESH MATERIALIZED VIEW CONCURRENTLY v_canvas_strategic;
+  1141→-- REFRESH MATERIALIZED VIEW CONCURRENTLY v_canvas_tactical;
+  1142→```
+  1143→
+  1144→---
+  1145→
+  1146→## 3.14 Database Maintenance
+  1147→
+  1148→```sql
+  1149→-- Automatic refresh of materialized views
+  1150→CREATE OR REPLACE FUNCTION refresh_canvas_views()
+  1151→RETURNS void AS $$
+  1152→BEGIN
+  1153→    REFRESH MATERIALIZED VIEW CONCURRENTLY v_canvas_strategic;
+  1154→    REFRESH MATERIALIZED VIEW CONCURRENTLY v_canvas_tactical;
+  1155→END;
+  1156→$$ LANGUAGE plpgsql;
+  1157→
+  1158→-- Schedule refresh every 15 minutes (use pg_cron or external scheduler)
+  1159→-- SELECT cron.schedule('*/15 * * * *', 'SELECT refresh_canvas_views()');
+  1160→
+  1161→-- Cleanup expired scenarios
+  1162→CREATE OR REPLACE FUNCTION cleanup_expired_scenarios()
+  1163→RETURNS INTEGER AS $$
+  1164→DECLARE
+  1165→    deleted_count INTEGER;
+  1166→BEGIN
+  1167→    UPDATE scenarios 
+  1168→    SET status = 'EXPIRED'
+  1169→    WHERE status = 'ACTIVE' 
+  1170→      AND expires_at < NOW();
+  1171→    
+  1172→    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  1173→    RETURN deleted_count;
+  1174→END;
+  1175→$$ LANGUAGE plpgsql;
+  1176→
+  1177→-- Release expired soft reservations
+  1178→CREATE OR REPLACE FUNCTION release_expired_reservations()
+  1179→RETURNS INTEGER AS $$
+  1180→DECLARE
+  1181→    released_count INTEGER;
+  1182→BEGIN
+  1183→    -- Update inventory positions
+  1184→    UPDATE inventory_positions ip
+  1185→    SET quantity_reserved = quantity_reserved - expired.total_qty
+  1186→    FROM (
+  1187→        SELECT inventory_position_id, SUM(quantity_reserved) as total_qty
+  1188→        FROM material_reservations
+  1189→        WHERE reservation_type = 'SOFT'
+  1190→          AND expires_at < NOW()
+  1191→          AND fulfilled_at IS NULL
+  1192→        GROUP BY inventory_position_id
+  1193→    ) expired
+  1194→    WHERE ip.id = expired.inventory_position_id;
+  1195→    
+  1196→    -- Delete expired reservations
+  1197→    DELETE FROM material_reservations
+  1198→    WHERE reservation_type = 'SOFT'
+  1199→      AND expires_at < NOW()
+  1200→      AND fulfilled_at IS NULL;
+  1201→    
+  1202→    GET DIAGNOSTICS released_count = ROW_COUNT;
+  1203→    RETURN released_count;
+  1204→END;
+  1205→$$ LANGUAGE plpgsql;
+  1206→
+  1207→-- Update train target mileage for fleet balancing
+  1208→CREATE OR REPLACE FUNCTION update_fleet_mileage_targets()
+  1209→RETURNS void AS $$
+  1210→BEGIN
+  1211→    UPDATE trains t
+  1212→    SET target_mileage_km = fleet_avg.avg_mileage
+  1213→    FROM (
+  1214→        SELECT fleet_id, AVG(current_mileage_km)::INTEGER as avg_mileage
+  1215→        FROM trains
+  1216→        WHERE active = TRUE
+  1217→        GROUP BY fleet_id
+  1218→    ) fleet_avg
+  1219→    WHERE t.fleet_id = fleet_avg.fleet_id
+  1220→      AND t.active = TRUE;
+  1221→END;
+  1222→$$ LANGUAGE plpgsql;
+  1223→```
+  1224→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

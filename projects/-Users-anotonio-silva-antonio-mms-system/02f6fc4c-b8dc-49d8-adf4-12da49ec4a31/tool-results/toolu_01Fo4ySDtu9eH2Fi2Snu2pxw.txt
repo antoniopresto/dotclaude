@@ -1,0 +1,535 @@
+     1→================================================================================
+     2→RALPH WIGGUM - PESQUISA COMPLETA DE MELHORES PRÁTICAS E AJUSTES
+     3→================================================================================
+     4→Data: 2026-01-20
+     5→Fonte: Pesquisa extensiva online incluindo podcasts, GitHub, artigos, e comunidade
+     6→================================================================================
+     7→
+     8→SUMÁRIO EXECUTIVO
+     9→================================================================================
+    10→
+    11→Esta pesquisa documenta como a comunidade Ralph Wiggum, Geoffrey Huntley (criador),
+    12→e implementações enterprise lidam com problemas comuns em implementações Ralph -
+    13→particularmente gerenciamento de contexto, tamanho de arquivos, e automação.
+    14→
+    15→INSIGHT CHAVE de Geoffrey Huntley:
+    16→"Disk is state, git is memory."
+    17→O progresso persiste em arquivos e histórico git, NÃO na janela de contexto do LLM.
+    18→
+    19→================================================================================
+    20→PARTE 1: ANÁLISE DOS PROBLEMAS IDENTIFICADOS NESTE PROJETO
+    21→================================================================================
+    22→
+    23→1.1 PROBLEMAS CRÍTICOS (P1)
+    24→--------------------------------------------------------------------------------
+    25→
+    26→PROBLEMA 1: IMPLEMENTATION_PLAN.md Excede Limites de Contexto
+    27→- Arquivo atual: 44,239 tokens (limite Claude: 25,000)
+    28→- Impacto: Não pode ser lido inteiro, causa "context rot"
+    29→- Contradiz princípio fundamental do Ralph: "fresh context per iteration"
+    30→
+    31→PROBLEMA 2: Circuit Breaker Defaults Desabilitados
+    32→- CB_NO_PROGRESS_THRESHOLD=9999999 (10 milhões!)
+    33→- CB_MAX_COST_USD=9999999 ($10 milhões!)
+    34→- Impacto: Loop pode rodar indefinidamente sem proteção
+    35→
+    36→PROBLEMA 3: NO_PUSH=true Por Padrão
+    37→- Localização: loop.sh:348
+    38→- Impacto: Trabalho existe apenas localmente - risco de perda total
+    39→
+    40→1.2 PROBLEMAS DE ALTA PRIORIDADE (P2)
+    41→--------------------------------------------------------------------------------
+    42→
+    43→PROBLEMA 4: Métricas de Conclusão Inconsistentes
+    44→- Header diz "~70% complete"
+    45→- Contagem de itens mostra ~42%
+    46→- Impacto: Informação enganosa para stakeholders
+    47→
+    48→PROBLEMA 5: Contagens de Subagents Inválidas
+    49→- PROMPT_plan.md:1 e PROMPT_build.md:45 dizem "500 parallel subagents"
+    50→- Claude Code não suporta 500 subagents paralelos
+    51→- Impacto: Confusão e tentativas de operações impossíveis
+    52→
+    53→PROBLEMA 6: Hook PostToolUse Faltando para Edit
+    54→- .claude/settings.json:52-63 tem Write mas não Edit
+    55→- Impacto: Imports proibidos podem ser adicionados via Edit sem detecção
+    56→
+    57→PROBLEMA 7: Numeração de Linhas Absurda no PROMPT_build.md
+    58→- Usa números como 99, 999, 9999, 99999999999
+    59→- Impacto: Difícil navegação e referência
+    60→
+    61→PROBLEMA 8: Leitura de Stdin Frágil nos Hooks
+    62→- block-forbidden-packages.sh:6-11 usa read -t 1
+    63→- Impacto: Timeout de 1 segundo pode perder inputs lentos
+    64→
+    65→1.3 PROBLEMAS DE MÉDIA PRIORIDADE (P3)
+    66→--------------------------------------------------------------------------------
+    67→
+    68→PROBLEMA 9: Performance do session-start.sh
+    69→- grep -rl escaneia todo src/ a cada sessão
+    70→- Impacto: Lento em codebases grandes
+    71→
+    72→PROBLEMA 10: Documentação de Rate Limit Inconsistente
+    73→- Código: MAX_CALLS_PER_HOUR=9999999
+    74→- Documentação: "default: 100"
+    75→
+    76→PROBLEMA 11: Dependência jq Não Enforçada
+    77→- circuit-breaker.sh falha silenciosamente sem jq
+    78→- Impacto: Mecanismo de segurança desabilitado sem aviso
+    79→
+    80→PROBLEMA 12: Contagem de Workers Incorreta no AGENTS.md
+    81→- Linha 181: "8 queues"
+    82→- Linhas 195-204: Lista 9 processors
+    83→
+    84→PROBLEMA 13: @belt/ai Não Documentado
+    85→- .agentrc.ts importa de "@belt/ai"
+    86→- Pacote não existe no npm público
+    87→
+    88→PROBLEMA 14: Detecção de Completion Signal Case-Sensitive
+    89→- loop.sh:86-94 usa grep sem -i
+    90→- "all_tasks_complete" não seria detectado
+    91→
+    92→PROBLEMA 15: Sem Validação de WORK_SCOPE
+    93→- loop.sh:424-432 aceita qualquer valor
+    94→- Typos como "ingeston" falham silenciosamente
+    95→
+    96→================================================================================
+    97→PARTE 2: COMO A COMUNIDADE LIDA COM IMPLEMENTATION_PLAN.md GRANDE
+    98→================================================================================
+    99→
+   100→2.1 FILOSOFIA CENTRAL: "Plans Are Disposable"
+   101→--------------------------------------------------------------------------------
+   102→
+   103→Fonte: The Ralph Wiggum Playbook (https://paddo.dev/blog/ralph-wiggum-playbook/)
+   104→
+   105→"Plans drift. Requirements change... regenerate. Switching back to planning
+   106→mode and rerunning gap analysis is CHEAP."
+   107→
+   108→INSIGHT: A comunidade trata IMPLEMENTATION_PLAN.md como ESTADO DE COORDENAÇÃO,
+   109→não histórico permanente. Histórico vive nos COMMITS GIT.
+   110→
+   111→2.2 ESTRATÉGIAS DA COMUNIDADE
+   112→--------------------------------------------------------------------------------
+   113→
+   114→ESTRATÉGIA 1: Limpeza Periódica via Ralph
+   115→-----------------------------------------
+   116→O playbook de Geoffrey Huntley inclui guardrail 99999999999:
+   117→
+   118→"When @IMPLEMENTATION_PLAN.md becomes large, periodically clean out
+   119→the items that are completed from the file using a subagent."
+   120→
+   121→Ralph USA ELE MESMO para manter seus arquivos. O prompt instrui o agente
+   122→a spawnar um SUBAGENT para limpeza, mantendo o contexto principal limpo.
+   123→
+   124→ESTRATÉGIA 2: Arquivamento Automático (Ralph Orchestrator & snarktank/ralph)
+   125→----------------------------------------------------------------------------
+   126→Fonte: https://github.com/snarktank/ralph
+   127→
+   128→"Ralph automatically archives previous runs when you start a new feature
+   129→(different branchName). Archives are saved to archive/YYYY-MM-DD-feature-name/"
+   130→
+   131→Arquivos de estado:
+   132→- prd.json - Status de conclusão de tasks
+   133→- progress.txt - Acumulador de learnings (append-only)
+   134→- Git commits - O histórico permanente
+   135→
+   136→ESTRATÉGIA 3: Padrão "Fresh Context"
+   137→------------------------------------
+   138→Fonte: HumanLayer ACE-FCA (github.com/humanlayer/advanced-context-engineering-for-coding-agents)
+   139→
+   140→"Each iteration clears context. Re-read specs, plan, code every cycle.
+   141→Fresh context is reliability."
+   142→
+   143→O arquivo de plano deve conter APENAS trabalho ativo. Fases completas vão para:
+   144→- Histórico git (commits são seu changelog)
+   145→- Arquivos de archive separados
+   146→- Ou simplesmente deletados (git tem o histórico)
+   147→
+   148→ESTRATÉGIA 4: Consciência de Budget de Tokens
+   149→---------------------------------------------
+   150→Fonte: https://github.com/agrimsingh/ralph-wiggum-cursor
+   151→
+   152→WARN_THRESHOLD=70000   # Enviar aviso de wrap-up
+   153→ROTATE_THRESHOLD=80000 # Forçar rotação de contexto
+   154→
+   155→Implementações Ralph rotacionam contexto a 40% da capacidade (80k/200k),
+   156→não a 90%. Isso é intencionalmente "wasteful" mas garante qualidade.
+   157→
+   158→2.3 ESTRUTURA DE ARQUIVOS RECOMENDADA
+   159→--------------------------------------------------------------------------------
+   160→
+   161→ralph/
+   162→├── IMPLEMENTATION_PLAN.md    # APENAS tasks ativas (~500 linhas max)
+   163→├── AGENTS.md                 # Guia operacional (~60 linhas max)
+   164→├── archive/                  # Arquivamento automático
+   165→│   └── YYYY-MM-DD-feature/
+   166→├── specs/                    # Requisitos (imutáveis)
+   167→└── loop.sh, PROMPT_*.md      # Orquestração
+   168→
+   169→================================================================================
+   170→PARTE 3: O QUE GEOFFREY HUNTLEY DIZ SOBRE ESSES PROBLEMAS
+   171→================================================================================
+   172→
+   173→3.1 FONTE PRINCIPAL: Dev Interrupted Podcast (Jan 13, 2026, 58 min)
+   174→--------------------------------------------------------------------------------
+   175→URL: https://linearb.io/dev-interrupted/podcast/inventing-the-ralph-wiggum-loop
+   176→Spotify: https://open.spotify.com/episode/3Gzsga210K1kW0GPr4RjH9
+   177→Apple: https://podcasts.apple.com/us/podcast/inventing-the-ralph-wiggum-loop-creator-geoffrey-huntley/id1537003676
+   178→
+   179→3.2 SOBRE CONTEXT ROT E COMPACTION
+   180→--------------------------------------------------------------------------------
+   181→
+   182→CITAÇÃO 1:
+   183→"Compaction is like a Jenga tower - if you pull out the wrong bricks
+   184→at the bottom, the tower falls over."
+   185→
+   186→CITAÇÃO 2:
+   187→"It's actually a loss. It's a lossy function folks... If the specifications
+   188→get compacted out, next thing you know, it starts making stuff up."
+   189→
+   190→3.3 SOBRE ALOCAÇÃO DE CONTEXTO
+   191→--------------------------------------------------------------------------------
+   192→
+   193→CITAÇÃO 3:
+   194→"The real number is like 176k tokens, but if you put in MCP servers,
+   195→it gets down to 120k. I've seen people operating with a Commodore 64
+   196→worth of memory... It's so easy for it to get forgetful. The more you
+   197→allocate, the more you're gonna get bad outcomes."
+   198→
+   199→CITAÇÃO 4:
+   200→"So Ralph is a deliberate attempt to MINIMIZE allocation.
+   201→So I never get a compaction event."
+   202→
+   203→3.4 SOBRE AUTO-MANUTENÇÃO
+   204→--------------------------------------------------------------------------------
+   205→
+   206→Fonte: https://ghuntley.com/ralph/
+   207→
+   208→"That's the beauty of Ralph - the technique is deterministically bad
+   209→in an undeterministic world."
+   210→
+   211→TRADUÇÃO: Espere falhas. Ajuste os prompts baseado nas falhas observadas.
+   212→O loop É o controle de qualidade.
+   213→
+   214→3.5 ABORDAGEM DE HUNTLEY PARA MANTER ARQUIVOS RALPH
+   215→--------------------------------------------------------------------------------
+   216→
+   217→Do playbook, Ralph ATUALIZA SEUS PRÓPRIOS ARQUIVOS:
+   218→
+   219→1. AGENTS.md:
+   220→   "When you learn something new about how to run the application,
+   221→   update @AGENTS.md using a subagent but keep it brief."
+   222→
+   223→2. IMPLEMENTATION_PLAN.md:
+   224→   "Keep @IMPLEMENTATION_PLAN.md current with learnings using a subagent."
+   225→
+   226→3. Limpeza:
+   227→   "When @IMPLEMENTATION_PLAN.md becomes large, periodically clean out
+   228→   completed items using a subagent."
+   229→
+   230→RESPOSTA À PERGUNTA DO USUÁRIO:
+   231→SIM, Ralph mantém Ralph. Mas através de SUBAGENTS para evitar poluir
+   232→o contexto principal.
+   233→
+   234→================================================================================
+   235→PARTE 4: FERRAMENTAS E IMPLEMENTAÇÕES DA COMUNIDADE
+   236→================================================================================
+   237→
+   238→4.1 Ralph Orchestrator
+   239→--------------------------------------------------------------------------------
+   240→URL: https://github.com/mikeyobrien/ralph-orchestrator
+   241→
+   242→Features que endereçam os problemas:
+   243→- Sumarização automática de contexto quando aproximando limites
+   244→- Git checkpoints a cada N iterações
+   245→- Arquivamento de prompts (track evolution)
+   246→- Comando `ralph clean` para resetar estado
+   247→
+   248→4.2 snarktank/ralph
+   249→--------------------------------------------------------------------------------
+   250→URL: https://github.com/snarktank/ralph
+   251→
+   252→Gerenciamento de estado:
+   253→- prd.json: Status de tasks (substitui checkbox tracking)
+   254→- progress.txt: Learnings append-only (nunca deletado)
+   255→- Arquivamento automático por branch: Nova feature = novo archive
+   256→
+   257→4.3 frankbria/ralph-claude-code
+   258→--------------------------------------------------------------------------------
+   259→URL: https://github.com/frankbria/ralph-claude-code
+   260→Stars: 463 (fork mais popular da comunidade)
+   261→
+   262→Features de segurança:
+   263→- Detecção inteligente de exit
+   264→- Rate limiting
+   265→- Dashboard de monitoramento
+   266→
+   267→4.4 Ralph TUI
+   268→--------------------------------------------------------------------------------
+   269→URL: https://ralph-tui.com/
+   270→
+   271→- Retomar trabalho interrompido seamlessly
+   272→- State saving automático
+   273→- Recuperação inteligente de contexto
+   274→
+   275→4.5 agrimsingh/ralph-wiggum-cursor
+   276→--------------------------------------------------------------------------------
+   277→URL: https://github.com/agrimsingh/ralph-wiggum-cursor
+   278→
+   279→Context Engineering Features:
+   280→- WARN_THRESHOLD=70000
+   281→- ROTATE_THRESHOLD=80000
+   282→- MAX_ITERATIONS=20
+   283→
+   284→================================================================================
+   285→PARTE 5: AUTOMAÇÕES E SCRIPTS RECOMENDADOS
+   286→================================================================================
+   287→
+   288→5.1 SCRIPT: Pre-Iteration Context Budget Check
+   289→--------------------------------------------------------------------------------
+   290→Arquivo: ralph/scripts/check-context.sh
+   291→
+   292→#!/bin/bash
+   293→# Verifica tamanho dos arquivos antes de cada iteração
+   294→
+   295→check_file_size() {
+   296→    local file="$1"
+   297→    local max_tokens="${2:-15000}"
+   298→    local tokens=$(wc -w < "$file" | awk '{print int($1 * 1.3)}')
+   299→
+   300→    if [[ $tokens -gt $max_tokens ]]; then
+   301→        echo "WARNING: $file has ~$tokens tokens (max: $max_tokens)"
+   302→        echo "Consider running: ralph plan --cleanup"
+   303→        return 1
+   304→    fi
+   305→}
+   306→
+   307→check_file_size "ralph/IMPLEMENTATION_PLAN.md" 15000
+   308→check_file_size "ralph/AGENTS.md" 2000
+   309→
+   310→5.2 SCRIPT: Automatic Archiving Hook (Post-Commit)
+   311→--------------------------------------------------------------------------------
+   312→Arquivo: ralph/scripts/archive-completed.sh
+   313→
+   314→#!/bin/bash
+   315→# Arquiva tasks completas após commits
+   316→
+   317→archive_completed_phase() {
+   318→    local plan="ralph/IMPLEMENTATION_PLAN.md"
+   319→    local archive_dir="ralph/archive/$(date +%Y-%m-%d)"
+   320→
+   321→    # Contar completas vs total
+   322→    local completed=$(grep -c "^\s*\[x\]" "$plan" || echo 0)
+   323→    local total=$(grep -c "^\s*\[.\]" "$plan" || echo 0)
+   324→
+   325→    if [[ $completed -gt 50 ]]; then
+   326→        mkdir -p "$archive_dir"
+   327→
+   328→        # Extrair seções completas para archive
+   329→        grep -B2 "^\s*\[x\]" "$plan" >> "$archive_dir/completed.md"
+   330→
+   331→        echo "Archived $completed completed tasks to $archive_dir/"
+   332→        echo "Run 'ralph plan --refresh' to regenerate clean plan"
+   333→    fi
+   334→}
+   335→
+   336→archive_completed_phase
+   337→
+   338→5.3 SCRIPT: Plan Regeneration
+   339→--------------------------------------------------------------------------------
+   340→Arquivo: ralph/scripts/refresh-plan.sh
+   341→
+   342→#!/bin/bash
+   343→# Regenera plano dos specs (descarta cruft acumulado)
+   344→
+   345→ARCHIVE_DIR="ralph/archive/$(date +%Y-%m-%d)"
+   346→mkdir -p "$ARCHIVE_DIR"
+   347→
+   348→# Arquivar plano atual
+   349→cp ralph/IMPLEMENTATION_PLAN.md "$ARCHIVE_DIR/pre-refresh.md"
+   350→
+   351→# Git é o histórico real
+   352→git log --oneline --since="30 days ago" > "$ARCHIVE_DIR/recent-commits.log"
+   353→
+   354→# Regenerar plano fresh
+   355→./ralph/loop.sh plan 3  # Max 3 iterações para planning
+   356→
+   357→echo "Plan refreshed. Archive: $ARCHIVE_DIR/"
+   358→
+   359→5.4 GUARDRAILS PARA ADICIONAR AO PROMPT_build.md
+   360→--------------------------------------------------------------------------------
+   361→
+   362→CONTEXT_HYGIENE. Before starting work:
+   363→   a. Check @IMPLEMENTATION_PLAN.md line count
+   364→   b. If > 400 lines, archive completed phases first
+   365→   c. Target: Always < 300 lines of active tasks
+   366→
+   367→AGENTS_BREVITY. @AGENTS.md must stay under 60 lines.
+   368→   - Operational commands only
+   369→   - No status updates (those go in IMPLEMENTATION_PLAN.md)
+   370→   - No learnings (those go in git commits)
+   371→
+   372→SELF_MAINTENANCE. When completing a phase:
+   373→   a. Archive completed tasks to ralph/archive/
+   374→   b. Update summary statistics
+   375→   c. Commit: "chore(ralph): archive phase N"
+   376→
+   377→5.5 CONFIGURAÇÃO DE HOOKS RECOMENDADA
+   378→--------------------------------------------------------------------------------
+   379→Arquivo: .claude/settings.json (seção hooks)
+   380→
+   381→{
+   382→  "hooks": {
+   383→    "PreToolUse": [
+   384→      {
+   385→        "matcher": "*",
+   386→        "hooks": [{
+   387→          "type": "command",
+   388→          "command": "bash ralph/scripts/check-context.sh"
+   389→        }]
+   390→      }
+   391→    ],
+   392→    "PostToolUse": [
+   393→      {
+   394→        "matcher": "Write",
+   395→        "hooks": [{
+   396→          "type": "command",
+   397→          "command": "bash ralph/scripts/check-plan-size.sh"
+   398→        }]
+   399→      },
+   400→      {
+   401→        "matcher": "Edit",
+   402→        "hooks": [{
+   403→          "type": "command",
+   404→          "command": "bash .claude/hooks/block-forbidden-imports.sh"
+   405→        }]
+   406→      }
+   407→    ]
+   408→  }
+   409→}
+   410→
+   411→================================================================================
+   412→PARTE 6: FIXES DE CONFIGURAÇÃO IMEDIATOS
+   413→================================================================================
+   414→
+   415→6.1 TABELA DE FIXES
+   416→--------------------------------------------------------------------------------
+   417→
+   418→| Arquivo               | Problema                    | Fix                          |
+   419→|-----------------------|-----------------------------|------------------------------|
+   420→| circuit-breaker.sh    | CB_NO_PROGRESS_THRESHOLD    | Mudar para 5                 |
+   421→| circuit-breaker.sh    | CB_MAX_COST_USD             | Mudar para 100               |
+   422→| loop.sh               | NO_PUSH=true                | Mudar para NO_PUSH=false     |
+   423→| settings.json         | Missing Edit PostToolUse    | Adicionar Edit matcher       |
+   424→| PROMPT_build.md       | 500 subagents               | Mudar para "up to 3"         |
+   425→| PROMPT_plan.md        | 250 subagents               | Mudar para "up to 3"         |
+   426→| AGENTS.md             | "8 queues"                  | Mudar para "9 queues"        |
+   427→
+   428→6.2 COMANDOS DE FIX ESPECÍFICOS
+   429→--------------------------------------------------------------------------------
+   430→
+   431→# Fix circuit-breaker.sh defaults
+   432→sed -i 's/CB_NO_PROGRESS_THRESHOLD:-9999999/CB_NO_PROGRESS_THRESHOLD:-5/g' ralph/circuit-breaker.sh
+   433→sed -i 's/CB_MAX_COST_USD:-9999999/CB_MAX_COST_USD:-100/g' ralph/circuit-breaker.sh
+   434→
+   435→# Fix loop.sh NO_PUSH default
+   436→sed -i 's/NO_PUSH=true/NO_PUSH=false/g' ralph/loop.sh
+   437→
+   438→================================================================================
+   439→PARTE 7: AS 5 REGRAS DE OURO DA COMUNIDADE
+   440→================================================================================
+   441→
+   442→De Geoffrey Huntley e a comunidade:
+   443→
+   444→1. "Disk is state, git is memory"
+   445→   Nunca dependa do contexto para histórico
+   446→
+   447→2. "Plans are disposable"
+   448→   Regenere ao invés de salvar
+   449→
+   450→3. "Fresh context is reliability"
+   451→   Rotate a 40%, não 90%
+   452→
+   453→4. "Ralph maintains Ralph"
+   454→   Use subagents para auto-limpeza
+   455→
+   456→5. "Deterministically bad > unpredictably good"
+   457→   Espere falhas, ajuste prompts
+   458→
+   459→================================================================================
+   460→PARTE 8: FONTES E REFERÊNCIAS
+   461→================================================================================
+   462→
+   463→Podcasts:
+   464→- Dev Interrupted: Inventing the Ralph Wiggum Loop (Jan 13, 2026, 58 min)
+   465→  https://linearb.io/dev-interrupted/podcast/inventing-the-ralph-wiggum-loop
+   466→  https://open.spotify.com/episode/3Gzsga210K1kW0GPr4RjH9
+   467→
+   468→Blogs e Artigos:
+   469→- Geoffrey Huntley's Ralph: https://ghuntley.com/ralph/
+   470→- The Ralph Wiggum Playbook: https://paddo.dev/blog/ralph-wiggum-playbook/
+   471→- VentureBeat: How Ralph Wiggum became the biggest name in AI
+   472→  https://venturebeat.com/technology/how-ralph-wiggum-went-from-the-simpsons-to-the-biggest-name-in-ai-right-now/
+   473→- HumanLayer: A Brief History of Ralph
+   474→  https://www.humanlayer.dev/blog/brief-history-of-ralph
+   475→
+   476→GitHub Repositories:
+   477→- ghuntley/how-to-ralph-wiggum (Official Playbook)
+   478→  https://github.com/ghuntley/how-to-ralph-wiggum
+   479→- HumanLayer ACE-FCA
+   480→  https://github.com/humanlayer/advanced-context-engineering-for-coding-agents
+   481→- snarktank/ralph
+   482→  https://github.com/snarktank/ralph
+   483→- mikeyobrien/ralph-orchestrator
+   484→  https://github.com/mikeyobrien/ralph-orchestrator
+   485→- frankbria/ralph-claude-code (463 stars)
+   486→  https://github.com/frankbria/ralph-claude-code
+   487→- agrimsingh/ralph-wiggum-cursor
+   488→  https://github.com/agrimsingh/ralph-wiggum-cursor
+   489→- snwfdhmp/awesome-ralph (Curated list)
+   490→  https://github.com/snwfdhmp/awesome-ralph
+   491→
+   492→Documentação Oficial:
+   493→- Claude Code Plugins: ralph-wiggum
+   494→  https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum
+   495→
+   496→Tutoriais e Guias:
+   497→- 11 Tips For AI Coding With Ralph Wiggum
+   498→  https://www.aihero.dev/tips-for-ai-coding-with-ralph-wiggum
+   499→- Ralph Wiggum Technique - Mechanics
+   500→  https://claudefa.st/blog/guide/mechanics/ralph-wiggum-technique
+   501→
+   502→================================================================================
+   503→PARTE 9: CHECKLIST DE VERIFICAÇÃO PÓS-IMPLEMENTAÇÃO
+   504→================================================================================
+   505→
+   506→Após implementar os fixes, verificar:
+   507→
+   508→# 1. IMPLEMENTATION_PLAN.md sob 25k tokens
+   509→wc -w ralph/IMPLEMENTATION_PLAN.md  # Deve ser < 15,000 palavras
+   510→
+   511→# 2. Circuit breaker tem defaults sãos
+   512→grep "CB_NO_PROGRESS_THRESHOLD" ralph/circuit-breaker.sh
+   513→grep "CB_MAX_COST_USD" ralph/circuit-breaker.sh
+   514→
+   515→# 3. NO_PUSH defaults corretamente
+   516→grep "NO_PUSH=" ralph/loop.sh
+   517→
+   518→# 4. PostToolUse tem Edit matcher
+   519→cat .claude/settings.json | grep -A5 "PostToolUse"
+   520→
+   521→# 5. Contagens de subagent são realísticas
+   522→grep -n "subagent" ralph/PROMPT_*.md
+   523→
+   524→# 6. Rodar validação do loop.sh
+   525→./ralph/loop.sh --help
+   526→./ralph/circuit-breaker.sh status
+   527→
+   528→================================================================================
+   529→FIM DO DOCUMENTO
+   530→================================================================================
+   531→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

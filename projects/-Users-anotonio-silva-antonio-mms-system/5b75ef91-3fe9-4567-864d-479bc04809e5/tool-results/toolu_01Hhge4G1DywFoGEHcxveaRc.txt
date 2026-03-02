@@ -1,0 +1,323 @@
+     1→/**
+     2→ * Authentication Middleware
+     3→ *
+     4→ * Provides JWT-based authentication for protected API routes.
+     5→ * Validates access tokens and populates user context for authorization.
+     6→ *
+     7→ * Usage:
+     8→ * - Apply `authMiddleware()` to routes requiring authentication
+     9→ * - Use `requireRole('ADMIN')` for role-based access control
+    10→ * - Use `requireDepotAccess()` for depot-scoped operations
+    11→ *
+    12→ * @see specs/005-api.md Section 5.2 (Authentication)
+    13→ */
+    14→
+    15→import type { Context, Next, MiddlewareHandler } from 'hono';
+    16→import { verify } from 'hono/jwt';
+    17→import type { AppVariables, AuthUser } from '../types';
+    18→import { getRequestId } from './request-context';
+    19→import { addUserContextToSpan } from './tracing';
+    20→import { error, ErrorCodes } from '../types';
+    21→import { AuthorizationError } from '../../lib/errors';
+    22→import type { JwtPayload } from '../../services/auth';
+    23→
+    24→/**
+    25→ * JWT secret - must match AuthService
+    26→ */
+    27→const JWT_SECRET = process.env.JWT_SECRET || 'mms-development-secret-change-in-production';
+    28→
+    29→/** JWT signing algorithm */
+    30→const JWT_ALGORITHM = 'HS256' as const;
+    31→
+    32→/**
+    33→ * Get authenticated user from context
+    34→ */
+    35→export function getAuthUser(c: Context<{ Variables: AppVariables }>): AuthUser | undefined {
+    36→  return c.get('user');
+    37→}
+    38→
+    39→/**
+    40→ * Require authenticated user - throws if not present
+    41→ */
+    42→export function requireAuthUser(c: Context<{ Variables: AppVariables }>): AuthUser {
+    43→  const user = c.get('user');
+    44→  if (!user) {
+    45→    throw new AuthorizationError('Authentication required');
+    46→  }
+    47→  return user;
+    48→}
+    49→
+    50→/**
+    51→ * Authentication middleware
+    52→ *
+    53→ * Validates Bearer token in Authorization header and populates user context.
+    54→ * Call this before any route handler that requires authentication.
+    55→ */
+    56→export function authMiddleware(): MiddlewareHandler<{ Variables: AppVariables }> {
+    57→  return async (c: Context<{ Variables: AppVariables }>, next: Next): Promise<Response | void> => {
+    58→    const requestId = getRequestId(c);
+    59→    const authHeader = c.req.header('authorization');
+    60→
+    61→    // Check for Authorization header
+    62→    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    63→      return c.json(
+    64→        error(
+    65→          ErrorCodes.UNAUTHORIZED,
+    66→          'Authorization header with Bearer token is required',
+    67→          requestId
+    68→        ),
+    69→        401 as const
+    70→      );
+    71→    }
+    72→
+    73→    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+    74→
+    75→    try {
+    76→      // Verify JWT token
+    77→      const verified = await verify(token, JWT_SECRET, JWT_ALGORITHM);
+    78→      const payload = verified as JwtPayload;
+    79→
+    80→      // Build user context
+    81→      const user: AuthUser = {
+    82→        id: payload.sub,
+    83→        email: payload.email,
+    84→        roles: payload.roles,
+    85→        depotId: payload.depotId || undefined,
+    86→      };
+    87→
+    88→      // Set user in context
+    89→      c.set('user', user);
+    90→
+    91→      // Add to OpenTelemetry span
+    92→      addUserContextToSpan(user);
+    93→
+    94→      await next();
+    95→    } catch (err) {
+    96→      if (err instanceof Error) {
+    97→        if (err.message.includes('expired')) {
+    98→          return c.json(
+    99→            error(ErrorCodes.UNAUTHORIZED, 'Access token has expired', requestId),
+   100→            401 as const
+   101→          );
+   102→        }
+   103→        if (err.message.includes('invalid') || err.message.includes('signature')) {
+   104→          return c.json(
+   105→            error(ErrorCodes.UNAUTHORIZED, 'Invalid access token', requestId),
+   106→            401 as const
+   107→          );
+   108→        }
+   109→      }
+   110→      return c.json(
+   111→        error(ErrorCodes.UNAUTHORIZED, 'Authentication failed', requestId),
+   112→        401 as const
+   113→      );
+   114→    }
+   115→  };
+   116→}
+   117→
+   118→/**
+   119→ * Optional authentication middleware
+   120→ *
+   121→ * Validates Bearer token if present but doesn't require it.
+   122→ * Populates user context when token is valid.
+   123→ */
+   124→export function optionalAuthMiddleware(): MiddlewareHandler<{ Variables: AppVariables }> {
+   125→  return async (c: Context<{ Variables: AppVariables }>, next: Next): Promise<void> => {
+   126→    const authHeader = c.req.header('authorization');
+   127→
+   128→    if (authHeader && authHeader.startsWith('Bearer ')) {
+   129→      const token = authHeader.substring(7);
+   130→
+   131→      try {
+   132→        const verified = await verify(token, JWT_SECRET, JWT_ALGORITHM);
+   133→        const payload = verified as JwtPayload;
+   134→
+   135→        const user: AuthUser = {
+   136→          id: payload.sub,
+   137→          email: payload.email,
+   138→          roles: payload.roles,
+   139→          depotId: payload.depotId || undefined,
+   140→        };
+   141→
+   142→        c.set('user', user);
+   143→        addUserContextToSpan(user);
+   144→      } catch {
+   145→        // Token is invalid but we don't require auth - continue without user context
+   146→      }
+   147→    }
+   148→
+   149→    await next();
+   150→  };
+   151→}
+   152→
+   153→/**
+   154→ * Role-based authorization middleware
+   155→ *
+   156→ * Requires user to have at least one of the specified roles.
+   157→ * Must be used after authMiddleware().
+   158→ *
+   159→ * @param allowedRoles - Array of role names that are permitted
+   160→ */
+   161→export function requireRole(
+   162→  ...allowedRoles: string[]
+   163→): MiddlewareHandler<{ Variables: AppVariables }> {
+   164→  return async (c: Context<{ Variables: AppVariables }>, next: Next): Promise<Response | void> => {
+   165→    const requestId = getRequestId(c);
+   166→    const user = c.get('user');
+   167→
+   168→    if (!user) {
+   169→      return c.json(
+   170→        error(ErrorCodes.UNAUTHORIZED, 'Authentication required', requestId),
+   171→        401 as const
+   172→      );
+   173→    }
+   174→
+   175→    // Check if user has at least one of the allowed roles
+   176→    const hasRole = user.roles.some((role) => allowedRoles.includes(role));
+   177→
+   178→    if (!hasRole) {
+   179→      return c.json(
+   180→        error(
+   181→          ErrorCodes.FORBIDDEN,
+   182→          `Access denied. Required role: ${allowedRoles.join(' or ')}`,
+   183→          requestId,
+   184→          { requiredRoles: allowedRoles, userRoles: user.roles }
+   185→        ),
+   186→        403 as const
+   187→      );
+   188→    }
+   189→
+   190→    await next();
+   191→  };
+   192→}
+   193→
+   194→/**
+   195→ * Depot access authorization middleware
+   196→ *
+   197→ * Validates that user has access to the depot specified in the request.
+   198→ * SYSTEM_ADMIN and PLANNER roles have access to all depots.
+   199→ *
+   200→ * @param depotIdParam - Name of the route parameter containing depot ID
+   201→ */
+   202→export function requireDepotAccess(
+   203→  depotIdParam: string = 'depotId'
+   204→): MiddlewareHandler<{ Variables: AppVariables }> {
+   205→  return async (c: Context<{ Variables: AppVariables }>, next: Next): Promise<Response | void> => {
+   206→    const requestId = getRequestId(c);
+   207→    const user = c.get('user');
+   208→
+   209→    if (!user) {
+   210→      return c.json(
+   211→        error(ErrorCodes.UNAUTHORIZED, 'Authentication required', requestId),
+   212→        401 as const
+   213→      );
+   214→    }
+   215→
+   216→    // System admins and planners can access all depots
+   217→    if (user.roles.includes('SYSTEM_ADMIN') || user.roles.includes('PLANNER')) {
+   218→      await next();
+   219→      return;
+   220→    }
+   221→
+   222→    // Get depot ID from route parameter or query
+   223→    const depotId = c.req.param(depotIdParam) || c.req.query(depotIdParam);
+   224→
+   225→    if (!depotId) {
+   226→      // No depot specified - allow access
+   227→      await next();
+   228→      return;
+   229→    }
+   230→
+   231→    // Check if user has access to this depot
+   232→    if (user.depotId && user.depotId !== depotId) {
+   233→      return c.json(
+   234→        error(
+   235→          ErrorCodes.FORBIDDEN,
+   236→          `Access denied to depot: ${depotId}`,
+   237→          requestId,
+   238→          { requestedDepot: depotId, userDepot: user.depotId }
+   239→        ),
+   240→        403 as const
+   241→      );
+   242→    }
+   243→
+   244→    await next();
+   245→  };
+   246→}
+   247→
+   248→/**
+   249→ * Permission-based authorization middleware
+   250→ *
+   251→ * Validates that user has specific permissions.
+   252→ * Permissions are stored in role definitions.
+   253→ *
+   254→ * @param resource - Resource name (e.g., 'pm_schedule')
+   255→ * @param action - Action name (e.g., 'write', 'delete')
+   256→ */
+   257→export function requirePermission(
+   258→  resource: string,
+   259→  action: string
+   260→): MiddlewareHandler<{ Variables: AppVariables }> {
+   261→  return async (c: Context<{ Variables: AppVariables }>, next: Next): Promise<Response | void> => {
+   262→    const requestId = getRequestId(c);
+   263→    const user = c.get('user');
+   264→
+   265→    if (!user) {
+   266→      return c.json(
+   267→        error(ErrorCodes.UNAUTHORIZED, 'Authentication required', requestId),
+   268→        401 as const
+   269→      );
+   270→    }
+   271→
+   272→    // System admins have all permissions
+   273→    if (user.roles.includes('SYSTEM_ADMIN')) {
+   274→      await next();
+   275→      return;
+   276→    }
+   277→
+   278→    // For now, permission checking is role-based
+   279→    // In a full implementation, we would look up role permissions from the database
+   280→    const permissionMap: Record<string, Record<string, string[]>> = {
+   281→      pm_schedule: {
+   282→        read: ['PLANNER', 'DEPOT_MANAGER', 'VIEWER'],
+   283→        write: ['PLANNER', 'DEPOT_MANAGER'],
+   284→        delete: ['PLANNER'],
+   285→      },
+   286→      baseline: {
+   287→        read: ['PLANNER', 'DEPOT_MANAGER', 'VIEWER'],
+   288→        write: ['PLANNER'],
+   289→        delete: ['PLANNER'],
+   290→      },
+   291→      train: {
+   292→        read: ['PLANNER', 'DEPOT_MANAGER', 'VIEWER', 'TECHNICIAN'],
+   293→        write: ['PLANNER', 'DEPOT_MANAGER'],
+   294→      },
+   295→      optimizer: {
+   296→        run: ['PLANNER'],
+   297→      },
+   298→    };
+   299→
+   300→    const allowedRoles = permissionMap[resource]?.[action] || [];
+   301→
+   302→    const hasPermission = user.roles.some((role) => allowedRoles.includes(role));
+   303→
+   304→    if (!hasPermission) {
+   305→      return c.json(
+   306→        error(
+   307→          ErrorCodes.FORBIDDEN,
+   308→          `Permission denied: ${resource}:${action}`,
+   309→          requestId,
+   310→          { resource, action, userRoles: user.roles }
+   311→        ),
+   312→        403 as const
+   313→      );
+   314→    }
+   315→
+   316→    await next();
+   317→  };
+   318→}
+   319→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

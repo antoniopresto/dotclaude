@@ -1,0 +1,599 @@
+     1→/**
+     2→ * PM Schedule Management Routes
+     3→ *
+     4→ * REST endpoints for PM schedule CRUD operations and history.
+     5→ * Wraps PMSchedulerService with HTTP interface per spec 005.5.
+     6→ *
+     7→ * Endpoints:
+     8→ * - GET /pm/schedule - List schedules with filtering
+     9→ * - GET /pm/schedule/:id - Get PM by ID
+    10→ * - POST /pm/schedule - Create new PM schedule
+    11→ * - PATCH /pm/schedule/:id - Update PM (reschedule, reassign)
+    12→ * - POST /pm/schedule/:id/lock - Lock PM to prevent optimizer changes
+    13→ * - POST /pm/schedule/:id/unlock - Unlock PM to allow optimizer changes
+    14→ * - GET /pm/schedule/:id/history - Get change history
+    15→ *
+    16→ * @see specs/005-api.md Section 5.5
+    17→ */
+    18→
+    19→import { Hono } from 'hono';
+    20→import { eq, and, gte, lte, isNull, count, desc } from 'drizzle-orm';
+    21→import type { SQL } from 'drizzle-orm';
+    22→import {
+    23→  success,
+    24→  paginatedSuccess,
+    25→  error,
+    26→  parsePaginationQuery,
+    27→  ErrorCodes,
+    28→  type AppVariables,
+    29→} from '../types';
+    30→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    31→import { getPMSchedulerService, type SchedulePmRequest, type MovePmRequest } from '../../services';
+    32→import { isValidUuid } from '../../lib/schemas';
+    33→import { db } from '../../lib/db/connection';
+    34→import { pmSchedule } from '../../lib/db/schema';
+    35→import { getWebSocketHub } from '../websocket';
+    36→
+    37→let pmSchedulerService: ReturnType<typeof getPMSchedulerService> | null = null;
+    38→
+    39→function getService(): ReturnType<typeof getPMSchedulerService> {
+    40→  if (!pmSchedulerService) {
+    41→    pmSchedulerService = getPMSchedulerService();
+    42→  }
+    43→  return pmSchedulerService;
+    44→}
+    45→
+    46→export const pmScheduleRoutes = new Hono<{ Variables: AppVariables }>();
+    47→
+    48→/**
+    49→ * GET /pm/schedule
+    50→ *
+    51→ * List PM schedules with filtering and pagination.
+    52→ *
+    53→ * Query Parameters:
+    54→ * - trainId: Filter by train
+    55→ * - depotId: Filter by assigned depot
+    56→ * - pmTypeId: Filter by PM type
+    57→ * - status: Filter by status (SCHEDULED, IN_PROGRESS, COMPLETED, DEFERRED, CANCELLED)
+    58→ * - fromDate: Target date from (inclusive)
+    59→ * - toDate: Target date to (inclusive)
+    60→ * - scenarioId: Get scenario schedule (null/omitted = production)
+    61→ */
+    62→pmScheduleRoutes.get('/pm/schedule', async (c) => {
+    63→  // Parse query filters
+    64→  const trainId = c.req.query('trainId');
+    65→  const depotId = c.req.query('depotId');
+    66→  const pmTypeId = c.req.query('pmTypeId');
+    67→  const status = c.req.query('status');
+    68→  const fromDate = c.req.query('fromDate');
+    69→  const toDate = c.req.query('toDate');
+    70→  const scenarioId = c.req.query('scenarioId');
+    71→
+    72→  // Build filter conditions
+    73→  const conditions: SQL<unknown>[] = [];
+    74→
+    75→  if (trainId && isValidUuid(trainId)) {
+    76→    conditions.push(eq(pmSchedule.trainId, trainId));
+    77→  }
+    78→  if (depotId && isValidUuid(depotId)) {
+    79→    conditions.push(eq(pmSchedule.assignedDepotId, depotId));
+    80→  }
+    81→  if (pmTypeId && isValidUuid(pmTypeId)) {
+    82→    conditions.push(eq(pmSchedule.pmTypeId, pmTypeId));
+    83→  }
+    84→  if (status) {
+    85→    const validStatuses = ['SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'DEFERRED', 'CANCELLED'] as const;
+    86→    if (validStatuses.includes(status as typeof validStatuses[number])) {
+    87→      conditions.push(eq(pmSchedule.status, status as typeof validStatuses[number]));
+    88→    }
+    89→  }
+    90→  if (fromDate) {
+    91→    conditions.push(gte(pmSchedule.targetDate, fromDate));
+    92→  }
+    93→  if (toDate) {
+    94→    conditions.push(lte(pmSchedule.targetDate, toDate));
+    95→  }
+    96→
+    97→  // Handle scenario filter
+    98→  if (scenarioId && isValidUuid(scenarioId)) {
+    99→    conditions.push(eq(pmSchedule.scenarioId, scenarioId));
+   100→  } else {
+   101→    // Default to production schedule (scenarioId is NULL)
+   102→    conditions.push(isNull(pmSchedule.scenarioId));
+   103→  }
+   104→
+   105→  // Parse pagination
+   106→  const pagination = parsePaginationQuery({
+   107→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   108→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   109→    sort: c.req.query('sort'),
+   110→  });
+   111→
+   112→  // Count total items
+   113→  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   114→  const totalResult = await db
+   115→    .select({ count: count() })
+   116→    .from(pmSchedule)
+   117→    .where(whereClause);
+   118→  const totalItems = totalResult[0]?.count ?? 0;
+   119→
+   120→  // Query with relations
+   121→  const schedules = await db.query.pmSchedule.findMany({
+   122→    where: whereClause,
+   123→    with: {
+   124→      train: true,
+   125→      pmType: true,
+   126→      assignedDepot: true,
+   127→      assignedTrack: true,
+   128→    },
+   129→    orderBy: desc(pmSchedule.targetDate),
+   130→    limit: pagination.pageSize,
+   131→    offset: pagination.offset,
+   132→  });
+   133→
+   134→  // Map to API response format
+   135→  const data = schedules.map((pm) => ({
+   136→    id: pm.id,
+   137→    train: pm.train
+   138→      ? {
+   139→          id: pm.train.id,
+   140→          trainNumber: pm.train.trainNumber,
+   141→          fleetCode: pm.train.fleetId, // TODO: Get fleet code from relation
+   142→        }
+   143→      : null,
+   144→    pmType: pm.pmType
+   145→      ? {
+   146→          id: pm.pmType.id,
+   147→          code: pm.pmType.pmCode,
+   148→          name: pm.pmType.pmName,
+   149→          estimatedHours: pm.pmType.estimatedHours,
+   150→        }
+   151→      : null,
+   152→    targetDate: pm.targetDate,
+   153→    targetMileageKm: pm.targetMileageKm,
+   154→    status: pm.status,
+   155→    constraintStart: pm.constraintStart,
+   156→    constraintEnd: pm.constraintEnd,
+   157→    assignedDepot: pm.assignedDepot
+   158→      ? {
+   159→          id: pm.assignedDepot.id,
+   160→          code: pm.assignedDepot.code,
+   161→        }
+   162→      : null,
+   163→    assignedTrack: pm.assignedTrack
+   164→      ? {
+   165→          id: pm.assignedTrack.id,
+   166→          trackNumber: pm.assignedTrack.trackNumber,
+   167→          trackType: pm.assignedTrack.trackType,
+   168→        }
+   169→      : null,
+   170→    assignedHours: pm.assignedHours ? Number(pm.assignedHours) : null,
+   171→    isLocked: pm.isLocked ?? false,
+   172→    maximoWoId: pm.maximoWoId,
+   173→  }));
+   174→
+   175→  return c.json(
+   176→    paginatedSuccess(
+   177→      data,
+   178→      {
+   179→        page: pagination.page,
+   180→        pageSize: pagination.pageSize,
+   181→        totalItems,
+   182→      },
+   183→      { durationMs: getRequestDuration(c) }
+   184→    )
+   185→  );
+   186→});
+   187→
+   188→/**
+   189→ * GET /pm/schedule/:id
+   190→ *
+   191→ * Get PM schedule details by ID.
+   192→ */
+   193→pmScheduleRoutes.get('/pm/schedule/:id', async (c) => {
+   194→  const requestId = getRequestId(c);
+   195→  const pmId = c.req.param('id');
+   196→
+   197→  if (!isValidUuid(pmId)) {
+   198→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid PM schedule ID format', requestId), 400);
+   199→  }
+   200→
+   201→  const service = getService();
+   202→  const pmResult = await service.getPm(pmId);
+   203→
+   204→  // Cast to include all query relations (service returns more than type declares)
+   205→  const pm = pmResult as typeof pmResult & {
+   206→    assignedDepot: { id: string; code: string; name: string } | null;
+   207→  };
+   208→
+   209→  // Check material availability for upcoming PMs
+   210→  let materialStatus = { allAvailable: true, warnings: [] as string[] };
+   211→  if (pm.status === 'SCHEDULED' && pm.assignedDepotId) {
+   212→    try {
+   213→      const materialResult = await service.checkMaterialAvailability(
+   214→        pm.pmTypeId,
+   215→        pm.assignedDepotId,
+   216→        pm.targetDate
+   217→      );
+   218→      materialStatus = {
+   219→        allAvailable: !materialResult.isBlocked && materialResult.softConstraintWarnings.length === 0,
+   220→        warnings: [
+   221→          ...materialResult.hardConstraintViolations.map((v) => `Blocked: ${v.partNumber} (need ${v.requiredQuantity}, have ${v.availableQuantity})`),
+   222→          ...materialResult.softConstraintWarnings.map((v) => `Warning: ${v.partNumber} may not be available`),
+   223→        ],
+   224→      };
+   225→    } catch {
+   226→      // Material check failed, assume available
+   227→    }
+   228→  }
+   229→
+   230→  return c.json(
+   231→    success({
+   232→      id: pm.id,
+   233→      train: pm.train
+   234→        ? {
+   235→            id: pm.train.id,
+   236→            trainNumber: pm.train.trainNumber,
+   237→            fleetId: pm.train.fleetId,
+   238→          }
+   239→        : null,
+   240→      pmType: pm.pmType
+   241→        ? {
+   242→            id: pm.pmType.id,
+   243→            code: pm.pmType.pmCode,
+   244→            name: pm.pmType.pmName,
+   245→            estimatedHours: pm.pmType.estimatedHours,
+   246→          }
+   247→        : null,
+   248→      targetDate: pm.targetDate,
+   249→      targetMileageKm: pm.targetMileageKm,
+   250→      status: pm.status,
+   251→      constraintStart: pm.constraintStart,
+   252→      constraintEnd: pm.constraintEnd,
+   253→      assignedDepot: pm.assignedDepot
+   254→        ? {
+   255→            id: pm.assignedDepot.id,
+   256→            code: pm.assignedDepot.code,
+   257→            name: pm.assignedDepot.name,
+   258→          }
+   259→        : null,
+   260→      assignedTrack: pm.assignedTrack
+   261→        ? {
+   262→            id: pm.assignedTrack.id,
+   263→            trackNumber: pm.assignedTrack.trackNumber,
+   264→            trackType: pm.assignedTrack.trackType,
+   265→          }
+   266→        : null,
+   267→      assignedHours: pm.assignedHours ? Number(pm.assignedHours) : null,
+   268→      assignedShift: pm.assignedShift,
+   269→      isLocked: pm.isLocked ?? false,
+   270→      lockedReason: pm.lockedReason,
+   271→      maximoWoId: pm.maximoWoId,
+   272→      materialStatus,
+   273→      actualStartDate: pm.actualStartDate,
+   274→      actualEndDate: pm.actualEndDate,
+   275→      actualHours: pm.actualHours ? Number(pm.actualHours) : null,
+   276→      completedAt: pm.completedAt,
+   277→      completedMileageKm: pm.completedMileageKm,
+   278→      createdAt: pm.createdAt,
+   279→      updatedAt: pm.updatedAt,
+   280→    })
+   281→  );
+   282→});
+   283→
+   284→/**
+   285→ * POST /pm/schedule
+   286→ *
+   287→ * Create a new PM schedule entry.
+   288→ *
+   289→ * Request body:
+   290→ * - trainId: UUID of train
+   291→ * - pmTypeId: UUID of PM type
+   292→ * - targetDate: Target date (YYYY-MM-DD)
+   293→ * - assignedDepotId?: UUID of assigned depot
+   294→ * - assignedTrackId?: UUID of assigned track
+   295→ * - scenarioId?: UUID of scenario (null for production)
+   296→ * - reason?: Reason for manual scheduling
+   297→ */
+   298→pmScheduleRoutes.post('/pm/schedule', async (c) => {
+   299→  const requestId = getRequestId(c);
+   300→  const body = await c.req.json();
+   301→
+   302→  // Validate required fields
+   303→  if (!body.trainId || !isValidUuid(body.trainId)) {
+   304→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'trainId is required and must be a valid UUID', requestId), 400);
+   305→  }
+   306→  if (!body.pmTypeId || !isValidUuid(body.pmTypeId)) {
+   307→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'pmTypeId is required and must be a valid UUID', requestId), 400);
+   308→  }
+   309→  if (!body.targetDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.targetDate)) {
+   310→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'targetDate is required and must be in YYYY-MM-DD format', requestId), 400);
+   311→  }
+   312→
+   313→  // Validate optional UUIDs
+   314→  if (body.assignedDepotId && !isValidUuid(body.assignedDepotId)) {
+   315→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'assignedDepotId must be a valid UUID', requestId), 400);
+   316→  }
+   317→  if (body.assignedTrackId && !isValidUuid(body.assignedTrackId)) {
+   318→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'assignedTrackId must be a valid UUID', requestId), 400);
+   319→  }
+   320→
+   321→  const service = getService();
+   322→  const user = c.get('user');
+   323→
+   324→  const request: SchedulePmRequest = {
+   325→    trainId: body.trainId,
+   326→    pmTypeId: body.pmTypeId,
+   327→    targetDate: body.targetDate,
+   328→    assignedDepotId: body.assignedDepotId,
+   329→    assignedTrackId: body.assignedTrackId,
+   330→    assignedShift: body.assignedShift,
+   331→    notes: body.reason,
+   332→    createdBy: user?.id,
+   333→  };
+   334→
+   335→  const created = await service.schedulePm(request);
+   336→
+   337→  return c.json(
+   338→    success({
+   339→      id: created.id,
+   340→      trainId: created.trainId,
+   341→      pmTypeId: created.pmTypeId,
+   342→      targetDate: created.targetDate,
+   343→      targetMileageKm: created.targetMileageKm,
+   344→      status: created.status,
+   345→      constraintStart: created.constraintStart,
+   346→      constraintEnd: created.constraintEnd,
+   347→      assignedDepotId: created.assignedDepotId,
+   348→      assignedTrackId: created.assignedTrackId,
+   349→      assignedHours: created.assignedHours ? Number(created.assignedHours) : null,
+   350→      createdAt: created.createdAt,
+   351→    }),
+   352→    201
+   353→  );
+   354→});
+   355→
+   356→/**
+   357→ * PATCH /pm/schedule/:id
+   358→ *
+   359→ * Update a PM schedule entry (move, reassign).
+   360→ *
+   361→ * Request body:
+   362→ * - targetDate?: New target date
+   363→ * - assignedTrackId?: New track assignment
+   364→ * - reason: Reason for change (required)
+   365→ */
+   366→pmScheduleRoutes.patch('/pm/schedule/:id', async (c) => {
+   367→  const requestId = getRequestId(c);
+   368→  const pmId = c.req.param('id');
+   369→
+   370→  if (!isValidUuid(pmId)) {
+   371→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid PM schedule ID format', requestId), 400);
+   372→  }
+   373→
+   374→  const body = await c.req.json();
+   375→
+   376→  // Validate reason is provided
+   377→  if (!body.reason || typeof body.reason !== 'string' || body.reason.trim().length === 0) {
+   378→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'reason is required for PM changes', requestId), 400);
+   379→  }
+   380→
+   381→  // Validate targetDate if provided
+   382→  if (body.targetDate && !/^\d{4}-\d{2}-\d{2}$/.test(body.targetDate)) {
+   383→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'targetDate must be in YYYY-MM-DD format', requestId), 400);
+   384→  }
+   385→
+   386→  // Validate assignedTrackId if provided
+   387→  if (body.assignedTrackId && !isValidUuid(body.assignedTrackId)) {
+   388→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'assignedTrackId must be a valid UUID', requestId), 400);
+   389→  }
+   390→
+   391→  const service = getService();
+   392→  const user = c.get('user');
+   393→
+   394→  // Get current PM to capture old values
+   395→  const currentPm = await service.getPm(pmId);
+   396→
+   397→  // Only proceed if targetDate is being changed
+   398→  if (!body.targetDate) {
+   399→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'targetDate is required for PM move', requestId), 400);
+   400→  }
+   401→
+   402→  const request: MovePmRequest = {
+   403→    pmScheduleId: pmId,
+   404→    newTargetDate: body.targetDate,
+   405→    newTrackId: body.assignedTrackId,
+   406→    reason: body.reason,
+   407→    movedBy: user?.id ?? 'system',
+   408→  };
+   409→
+   410→  const updated = await service.movePm(request);
+   411→
+   412→  // Calculate impact assessment
+   413→  const impactAssessment = {
+   414→    complianceStatus: updated.targetDate >= updated.constraintStart && updated.targetDate <= updated.constraintEnd
+   415→      ? 'WITHIN_WINDOW'
+   416→      : 'OUTSIDE_WINDOW',
+   417→    manhourImpact: 0, // TODO: Calculate actual impact
+   418→    conflictsCreated: 0, // TODO: Check for new conflicts
+   419→  };
+   420→
+   421→  // Broadcast PM update to all connected canvas subscribers
+   422→  const hub = getWebSocketHub();
+   423→  hub.broadcastPmUpdated({
+   424→    pmId: updated.id,
+   425→    trainId: updated.trainId,
+   426→    trainNumber: currentPm.train?.trainNumber ?? 'Unknown',
+   427→    changes: [
+   428→      { field: 'targetDate', oldValue: currentPm.targetDate, newValue: updated.targetDate },
+   429→      ...(body.assignedTrackId && body.assignedTrackId !== currentPm.assignedTrackId
+   430→        ? [{ field: 'assignedTrackId', oldValue: currentPm.assignedTrackId, newValue: body.assignedTrackId }]
+   431→        : []),
+   432→    ],
+   433→    changedBy: {
+   434→      userId: user?.id ?? 'system',
+   435→      displayName: user?.email ?? 'System',
+   436→    },
+   437→  });
+   438→
+   439→  return c.json(
+   440→    success({
+   441→      id: updated.id,
+   442→      targetDate: updated.targetDate,
+   443→      previousTargetDate: currentPm.targetDate,
+   444→      assignedTrackId: updated.assignedTrackId,
+   445→      previousTrackId: currentPm.assignedTrackId,
+   446→      updatedAt: updated.updatedAt,
+   447→      updatedBy: user?.id,
+   448→      explanation: {
+   449→        changeType: 'DATE_CHANGED',
+   450→        reason: body.reason,
+   451→        impactAssessment,
+   452→      },
+   453→    })
+   454→  );
+   455→});
+   456→
+   457→/**
+   458→ * POST /pm/schedule/:id/lock
+   459→ *
+   460→ * Lock a PM to prevent optimizer changes.
+   461→ *
+   462→ * Request body:
+   463→ * - reason: Reason for locking (required)
+   464→ */
+   465→pmScheduleRoutes.post('/pm/schedule/:id/lock', async (c) => {
+   466→  const requestId = getRequestId(c);
+   467→  const pmId = c.req.param('id');
+   468→
+   469→  if (!isValidUuid(pmId)) {
+   470→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid PM schedule ID format', requestId), 400);
+   471→  }
+   472→
+   473→  const body = await c.req.json();
+   474→
+   475→  if (!body.reason || typeof body.reason !== 'string' || body.reason.trim().length === 0) {
+   476→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'reason is required for locking', requestId), 400);
+   477→  }
+   478→
+   479→  const service = getService();
+   480→  const user = c.get('user');
+   481→
+   482→  // Get PM with train details for broadcast
+   483→  const pm = await service.getPm(pmId);
+   484→
+   485→  const updated = await service.lockPm(pmId, body.reason, user?.id ?? 'system');
+   486→
+   487→  // Broadcast lock event to all connected canvas subscribers
+   488→  const hub = getWebSocketHub();
+   489→  hub.broadcastPmLocked({
+   490→    pmId: updated.id,
+   491→    trainId: pm.trainId,
+   492→    trainNumber: pm.train?.trainNumber ?? 'Unknown',
+   493→    isLocked: true,
+   494→    lockedReason: body.reason,
+   495→    lockedBy: {
+   496→      userId: user?.id ?? 'system',
+   497→      displayName: user?.email ?? 'System',
+   498→    },
+   499→  });
+   500→
+   501→  return c.json(
+   502→    success({
+   503→      id: updated.id,
+   504→      isLocked: updated.isLocked,
+   505→      lockedReason: updated.lockedReason,
+   506→      lockedBy: updated.lockedBy,
+   507→      lockedAt: updated.lockedAt,
+   508→    })
+   509→  );
+   510→});
+   511→
+   512→/**
+   513→ * POST /pm/schedule/:id/unlock
+   514→ *
+   515→ * Unlock a PM to allow optimizer changes.
+   516→ */
+   517→pmScheduleRoutes.post('/pm/schedule/:id/unlock', async (c) => {
+   518→  const requestId = getRequestId(c);
+   519→  const pmId = c.req.param('id');
+   520→
+   521→  if (!isValidUuid(pmId)) {
+   522→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid PM schedule ID format', requestId), 400);
+   523→  }
+   524→
+   525→  const service = getService();
+   526→  const user = c.get('user');
+   527→
+   528→  // Get PM with train details for broadcast
+   529→  const pm = await service.getPm(pmId);
+   530→
+   531→  const updated = await service.unlockPm(pmId, user?.id ?? 'system');
+   532→
+   533→  // Broadcast unlock event to all connected canvas subscribers
+   534→  const hub = getWebSocketHub();
+   535→  hub.broadcastPmLocked({
+   536→    pmId: updated.id,
+   537→    trainId: pm.trainId,
+   538→    trainNumber: pm.train?.trainNumber ?? 'Unknown',
+   539→    isLocked: false,
+   540→    lockedBy: {
+   541→      userId: user?.id ?? 'system',
+   542→      displayName: user?.email ?? 'System',
+   543→    },
+   544→  });
+   545→
+   546→  return c.json(
+   547→    success({
+   548→      id: updated.id,
+   549→      isLocked: updated.isLocked,
+   550→      lockedReason: updated.lockedReason,
+   551→      lockedBy: updated.lockedBy,
+   552→      lockedAt: updated.lockedAt,
+   553→    })
+   554→  );
+   555→});
+   556→
+   557→/**
+   558→ * GET /pm/schedule/:id/history
+   559→ *
+   560→ * Get change history for a PM.
+   561→ */
+   562→pmScheduleRoutes.get('/pm/schedule/:id/history', async (c) => {
+   563→  const requestId = getRequestId(c);
+   564→  const pmId = c.req.param('id');
+   565→
+   566→  if (!isValidUuid(pmId)) {
+   567→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid PM schedule ID format', requestId), 400);
+   568→  }
+   569→
+   570→  const service = getService();
+   571→  const history = await service.getPmHistory(pmId);
+   572→
+   573→  const data = history.map((entry) => ({
+   574→    id: entry.id,
+   575→    changeType: entry.changeType,
+   576→    oldTargetDate: entry.oldTargetDate,
+   577→    newTargetDate: entry.newTargetDate,
+   578→    oldStatus: entry.oldStatus,
+   579→    newStatus: entry.newStatus,
+   580→    oldAssignedTrackId: entry.oldAssignedTrackId,
+   581→    newAssignedTrackId: entry.newAssignedTrackId,
+   582→    changedBy: entry.changedByUser
+   583→      ? {
+   584→          id: entry.changedByUser.id,
+   585→          displayName: entry.changedByUser.displayName,
+   586→        }
+   587→      : null,
+   588→    changedAt: entry.changedAt,
+   589→    changeReason: entry.changeReason,
+   590→    changeSource: entry.changeSource,
+   591→  }));
+   592→
+   593→  return c.json(success(data));
+   594→});
+   595→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

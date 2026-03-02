@@ -1,0 +1,376 @@
+     1→/**
+     2→ * Export Routes Tests
+     3→ *
+     4→ * Tests for the Export API endpoints.
+     5→ *
+     6→ * @see specs/005-api.md Section 5.15
+     7→ */
+     8→
+     9→import { describe, it, expect, beforeEach, mock } from 'bun:test';
+    10→import { Hono } from 'hono';
+    11→import { exportRoutes } from './export';
+    12→import type { AppVariables } from '../types';
+    13→
+    14→// Mock the queue module - import real module and override only what's needed
+    15→import * as realQueue from '../../lib/queue';
+    16→mock.module('../../lib/queue', () => ({
+    17→  ...realQueue,
+    18→  addJob: mock(() => Promise.resolve({ id: 'test-job-id' })),
+    19→  getJob: mock(() => Promise.resolve(null)),
+    20→}));
+    21→
+    22→// Mock the logger - import real module and preserve other exports
+    23→import * as realLogger from '../../lib/logging/logger';
+    24→mock.module('../../lib/logging/logger', () => ({
+    25→  ...realLogger,
+    26→  logger: {
+    27→    info: mock(() => {}),
+    28→    debug: mock(() => {}),
+    29→    warn: mock(() => {}),
+    30→    error: mock(() => {}),
+    31→    child: mock(() => ({
+    32→      info: mock(() => {}),
+    33→      debug: mock(() => {}),
+    34→      warn: mock(() => {}),
+    35→      error: mock(() => {}),
+    36→    })),
+    37→  },
+    38→}));
+    39→
+    40→// Mock the tracing module - import real module and override only what's needed
+    41→import * as realTracing from '../../lib/tracing';
+    42→mock.module('../../lib/tracing', () => ({
+    43→  ...realTracing,
+    44→  withSpan: mock((_name: string, fn: () => unknown) => fn()),
+    45→}));
+    46→
+    47→// Mock the request-context middleware
+    48→mock.module('../middleware/request-context', () => ({
+    49→  getRequestId: mock(() => 'test-request-id'),
+    50→  getRequestDuration: mock(() => 42),
+    51→}));
+    52→
+    53→describe('Export Routes', () => {
+    54→  let app: Hono<{ Variables: AppVariables }>;
+    55→
+    56→  beforeEach(() => {
+    57→    app = new Hono<{ Variables: AppVariables }>();
+    58→    app.route('/', exportRoutes);
+    59→  });
+    60→
+    61→  describe('POST /export/pm-schedule', () => {
+    62→    it('should queue a PM schedule export with xlsx format', async () => {
+    63→      const res = await app.request('/export/pm-schedule', {
+    64→        method: 'POST',
+    65→        headers: { 'Content-Type': 'application/json' },
+    66→        body: JSON.stringify({
+    67→          format: 'xlsx',
+    68→        }),
+    69→      });
+    70→
+    71→      expect(res.status).toBe(202);
+    72→
+    73→      const body = await res.json();
+    74→      expect(body.success).toBe(true);
+    75→      expect(body.data.jobId).toMatch(/^export-/);
+    76→      expect(body.data.status).toBe('QUEUED');
+    77→      expect(body.data.estimatedSizeBytes).toBeGreaterThan(0);
+    78→    });
+    79→
+    80→    it('should queue a PM schedule export with csv format', async () => {
+    81→      const res = await app.request('/export/pm-schedule', {
+    82→        method: 'POST',
+    83→        headers: { 'Content-Type': 'application/json' },
+    84→        body: JSON.stringify({
+    85→          format: 'csv',
+    86→        }),
+    87→      });
+    88→
+    89→      expect(res.status).toBe(202);
+    90→
+    91→      const body = await res.json();
+    92→      expect(body.success).toBe(true);
+    93→      expect(body.data.status).toBe('QUEUED');
+    94→    });
+    95→
+    96→    it('should queue export with filters', async () => {
+    97→      const res = await app.request('/export/pm-schedule', {
+    98→        method: 'POST',
+    99→        headers: { 'Content-Type': 'application/json' },
+   100→        body: JSON.stringify({
+   101→          format: 'xlsx',
+   102→          filters: {
+   103→            depotId: 'depot-bishan',
+   104→            fromDate: '2026-01-01',
+   105→            toDate: '2026-12-31',
+   106→          },
+   107→        }),
+   108→      });
+   109→
+   110→      expect(res.status).toBe(202);
+   111→
+   112→      const body = await res.json();
+   113→      expect(body.success).toBe(true);
+   114→    });
+   115→
+   116→    it('should queue export with custom columns', async () => {
+   117→      const res = await app.request('/export/pm-schedule', {
+   118→        method: 'POST',
+   119→        headers: { 'Content-Type': 'application/json' },
+   120→        body: JSON.stringify({
+   121→          format: 'xlsx',
+   122→          columns: ['trainNumber', 'pmCode', 'targetDate', 'status', 'assignedTrack'],
+   123→        }),
+   124→      });
+   125→
+   126→      expect(res.status).toBe(202);
+   127→
+   128→      const body = await res.json();
+   129→      expect(body.success).toBe(true);
+   130→    });
+   131→
+   132→    it('should return 400 for missing format', async () => {
+   133→      const res = await app.request('/export/pm-schedule', {
+   134→        method: 'POST',
+   135→        headers: { 'Content-Type': 'application/json' },
+   136→        body: JSON.stringify({}),
+   137→      });
+   138→
+   139→      expect(res.status).toBe(400);
+   140→
+   141→      const body = await res.json();
+   142→      expect(body.success).toBe(false);
+   143→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   144→    });
+   145→
+   146→    it('should return 400 for invalid format', async () => {
+   147→      const res = await app.request('/export/pm-schedule', {
+   148→        method: 'POST',
+   149→        headers: { 'Content-Type': 'application/json' },
+   150→        body: JSON.stringify({
+   151→          format: 'pdf',
+   152→        }),
+   153→      });
+   154→
+   155→      expect(res.status).toBe(400);
+   156→
+   157→      const body = await res.json();
+   158→      expect(body.success).toBe(false);
+   159→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   160→    });
+   161→  });
+   162→
+   163→  describe('POST /export/report', () => {
+   164→    it('should queue a weekly compliance report', async () => {
+   165→      const res = await app.request('/export/report', {
+   166→        method: 'POST',
+   167→        headers: { 'Content-Type': 'application/json' },
+   168→        body: JSON.stringify({
+   169→          reportType: 'WEEKLY_COMPLIANCE',
+   170→          parameters: {
+   171→            depotId: 'depot-bishan',
+   172→            weekOf: '2026-01-13',
+   173→          },
+   174→        }),
+   175→      });
+   176→
+   177→      expect(res.status).toBe(202);
+   178→
+   179→      const body = await res.json();
+   180→      expect(body.success).toBe(true);
+   181→      expect(body.data.jobId).toMatch(/^report-/);
+   182→      expect(body.data.status).toBe('QUEUED');
+   183→    });
+   184→
+   185→    it('should queue a fleet status report', async () => {
+   186→      const res = await app.request('/export/report', {
+   187→        method: 'POST',
+   188→        headers: { 'Content-Type': 'application/json' },
+   189→        body: JSON.stringify({
+   190→          reportType: 'FLEET_STATUS',
+   191→        }),
+   192→      });
+   193→
+   194→      expect(res.status).toBe(202);
+   195→
+   196→      const body = await res.json();
+   197→      expect(body.success).toBe(true);
+   198→    });
+   199→
+   200→    it('should queue a TCO projection report', async () => {
+   201→      const res = await app.request('/export/report', {
+   202→        method: 'POST',
+   203→        headers: { 'Content-Type': 'application/json' },
+   204→        body: JSON.stringify({
+   205→          reportType: 'TCO_PROJECTION',
+   206→          parameters: {
+   207→            fleetId: 'fleet-001',
+   208→          },
+   209→        }),
+   210→      });
+   211→
+   212→      expect(res.status).toBe(202);
+   213→
+   214→      const body = await res.json();
+   215→      expect(body.success).toBe(true);
+   216→    });
+   217→
+   218→    it('should return 400 for missing reportType', async () => {
+   219→      const res = await app.request('/export/report', {
+   220→        method: 'POST',
+   221→        headers: { 'Content-Type': 'application/json' },
+   222→        body: JSON.stringify({}),
+   223→      });
+   224→
+   225→      expect(res.status).toBe(400);
+   226→
+   227→      const body = await res.json();
+   228→      expect(body.success).toBe(false);
+   229→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   230→    });
+   231→
+   232→    it('should return 400 for invalid reportType', async () => {
+   233→      const res = await app.request('/export/report', {
+   234→        method: 'POST',
+   235→        headers: { 'Content-Type': 'application/json' },
+   236→        body: JSON.stringify({
+   237→          reportType: 'INVALID_REPORT',
+   238→        }),
+   239→      });
+   240→
+   241→      expect(res.status).toBe(400);
+   242→
+   243→      const body = await res.json();
+   244→      expect(body.success).toBe(false);
+   245→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   246→    });
+   247→  });
+   248→
+   249→  describe('GET /export/:jobId', () => {
+   250→    it('should return job status for existing job', async () => {
+   251→      // First create a job
+   252→      const createRes = await app.request('/export/pm-schedule', {
+   253→        method: 'POST',
+   254→        headers: { 'Content-Type': 'application/json' },
+   255→        body: JSON.stringify({ format: 'xlsx' }),
+   256→      });
+   257→      const createBody = await createRes.json();
+   258→      const jobId = createBody.data.jobId;
+   259→
+   260→      // Get its status
+   261→      const res = await app.request(`/export/${jobId}`);
+   262→
+   263→      expect(res.status).toBe(200);
+   264→
+   265→      const body = await res.json();
+   266→      expect(body.success).toBe(true);
+   267→      expect(body.data.jobId).toBe(jobId);
+   268→      expect(body.data.status).toBe('QUEUED');
+   269→    });
+   270→
+   271→    it('should return 404 for non-existent job', async () => {
+   272→      const res = await app.request('/export/non-existent-job');
+   273→
+   274→      expect(res.status).toBe(404);
+   275→
+   276→      const body = await res.json();
+   277→      expect(body.success).toBe(false);
+   278→      expect(body.error.code).toBe('NOT_FOUND');
+   279→    });
+   280→  });
+   281→
+   282→  describe('GET /export/jobs', () => {
+   283→    it('should list export jobs', async () => {
+   284→      // Create a job first
+   285→      await app.request('/export/pm-schedule', {
+   286→        method: 'POST',
+   287→        headers: { 'Content-Type': 'application/json' },
+   288→        body: JSON.stringify({ format: 'xlsx' }),
+   289→      });
+   290→
+   291→      const res = await app.request('/export/jobs');
+   292→
+   293→      expect(res.status).toBe(200);
+   294→
+   295→      const body = await res.json();
+   296→      expect(body.success).toBe(true);
+   297→      expect(Array.isArray(body.data)).toBe(true);
+   298→      expect(body.meta?.pagination).toBeDefined();
+   299→    });
+   300→
+   301→    it('should support pagination', async () => {
+   302→      const res = await app.request('/export/jobs?page=1&pageSize=5');
+   303→
+   304→      expect(res.status).toBe(200);
+   305→
+   306→      const body = await res.json();
+   307→      expect(body.meta?.pagination.page).toBe(1);
+   308→      expect(body.meta?.pagination.pageSize).toBe(5);
+   309→    });
+   310→
+   311→    it('should filter by status', async () => {
+   312→      const res = await app.request('/export/jobs?status=QUEUED');
+   313→
+   314→      expect(res.status).toBe(200);
+   315→
+   316→      const body = await res.json();
+   317→      expect(body.success).toBe(true);
+   318→      // All returned jobs should have QUEUED status
+   319→      body.data.forEach((job: { status: string }) => {
+   320→        expect(job.status).toBe('QUEUED');
+   321→      });
+   322→    });
+   323→
+   324→    it('should filter by type', async () => {
+   325→      // Create both types of jobs
+   326→      await app.request('/export/pm-schedule', {
+   327→        method: 'POST',
+   328→        headers: { 'Content-Type': 'application/json' },
+   329→        body: JSON.stringify({ format: 'xlsx' }),
+   330→      });
+   331→
+   332→      await app.request('/export/report', {
+   333→        method: 'POST',
+   334→        headers: { 'Content-Type': 'application/json' },
+   335→        body: JSON.stringify({ reportType: 'FLEET_STATUS' }),
+   336→      });
+   337→
+   338→      const pmRes = await app.request('/export/jobs?type=pm_schedule');
+   339→      const reportRes = await app.request('/export/jobs?type=report');
+   340→
+   341→      expect(pmRes.status).toBe(200);
+   342→      expect(reportRes.status).toBe(200);
+   343→
+   344→      const pmBody = await pmRes.json();
+   345→      const reportBody = await reportRes.json();
+   346→
+   347→      pmBody.data.forEach((job: { type: string }) => {
+   348→        expect(job.type).toBe('pm_schedule');
+   349→      });
+   350→
+   351→      reportBody.data.forEach((job: { type: string }) => {
+   352→        expect(job.type).toBe('report');
+   353→      });
+   354→    });
+   355→  });
+   356→
+   357→  describe('POST /export/cleanup', () => {
+   358→    it('should trigger cleanup and return count', async () => {
+   359→      const res = await app.request('/export/cleanup', {
+   360→        method: 'POST',
+   361→      });
+   362→
+   363→      expect(res.status).toBe(200);
+   364→
+   365→      const body = await res.json();
+   366→      expect(body.success).toBe(true);
+   367→      expect(body.data.message).toBe('Cleanup completed');
+   368→      expect(typeof body.data.cleanedCount).toBe('number');
+   369→    });
+   370→  });
+   371→});
+   372→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

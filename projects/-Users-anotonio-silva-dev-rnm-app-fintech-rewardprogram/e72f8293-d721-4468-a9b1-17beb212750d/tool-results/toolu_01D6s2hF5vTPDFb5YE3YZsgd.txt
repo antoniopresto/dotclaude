@@ -1,0 +1,406 @@
+     1→import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+     2→import { InteractionManager, NativeSyntheticEvent, NativeScrollEvent } from 'react-native';
+     3→import { useFocusEffect } from '@react-navigation/native';
+     4→import { useShallow } from 'zustand/react/shallow';
+     5→import type { PropsModalizeRef } from '@semparar/design-system-app/src/@types/modelize';
+     6→import type { propsItemsListCardTransition } from '@semparar/design-system-app/src/atomic/organisms/ListCardTransition/Models';
+     7→import { getPointsExtract, getPointsBalance } from '../../services/services';
+     8→import {
+     9→  PointsExtractStatus,
+    10→  PointsBalanceStatus,
+    11→  type AppliedFilters,
+    12→  type PointsTransaction,
+    13→} from '../../services/models';
+    14→import { eventScreenViewV3, eventSelectContent } from '../../constants/functions';
+    15→import { EXTRACT_CONSTANTS } from '../../services/constants';
+    16→import { ANALYTICS_EVENTS, SCREEN_STRINGS } from './data';
+    17→import type {
+    18→  ExtractRewardProgramProps,
+    19→  UseExtractRewardProgramReturn,
+    20→  FilterGroup,
+    21→} from './Models';
+    22→import { PERIOD_DAYS_MAP } from './Models';
+    23→import { useRootStore } from '~/store';
+    24→import { getFilteredTransactions, getFilteredTransactionsByText } from './utils';
+    25→import { processPointsExtractData } from '../../services/repository';
+    26→import useDebounce from '../../hooks/useDebounce';
+    27→
+    28→const SCROLL_THRESHOLD = 300;
+    29→
+    30→export function useExtractRewardProgramScreen(
+    31→  params?: ExtractRewardProgramProps,
+    32→): UseExtractRewardProgramReturn {
+    33→  const hasTrackedScreenView = useRef(false);
+    34→  const hasTrackedSearchPress = useRef(false);
+    35→  const canLoadMoreRef = useRef(false);
+    36→  const isLoadingMoreRef = useRef(false);
+    37→
+    38→  const modalizeRefInfo = useRef<PropsModalizeRef>(null as unknown as PropsModalizeRef);
+    39→  const modalizeRefFilters = useRef<PropsModalizeRef>(null as unknown as PropsModalizeRef);
+    40→
+    41→  const [isRefreshing, setIsRefreshing] = useState(false);
+    42→  const [transactionsData, setTransactionsData] = useState<propsItemsListCardTransition[]>([]);
+    43→  const [searchText, setSearchText, debouncedSearchText] = useDebounce('', 400);
+    44→
+    45→  const { pointsExtract, pointsBalance, pointsExtractFilters, pointsExtractActions } =
+    46→    useRootStore(
+    47→      useShallow((state) => ({
+    48→        pointsExtract: state.pointsExtract,
+    49→        pointsBalance: state.pointsBalance,
+    50→        pointsExtractFilters: state.pointsExtractFilters,
+    51→        pointsExtractActions: state.pointsExtractActions,
+    52→      })),
+    53→    );
+    54→
+    55→  const isLoadingExtract = pointsExtract.status === PointsExtractStatus.LOADING;
+    56→  const isLoadingMore = pointsExtract.isLoadingMore;
+    57→  const isLoadingBalance = pointsBalance.status === PointsBalanceStatus.LOADING;
+    58→  const appliedTransactionsFilters = pointsExtractFilters.appliedTransactionsFilters;
+    59→
+    60→  useFocusEffect(
+    61→    useCallback(() => {
+    62→      if (!hasTrackedScreenView.current) {
+    63→        eventScreenViewV3(
+    64→          ANALYTICS_EVENTS.SCREEN_VIEW.screen_name,
+    65→          ANALYTICS_EVENTS.SCREEN_VIEW.screen_class,
+    66→          ANALYTICS_EVENTS.SCREEN_VIEW.screen_bussines,
+    67→          {
+    68→            location_1: ANALYTICS_EVENTS.SCREEN_VIEW.location_1,
+    69→            location_2: ANALYTICS_EVENTS.SCREEN_VIEW.location_2,
+    70→            location_3: ANALYTICS_EVENTS.SCREEN_VIEW.location_3,
+    71→          },
+    72→        );
+    73→        hasTrackedScreenView.current = true;
+    74→      }
+    75→
+    76→      return () => {
+    77→        hasTrackedScreenView.current = false;
+    78→      };
+    79→    }, []),
+    80→  );
+    81→
+    82→  useEffect(() => {
+    83→    const shouldFetchBalance =
+    84→      pointsBalance.points === undefined ||
+    85→      pointsBalance.status === PointsBalanceStatus.ERROR;
+    86→
+    87→    if (shouldFetchBalance) {
+    88→      getPointsBalance();
+    89→    }
+    90→
+    91→    getPointsExtract({ page: EXTRACT_CONSTANTS.DEFAULT_PAGE });
+    92→  }, [pointsBalance.points, pointsBalance.status]);
+    93→
+    94→  useEffect(() => {
+    95→    if (!isLoadingExtract && isRefreshing) {
+    96→      setIsRefreshing(false);
+    97→    }
+    98→  }, [isLoadingExtract, isRefreshing]);
+    99→
+   100→  useEffect(() => {
+   101→    if (searchText.length === 0) {
+   102→      hasTrackedSearchPress.current = false;
+   103→    }
+   104→  }, [searchText]);
+   105→
+   106→  const getPointsAvailable = useMemo(() => {
+   107→    return pointsBalance.points ?? 0;
+   108→  }, [pointsBalance.points]);
+   109→
+   110→  const handleGoBack = useCallback(() => {
+   111→    params?.navigation?.goBack();
+   112→  }, [params?.navigation]);
+   113→
+   114→  const requestPointsExtract = useCallback(() => {
+   115→    getPointsExtract({ page: EXTRACT_CONSTANTS.DEFAULT_PAGE });
+   116→  }, []);
+   117→
+   118→  const handleLoadMore = useCallback(() => {
+   119→    const currentPage = pointsExtract.extractData?.pagination?.page ?? 1;
+   120→    const totalPages = pointsExtract.extractData?.pagination?.totalPages ?? 1;
+   121→    const canLoadMore = currentPage < totalPages && !pointsExtract.isLoadingMore;
+   122→
+   123→    if (canLoadMore) {
+   124→      getPointsExtract({ page: currentPage + 1 });
+   125→    }
+   126→  }, [
+   127→    pointsExtract.extractData?.pagination,
+   128→    pointsExtract.isLoadingMore,
+   129→  ]);
+   130→
+   131→  const setTransactionsFilters = useCallback(
+   132→    (filters: AppliedFilters) => {
+   133→      pointsExtractActions.setTransactionsFilters(filters);
+   134→    },
+   135→    [pointsExtractActions],
+   136→  );
+   137→
+   138→  const clearTransactionsFilters = useCallback(() => {
+   139→    pointsExtractActions.clearTransactionsFilters();
+   140→  }, [pointsExtractActions]);
+   141→
+   142→  const getTransactionsWithFilters = useCallback(
+   143→    (transactions: PointsTransaction[]): PointsTransaction[] => {
+   144→      let filtered = transactions;
+   145→
+   146→      if (appliedTransactionsFilters) {
+   147→        const filtersWithDays: AppliedFilters = {
+   148→          ...appliedTransactionsFilters,
+   149→          period: appliedTransactionsFilters.period !== undefined
+   150→            ? PERIOD_DAYS_MAP[appliedTransactionsFilters.period]
+   151→            : undefined,
+   152→        };
+   153→        filtered = getFilteredTransactions(filtered, filtersWithDays);
+   154→      }
+   155→
+   156→      return filtered;
+   157→    },
+   158→    [appliedTransactionsFilters],
+   159→  );
+   160→
+   161→  const getExtractData = useMemo(() => {
+   162→    if (!pointsExtract.extractData) return undefined;
+   163→
+   164→    const transactions = getTransactionsWithFilters(
+   165→      pointsExtract.extractData.transactions,
+   166→    );
+   167→
+   168→    return {
+   169→      ...pointsExtract.extractData,
+   170→      transactions,
+   171→    };
+   172→  }, [pointsExtract.extractData, getTransactionsWithFilters]);
+   173→
+   174→  const getTransactionsData = useMemo(() => {
+   175→    if (!getExtractData?.transactions) {
+   176→      return [];
+   177→    }
+   178→
+   179→    if (debouncedSearchText && debouncedSearchText.trim() !== '') {
+   180→      return getFilteredTransactionsByText(
+   181→        getExtractData.transactions,
+   182→        debouncedSearchText,
+   183→        false,
+   184→      );
+   185→    }
+   186→
+   187→    return getExtractData.transactions;
+   188→  }, [getExtractData?.transactions, debouncedSearchText]);
+   189→
+   190→  useEffect(() => {
+   191→    if (!getExtractData) return;
+   192→
+   193→    let cancelled = false;
+   194→    const task = InteractionManager.runAfterInteractions(() => {
+   195→      if (cancelled) return;
+   196→      const processed = processPointsExtractData({
+   197→        transactions: getTransactionsData,
+   198→        pagination:
+   199→          getExtractData.pagination ?? {
+   200→            page: 1,
+   201→            pageSize: 100,
+   202→            total: 0,
+   203→            totalPages: 0,
+   204→          },
+   205→      });
+   206→      if (!cancelled) {
+   207→        setTransactionsData(processed.mappedTransactions);
+   208→      }
+   209→    });
+   210→
+   211→    return () => {
+   212→      cancelled = true;
+   213→      task.cancel();
+   214→    };
+   215→  }, [getExtractData, getTransactionsData]);
+   216→
+   217→  const getActiveFiltersCount = useMemo(() => {
+   218→    let count = 0;
+   219→    if (appliedTransactionsFilters?.period !== undefined && appliedTransactionsFilters?.period !== null) count++;
+   220→    if (appliedTransactionsFilters?.types?.length) count++;
+   221→    return count > 0 ? count.toString() : undefined;
+   222→  }, [appliedTransactionsFilters]);
+   223→
+   224→  const getTransactionsEmptyMessage = useMemo(() => {
+   225→    const hasSearchText = debouncedSearchText && debouncedSearchText.trim() !== '';
+   226→    const hasActiveFilters =
+   227→      (appliedTransactionsFilters?.period !== undefined && appliedTransactionsFilters?.period !== null) ||
+   228→      (appliedTransactionsFilters?.types?.length ?? 0) > 0;
+   229→    return hasSearchText || hasActiveFilters
+   230→      ? SCREEN_STRINGS.EMPTY_SEARCH_RESULTS
+   231→      : SCREEN_STRINGS.EMPTY_ALL_LIST;
+   232→  }, [debouncedSearchText, appliedTransactionsFilters]);
+   233→
+   234→  const getShouldShowTransactionsList = isLoadingExtract || transactionsData.length > 0;
+   235→
+   236→  const canLoadMore = pointsExtract.extractData?.pagination && 
+   237→    pointsExtract.extractData.pagination.page < pointsExtract.extractData.pagination.totalPages;
+   238→
+   239→  useEffect(() => {
+   240→    canLoadMoreRef.current = !!canLoadMore;
+   241→  }, [canLoadMore]);
+   242→
+   243→  useEffect(() => {
+   244→    isLoadingMoreRef.current = isLoadingMore;
+   245→  }, [isLoadingMore]);
+   246→
+   247→  const handleSearchChange = useCallback((text: string) => {
+   248→    setSearchText(text);
+   249→  }, [setSearchText]);
+   250→
+   251→  const handleRefresh = useCallback(() => {
+   252→    setIsRefreshing(true);
+   253→    requestPointsExtract();
+   254→  }, [requestPointsExtract]);
+   255→
+   256→  const handleError = useCallback(() => {
+   257→    requestPointsExtract();
+   258→  }, [requestPointsExtract]);
+   259→
+   260→  const handleScroll = useCallback(
+   261→    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+   262→      const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;
+   263→      const distanceFromBottom = contentSize.height - layoutMeasurement.height - contentOffset.y;
+   264→
+   265→      if (distanceFromBottom < SCROLL_THRESHOLD && canLoadMoreRef.current && !isLoadingMoreRef.current) {
+   266→        handleLoadMore();
+   267→      }
+   268→    },
+   269→    [handleLoadMore],
+   270→  );
+   271→
+   272→  const handleIconInfoPress = useCallback(() => {
+   273→    eventSelectContent(ANALYTICS_EVENTS.POINTS_INFO);
+   274→    modalizeRefInfo.current?.open?.();
+   275→  }, []);
+   276→
+   277→  const handleFilterIconPress = useCallback(() => {
+   278→    eventSelectContent({
+   279→      content_type: 'cta',
+   280→      ...ANALYTICS_EVENTS.FILTER,
+   281→    });
+   282→    modalizeRefFilters.current?.open?.();
+   283→  }, []);
+   284→
+   285→  const handleApplyFilters = useCallback(
+   286→    (filters: Record<number, unknown>) => {
+   287→      const period = filters[0] as number | undefined;
+   288→      const types = filters[1] as string | undefined;
+   289→
+   290→      const hasPeriod = period !== undefined && period !== null;
+   291→      const hasTypes = types !== undefined && types !== null;
+   292→
+   293→      if (!hasPeriod && !hasTypes) {
+   294→        clearTransactionsFilters();
+   295→      } else {
+   296→        setTransactionsFilters({
+   297→          period: hasPeriod ? period : undefined,
+   298→          types: hasTypes ? [types] : undefined,
+   299→        });
+   300→      }
+   301→    },
+   302→    [setTransactionsFilters, clearTransactionsFilters],
+   303→  );
+   304→
+   305→  const handleTabChange = useCallback((index: number) => {
+   306→    if (index === 0) {
+   307→      eventSelectContent({
+   308→        content_type: 'cta',
+   309→        content_id: 'aba_todos',
+   310→        location_1: 'monetizacao',
+   311→        location_2: 'hub_recompensas_spmais',
+   312→        location_3: 'extrato_hub_recompensas',
+   313→      });
+   314→    } else {
+   315→      eventSelectContent({
+   316→        content_type: 'cta',
+   317→        content_id: 'aba_expirados',
+   318→        location_1: 'monetizacao',
+   319→        location_2: 'hub_recompensas_spmais',
+   320→        location_3: 'extrato_hub_recompensas',
+   321→      });
+   322→    }
+   323→  }, []);
+   324→
+   325→  const handleSearchPressIn = useCallback(() => {
+   326→    if (!hasTrackedSearchPress.current) {
+   327→      eventSelectContent(ANALYTICS_EVENTS.SEARCH);
+   328→      hasTrackedSearchPress.current = true;
+   329→    }
+   330→  }, []);
+   331→
+   332→  const getFilterGroups: FilterGroup[] = useMemo(() => {
+   333→    return [{
+   334→      label: 'Períodos',
+   335→      options: [
+   336→        { label: '7 dias', value: 0 },
+   337→        { label: '15 dias', value: 1 },
+   338→        { label: '30 dias', value: 2 },
+   339→        { label: '60 dias', value: 3 },
+   340→        { label: '90 dias', value: 4 },
+   341→      ],
+   342→    }, {
+   343→      label: 'Tipos de lançamentos',
+   344→      options: [
+   345→        { label: 'Ganhos', value: 'CREDIT' },
+   346→        { label: 'Usados', value: 'RESCUE' },
+   347→        { label: 'Expirados', value: 'EXPIRED' },
+   348→        { label: 'Estornados', value: 'REFUNDED' },
+   349→      ],
+   350→    }];
+   351→  }, []);
+   352→
+   353→  const getInitialFilters = useMemo(() => {
+   354→    const filters: Record<number, unknown> = {};
+   355→    if (appliedTransactionsFilters?.period !== undefined && appliedTransactionsFilters?.period !== null) {
+   356→      filters[0] = appliedTransactionsFilters.period;
+   357→    }
+   358→    if (appliedTransactionsFilters?.types?.length) {
+   359→      filters[1] = appliedTransactionsFilters.types[0];
+   360→    }
+   361→    return filters;
+   362→  }, [appliedTransactionsFilters]);
+   363→
+   364→  return {
+   365→    pointsAvailable: getPointsAvailable,
+   366→    extractData: getExtractData,
+   367→    pagination: pointsExtract.extractData?.pagination,
+   368→    isLoadingExtract,
+   369→    isLoadingMore,
+   370→    isLoadingBalance,
+   371→    hasError: false,
+   372→    appliedTransactionsFilters,
+   373→    isRefreshing,
+   374→    transactionsData,
+   375→    searchText,
+   376→    activeFiltersCount: getActiveFiltersCount,
+   377→    transactionsEmptyMessage: getTransactionsEmptyMessage,
+   378→    shouldShowTransactionsList: getShouldShowTransactionsList,
+   379→    filterGroups: getFilterGroups,
+   380→    initialFilters: getInitialFilters,
+   381→    modalizeRefInfo,
+   382→    modalizeRefFilters,
+   383→    handleGoBack,
+   384→    requestPointsExtract,
+   385→    handleLoadMore,
+   386→    setTransactionsFilters,
+   387→    clearTransactionsFilters,
+   388→    handleSearchChange,
+   389→    handleRefresh,
+   390→    handleError,
+   391→    handleScroll,
+   392→    handleIconInfoPress,
+   393→    handleFilterIconPress,
+   394→    handleApplyFilters,
+   395→    handleTabChange,
+   396→    handleSearchPressIn,
+   397→  };
+   398→}
+   399→
+   400→export { getPlaceholder } from './utils';
+   401→export { default } from './view';
+   402→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

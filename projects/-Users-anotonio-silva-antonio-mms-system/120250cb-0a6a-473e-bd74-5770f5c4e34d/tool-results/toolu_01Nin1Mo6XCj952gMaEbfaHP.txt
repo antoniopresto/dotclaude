@@ -1,0 +1,666 @@
+     1→/**
+     2→ * Tactical Gantt Layer
+     3→ *
+     4→ * Konva-based Gantt chart layer for tactical PM scheduling (zoom levels 8-12).
+     5→ * Renders PM blocks, constraint walls, train labels, and timeline axis.
+     6→ *
+     7→ * Features:
+     8→ * - PM blocks with status-based colors
+     9→ * - Compliance window constraint walls
+    10→ * - Train labels on the left
+    11→ * - Week/day timeline axis at top
+    12→ * - Drag-and-drop PM rescheduling (with constraint validation)
+    13→ * - Hover tooltips
+    14→ *
+    15→ * @see specs/006-user-interface.md Section 6.3.3
+    16→ */
+    17→
+    18→import { useRef } from 'react';
+    19→import { Stage, Layer, Rect, Text, Line, Group } from 'react-konva';
+    20→import type { KonvaEventObject } from 'konva/lib/Node';
+    21→import type { Stage as StageType } from 'konva/lib/Stage';
+    22→
+    23→import type { PmBlock, ConstraintWall, TacticalCanvasData } from './types';
+    24→import { PM_STATUS_COLORS, CONSTRAINT_COLORS, FLEET_COLORS } from '../../theme/colors';
+    25→
+    26→// =============================================================================
+    27→// Constants
+    28→// =============================================================================
+    29→
+    30→/** Layout constants for the Gantt chart */
+    31→const LAYOUT = {
+    32→  HEADER_HEIGHT: 48,
+    33→  TRAIN_LABEL_WIDTH: 120,
+    34→  ROW_HEIGHT: 40,
+    35→  PM_BLOCK_HEIGHT: 28,
+    36→  PM_BLOCK_MARGIN: 6,
+    37→  DAY_WIDTH: 24,
+    38→  WEEK_WIDTH: 24 * 7,
+    39→  MIN_PM_WIDTH: 20,
+    40→  CONSTRAINT_WALL_WIDTH: 2,
+    41→  GRID_LINE_COLOR: '#e2e8f0',
+    42→  HEADER_BG: '#f8fafc',
+    43→  TRAIN_LABEL_BG: '#ffffff',
+    44→  FONT_FAMILY: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    45→};
+    46→
+    47→/** PM status to color mapping */
+    48→function getPmColor(status: string): string {
+    49→  switch (status) {
+    50→    case 'SCHEDULED':
+    51→      return PM_STATUS_COLORS.scheduled;
+    52→    case 'IN_PROGRESS':
+    53→      return PM_STATUS_COLORS.inProgress;
+    54→    case 'COMPLETED':
+    55→      return PM_STATUS_COLORS.completed;
+    56→    case 'CANCELLED':
+    57→      return PM_STATUS_COLORS.cancelled;
+    58→    case 'DEFERRED':
+    59→      return PM_STATUS_COLORS.deferred;
+    60→    default:
+    61→      return PM_STATUS_COLORS.scheduled;
+    62→  }
+    63→}
+    64→
+    65→// =============================================================================
+    66→// Types
+    67→// =============================================================================
+    68→
+    69→export interface TacticalGanttLayerProps {
+    70→  data: TacticalCanvasData | null;
+    71→  trainOrder: string[];
+    72→  fromDate: Date;
+    73→  toDate: Date;
+    74→  width: number;
+    75→  height: number;
+    76→  selectedPmIds: string[];
+    77→  onPmClick?: (pmId: string) => void;
+    78→  onPmHover?: (pm: PmBlock | null) => void;
+    79→  onPmDragStart?: (pmId: string) => void;
+    80→  onPmDragEnd?: (pmId: string, newDate: string) => void;
+    81→  showConstraintWalls?: boolean;
+    82→  showGrid?: boolean;
+    83→}
+    84→
+    85→interface DayData {
+    86→  date: Date;
+    87→  dateStr: string;
+    88→  dayOfWeek: number;
+    89→  isWeekStart: boolean;
+    90→  isToday: boolean;
+    91→}
+    92→
+    93→interface WeekData {
+    94→  weekStart: Date;
+    95→  weekNum: number;
+    96→  daysInWeek: number;
+    97→}
+    98→
+    99→// =============================================================================
+   100→// Pure Utility Functions
+   101→// =============================================================================
+   102→
+   103→function getDays(fromDate: Date, toDate: Date): DayData[] {
+   104→  const days: DayData[] = [];
+   105→  const current = new Date(fromDate);
+   106→  const today = new Date();
+   107→  today.setHours(0, 0, 0, 0);
+   108→
+   109→  while (current <= toDate) {
+   110→    const dayOfWeek = current.getDay();
+   111→    days.push({
+   112→      date: new Date(current),
+   113→      dateStr: current.toISOString().split('T')[0],
+   114→      dayOfWeek,
+   115→      isWeekStart: dayOfWeek === 0,
+   116→      isToday: current.getTime() === today.getTime(),
+   117→    });
+   118→    current.setDate(current.getDate() + 1);
+   119→  }
+   120→  return days;
+   121→}
+   122→
+   123→function getWeeks(days: DayData[]): WeekData[] {
+   124→  const weeks: WeekData[] = [];
+   125→  let currentWeek: WeekData | null = null;
+   126→
+   127→  for (const day of days) {
+   128→    if (day.isWeekStart || currentWeek === null) {
+   129→      if (currentWeek) {
+   130→        weeks.push(currentWeek);
+   131→      }
+   132→      const weekNum = getWeekNumber(day.date);
+   133→      currentWeek = { weekStart: day.date, weekNum, daysInWeek: 1 };
+   134→    } else {
+   135→      currentWeek.daysInWeek++;
+   136→    }
+   137→  }
+   138→  if (currentWeek) {
+   139→    weeks.push(currentWeek);
+   140→  }
+   141→  return weeks;
+   142→}
+   143→
+   144→function getWeekNumber(date: Date): number {
+   145→  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+   146→  const dayNum = d.getUTCDay() || 7;
+   147→  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+   148→  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+   149→  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+   150→}
+   151→
+   152→function dateDiffDays(a: Date, b: Date): number {
+   153→  return Math.floor((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24));
+   154→}
+   155→
+   156→function parseDate(dateStr: string): Date {
+   157→  return new Date(dateStr + 'T00:00:00');
+   158→}
+   159→
+   160→function buildTrainIndexMap(trainOrder: string[]): Map<string, number> {
+   161→  const map = new Map<string, number>();
+   162→  trainOrder.forEach((id, i) => map.set(id, i));
+   163→  return map;
+   164→}
+   165→
+   166→function buildTrainMetadata(pmBlocks: PmBlock[]): { numbers: Map<string, string>; fleets: Map<string, string> } {
+   167→  const numbers = new Map<string, string>();
+   168→  const fleets = new Map<string, string>();
+   169→
+   170→  for (const pm of pmBlocks) {
+   171→    if (!numbers.has(pm.trainId)) {
+   172→      numbers.set(pm.trainId, pm.trainNumber);
+   173→      const code = pm.trainNumber.split('-')[0] || 'KS';
+   174→      fleets.set(pm.trainId, code);
+   175→    }
+   176→  }
+   177→
+   178→  return { numbers, fleets };
+   179→}
+   180→
+   181→// =============================================================================
+   182→// Sub-Components
+   183→// =============================================================================
+   184→
+   185→interface TimelineHeaderProps {
+   186→  days: DayData[];
+   187→  weeks: WeekData[];
+   188→  offsetX: number;
+   189→}
+   190→
+   191→function TimelineHeader({ days, weeks, offsetX }: TimelineHeaderProps) {
+   192→  return (
+   193→    <Group x={offsetX} y={0}>
+   194→      {/* Week row */}
+   195→      <Rect
+   196→        x={0}
+   197→        y={0}
+   198→        width={days.length * LAYOUT.DAY_WIDTH}
+   199→        height={LAYOUT.HEADER_HEIGHT / 2}
+   200→        fill={LAYOUT.HEADER_BG}
+   201→      />
+   202→      {weeks.map((week, i) => {
+   203→        const x = days.findIndex((d) => d.date.getTime() === week.weekStart.getTime()) * LAYOUT.DAY_WIDTH;
+   204→        const width = week.daysInWeek * LAYOUT.DAY_WIDTH;
+   205→        return (
+   206→          <Group key={i} x={x} y={0}>
+   207→            <Rect
+   208→              width={width}
+   209→              height={LAYOUT.HEADER_HEIGHT / 2}
+   210→              stroke={LAYOUT.GRID_LINE_COLOR}
+   211→              strokeWidth={1}
+   212→            />
+   213→            <Text
+   214→              x={4}
+   215→              y={6}
+   216→              text={`Week ${week.weekNum}`}
+   217→              fontSize={11}
+   218→              fontFamily={LAYOUT.FONT_FAMILY}
+   219→              fill="#64748b"
+   220→            />
+   221→          </Group>
+   222→        );
+   223→      })}
+   224→
+   225→      {/* Day row */}
+   226→      {days.map((day, i) => (
+   227→        <Group key={day.dateStr} x={i * LAYOUT.DAY_WIDTH} y={LAYOUT.HEADER_HEIGHT / 2}>
+   228→          <Rect
+   229→            width={LAYOUT.DAY_WIDTH}
+   230→            height={LAYOUT.HEADER_HEIGHT / 2}
+   231→            fill={day.isToday ? '#dbeafe' : day.dayOfWeek === 0 || day.dayOfWeek === 6 ? '#f1f5f9' : LAYOUT.HEADER_BG}
+   232→            stroke={LAYOUT.GRID_LINE_COLOR}
+   233→            strokeWidth={0.5}
+   234→          />
+   235→          <Text
+   236→            x={2}
+   237→            y={6}
+   238→            text={['S', 'M', 'T', 'W', 'T', 'F', 'S'][day.dayOfWeek]}
+   239→            fontSize={9}
+   240→            fontFamily={LAYOUT.FONT_FAMILY}
+   241→            fill={day.isToday ? '#2563eb' : '#94a3b8'}
+   242→          />
+   243→          <Text
+   244→            x={2}
+   245→            y={15}
+   246→            text={String(day.date.getDate())}
+   247→            fontSize={9}
+   248→            fontFamily={LAYOUT.FONT_FAMILY}
+   249→            fill={day.isToday ? '#2563eb' : '#64748b'}
+   250→            fontStyle={day.isToday ? 'bold' : 'normal'}
+   251→          />
+   252→        </Group>
+   253→      ))}
+   254→    </Group>
+   255→  );
+   256→}
+   257→
+   258→interface TrainLabelsPanelProps {
+   259→  trainOrder: string[];
+   260→  trainNumbers: Map<string, string>;
+   261→  fleetCodes: Map<string, string>;
+   262→}
+   263→
+   264→function TrainLabelsPanel({ trainOrder, trainNumbers, fleetCodes }: TrainLabelsPanelProps) {
+   265→  return (
+   266→    <Group x={0} y={LAYOUT.HEADER_HEIGHT}>
+   267→      <Rect
+   268→        width={LAYOUT.TRAIN_LABEL_WIDTH}
+   269→        height={trainOrder.length * LAYOUT.ROW_HEIGHT}
+   270→        fill={LAYOUT.TRAIN_LABEL_BG}
+   271→      />
+   272→      {trainOrder.map((trainId, i) => {
+   273→        const trainNumber = trainNumbers.get(trainId) || trainId.slice(0, 8);
+   274→        const fleetCode = fleetCodes.get(trainId) || 'KS';
+   275→        const fleetColor = FLEET_COLORS[fleetCode as keyof typeof FLEET_COLORS] || FLEET_COLORS.KS;
+   276→
+   277→        return (
+   278→          <Group key={trainId} y={i * LAYOUT.ROW_HEIGHT}>
+   279→            <Rect
+   280→              width={LAYOUT.TRAIN_LABEL_WIDTH}
+   281→              height={LAYOUT.ROW_HEIGHT}
+   282→              stroke={LAYOUT.GRID_LINE_COLOR}
+   283→              strokeWidth={0.5}
+   284→            />
+   285→            <Rect
+   286→              x={4}
+   287→              y={10}
+   288→              width={4}
+   289→              height={LAYOUT.ROW_HEIGHT - 20}
+   290→              fill={fleetColor}
+   291→              cornerRadius={2}
+   292→            />
+   293→            <Text
+   294→              x={14}
+   295→              y={12}
+   296→              text={trainNumber}
+   297→              fontSize={12}
+   298→              fontFamily={LAYOUT.FONT_FAMILY}
+   299→              fill="#1e293b"
+   300→              fontStyle="bold"
+   301→            />
+   302→            <Text
+   303→              x={14}
+   304→              y={26}
+   305→              text={fleetCode}
+   306→              fontSize={10}
+   307→              fontFamily={LAYOUT.FONT_FAMILY}
+   308→              fill="#64748b"
+   309→            />
+   310→          </Group>
+   311→        );
+   312→      })}
+   313→    </Group>
+   314→  );
+   315→}
+   316→
+   317→interface GanttGridProps {
+   318→  days: DayData[];
+   319→  rowCount: number;
+   320→  offsetX: number;
+   321→}
+   322→
+   323→function GanttGrid({ days, rowCount, offsetX }: GanttGridProps) {
+   324→  const weekStartDays = days.filter((d) => d.isWeekStart);
+   325→  const todayIndex = days.findIndex((d) => d.isToday);
+   326→
+   327→  return (
+   328→    <Group x={offsetX} y={LAYOUT.HEADER_HEIGHT}>
+   329→      {/* Row backgrounds */}
+   330→      {Array.from({ length: rowCount }).map((_, i) => (
+   331→        <Rect
+   332→          key={i}
+   333→          y={i * LAYOUT.ROW_HEIGHT}
+   334→          width={days.length * LAYOUT.DAY_WIDTH}
+   335→          height={LAYOUT.ROW_HEIGHT}
+   336→          fill={i % 2 === 0 ? '#ffffff' : '#fafafa'}
+   337→          stroke={LAYOUT.GRID_LINE_COLOR}
+   338→          strokeWidth={0.5}
+   339→        />
+   340→      ))}
+   341→
+   342→      {/* Day columns - today highlight */}
+   343→      {todayIndex >= 0 && (
+   344→        <Rect
+   345→          x={todayIndex * LAYOUT.DAY_WIDTH}
+   346→          y={0}
+   347→          width={LAYOUT.DAY_WIDTH}
+   348→          height={rowCount * LAYOUT.ROW_HEIGHT}
+   349→          fill="rgba(37, 99, 235, 0.05)"
+   350→        />
+   351→      )}
+   352→
+   353→      {/* Week separators */}
+   354→      {weekStartDays.map((day) => {
+   355→        const x = days.indexOf(day) * LAYOUT.DAY_WIDTH;
+   356→        return (
+   357→          <Line
+   358→            key={`week-${day.dateStr}`}
+   359→            points={[x, 0, x, rowCount * LAYOUT.ROW_HEIGHT]}
+   360→            stroke="#cbd5e1"
+   361→            strokeWidth={1}
+   362→          />
+   363→        );
+   364→      })}
+   365→
+   366→      {/* Today line */}
+   367→      {todayIndex >= 0 && (
+   368→        <Line
+   369→          points={[
+   370→            todayIndex * LAYOUT.DAY_WIDTH,
+   371→            0,
+   372→            todayIndex * LAYOUT.DAY_WIDTH,
+   373→            rowCount * LAYOUT.ROW_HEIGHT,
+   374→          ]}
+   375→          stroke="#2563eb"
+   376→          strokeWidth={2}
+   377→          dash={[4, 4]}
+   378→        />
+   379→      )}
+   380→    </Group>
+   381→  );
+   382→}
+   383→
+   384→interface PmBlockRectProps {
+   385→  pm: PmBlock;
+   386→  x: number;
+   387→  y: number;
+   388→  width: number;
+   389→  isSelected: boolean;
+   390→  onHover?: (pm: PmBlock | null) => void;
+   391→  onClick?: (pmId: string) => void;
+   392→  onDragStart?: (pmId: string) => void;
+   393→  onDragEnd?: (pmId: string, newDate: string) => void;
+   394→  fromDate: Date;
+   395→}
+   396→
+   397→function PmBlockRect({
+   398→  pm,
+   399→  x,
+   400→  y,
+   401→  width,
+   402→  isSelected,
+   403→  onHover,
+   404→  onClick,
+   405→  onDragStart,
+   406→  onDragEnd,
+   407→  fromDate,
+   408→}: PmBlockRectProps) {
+   409→  const color = pm.displayColor || getPmColor(pm.status);
+   410→  const finalWidth = Math.max(width, LAYOUT.MIN_PM_WIDTH);
+   411→
+   412→  const handleDragEnd = (e: KonvaEventObject<DragEvent>) => {
+   413→    if (onDragEnd) {
+   414→      const newX = e.target.x();
+   415→      const dayOffset = Math.round(newX / LAYOUT.DAY_WIDTH);
+   416→      const newDate = new Date(fromDate);
+   417→      newDate.setDate(newDate.getDate() + dayOffset);
+   418→      onDragEnd(pm.pmId, newDate.toISOString().split('T')[0]);
+   419→    }
+   420→  };
+   421→
+   422→  return (
+   423→    <Group
+   424→      x={x}
+   425→      y={y}
+   426→      draggable={!pm.isLocked}
+   427→      onDragStart={() => onDragStart?.(pm.pmId)}
+   428→      onDragEnd={handleDragEnd}
+   429→      onMouseEnter={() => onHover?.(pm)}
+   430→      onMouseLeave={() => onHover?.(null)}
+   431→      onClick={() => onClick?.(pm.pmId)}
+   432→    >
+   433→      {/* Shadow for selected */}
+   434→      {isSelected && (
+   435→        <Rect
+   436→          x={-2}
+   437→          y={-2}
+   438→          width={finalWidth + 4}
+   439→          height={LAYOUT.PM_BLOCK_HEIGHT + 4}
+   440→          fill="transparent"
+   441→          stroke="#3b82f6"
+   442→          strokeWidth={2}
+   443→          cornerRadius={6}
+   444→        />
+   445→      )}
+   446→
+   447→      {/* PM block */}
+   448→      <Rect
+   449→        width={finalWidth}
+   450→        height={LAYOUT.PM_BLOCK_HEIGHT}
+   451→        fill={color}
+   452→        stroke={isSelected ? '#1d4ed8' : '#00000015'}
+   453→        strokeWidth={1}
+   454→        cornerRadius={4}
+   455→        shadowColor="#000"
+   456→        shadowBlur={2}
+   457→        shadowOpacity={0.1}
+   458→        shadowOffsetY={1}
+   459→      />
+   460→
+   461→      {/* Lock indicator */}
+   462→      {pm.isLocked && (
+   463→        <Text
+   464→          x={4}
+   465→          y={7}
+   466→          text="🔒"
+   467→          fontSize={10}
+   468→        />
+   469→      )}
+   470→
+   471→      {/* PM code label */}
+   472→      <Text
+   473→        x={pm.isLocked ? 18 : 6}
+   474→        y={7}
+   475→        text={pm.pmCode}
+   476→        fontSize={11}
+   477→        fontFamily={LAYOUT.FONT_FAMILY}
+   478→        fill="#ffffff"
+   479→        fontStyle="bold"
+   480→      />
+   481→
+   482→      {/* Duration label (if space) */}
+   483→      {finalWidth > 50 && pm.estimatedHours && (
+   484→        <Text
+   485→          x={finalWidth - 30}
+   486→          y={8}
+   487→          text={`${pm.estimatedHours}h`}
+   488→          fontSize={9}
+   489→          fontFamily={LAYOUT.FONT_FAMILY}
+   490→          fill="rgba(255,255,255,0.8)"
+   491→        />
+   492→      )}
+   493→    </Group>
+   494→  );
+   495→}
+   496→
+   497→interface ConstraintWallsLayerProps {
+   498→  walls: ConstraintWall[];
+   499→  trainOrder: string[];
+   500→  days: DayData[];
+   501→  pmBlocks: PmBlock[];
+   502→  offsetX: number;
+   503→}
+   504→
+   505→function ConstraintWallsLayer({ walls, trainOrder, days, pmBlocks, offsetX }: ConstraintWallsLayerProps) {
+   506→  const trainIndexMap = buildTrainIndexMap(trainOrder);
+   507→  const pmBlockMap = new Map<string, PmBlock>();
+   508→  pmBlocks.forEach((pm) => pmBlockMap.set(pm.pmId, pm));
+   509→
+   510→  return (
+   511→    <Group x={offsetX} y={LAYOUT.HEADER_HEIGHT}>
+   512→      {walls.map((wall) => {
+   513→        const pm = pmBlockMap.get(wall.pmId);
+   514→        if (!pm) return null;
+   515→
+   516→        const trainIndex = trainIndexMap.get(pm.trainId);
+   517→        if (trainIndex === undefined) return null;
+   518→
+   519→        const dayIndex = days.findIndex((d) => d.dateStr === wall.date);
+   520→        if (dayIndex < 0) return null;
+   521→
+   522→        const x = dayIndex * LAYOUT.DAY_WIDTH;
+   523→        const y = trainIndex * LAYOUT.ROW_HEIGHT;
+   524→        const color = wall.type === 'COMPLIANCE_START'
+   525→          ? CONSTRAINT_COLORS.approaching
+   526→          : CONSTRAINT_COLORS.hardViolation;
+   527→
+   528→        return (
+   529→          <Line
+   530→            key={`${wall.pmId}-${wall.type}`}
+   531→            points={[x, y + 4, x, y + LAYOUT.ROW_HEIGHT - 4]}
+   532→            stroke={color}
+   533→            strokeWidth={LAYOUT.CONSTRAINT_WALL_WIDTH}
+   534→            dash={[4, 2]}
+   535→          />
+   536→        );
+   537→      })}
+   538→    </Group>
+   539→  );
+   540→}
+   541→
+   542→// =============================================================================
+   543→// Main Component
+   544→// =============================================================================
+   545→
+   546→export function TacticalGanttLayer({
+   547→  data,
+   548→  trainOrder,
+   549→  fromDate,
+   550→  toDate,
+   551→  width,
+   552→  height,
+   553→  selectedPmIds,
+   554→  onPmClick,
+   555→  onPmHover,
+   556→  onPmDragStart,
+   557→  onPmDragEnd,
+   558→  showConstraintWalls = true,
+   559→  showGrid = true,
+   560→}: TacticalGanttLayerProps) {
+   561→  const stageRef = useRef<StageType>(null);
+   562→
+   563→  if (!data) {
+   564→    return null;
+   565→  }
+   566→
+   567→  // Compute derived data inline (no useMemo - pure functions)
+   568→  const days = getDays(fromDate, toDate);
+   569→  const weeks = getWeeks(days);
+   570→  const trainIndexMap = buildTrainIndexMap(trainOrder);
+   571→  const { numbers: trainNumbers, fleets: fleetCodes } = buildTrainMetadata(data.pmBlocks);
+   572→  const selectedSet = new Set(selectedPmIds);
+   573→
+   574→  const gridOffsetX = LAYOUT.TRAIN_LABEL_WIDTH;
+   575→  const contentWidth = days.length * LAYOUT.DAY_WIDTH + gridOffsetX;
+   576→  const contentHeight = trainOrder.length * LAYOUT.ROW_HEIGHT + LAYOUT.HEADER_HEIGHT;
+   577→
+   578→  return (
+   579→    <Stage
+   580→      ref={stageRef}
+   581→      width={width}
+   582→      height={height}
+   583→      style={{ backgroundColor: '#f8fafc' }}
+   584→    >
+   585→      {/* Background layer */}
+   586→      <Layer>
+   587→        <Rect width={contentWidth} height={contentHeight} fill="#ffffff" />
+   588→      </Layer>
+   589→
+   590→      {/* Grid layer */}
+   591→      {showGrid && (
+   592→        <Layer>
+   593→          <GanttGrid days={days} rowCount={trainOrder.length} offsetX={gridOffsetX} />
+   594→        </Layer>
+   595→      )}
+   596→
+   597→      {/* Constraint walls layer */}
+   598→      {showConstraintWalls && data.constraintWalls.length > 0 && (
+   599→        <Layer>
+   600→          <ConstraintWallsLayer
+   601→            walls={data.constraintWalls}
+   602→            trainOrder={trainOrder}
+   603→            days={days}
+   604→            pmBlocks={data.pmBlocks}
+   605→            offsetX={gridOffsetX}
+   606→          />
+   607→        </Layer>
+   608→      )}
+   609→
+   610→      {/* PM blocks layer */}
+   611→      <Layer>
+   612→        <Group x={gridOffsetX} y={LAYOUT.HEADER_HEIGHT}>
+   613→          {data.pmBlocks.map((pm) => {
+   614→            const trainIndex = trainIndexMap.get(pm.trainId);
+   615→            if (trainIndex === undefined) return null;
+   616→
+   617→            const pmDate = parseDate(pm.targetDate);
+   618→            const dayOffset = dateDiffDays(pmDate, fromDate);
+   619→            if (dayOffset < 0 || dayOffset >= days.length) return null;
+   620→
+   621→            const x = dayOffset * LAYOUT.DAY_WIDTH;
+   622→            const y = trainIndex * LAYOUT.ROW_HEIGHT + LAYOUT.PM_BLOCK_MARGIN;
+   623→            const blockWidth = pm.durationDays * LAYOUT.DAY_WIDTH - 4;
+   624→
+   625→            return (
+   626→              <PmBlockRect
+   627→                key={pm.pmId}
+   628→                pm={pm}
+   629→                x={x}
+   630→                y={y}
+   631→                width={blockWidth}
+   632→                isSelected={selectedSet.has(pm.pmId)}
+   633→                onHover={onPmHover}
+   634→                onClick={onPmClick}
+   635→                onDragStart={onPmDragStart}
+   636→                onDragEnd={onPmDragEnd}
+   637→                fromDate={fromDate}
+   638→              />
+   639→            );
+   640→          })}
+   641→        </Group>
+   642→      </Layer>
+   643→
+   644→      {/* Timeline header layer (on top) */}
+   645→      <Layer>
+   646→        <TimelineHeader days={days} weeks={weeks} offsetX={gridOffsetX} />
+   647→      </Layer>
+   648→
+   649→      {/* Train labels layer (fixed left) */}
+   650→      <Layer>
+   651→        <TrainLabelsPanel
+   652→          trainOrder={trainOrder}
+   653→          trainNumbers={trainNumbers}
+   654→          fleetCodes={fleetCodes}
+   655→        />
+   656→      </Layer>
+   657→    </Stage>
+   658→  );
+   659→}
+   660→
+   661→export default TacticalGanttLayer;
+   662→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

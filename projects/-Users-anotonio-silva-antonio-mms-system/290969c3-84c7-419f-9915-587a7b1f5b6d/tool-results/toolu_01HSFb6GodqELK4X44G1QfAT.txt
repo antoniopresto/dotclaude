@@ -1,0 +1,453 @@
+     1→/**
+     2→ * Material Routes
+     3→ *
+     4→ * REST endpoints for inventory positions and material reservations.
+     5→ * Materials are a constraint for PM scheduling - PMs cannot proceed without
+     6→ * required blocking parts.
+     7→ *
+     8→ * Key features:
+     9→ * - Inventory positions with filtering (depot, part number, low stock)
+    10→ * - Material reservations with filtering (PM, status)
+    11→ * - Reservation fulfillment workflow
+    12→ *
+    13→ * @see specs/005-api.md Section 5.11
+    14→ */
+    15→
+    16→import { Hono } from 'hono';
+    17→import {
+    18→  success,
+    19→  paginatedSuccess,
+    20→  error,
+    21→  ErrorCodes,
+    22→  parsePaginationQuery,
+    23→  type AppVariables,
+    24→} from '../types';
+    25→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    26→import { getMaterialService, type ReservationStatus } from '../../services';
+    27→import { isValidUuid } from '../../lib/schemas';
+    28→
+    29→// Singleton service instance
+    30→let materialService: ReturnType<typeof getMaterialService> | null = null;
+    31→
+    32→function getService(): ReturnType<typeof getMaterialService> {
+    33→  if (!materialService) {
+    34→    materialService = getMaterialService();
+    35→  }
+    36→  return materialService;
+    37→}
+    38→
+    39→export const materialRoutes = new Hono<{ Variables: AppVariables }>();
+    40→
+    41→// =============================================================================
+    42→// Inventory Endpoints
+    43→// =============================================================================
+    44→
+    45→/**
+    46→ * GET /materials/inventory
+    47→ *
+    48→ * Get inventory positions with filtering.
+    49→ *
+    50→ * Query Parameters:
+    51→ * - depotId: Filter by depot (UUID)
+    52→ * - partNumber: Filter by part number (partial match)
+    53→ * - lowStock: Only show low stock items (boolean)
+    54→ * - page: Page number (default: 1)
+    55→ * - pageSize: Items per page (default: 50, max: 200)
+    56→ *
+    57→ * @returns Paginated list of inventory positions with depot info
+    58→ */
+    59→materialRoutes.get('/materials/inventory', async (c) => {
+    60→  const requestId = getRequestId(c);
+    61→  const service = getService();
+    62→
+    63→  // Parse query parameters
+    64→  const depotId = c.req.query('depotId');
+    65→  const partNumber = c.req.query('partNumber');
+    66→  const lowStockParam = c.req.query('lowStock');
+    67→
+    68→  // Validate depotId if provided
+    69→  if (depotId && !isValidUuid(depotId)) {
+    70→    return c.json(
+    71→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid depotId format', requestId),
+    72→      400
+    73→    );
+    74→  }
+    75→
+    76→  // Parse boolean
+    77→  const lowStock = lowStockParam === 'true';
+    78→
+    79→  // Parse pagination
+    80→  const pagination = parsePaginationQuery({
+    81→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+    82→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+    83→  });
+    84→
+    85→  const result = await service.listInventory(
+    86→    {
+    87→      depotId: depotId || undefined,
+    88→      partNumber: partNumber || undefined,
+    89→      lowStock: lowStockParam !== undefined ? lowStock : undefined,
+    90→    },
+    91→    { page: pagination.page, pageSize: pagination.pageSize }
+    92→  );
+    93→
+    94→  // Map to API response format per spec 005.11
+    95→  const items = result.items.map((item) => ({
+    96→    id: item.id,
+    97→    depotId: item.depotId,
+    98→    depotCode: item.depotCode,
+    99→    partNumber: item.partNumber,
+   100→    partDescription: item.partDescription,
+   101→    quantityOnHand: item.quantityOnHand,
+   102→    quantityReserved: item.quantityReserved,
+   103→    quantityAvailable: item.quantityAvailable,
+   104→    quantityOnOrder: item.quantityOnOrder,
+   105→    reorderPoint: item.reorderPoint,
+   106→    nextDeliveryDate: item.nextDeliveryDate,
+   107→    unitCost: item.unitCost,
+   108→    lastSyncAt: item.lastSyncAt,
+   109→  }));
+   110→
+   111→  return c.json(
+   112→    paginatedSuccess(items, {
+   113→      page: result.page,
+   114→      pageSize: result.pageSize,
+   115→      totalItems: result.total,
+   116→    }, { durationMs: getRequestDuration(c) })
+   117→  );
+   118→});
+   119→
+   120→/**
+   121→ * GET /materials/inventory/:id
+   122→ *
+   123→ * Get a single inventory position by ID.
+   124→ *
+   125→ * @returns Inventory position with depot info
+   126→ */
+   127→materialRoutes.get('/materials/inventory/:id', async (c) => {
+   128→  const requestId = getRequestId(c);
+   129→  const service = getService();
+   130→  const id = c.req.param('id');
+   131→
+   132→  // Validate UUID
+   133→  if (!isValidUuid(id)) {
+   134→    return c.json(
+   135→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid inventory ID format', requestId),
+   136→      400
+   137→    );
+   138→  }
+   139→
+   140→  try {
+   141→    const item = await service.getInventoryById(id);
+   142→
+   143→    return c.json(
+   144→      success(
+   145→        {
+   146→          id: item.id,
+   147→          depotId: item.depotId,
+   148→          depotCode: item.depotCode,
+   149→          partNumber: item.partNumber,
+   150→          partDescription: item.partDescription,
+   151→          quantityOnHand: item.quantityOnHand,
+   152→          quantityReserved: item.quantityReserved,
+   153→          quantityAvailable: item.quantityAvailable,
+   154→          quantityOnOrder: item.quantityOnOrder,
+   155→          reorderPoint: item.reorderPoint,
+   156→          reorderQuantity: item.reorderQuantity,
+   157→          nextDeliveryDate: item.nextDeliveryDate,
+   158→          nextDeliveryQuantity: item.nextDeliveryQuantity,
+   159→          unitCost: item.unitCost,
+   160→          currency: item.currency,
+   161→          lastSyncAt: item.lastSyncAt,
+   162→          sourceSystem: item.sourceSystem,
+   163→          isLowStock: item.isLowStock,
+   164→        },
+   165→        { timing: { durationMs: getRequestDuration(c) } }
+   166→      )
+   167→    );
+   168→  } catch (err) {
+   169→    if (err instanceof Error && err.name === 'NotFoundError') {
+   170→      return c.json(
+   171→        error(ErrorCodes.NOT_FOUND, `Inventory position not found: ${id}`, requestId),
+   172→        404
+   173→      );
+   174→    }
+   175→    throw err;
+   176→  }
+   177→});
+   178→
+   179→/**
+   180→ * GET /materials/inventory/summary
+   181→ *
+   182→ * Get inventory summary statistics.
+   183→ *
+   184→ * @returns Aggregate stats including low stock counts per depot
+   185→ */
+   186→materialRoutes.get('/materials/inventory/summary', async (c) => {
+   187→  const service = getService();
+   188→
+   189→  const summary = await service.getInventorySummary();
+   190→
+   191→  return c.json(
+   192→    success(summary, { timing: { durationMs: getRequestDuration(c) } })
+   193→  );
+   194→});
+   195→
+   196→// =============================================================================
+   197→// Reservation Endpoints
+   198→// =============================================================================
+   199→
+   200→/**
+   201→ * GET /materials/reservations
+   202→ *
+   203→ * Get material reservations with filtering.
+   204→ *
+   205→ * Query Parameters:
+   206→ * - pmScheduleId: Filter by PM (UUID)
+   207→ * - status: Filter by status (PENDING, FULFILLED, EXPIRED)
+   208→ * - depotId: Filter by depot (UUID)
+   209→ * - partNumber: Filter by part number
+   210→ * - page: Page number (default: 1)
+   211→ * - pageSize: Items per page (default: 50, max: 200)
+   212→ *
+   213→ * @returns Paginated list of reservations with PM and depot details
+   214→ */
+   215→materialRoutes.get('/materials/reservations', async (c) => {
+   216→  const requestId = getRequestId(c);
+   217→  const service = getService();
+   218→
+   219→  // Parse query parameters
+   220→  const pmScheduleId = c.req.query('pmScheduleId');
+   221→  const status = c.req.query('status') as ReservationStatus | undefined;
+   222→  const depotId = c.req.query('depotId');
+   223→  const partNumber = c.req.query('partNumber');
+   224→
+   225→  // Validate UUIDs if provided
+   226→  if (pmScheduleId && !isValidUuid(pmScheduleId)) {
+   227→    return c.json(
+   228→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid pmScheduleId format', requestId),
+   229→      400
+   230→    );
+   231→  }
+   232→
+   233→  if (depotId && !isValidUuid(depotId)) {
+   234→    return c.json(
+   235→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid depotId format', requestId),
+   236→      400
+   237→    );
+   238→  }
+   239→
+   240→  // Validate status if provided
+   241→  if (status && !['PENDING', 'FULFILLED', 'EXPIRED'].includes(status)) {
+   242→    return c.json(
+   243→      error(
+   244→        ErrorCodes.VALIDATION_ERROR,
+   245→        'status must be one of: PENDING, FULFILLED, EXPIRED',
+   246→        requestId
+   247→      ),
+   248→      400
+   249→    );
+   250→  }
+   251→
+   252→  // Parse pagination
+   253→  const pagination = parsePaginationQuery({
+   254→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   255→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   256→  });
+   257→
+   258→  const result = await service.listReservations(
+   259→    {
+   260→      pmScheduleId: pmScheduleId || undefined,
+   261→      status: status || undefined,
+   262→      depotId: depotId || undefined,
+   263→      partNumber: partNumber || undefined,
+   264→    },
+   265→    { page: pagination.page, pageSize: pagination.pageSize }
+   266→  );
+   267→
+   268→  // Map to API response format per spec 005.11
+   269→  const items = result.items.map((item) => ({
+   270→    id: item.id,
+   271→    pmScheduleId: item.pmScheduleId,
+   272→    partNumber: item.partNumber,
+   273→    quantityReserved: item.quantityReserved,
+   274→    reservationType: item.reservationType,
+   275→    reservedAt: item.reservedAt,
+   276→    expiresAt: item.expiresAt,
+   277→    fulfilledAt: item.fulfilledAt,
+   278→    fulfilledQuantity: item.fulfilledQuantity,
+   279→    status: item.status,
+   280→    pm: item.pm,
+   281→    depot: item.depot,
+   282→    reservedBy: item.reservedByName,
+   283→  }));
+   284→
+   285→  return c.json(
+   286→    paginatedSuccess(items, {
+   287→      page: result.page,
+   288→      pageSize: result.pageSize,
+   289→      totalItems: result.total,
+   290→    }, { durationMs: getRequestDuration(c) })
+   291→  );
+   292→});
+   293→
+   294→/**
+   295→ * GET /materials/reservations/:id
+   296→ *
+   297→ * Get a single reservation by ID.
+   298→ *
+   299→ * @returns Reservation with details
+   300→ */
+   301→materialRoutes.get('/materials/reservations/:id', async (c) => {
+   302→  const requestId = getRequestId(c);
+   303→  const service = getService();
+   304→  const id = c.req.param('id');
+   305→
+   306→  // Validate UUID
+   307→  if (!isValidUuid(id)) {
+   308→    return c.json(
+   309→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid reservation ID format', requestId),
+   310→      400
+   311→    );
+   312→  }
+   313→
+   314→  try {
+   315→    const item = await service.getReservationById(id);
+   316→
+   317→    return c.json(
+   318→      success(
+   319→        {
+   320→          id: item.id,
+   321→          pmScheduleId: item.pmScheduleId,
+   322→          inventoryPositionId: item.inventoryPositionId,
+   323→          partNumber: item.partNumber,
+   324→          quantityReserved: item.quantityReserved,
+   325→          reservationType: item.reservationType,
+   326→          reservedAt: item.reservedAt,
+   327→          reservedBy: item.reservedByName,
+   328→          expiresAt: item.expiresAt,
+   329→          fulfilledAt: item.fulfilledAt,
+   330→          fulfilledQuantity: item.fulfilledQuantity,
+   331→          status: item.status,
+   332→          pm: item.pm,
+   333→          depot: item.depot,
+   334→        },
+   335→        { timing: { durationMs: getRequestDuration(c) } }
+   336→      )
+   337→    );
+   338→  } catch (err) {
+   339→    if (err instanceof Error && err.name === 'NotFoundError') {
+   340→      return c.json(
+   341→        error(ErrorCodes.NOT_FOUND, `Reservation not found: ${id}`, requestId),
+   342→        404
+   343→      );
+   344→    }
+   345→    throw err;
+   346→  }
+   347→});
+   348→
+   349→/**
+   350→ * POST /materials/reservations/:id/fulfill
+   351→ *
+   352→ * Mark a reservation as fulfilled.
+   353→ *
+   354→ * Request body (optional):
+   355→ * - fulfilledQuantity: Quantity actually delivered (defaults to reserved quantity)
+   356→ *
+   357→ * @returns Updated reservation with fulfillment details
+   358→ */
+   359→materialRoutes.post('/materials/reservations/:id/fulfill', async (c) => {
+   360→  const requestId = getRequestId(c);
+   361→  const service = getService();
+   362→  const id = c.req.param('id');
+   363→
+   364→  // Validate UUID
+   365→  if (!isValidUuid(id)) {
+   366→    return c.json(
+   367→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid reservation ID format', requestId),
+   368→      400
+   369→    );
+   370→  }
+   371→
+   372→  // Parse request body (optional)
+   373→  let fulfilledQuantity: number | undefined;
+   374→  try {
+   375→    const body = await c.req.json().catch(() => ({}));
+   376→    if (body.fulfilledQuantity !== undefined) {
+   377→      if (typeof body.fulfilledQuantity !== 'number' || body.fulfilledQuantity < 0) {
+   378→        return c.json(
+   379→          error(
+   380→            ErrorCodes.VALIDATION_ERROR,
+   381→            'fulfilledQuantity must be a non-negative number',
+   382→            requestId
+   383→          ),
+   384→          400
+   385→        );
+   386→      }
+   387→      fulfilledQuantity = body.fulfilledQuantity;
+   388→    }
+   389→  } catch {
+   390→    // Empty body is fine
+   391→  }
+   392→
+   393→  try {
+   394→    // Get user ID from context if available
+   395→    const user = c.get('user');
+   396→    const userId = user?.id;
+   397→
+   398→    const result = await service.fulfillReservation({
+   399→      reservationId: id,
+   400→      fulfilledQuantity,
+   401→      userId,
+   402→    });
+   403→
+   404→    return c.json(
+   405→      success(
+   406→        {
+   407→          id: result.id,
+   408→          partNumber: result.partNumber,
+   409→          quantityReserved: result.quantityReserved,
+   410→          fulfilledQuantity: result.fulfilledQuantity,
+   411→          fulfilledAt: result.fulfilledAt,
+   412→          status: result.status,
+   413→        },
+   414→        { timing: { durationMs: getRequestDuration(c) } }
+   415→      )
+   416→    );
+   417→  } catch (err) {
+   418→    if (err instanceof Error) {
+   419→      if (err.name === 'NotFoundError') {
+   420→        return c.json(
+   421→          error(ErrorCodes.NOT_FOUND, `Reservation not found: ${id}`, requestId),
+   422→          404
+   423→        );
+   424→      }
+   425→      if (err.name === 'ValidationError') {
+   426→        const validationErr = err as Error & { context?: { code?: string } };
+   427→        const errorCode = validationErr.context?.code;
+   428→        if (errorCode === 'ALREADY_FULFILLED') {
+   429→          return c.json(
+   430→            error(ErrorCodes.CONFLICT, 'Reservation is already fulfilled', requestId),
+   431→            409
+   432→          );
+   433→        }
+   434→        if (errorCode === 'RESERVATION_EXPIRED') {
+   435→          return c.json(
+   436→            error(
+   437→              ErrorCodes.CONFLICT,
+   438→              'Cannot fulfill an expired reservation',
+   439→              requestId
+   440→            ),
+   441→            409
+   442→          );
+   443→        }
+   444→      }
+   445→    }
+   446→    throw err;
+   447→  }
+   448→});
+   449→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

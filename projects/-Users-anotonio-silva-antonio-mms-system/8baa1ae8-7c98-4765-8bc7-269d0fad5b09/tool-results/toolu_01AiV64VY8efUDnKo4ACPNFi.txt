@@ -1,0 +1,1449 @@
+     1→54-[Omitted long context line]
+     2→55-```
+     3→56-
+     4→57----
+     5→58-
+     6→59:## 4.2 Ingestion Service
+     7→60-
+     8→61-### 4.2.1 Purpose
+     9→62-
+    10→63:Process daily CSV files containing mileage data, validate records, handle meter events, and update the database.
+    11→64-
+    12→65-### 4.2.2 File Watcher
+    13→66-
+    14→67-```typescript
+    15→68:interface FileWatcherConfig {
+    16→69-  inboxPath: string;           // /data/inbox
+    17→70-  processedPath: string;       // /data/processed
+    18→71-  quarantinePath: string;      // /data/quarantine
+    19→72:  expectedFilePattern: RegExp; // /^mileage_\d{8}\.csv$/
+    20→73-  maxFileSizeBytes: number;    // 10MB
+    21→74-  alertThresholdHours: number; // 2
+    22→75-}
+    23→76-
+    24→77:class FileWatcherService {
+    25→78-  private watcher: FSWatcher;
+    26→79-  private lastFileReceivedAt: Date | null = null;
+    27→80-  
+    28→81-  async start(): Promise<void> {
+    29→82-    this.watcher = chokidar.watch(this.config.inboxPath, {
+    30→83-      persistent: true,
+    31→84-      awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 500 }
+    32→85-    });
+    33→86-    
+    34→87-    this.watcher.on('add', async (filePath) => {
+    35→88-      this.lastFileReceivedAt = new Date();
+    36→89-      await this.processFile(filePath);
+    37→90-    });
+    38→91-    
+    39→92-    // Health check interval
+    40→93-    setInterval(() => this.checkFileArrivalHealth(), 30 * 60 * 1000);
+    41→94-  }
+    42→95-  
+    43→96-  private async processFile(filePath: string): Promise<void> {
+    44→97-    const filename = path.basename(filePath);
+    45→98-    const jobId = crypto.randomUUID();
+    46→99-    
+    47→100-    try {
+    48→101-      // Validate file
+    49→102-      await this.validateFile(filePath);
+    50→103-      
+    51→104-      // Queue for processing
+    52→105-      await this.jobQueue.add('ingestion', {
+    53→106-        jobId,
+    54→107-        filePath,
+    55→108-        filename,
+    56→109-        receivedAt: new Date().toISOString()
+    57→110-      }, {
+    58→111-        attempts: 3,
+    59→112-        backoff: { type: 'exponential', delay: 5000 }
+    60→113-      });
+    61→114-      
+    62→115-      this.logger.info({ jobId, filename }, 'File queued for ingestion');
+    63→116-      
+    64→117-    } catch (error) {
+    65→--
+    66→147-      throw new Error(`Filename does not match expected pattern: ${filename}`);
+    67→148-    }
+    68→149-    
+    69→150-    // Content check (first 10 lines)
+    70→151-    const sample = await this.readFirstLines(filePath, 10);
+    71→152:    await this.validateCSVStructure(sample);
+    72→153-  }
+    73→154-  
+    74→155-  private async checkFileArrivalHealth(): Promise<void> {
+    75→156-    if (!this.lastFileReceivedAt) return;
+    76→157-    
+    77→158-    const hoursSinceLastFile = 
+    78→159-      (Date.now() - this.lastFileReceivedAt.getTime()) / (1000 * 60 * 60);
+    79→160-    
+    80→161-    if (hoursSinceLastFile > this.config.alertThresholdHours) {
+    81→162-      await this.alertService.send({
+    82→163-        type: 'FILE_ARRIVAL_DELAYED',
+    83→164-        severity: 'WARNING',
+    84→165:        message: `No mileage files received in ${hoursSinceLastFile.toFixed(1)} hours`,
+    85→166-        lastFileAt: this.lastFileReceivedAt.toISOString(),
+    86→167-        expectedInterval: `${this.config.alertThresholdHours} hours`
+    87→168-      });
+    88→169-    }
+    89→170-  }
+    90→171-}
+    91→172-```
+    92→173-
+    93→174:### 4.2.3 Ingestion Worker
+    94→175-
+    95→176-```typescript
+    96→177-interface MileageRecord {
+    97→178-  trainNumber: string;
+    98→179-  readingDate: string;  // YYYY-MM-DD
+    99→180-  odometerValue: number;
+   100→181-  source?: string;
+   101→182-}
+   102→183-
+   103→184:interface IngestionResult {
+   104→185-  jobId: string;
+   105→186-  filename: string;
+   106→187-  totalRecords: number;
+   107→188-  validRecords: number;
+   108→189-  invalidRecords: number;
+   109→190-  anomalies: AnomalyRecord[];
+   110→191-  meterEvents: MeterEventRecord[];
+   111→192-  processingTimeMs: number;
+   112→193-}
+   113→194-
+   114→195:class IngestionWorker {
+   115→196:  async process(job: Job<IngestionJobData>): Promise<IngestionResult> {
+   116→197-    const startTime = Date.now();
+   117→198-    const { jobId, filePath, filename } = job.data;
+   118→199-    
+   119→200:    const result: IngestionResult = {
+   120→201-      jobId,
+   121→202-      filename,
+   122→203-      totalRecords: 0,
+   123→204-      validRecords: 0,
+   124→205-      invalidRecords: 0,
+   125→206-      anomalies: [],
+   126→207-      meterEvents: [],
+   127→208-      processingTimeMs: 0
+   128→209-    };
+   129→210-    
+   130→211:    // Parse CSV
+   131→212:    const records = await this.parseCSV(filePath);
+   132→213-    result.totalRecords = records.length;
+   133→214-    
+   134→215-    // Process in batches
+   135→216-    const batches = this.chunk(records, 100);
+   136→217-    
+   137→218-    for (const batch of batches) {
+   138→219-      await this.db.transaction(async (tx) => {
+   139→220-        for (const record of batch) {
+   140→221-          try {
+   141→222-            await this.processRecord(tx, record, result);
+   142→223-            result.validRecords++;
+   143→224-          } catch (error) {
+   144→225-            result.invalidRecords++;
+   145→226-            this.logger.warn({ record, error }, 'Record processing failed');
+   146→227-          }
+   147→228-        }
+   148→229-      });
+   149→230-    }
+   150→231-    
+   151→232-    // Move file to processed
+   152→233-    const processedPath = path.join(
+   153→234-      this.config.processedPath,
+   154→235-      `${Date.now()}_${filename}`
+   155→236-    );
+   156→237-    await fs.rename(filePath, processedPath);
+   157→238-    
+   158→239:    // Update train current mileage
+   159→240-    await this.updateTrainMileage(records);
+   160→241-    
+   161→242-    // Trigger downstream processing
+   162→243-    await this.triggerDriftCheck();
+   163→244-    
+   164→245-    result.processingTimeMs = Date.now() - startTime;
+   165→246-    
+   166→247-    return result;
+   167→248-  }
+   168→249-  
+   169→250-  private async processRecord(
+   170→251-    tx: Transaction,
+   171→252-    record: MileageRecord,
+   172→253:    result: IngestionResult
+   173→254-  ): Promise<void> {
+   174→255-    // Find train
+   175→256-    const train = await tx.query.trains.findFirst({
+   176→257-      where: eq(trains.trainNumber, record.trainNumber)
+   177→258-    });
+   178→259-    
+   179→260-    if (!train) {
+   180→261-      throw new Error(`Unknown train: ${record.trainNumber}`);
+   181→262-    }
+   182→263-    
+   183→264-    // Get previous reading
+   184→265:    const previousReading = await tx.query.mileageReadings.findFirst({
+   185→266-      where: and(
+   186→267:        eq(mileageReadings.trainId, train.id),
+   187→268:        lt(mileageReadings.readingDate, record.readingDate)
+   188→269-      ),
+   189→270:      orderBy: desc(mileageReadings.readingDate)
+   190→271-    });
+   191→272-    
+   192→273-    // Calculate adjusted value (handle meter events)
+   193→274-    const adjustment = await this.getMeterAdjustment(tx, train.id, record.readingDate);
+   194→275-    const adjustedReading = record.odometerValue + adjustment;
+   195→276-    
+   196→277-    // Calculate daily km
+   197→278-    let dailyKm: number | null = null;
+   198→279-    let anomalyType: string | null = null;
+   199→280-    
+   200→281-    if (previousReading) {
+   201→282-      dailyKm = adjustedReading - previousReading.adjustedReading;
+   202→283-      
+   203→284-      // Anomaly detection
+   204→285-      if (dailyKm < 0) {
+   205→286-        anomalyType = 'NEGATIVE';
+   206→287-        result.anomalies.push({
+   207→288-          trainNumber: record.trainNumber,
+   208→289-          date: record.readingDate,
+   209→290-          type: 'NEGATIVE',
+   210→291-          value: dailyKm,
+   211→292:          message: `Negative daily mileage: ${dailyKm} km`
+   212→293-        });
+   213→294-      } else if (dailyKm > 1000) {  // Spike threshold
+   214→295-        anomalyType = 'SPIKE';
+   215→296-        result.anomalies.push({
+   216→297-          trainNumber: record.trainNumber,
+   217→298-          date: record.readingDate,
+   218→299-          type: 'SPIKE',
+   219→300-          value: dailyKm,
+   220→301:          message: `Unusually high daily mileage: ${dailyKm} km`
+   221→302-        });
+   222→303-      }
+   223→304-    }
+   224→305-    
+   225→306-    // Insert or update reading
+   226→307:    await tx.insert(mileageReadings)
+   227→308-      .values({
+   228→309-        trainId: train.id,
+   229→310-        readingDate: record.readingDate,
+   230→311-        rawReading: record.odometerValue,
+   231→312-        adjustedReading,
+   232→313-        dailyKm,
+   233→314-        validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+   234→315-        anomalyType,
+   235→316-        sourceFile: result.filename
+   236→317-      })
+   237→318-      .onConflictDoUpdate({
+   238→319:        target: [mileageReadings.trainId, mileageReadings.readingDate],
+   239→320-        set: {
+   240→321-          rawReading: record.odometerValue,
+   241→322-          adjustedReading,
+   242→323-          dailyKm,
+   243→324-          validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+   244→325-          anomalyType,
+   245→326-          sourceFile: result.filename
+   246→327-        }
+   247→328-      });
+   248→329-  }
+   249→330-  
+   250→331-  private async getMeterAdjustment(
+   251→332-    tx: Transaction,
+   252→333-    trainId: string,
+   253→334-    asOfDate: string
+   254→335-  ): Promise<number> {
+   255→336-    // Sum all meter event adjustments up to this date
+   256→337-    const events = await tx.query.meterEvents.findMany({
+   257→338-      where: and(
+   258→339-        eq(meterEvents.trainId, trainId),
+   259→340-        lte(meterEvents.eventDate, asOfDate)
+   260→341-      )
+   261→342-    });
+   262→343-    
+   263→344-    return events.reduce((sum, e) => sum + (e.adjustmentKm || 0), 0);
+   264→345-  }
+   265→346-  
+   266→347-  private async updateTrainMileage(records: MileageRecord[]): Promise<void> {
+   267→348-    // Group by train, find latest reading
+   268→349-    const latestByTrain = new Map<string, MileageRecord>();
+   269→350-    
+   270→351-    for (const record of records) {
+   271→352-      const existing = latestByTrain.get(record.trainNumber);
+   272→353-      if (!existing || record.readingDate > existing.readingDate) {
+   273→354-        latestByTrain.set(record.trainNumber, record);
+   274→355-      }
+   275→356-    }
+   276→357-    
+   277→358:    // Update train current_mileage
+   278→359-    for (const [trainNumber, record] of latestByTrain) {
+   279→360-      await this.db.update(trains)
+   280→361-        .set({ 
+   281→362-          currentMileageKm: record.odometerValue,
+   282→363-          updatedAt: new Date()
+   283→364-        })
+   284→365-        .where(eq(trains.trainNumber, trainNumber));
+   285→366-    }
+   286→367-    
+   287→368:    // Update fleet mileage targets
+   288→369:    await this.db.execute(sql`SELECT update_fleet_mileage_targets()`);
+   289→370-  }
+   290→371-}
+   291→372-```
+   292→373-
+   293→374----
+   294→375-
+   295→376-## 4.2.5 Unavailability Service (NEW v2.1)
+   296→377-
+   297→378-### 4.2.5.1 Purpose
+   298→379-
+   299→380-Track trains that are unavailable due to corrective maintenance, incidents, or other blocking factors. This service is **critical** for schedule validity - without it, the optimizer can schedule PMs for trains that are grounded for weeks.
+   300→381-
+   301→382-### 4.2.5.2 Implementation
+   302→383-
+   303→384-```typescript
+   304→385-interface UnavailabilityEvent {
+   305→386-  id: string;
+   306→387-  trainId: string;
+   307→388-  eventType: 'CORRECTIVE' | 'INCIDENT' | 'COLLISION' | 'VANDALISM' | 'EXTERNAL' | 'PLANNED_OUTAGE';
+   308→389-  status: 'ACTIVE' | 'RESOLVED';
+   309→390-  restrictionLevel: 'RESTRICTED' | 'GROUNDED';
+   310→391-  
+   311→392-  reportedAt: Date;
+   312→393-  estimatedRepairHours?: number;
+   313→394-  estimatedReturnDate?: Date;
+   314→395-  actualReturnDate?: Date;
+   315→396-  
+   316→397-  sourceSystem: 'MAXIMO' | 'OCC' | 'MANUAL';
+   317→398-  externalReference?: string;   // Maximo WO number
+   318→399-  externalStatus?: string;      // Maximo status
+   319→400-  
+   320→401-  description?: string;
+   321→402-  failureCode?: string;
+   322→403-  affectedSystem?: string;
+   323→404-  
+   324→405-  blocksPmScheduling: boolean;
+   325→406-  blocksRunAssignment: boolean;
+   326→407-}
+   327→408-
+   328→409-interface CreateUnavailabilityInput {
+   329→--
+   330→904-
+   331→905-## 4.2.7 Route Utilization Service (NEW v2.1)
+   332→906-
+   333→907-### 4.2.7.1 Purpose
+   334→908-
+   335→909:Provide route-specific daily mileage rates for accurate long-term projections. Using fleet-wide averages can result in 60,000+ km projection error over 12 years.
+   336→910-
+   337→911-### 4.2.7.2 Implementation
+   338→912-
+   339→913-```typescript
+   340→914-interface RouteUtilizationProfile {
+   341→915-  id: string;
+   342→916-  routeId: string;
+   343→917-  effectiveDate: Date;
+   344→918-  
+   345→919-  weekdayKm: number;
+   346→920-  saturdayKm?: number;
+   347→921-  sundayKm?: number;
+   348→922-  holidayKm?: number;
+   349→923-  
+   350→924-  peakSeasonMultiplier: number;
+   351→925-  offPeakMultiplier: number;
+   352→926-  
+   353→927-  confidence: 'HIGH' | 'MEDIUM' | 'LOW' | 'ESTIMATED';
+   354→928-}
+   355→929-
+   356→930-class RouteUtilizationService {
+   357→931-  constructor(private db: Database) {}
+   358→932-  
+   359→933-  /**
+   360→934-   * Get utilization profile for a route
+   361→935-   */
+   362→936-  async getProfile(routeId: string, asOfDate?: Date): Promise<RouteUtilizationProfile | null> {
+   363→937-    const date = asOfDate || new Date();
+   364→938-    
+   365→939-    const profile = await this.db
+   366→940-      .select()
+   367→941-      .from(routeUtilizationProfiles)
+   368→942-      .where(and(
+   369→943-        eq(routeUtilizationProfiles.routeId, routeId),
+   370→944-        lte(routeUtilizationProfiles.effectiveDate, date)
+   371→945-      ))
+   372→946-      .orderBy(desc(routeUtilizationProfiles.effectiveDate))
+   373→947-      .limit(1);
+   374→948-    
+   375→949-    return profile[0] || null;
+   376→--
+   377→997-      confidence: 'ESTIMATED'
+   378→998-    };
+   379→999-  }
+   380→1000-  
+   381→1001-  /**
+   382→1002:   * Project mileage for a train over a time horizon
+   383→1003-   */
+   384→1004-  async projectMileage(
+   385→1005-    trainId: string,
+   386→1006-    startDate: Date,
+   387→1007-    horizonDays: number
+   388→1008-  ): Promise<{ date: Date; projectedKm: number; cumulativeKm: number }[]> {
+   389→1009-    const train = await this.db
+   390→1010-      .select()
+   391→1011-      .from(trains)
+   392→1012-      .where(eq(trains.id, trainId))
+   393→1013-      .limit(1);
+   394→1014-    
+   395→1015-    if (!train[0]) {
+   396→1016-      throw new NotFoundError(`Train ${trainId} not found`);
+   397→1017-    }
+   398→1018-    
+   399→1019-    let cumulativeKm = train[0].currentMileageKm;
+   400→1020-    const projections: { date: Date; projectedKm: number; cumulativeKm: number }[] = [];
+   401→1021-    
+   402→1022-    for (let day = 0; day < horizonDays; day++) {
+   403→1023-      const targetDate = addDays(startDate, day);
+   404→1024-      const { dailyKm } = await this.calculateDailyRate(trainId, targetDate);
+   405→1025-      
+   406→1026-      cumulativeKm += dailyKm;
+   407→1027-      projections.push({
+   408→1028-        date: targetDate,
+   409→1029-        projectedKm: dailyKm,
+   410→1030-        cumulativeKm
+   411→1031-      });
+   412→1032-    }
+   413→1033-    
+   414→1034-    return projections;
+   415→1035-  }
+   416→1036-  
+   417→1037-  private async getTypicalRouteAssignment(trainId: string): Promise<{ routeId: string } | null> {
+   418→1038-    // Look at recent run assignments to determine typical route
+   419→1039-    const recentAssignments = await this.db
+   420→1040-      .select({ routeId: runAssignments.routeId, count: count() })
+   421→1041-      .from(runAssignments)
+   422→1042-      .where(and(
+   423→--
+   424→1049-    
+   425→1050-    return recentAssignments[0] || null;
+   426→1051-  }
+   427→1052-  
+   428→1053-  private async getFleetAverage(fleetId: string): Promise<number> {
+   429→1054:    // Calculate from recent mileage readings
+   430→1055-    const result = await this.db
+   431→1056:      .select({ avgDaily: avg(mileageReadings.dailyKm) })
+   432→1057:      .from(mileageReadings)
+   433→1058:      .innerJoin(trains, eq(mileageReadings.trainId, trains.id))
+   434→1059-      .where(and(
+   435→1060-        eq(trains.fleetId, fleetId),
+   436→1061:        gte(mileageReadings.readingDate, addDays(new Date(), -30)),
+   437→1062:        eq(mileageReadings.validationStatus, 'VALID')
+   438→1063-      ));
+   439→1064-    
+   440→1065-    return Math.round(result[0]?.avgDaily || 250);
+   441→1066-  }
+   442→1067-  
+   443→1068-  private getKmForDayType(profile: RouteUtilizationProfile, dayType: string): number {
+   444→1069-    switch (dayType) {
+   445→1070-      case 'SATURDAY': return profile.saturdayKm || profile.weekdayKm * 0.8;
+   446→1071-      case 'SUNDAY': return profile.sundayKm || profile.weekdayKm * 0.7;
+   447→1072-      case 'HOLIDAY': return profile.holidayKm || profile.weekdayKm * 0.6;
+   448→1073-      default: return profile.weekdayKm;
+   449→1074-    }
+   450→1075-  }
+   451→1076-  
+   452→1077-  private getSeasonalMultiplier(profile: RouteUtilizationProfile, date: Date): number {
+   453→1078-    / TODO: Integrate with season calendar
+   454→1079-    const month = date.getMonth();
+   455→1080-    / Peak season: CNY (Jan-Feb), School holidays (Jun, Nov-Dec)
+   456→1081-    const peakMonths = [0, 1, 5, 10, 11];
+   457→1082-    return peakMonths.includes(month) ? profile.peakSeasonMultiplier : profile.offPeakMultiplier;
+   458→1083-  }
+   459→1084-  
+   460→1085-  private getDayType(date: Date): string {
+   461→1086-    const dayOfWeek = date.getDay();
+   462→1087-    if (dayOfWeek === 0) return 'SUNDAY';
+   463→1088-    if (dayOfWeek === 6) return 'SATURDAY';
+   464→1089-    return 'WEEKDAY';
+   465→1090-  }
+   466→1091-}
+   467→1092-```
+   468→1093-
+   469→1094----
+   470→1095-
+   471→1096-## 4.3 Run Assignment Optimizer
+   472→1097-
+   473→1098-### 4.3.1 Purpose
+   474→1099-
+   475→1100:Optimize daily train-to-route assignments for mileage balancing while respecting hard constraints (fitness, PM due, **unavailability**, **service demand**) and minimizing soft constraint penalties.
+   476→1101-
+   477→1102-### 4.3.2 Optimizer Service (TypeScript Wrapper)
+   478→1103-
+   479→1104-```typescript
+   480→1105-interface OptimizerConfig {
+   481→1106-  binaryPath: string;          // ./mms-optimizer
+   482→1107-  maxSolveTimeSeconds: number; // 30
+   483→1108-  numWorkers: number;          // 4
+   484→1109-  timeoutMs: number;           // 60000
+   485→1110-  fallbackEnabled: boolean;    // true
+   486→1111-}
+   487→1112-
+   488→1113-class RunAssignmentOptimizer {
+   489→1114-  private process: Subprocess | null = null;
+   490→1115-  
+   491→1116-  async optimize(input: OptimizerInput): Promise<OptimizerResult> {
+   492→1117-    const startTime = Date.now();
+   493→1118-    
+   494→1119-    try {
+   495→1120-      // Try C++ optimizer first
+   496→1121-      const result = await this.runCppOptimizer(input);
+   497→1122-      
+   498→1123-      // Validate result
+   499→1124-      if (result.status === 'INFEASIBLE' && this.config.fallbackEnabled) {
+   500→1125-        this.logger.warn('C++ optimizer returned INFEASIBLE, using fallback');
+   501→1126-        return await this.runFallbackOptimizer(input);
+   502→1127-      }
+   503→1128-      
+   504→1129-      return result;
+   505→1130-      
+   506→1131-    } catch (error) {
+   507→1132-      this.logger.error({ error }, 'C++ optimizer failed, using fallback');
+   508→1133-      
+   509→1134-      if (this.config.fallbackEnabled) {
+   510→1135-        return await this.runFallbackOptimizer(input);
+   511→1136-      }
+   512→1137-      
+   513→1138-      throw error;
+   514→1139-    }
+   515→1140-  }
+   516→--
+   517→1215-    // Sort routes by priority (required trains desc)
+   518→1216-    const sortedRoutes = [...input.routes].sort(
+   519→1217-      (a, b) => b.required_trains - a.required_trains
+   520→1218-    );
+   521→1219-    
+   522→1220:    // Sort trains by fitness and mileage balance
+   523→1221-    const sortedTrains = [...input.trains]
+   524→1222-      .filter(t => t.fitness_status === 'FIT')
+   525→1223-      .sort((a, b) => {
+   526→1224-        // Prioritize under-utilized trains
+   527→1225:        const aBalance = a.current_mileage - a.target_mileage;
+   528→1226:        const bBalance = b.current_mileage - b.target_mileage;
+   529→1227-        return aBalance - bBalance;
+   530→1228-      });
+   531→1229-    
+   532→1230-    for (const route of sortedRoutes) {
+   533→1231-      let assigned = 0;
+   534→1232-      
+   535→1233-      for (const train of sortedTrains) {
+   536→1234-        if (assigned >= route.required_trains) break;
+   537→1235-        if (assignedTrainIds.has(train.id)) continue;
+   538→1236-        
+   539→1237-        // Check hard constraints
+   540→1238-        const hardViolation = this.checkHardConstraints(train, route, input);
+   541→1239-        if (hardViolation) {
+   542→1240-          continue;
+   543→1241-        }
+   544→1242-        
+   545→1243-        // Check fleet compatibility
+   546→1244-        if (route.allowed_fleets.length > 0 && 
+   547→1245-            !route.allowed_fleets.includes(train.fleet_id)) {
+   548→1246-          continue;
+   549→1247-        }
+   550→1248-        
+   551→1249-        // Assign
+   552→1250-        assignments.push({
+   553→1251-          train_id: train.id,
+   554→1252-          route_id: route.id,
+   555→1253-          score: this.calculateScore(train, route),
+   556→1254-          explanation: [
+   557→1255-            {
+   558→1256-              constraint_type: 'SOFT',
+   559→1257-              constraint_name: 'MILEAGE_BALANCE',
+   560→1258:              impact: train.current_mileage - train.target_mileage,
+   561→1259:              description: `Train is ${Math.abs(train.current_mileage - train.target_mileage)}km ${
+   562→1260:                train.current_mileage < train.target_mileage ? 'under' : 'over'
+   563→1261-              } target`
+   564→1262-            }
+   565→1263-          ]
+   566→1264-        });
+   567→1265-        
+   568→1266-        assignedTrainIds.add(train.id);
+   569→1267-        assigned++;
+   570→1268-      }
+   571→1269-      
+   572→1270-      // Record shortfall
+   573→1271-      if (assigned < route.required_trains) {
+   574→1272-        unassigned.push({
+   575→1273-          route_id: route.id,
+   576→1274-          shortfall: route.required_trains - assigned,
+   577→1275-          reason: 'Insufficient fit trains available'
+   578→1276-        });
+   579→1277-      }
+   580→1278-    }
+   581→1279-    
+   582→1280-    // Record unassigned trains with reasons
+   583→1281-    for (const train of input.trains) {
+   584→1282-      if (assignedTrainIds.has(train.id)) continue;
+   585→1283-      
+   586→1284-      const reason = train.fitness_status !== 'FIT' 
+   587→1285-        ? `Train is ${train.fitness_status}`
+   588→1286-        : this.findBlockingConstraint(train, input);
+   589→1287-      
+   590→1288-      unassigned.push({
+   591→1289-        train_id: train.id,
+   592→1290-        reason,
+   593→1291-        blocking_constraints: this.getBlockingConstraints(train, input)
+   594→1292-      });
+   595→1293-    }
+   596→1294-    
+   597→1295-    return {
+   598→1296-      type: 'RESULT',
+   599→1297-      request_id: input.request_id,
+   600→1298-      status: 'FALLBACK',
+   601→1299-      solve_time_ms: 0,
+   602→1300-      assignments,
+   603→--
+   604→1378-  
+   605→1379-  trains: {
+   606→1380-    id: string;
+   607→1381-    train_number: string;
+   608→1382-    fleet_id: string;
+   609→1383:    current_mileage: number;
+   610→1384:    target_mileage: number;
+   611→1385-    fitness_status: 'FIT' | 'RESTRICTED' | 'GROUNDED';
+   612→1386-    home_depot_id: string;
+   613→1387-  }[];
+   614→1388-  
+   615→1389-  routes: {
+   616→1390-    id: string;
+   617→1391-    route_code: string;
+   618→1392-    expected_km: number;
+   619→1393-    required_trains: number;
+   620→1394-    allowed_fleets: string[];
+   621→1395-  }[];
+   622→1396-  
+   623→1397-  hard_constraints: {
+   624→1398-    train_id: string;
+   625→1399-    type: string;
+   626→1400-    description: string;
+   627→1401-  }[];
+   628→1402-  
+   629→1403-  pending_pms: {
+   630→1404-    train_id: string;
+   631→1405-    pm_type: string;
+   632→1406-    target_date: string;
+   633→1407-    required_materials: {
+   634→1408-      part_number: string;
+   635→1409-      quantity: number;
+   636→1410-      criticality: 'BLOCKING' | 'DEFERRABLE' | 'CONSUMABLE';
+   637→1411-    }[];
+   638→1412-  }[];
+   639→1413-  
+   640→1414-  material_positions: {
+   641→1415-    depot_id: string;
+   642→1416-    part_number: string;
+   643→1417-    quantity_available: number;
+   644→1418-  }[];
+   645→1419-  
+   646→1420-  / NEW v2.1: Unavailability events
+   647→1421-  unavailability_events?: {
+   648→1422-    train_id: string;
+   649→1423-    event_type: string;
+   650→1424-    status: 'ACTIVE' | 'RESOLVED';
+   651→--
+   652→1445-  
+   653→1446-  config: {
+   654→1447-    max_solve_time_seconds: number;
+   655→1448-    num_workers: number;
+   656→1449-    soft_constraint_penalties: {
+   657→1450:      mileage_imbalance: number;
+   658→1451-      route_preference: number;
+   659→1452-    };
+   660→1453-  };
+   661→1454-}
+   662→1455-```
+   663→1456-
+   664→1457-### 4.3.3 C++ Optimizer Core
+   665→1458-
+   666→1459-```cpp
+   667→1460-// mms-optimizer/src/solver.cpp
+   668→1461-
+   669→1462-#include <ortools/sat/cp_model.h>
+   670→1463-#include <nlohmann/json.hpp>
+   671→1464-#include <vector>
+   672→1465-#include <unordered_map>
+   673→1466-
+   674→1467-using namespace operations_research::sat;
+   675→1468-using json = nlohmann::json;
+   676→1469-
+   677→1470-struct ExplanationFactor {
+   678→1471-    std::string constraint_type;  // "HARD" or "SOFT"
+   679→1472-    std::string constraint_name;
+   680→1473-    double impact;
+   681→1474-    std::string description;
+   682→1475-};
+   683→1476-
+   684→1477-class MmsSolver {
+   685→1478-public:
+   686→1479-    json solve(const json& input) {
+   687→1480-        CpModelBuilder model;
+   688→1481-        std::string request_id = input["request_id"];
+   689→1482-        
+   690→1483-        auto trains = input["trains"];
+   691→1484-        auto routes = input["routes"];
+   692→1485-        auto config = input["config"];
+   693→1486-        
+   694→1487-        / Decision variables: assign[t][r] = 1 if train t assigned to route r
+   695→1488-        std::vector<std::vector<BoolVar>> assign;
+   696→1489-        assign.resize(trains.size());
+   697→1490-        
+   698→--
+   699→1563-                }
+   700→1564-            }
+   701→1565-        }
+   702→1566-        
+   703→1567-        / Soft constraint: Mileage balance
+   704→1568:        std::vector<IntVar> mileage_penalties;
+   705→1569-        auto penalties = config["soft_constraint_penalties"];
+   706→1570:        int mileage_weight = penalties["mileage_imbalance"].get<int>();
+   707→1571-        
+   708→1572-        for (size_t t = 0; t < trains.size(); t++) {
+   709→1573:            int current = trains[t]["current_mileage"];
+   710→1574:            int target = trains[t]["target_mileage"];
+   711→1575-            int variance = std::abs(current - target);
+   712→1576-            
+   713→1577-            for (size_t r = 0; r < routes.size(); r++) {
+   714→1578-                int route_km = routes[r]["expected_km"];
+   715→1579-                
+   716→1580-                // Penalty for assigning over-utilized train to high-km route
+   717→1581-                if (current > target && route_km > 200) {
+   718→1582:                    IntVar penalty = model.NewIntVar({0, variance * mileage_weight});
+   719→1583:                    model.AddEquality(penalty, variance * mileage_weight)
+   720→1584-                        .OnlyEnforceIf(assign[t][r]);
+   721→1585-                    model.AddEquality(penalty, 0)
+   722→1586-                        .OnlyEnforceIf(assign[t][r].Not());
+   723→1587:                    mileage_penalties.push_back(penalty);
+   724→1588-                }
+   725→1589-            }
+   726→1590-        }
+   727→1591-        
+   728→1592-        / Objective: Minimize total penalty
+   729→1593:        model.Minimize(LinearExpr::Sum(mileage_penalties));
+   730→1594-        
+   731→1595-        // Solve
+   732→1596-        SatParameters params;
+   733→1597-        params.set_max_time_in_seconds(
+   734→1598-            config["max_solve_time_seconds"].get<double>()
+   735→1599-        );
+   736→1600-        params.set_num_search_workers(
+   737→1601-            config["num_workers"].get<int>()
+   738→1602-        );
+   739→1603-        
+   740→1604-        Model cp_model;
+   741→1605-        cp_model.Add(NewSatParameters(params));
+   742→1606-        
+   743→1607-        // Progress callback
+   744→1608-        int callback_count = 0;
+   745→1609-        cp_model.Add(NewFeasibleSolutionObserver([&](const CpSolverResponse& r) {
+   746→1610-            callback_count++;
+   747→1611-            if (callback_count % 5 == 0) {
+   748→1612-                emitProgress(request_id, 
+   749→1613-                    std::min(90.0, callback_count * 3.0),
+   750→1614-                    r.objective_value(), true);
+   751→1615-            }
+   752→1616-        }));
+   753→1617-        
+   754→1618-        CpSolverResponse response = SolveCpModel(model.Build(), &cp_model);
+   755→1619-        
+   756→1620-        // Build result
+   757→1621-        json result;
+   758→1622-        result["type"] = "RESULT";
+   759→1623-        result["request_id"] = request_id;
+   760→1624-        result["solve_time_ms"] = response.wall_time() * 1000;
+   761→1625-        
+   762→1626-        if (response.status() == CpSolverStatus::OPTIMAL ||
+   763→1627-            response.status() == CpSolverStatus::FEASIBLE) {
+   764→1628-            
+   765→1629-            result["status"] = response.status() == CpSolverStatus::OPTIMAL 
+   766→1630-                ? "OPTIMAL" : "FEASIBLE";
+   767→1631-            
+   768→1632-            json assignments = json::array();
+   769→1633-            
+   770→--
+   771→1673-        const CpSolverResponse& response
+   772→1674-    ) {
+   773→1675-        json factors = json::array();
+   774→1676-        
+   775→1677-        // Mileage balance factor
+   776→1678:        int current = train["current_mileage"];
+   777→1679:        int target = train["target_mileage"];
+   778→1680-        int variance = current - target;
+   779→1681-        
+   780→1682-        factors.push_back({
+   781→1683-            {"constraint_type", "SOFT"},
+   782→1684-            {"constraint_name", "MILEAGE_BALANCE"},
+   783→1685-            {"impact", std::abs(variance)},
+   784→1686-            {"description", fmt::format(
+   785→1687-                "Train is {}km {} fleet target",
+   786→1688-                std::abs(variance),
+   787→1689-                variance < 0 ? "under" : "over"
+   788→1690-            )}
+   789→1691-        });
+   790→1692-        
+   791→1693-        // Route match factor
+   792→1694-        int route_km = route["expected_km"];
+   793→1695-        std::string route_advice = "";
+   794→1696-        
+   795→1697-        if (variance < -1000 && route_km > 300) {
+   796→1698-            route_advice = "High-km route helps balance under-utilized train";
+   797→1699-        } else if (variance > 1000 && route_km < 150) {
+   798→1700-            route_advice = "Low-km route reduces over-utilization";
+   799→1701-        }
+   800→1702-        
+   801→1703-        if (!route_advice.empty()) {
+   802→1704-            factors.push_back({
+   803→1705-                {"constraint_type", "SOFT"},
+   804→1706-                {"constraint_name", "ROUTE_MATCH"},
+   805→1707-                {"impact", route_km},
+   806→1708-                {"description", route_advice}
+   807→1709-            });
+   808→1710-        }
+   809→1711-        
+   810→1712-        // Check if alternatives were blocked
+   811→1713-        for (const auto& constraint : input["hard_constraints"]) {
+   812→1714-            // Find trains that could have taken this route but were blocked
+   813→1715-            factors.push_back({
+   814→1716-                {"constraint_type", "HARD"},
+   815→1717-                {"constraint_name", constraint["type"]},
+   816→1718-                {"impact", 0},
+   817→1719-                {"description", fmt::format(
+   818→--
+   819→2324-  /**
+   820→2325-   * Project PM requirements for all trains over the planning horizon.
+   821→2326-   * 
+   822→2327-   * CRITICAL: This implementation correctly handles:
+   823→2328-   * 1. PM hierarchy (C4 satisfies C1/C2/C3 - resets their counters)
+   824→2329:   * 2. Dual triggers (mileage OR time, whichever comes first)
+   825→2330-   * 3. Recent velocity calculation for accurate projections
+   826→2331-   * 4. Cascading projections (each PM feeds into next cycle)
+   827→2332-   */
+   828→2333-  private async projectPMRequirements(
+   829→2334-    fleetState: FleetState,
+   830→2335-    horizonYears: number
+   831→2336-  ): Promise<PMRequirement[]> {
+   832→2337-    const requirements: PMRequirement[] = [];
+   833→2338-    const horizonEnd = addYears(new Date(), horizonYears);
+   834→2339-    
+   835→2340-    for (const train of fleetState.trains) {
+   836→2341-      const trainRules = await this.getPMRulesForFleet(train.fleetId);
+   837→2342-      const trainHistory = await this.getPMHistoryForTrain(train.id);
+   838→2343-      
+   839→2344-      // Calculate daily utilization for this train
+   840→2345-      const dailyKm = this.calculateDailyUtilization(train, trainHistory);
+   841→2346-      
+   842→2347-      // Project all PM types for this train
+   843→2348-      const trainProjections = await this.projectTrainPMs(
+   844→2349-        train,
+   845→2350-        trainRules,
+   846→2351-        trainHistory,
+   847→2352-        horizonEnd,
+   848→2353-        dailyKm
+   849→2354-      );
+   850→2355-      
+   851→2356-      requirements.push(...trainProjections);
+   852→2357-    }
+   853→2358-    
+   854→2359-    return requirements;
+   855→2360-  }
+   856→2361-  
+   857→2362-  /**
+   858→2363-   * Project all PM events for a single train over the horizon.
+   859→2364-   */
+   860→2365-  private async projectTrainPMs(
+   861→2366-    train: Train,
+   862→2367-    pmRules: PMType[],
+   863→2368-    pmHistory: PMHistory[],
+   864→2369-    horizonEnd: Date,
+   865→--
+   866→2380-    while (currentDate < horizonEnd) {
+   867→2381-      // Find next PM due across all PM types
+   868→2382-      let nextPM: { 
+   869→2383-        rule: PMType; 
+   870→2384-        date: Date; 
+   871→2385:        mileage: number; 
+   872→2386-        trigger: 'MILEAGE' | 'TIME' 
+   873→2387-      } | null = null;
+   874→2388-      
+   875→2389-      for (const rule of pmRules) {
+   876→2390-        const projection = this.calculateNextPMDue(
+   877→2391-          train,
+   878→2392-          rule,
+   879→2393-          pmRules,
+   880→2394-          workingHistory,
+   881→2395-          currentMileage,
+   882→2396-          currentDate,
+   883→2397-          dailyKm
+   884→2398-        );
+   885→2399-        
+   886→2400-        if (!nextPM || projection.date < nextPM.date) {
+   887→2401-          nextPM = {
+   888→2402-            rule,
+   889→2403-            date: projection.date,
+   890→2404:            mileage: projection.mileage,
+   891→2405-            trigger: projection.trigger
+   892→2406-          };
+   893→2407-        }
+   894→2408-      }
+   895→2409-      
+   896→2410-      if (!nextPM || nextPM.date > horizonEnd) break;
+   897→2411-      
+   898→2412-      // Create requirement
+   899→2413-      const requirement: PMRequirement = {
+   900→2414-        id: generateUUID(),
+   901→2415-        trainId: train.id,
+   902→2416-        trainNumber: train.trainNumber,
+   903→2417-        pmTypeId: nextPM.rule.id,
+   904→2418-        pmCode: nextPM.rule.pmCode,
+   905→2419-        projectedDate: nextPM.date,
+   906→2420:        projectedMileageKm: nextPM.mileage,
+   907→2421-        triggerType: nextPM.trigger,
+   908→2422-        confidence: workingHistory.length > 0 ? 'HISTORICAL' : 'ESTIMATED',
+   909→2423-        estimatedHours: nextPM.rule.estimatedHours,
+   910→2424-        trackType: nextPM.rule.trackType,
+   911→2425-        durationDays: nextPM.rule.minTrackDays,
+   912→2426-        // Compliance window (Ã‚Â±10% of interval by default)
+   913→2427-        constraintStart: addDays(nextPM.date, -Math.round(nextPM.rule.intervalKm * 0.1 / dailyKm)),
+   914→2428-        constraintEnd: addDays(nextPM.date, Math.round(nextPM.rule.intervalKm * 0.1 / dailyKm))
+   915→2429-      };
+   916→2430-      
+   917→2431-      projections.push(requirement);
+   918→2432-      
+   919→2433-      // Add to working history for cascading projection
+   920→2434-      workingHistory.push({
+   921→2435-        id: requirement.id,
+   922→2436-        trainId: train.id,
+   923→2437-        pmTypeId: nextPM.rule.id,
+   924→2438-        pmCode: nextPM.rule.pmCode,
+   925→2439-        completionDate: nextPM.date,
+   926→2440:        mileageAtCompletion: nextPM.mileage
+   927→2441-      });
+   928→2442-      
+   929→2443-      // Advance state past this PM
+   930→2444-      currentDate = addDays(nextPM.date, nextPM.rule.minTrackDays);
+   931→2445:      currentMileage = nextPM.mileage + (nextPM.rule.minTrackDays * dailyKm * 0.1);
+   932→2446-    }
+   933→2447-    
+   934→2448-    return projections;
+   935→2449-  }
+   936→2450-  
+   937→2451-  /**
+   938→2452-   * Calculate when the next instance of a specific PM type is due.
+   939→2453-   * 
+   940→2454-   * CRITICAL: Accounts for PM hierarchy - a C4 satisfies C1/C2/C3 requirements,
+   941→2455:   * so the mileage counter resets from the C4 completion point.
+   942→2456-   * 
+   943→2457-   * CRITICAL: Handles "Cold Start" case where train has no PM history.
+   944→2458:   * Without this fix, trains with high mileage and no history would show
+   945→2459-   * ALL PMs as overdue immediately.
+   946→2460-   */
+   947→2461-  private calculateNextPMDue(
+   948→2462-    train: Train,
+   949→2463-    targetRule: PMType,
+   950→2464-    allRules: PMType[],
+   951→2465-    history: PMHistory[],
+   952→2466-    currentMileage: number,
+   953→2467-    currentDate: Date,
+   954→2468-    dailyKm: number
+   955→2469:  ): { date: Date; mileage: number; trigger: 'MILEAGE' | 'TIME' } {
+   956→2470-    
+   957→2471-    // 1. Find all PM types that SATISFY the target PM
+   958→2472-    // (the target itself + any higher-level PM that includes target in satisfiesCodes)
+   959→2473-    const satisfyingCodes = this.getSatisfyingCodes(targetRule.pmCode, allRules);
+   960→2474-    
+   961→2475-    // 2. Find the most recent PM that satisfies this requirement
+   962→2476-    const lastSatisfying = history
+   963→2477-      .filter(h => satisfyingCodes.includes(h.pmCode))
+   964→2478:      .sort((a, b) => b.mileageAtCompletion - a.mileageAtCompletion)[0];
+   965→2479-    
+   966→2480-    // 3. Handle "Cold Start" - no PM history exists
+   967→2481-    //    Assume train has been maintained on schedule since commissioning.
+   968→2482-    //    Calculate which cycle we're currently in and when it started.
+   969→2483-    let lastMileage: number;
+   970→2484-    let lastDate: Date;
+   971→2485-    
+   972→2486-    if (lastSatisfying) {
+   973→2487-      / Normal case: use actual history
+   974→2488:      lastMileage = lastSatisfying.mileageAtCompletion;
+   975→2489-      lastDate = new Date(lastSatisfying.completionDate);
+   976→2490-    } else {
+   977→2491-      / COLD START FIX: Create "virtual" last PM
+   978→2492-      // Calculate how many complete cycles since commissioning
+   979→2493-      const cyclesCompleted = Math.floor(currentMileage / targetRule.intervalKm);
+   980→2494-      
+   981→2495-      if (cyclesCompleted > 0) {
+   982→2496-        // Assume last PM occurred at start of current cycle
+   983→2497-        lastMileage = cyclesCompleted * targetRule.intervalKm;
+   984→2498:        // Estimate when that mileage was reached
+   985→2499-        const daysAgo = (currentMileage - lastMileage) / dailyKm;
+   986→2500-        lastDate = addDays(currentDate, -daysAgo);
+   987→2501-      } else {
+   988→2502-        // Train hasn't completed first cycle yet - use commissioning as baseline
+   989→2503-        lastMileage = 0;
+   990→2504-        lastDate = train.commissioningDate;
+   991→2505-      }
+   992→2506-    }
+   993→2507-    
+   994→2508:    // 4. Calculate mileage-based due date
+   995→2509-    const kmSinceLast = currentMileage - lastMileage;
+   996→2510-    const kmRemaining = Math.max(0, targetRule.intervalKm - kmSinceLast);
+   997→2511-    const daysUntilMileageDue = kmRemaining / dailyKm;
+   998→2512-    const dateByMileage = addDays(currentDate, daysUntilMileageDue);
+   999→2513:    const mileageAtDue = currentMileage + kmRemaining;
+  1000→2514-    
+  1001→2515-    // 5. Calculate time-based due date (if interval defined)
+  1002→2516-    let dateByTime: Date | null = null;
+  1003→2517-    if (targetRule.intervalMonths) {
+  1004→2518-      dateByTime = addMonths(lastDate, targetRule.intervalMonths);
+  1005→2519-    }
+  1006→2520-    
+  1007→2521-    // 6. Return whichever comes first (dual trigger)
+  1008→2522-    if (dateByTime && dateByTime < dateByMileage) {
+  1009→2523-      const daysUntilTime = differenceInDays(dateByTime, currentDate);
+  1010→2524:      const mileageAtTime = currentMileage + (Math.max(0, daysUntilTime) * dailyKm);
+  1011→2525:      return { date: dateByTime, mileage: mileageAtTime, trigger: 'TIME' };
+  1012→2526-    } else {
+  1013→2527:      return { date: dateByMileage, mileage: mileageAtDue, trigger: 'MILEAGE' };
+  1014→2528-    }
+  1015→2529-  }
+  1016→2530-  
+  1017→2531-  /**
+  1018→2532-   * Find all PM codes that satisfy a target PM code.
+  1019→2533-   * Returns the target itself plus any higher-level PMs that include it in satisfiesCodes.
+  1020→2534-   * 
+  1021→2535-   * Example: For C2, returns ['C2', 'C3', 'C4', 'OH'] because C3/C4/OH all satisfy C2.
+  1022→2536-   */
+  1023→2537-  private getSatisfyingCodes(targetCode: string, allRules: PMType[]): string[] {
+  1024→2538-    const result = [targetCode];
+  1025→2539-    
+  1026→2540-    for (const rule of allRules) {
+  1027→2541-      if (rule.satisfiesCodes?.includes(targetCode)) {
+  1028→2542-        result.push(rule.pmCode);
+  1029→2543-      }
+  1030→2544-    }
+  1031→2545-    
+  1032→2546-    return result;
+  1033→2547-  }
+  1034→2548-  
+  1035→2549-  /**
+  1036→2550:   * Calculate daily mileage rate for a train.
+  1037→2551-   * Uses recent velocity (between last 2 PMs) if available for accuracy,
+  1038→2552-   * falls back to lifetime average from commissioning date.
+  1039→2553-   */
+  1040→2554-  private calculateDailyUtilization(train: Train, history: PMHistory[]): number {
+  1041→2555:    // Filter valid entries (positive mileage)
+  1042→2556-    const validHistory = history
+  1043→2557:      .filter(h => h.mileageAtCompletion > 0)
+  1044→2558-      .sort((a, b) => new Date(b.completionDate).getTime() - new Date(a.completionDate).getTime());
+  1045→2559-    
+  1046→2560-    / Try: Recent velocity between last 2 PMs (most accurate)
+  1047→2561-    if (validHistory.length >= 2) {
+  1048→2562-      const recent = validHistory[0];
+  1049→2563-      const previous = validHistory[1];
+  1050→2564-      const daysBetween = differenceInDays(
+  1051→2565-        new Date(recent.completionDate),
+  1052→2566-        new Date(previous.completionDate)
+  1053→2567-      );
+  1054→2568:      const kmBetween = recent.mileageAtCompletion - previous.mileageAtCompletion;
+  1055→2569-      
+  1056→2570:      // Sanity checks: at least 14 days apart, positive mileage, reasonable rate
+  1057→2571-      if (daysBetween >= 14 && kmBetween > 0) {
+  1058→2572-        const rate = kmBetween / daysBetween;
+  1059→2573-        / Typical metro range: 50-500 km/day
+  1060→2574-        if (rate > 50 && rate < 500) {
+  1061→2575-          return rate;
+  1062→2576-        }
+  1063→2577-      }
+  1064→2578-    }
+  1065→2579-    
+  1066→2580-    / Fallback: Lifetime average from commissioning
+  1067→2581-    const daysSinceCommission = differenceInDays(new Date(), train.commissioningDate);
+  1068→2582-    if (daysSinceCommission > 0 && train.currentMileageKm > 0) {
+  1069→2583-      return train.currentMileageKm / daysSinceCommission;
+  1070→2584-    }
+  1071→2585-    
+  1072→2586-    / Last resort: Fleet typical value
+  1073→2587-    return 150;  // Conservative metro average
+  1074→2588-  }
+  1075→2589-  
+  1076→2590-  private async runGeneticAlgorithm(
+  1077→2591-    requirements: PMRequirement[],
+  1078→2592-    envelopes: ConstraintEnvelope[]
+  1079→2593-  ): Promise<StrategicAllocation[]> {
+  1080→2594-    // Initialize population
+  1081→2595-    let population = this.initializePopulation(requirements, envelopes);
+  1082→2596-    
+  1083→2597-    for (let gen = 0; gen < this.config.generations; gen++) {
+  1084→2598-      // Evaluate fitness
+  1085→2599-      const fitness = population.map(individual => 
+  1086→2600-        this.evaluateFitness(individual, envelopes)
+  1087→2601-      );
+  1088→2602-      
+  1089→2603-      // Selection
+  1090→2604-      const selected = this.tournamentSelection(population, fitness);
+  1091→2605-      
+  1092→2606-      // Crossover
+  1093→2607-      const offspring = this.crossover(selected);
+  1094→2608-      
+  1095→2609-      // Mutation
+  1096→2610-      const mutated = this.mutate(offspring, envelopes);
+  1097→--
+  1098→3049-        .returning();
+  1099→3050-      
+  1100→3051-      // Snapshot PM schedule
+  1101→3052-      await tx.execute(sql`
+  1102→3053-        INSERT INTO baseline_pm_schedule 
+  1103→3054:          (baseline_id, train_id, pm_type_id, projected_date, projected_mileage_km, assigned_depot_id, assigned_hours)
+  1104→3055-        SELECT 
+  1105→3056-          ${baselineRecord.id},
+  1106→3057-          train_id,
+  1107→3058-          pm_type_id,
+  1108→3059-          target_date,
+  1109→3060:          target_mileage_km,
+  1110→3061-          assigned_depot_id,
+  1111→3062-          assigned_hours
+  1112→3063-        FROM pm_schedule
+  1113→3064-        WHERE scenario_id IS NULL
+  1114→3065-          AND status IN ('SCHEDULED', 'IN_PROGRESS')
+  1115→3066-          AND target_date >= CURRENT_DATE
+  1116→3067-      `);
+  1117→3068-      
+  1118→3069:      // Snapshot mileage projections
+  1119→3070-      const projections = await this.generateMileageProjections(
+  1120→3071-        baselineRecord.horizonEnd
+  1121→3072-      );
+  1122→3073-      
+  1123→3074-      for (const proj of projections) {
+  1124→3075-        await tx.insert(baselineMileageProjection)
+  1125→3076-          .values({
+  1126→3077-            baselineId: baselineRecord.id,
+  1127→3078-            trainId: proj.trainId,
+  1128→3079-            projectionDate: proj.date,
+  1129→3080-            projectedCumulativeKm: proj.projectedKm,
+  1130→3081-            dailyRateKm: proj.dailyRate
+  1131→3082-          });
+  1132→3083-      }
+  1133→3084-      
+  1134→3085-      // Supersede previous baseline
+  1135→3086-      if (latestBaseline) {
+  1136→3087-        await tx.update(planBaselines)
+  1137→3088-          .set({
+  1138→3089-            status: 'SUPERSEDED',
+  1139→3090-            supersededBy: baselineRecord.id,
+  1140→3091-            supersededAt: new Date()
+  1141→3092-          })
+  1142→3093-          .where(eq(planBaselines.id, latestBaseline.id));
+  1143→3094-      }
+  1144→3095-      
+  1145→3096-      return baselineRecord;
+  1146→3097-    });
+  1147→3098-    
+  1148→3099-    // 4. Audit log
+  1149→3100-    await this.auditLog.record({
+  1150→3101-      entityType: 'plan_baseline',
+  1151→3102-      entityId: baseline.id,
+  1152→3103-      action: 'PUBLISH',
+  1153→3104-      userId,
+  1154→3105-      newValues: { name, version, description }
+  1155→3106-    });
+  1156→3107-    
+  1157→3108-    // 5. Notify
+  1158→3109-    await this.notificationService.notify({
+  1159→--
+  1160→3124-    });
+  1161→3125-    
+  1162→3126-    const projections: MileageProjection[] = [];
+  1163→3127-    
+  1164→3128-    for (const train of trains) {
+  1165→3129:      // Calculate average daily mileage from last 30 days
+  1166→3130:      const recentMileage = await this.db.query.mileageReadings.findMany({
+  1167→3131-        where: and(
+  1168→3132:          eq(mileageReadings.trainId, train.id),
+  1169→3133:          gte(mileageReadings.readingDate, subDays(new Date(), 30)),
+  1170→3134:          eq(mileageReadings.validationStatus, 'VALID')
+  1171→3135-        )
+  1172→3136-      });
+  1173→3137-      
+  1174→3138-      const avgDailyKm = recentMileage.length > 0
+  1175→3139-        ? recentMileage.reduce((sum, r) => sum + (r.dailyKm || 0), 0) / recentMileage.length
+  1176→3140-        : 150;  // Default if no history
+  1177→3141-      
+  1178→3142-      // Project forward at monthly intervals
+  1179→3143-      let currentKm = train.currentMileageKm;
+  1180→3144-      let currentDate = new Date();
+  1181→3145-      
+  1182→3146-      while (currentDate < horizonEnd) {
+  1183→3147-        currentDate = addMonths(currentDate, 1);
+  1184→3148-        currentKm += avgDailyKm * 30;
+  1185→3149-        
+  1186→3150-        projections.push({
+  1187→3151-          trainId: train.id,
+  1188→3152-          date: currentDate,
+  1189→3153-          projectedKm: Math.round(currentKm),
+  1190→3154-          dailyRate: Math.round(avgDailyKm)
+  1191→3155-        });
+  1192→3156-      }
+  1193→3157-    }
+  1194→3158-    
+  1195→3159-    return projections;
+  1196→3160-  }
+  1197→3161-}
+  1198→3162-```
+  1199→3163-
+  1200→3164----
+  1201→3165-
+  1202→3166-## 4.8 Drift Monitor Service
+  1203→3167-
+  1204→3168-### 4.8.1 Purpose
+  1205→3169-
+  1206→3170-Compare actual state against published baseline, calculate drift metrics, and alert when thresholds are exceeded.
+  1207→3171-
+  1208→3172-### 4.8.2 Implementation
+  1209→3173-
+  1210→3174-```typescript
+  1211→3175-interface DriftThresholds {
+  1212→3176:  mileageDriftPct: number;        // 5.0
+  1213→3177-  scheduleDriftDays: number;      // 14
+  1214→3178-  fleetDriftTrainCount: number;   // 5
+  1215→3179-}
+  1216→3180-
+  1217→3181-class DriftMonitorService {
+  1218→3182-  private readonly thresholds: DriftThresholds = {
+  1219→3183:    mileageDriftPct: 5.0,
+  1220→3184-    scheduleDriftDays: 14,
+  1221→3185-    fleetDriftTrainCount: 5
+  1222→3186-  };
+  1223→3187-  
+  1224→3188-  /**
+  1225→3189-   * Run nightly drift analysis
+  1226→3190-   */
+  1227→3191-  async runDriftAnalysis(): Promise<DriftAnalysisResult> {
+  1228→3192-    const baseline = await this.getPublishedBaseline();
+  1229→3193-    if (!baseline) {
+  1230→3194-      this.logger.info('No published baseline, skipping drift analysis');
+  1231→3195-      return { skipped: true, reason: 'No published baseline' };
+  1232→3196-    }
+  1233→3197-    
+  1234→3198-    const analysisDate = new Date();
+  1235→3199-    const trainAnalyses: TrainDriftAnalysis[] = [];
+  1236→3200-    const alerts: DriftAlert[] = [];
+  1237→3201-    
+  1238→3202-    // Analyze each train
+  1239→3203-    const trains = await this.db.query.trains.findMany({
+  1240→3204-      where: eq(trains.active, true)
+  1241→3205-    });
+  1242→3206-    
+  1243→3207-    for (const train of trains) {
+  1244→3208-      const analysis = await this.analyzeTrainDrift(train, baseline, analysisDate);
+  1245→3209-      trainAnalyses.push(analysis);
+  1246→3210-      
+  1247→3211-      // Check thresholds
+  1248→3212-      if (analysis.requiresReplan) {
+  1249→3213-        alerts.push({
+  1250→3214-          trainId: train.id,
+  1251→3215-          trainNumber: train.trainNumber,
+  1252→3216-          severity: 'HIGH',
+  1253→3217-          type: 'REPLAN_REQUIRED',
+  1254→3218-          message: analysis.replanReason,
+  1255→3219-          metrics: {
+  1256→3220:            mileageDriftPct: analysis.mileageDriftPct,
+  1257→3221-            avgPmDriftDays: analysis.avgPmDriftDays
+  1258→3222-          }
+  1259→3223-        });
+  1260→3224:      } else if (Math.abs(analysis.mileageDriftPct) > this.thresholds.mileageDriftPct * 0.7) {
+  1261→3225-        alerts.push({
+  1262→3226-          trainId: train.id,
+  1263→3227-          trainNumber: train.trainNumber,
+  1264→3228-          severity: 'MEDIUM',
+  1265→3229-          type: 'APPROACHING_THRESHOLD',
+  1266→3230:          message: `Mileage drift at ${analysis.mileageDriftPct.toFixed(1)}% (threshold: ${this.thresholds.mileageDriftPct}%)`,
+  1267→3231-          metrics: {
+  1268→3232:            mileageDriftPct: analysis.mileageDriftPct
+  1269→3233-          }
+  1270→3234-        });
+  1271→3235-      }
+  1272→3236-      
+  1273→3237-      // Persist analysis
+  1274→3238-      await this.persistDriftAnalysis(analysis, baseline.id, analysisDate);
+  1275→3239-    }
+  1276→3240-    
+  1277→3241-    // Fleet-level analysis
+  1278→3242-    const trainsRequiringReplan = trainAnalyses.filter(a => a.requiresReplan).length;
+  1279→3243-    
+  1280→3244-    if (trainsRequiringReplan >= this.thresholds.fleetDriftTrainCount) {
+  1281→3245-      alerts.push({
+  1282→3246-        severity: 'CRITICAL',
+  1283→3247-        type: 'FLEET_REPLAN_RECOMMENDED',
+  1284→3248-        message: `${trainsRequiringReplan} trains require replanning - consider strategic replan`,
+  1285→3249-        metrics: {
+  1286→3250-          affectedTrains: trainsRequiringReplan
+  1287→3251-        }
+  1288→3252-      });
+  1289→3253-    }
+  1290→3254-    
+  1291→3255-    // Send alerts
+  1292→3256-    if (alerts.length > 0) {
+  1293→3257-      await this.sendDriftAlerts(alerts);
+  1294→3258-    }
+  1295→3259-    
+  1296→3260-    // Broadcast to canvas
+  1297→3261-    await this.websocketHub.broadcast('drift:updated', {
+  1298→3262-      baselineId: baseline.id,
+  1299→3263-      analysisDate,
+  1300→3264-      summary: {
+  1301→3265-        totalTrains: trains.length,
+  1302→3266:        trainsWithDrift: trainAnalyses.filter(a => Math.abs(a.mileageDriftPct) > 1).length,
+  1303→3267-        trainsRequiringReplan,
+  1304→3268:        avgFleetDriftPct: trainAnalyses.reduce((sum, a) => sum + a.mileageDriftPct, 0) / trainAnalyses.length
+  1305→3269-      },
+  1306→3270-      alerts
+  1307→3271-    });
+  1308→3272-    
+  1309→3273-    return {
+  1310→3274-      skipped: false,
+  1311→3275-      baselineId: baseline.id,
+  1312→3276-      analysisDate,
+  1313→3277-      trainAnalyses,
+  1314→3278-      alerts
+  1315→3279-    };
+  1316→3280-  }
+  1317→3281-  
+  1318→3282-  private async analyzeTrainDrift(
+  1319→3283-    train: Train,
+  1320→3284-    baseline: PlanBaseline,
+  1321→3285-    analysisDate: Date
+  1322→3286-  ): Promise<TrainDriftAnalysis> {
+  1323→3287-    // Get baseline projection for today
+  1324→3288-    const baselineProjection = await this.db.query.baselineMileageProjection.findFirst({
+  1325→3289-      where: and(
+  1326→3290-        eq(baselineMileageProjection.baselineId, baseline.id),
+  1327→3291-        eq(baselineMileageProjection.trainId, train.id),
+  1328→3292-        lte(baselineMileageProjection.projectionDate, analysisDate)
+  1329→3293-      ),
+  1330→3294-      orderBy: desc(baselineMileageProjection.projectionDate)
+  1331→3295-    });
+  1332→3296-    
+  1333→3297:    // Calculate mileage drift
+  1334→3298-    const baselineKm = baselineProjection?.projectedCumulativeKm || train.currentMileageKm;
+  1335→3299-    const actualKm = train.currentMileageKm;
+  1336→3300:    const mileageDriftKm = actualKm - baselineKm;
+  1337→3301:    const mileageDriftPct = (mileageDriftKm / baselineKm) * 100;
+  1338→3302-    
+  1339→3303-    // Get baseline PM schedule
+  1340→3304-    const baselinePMs = await this.db.query.baselinePmSchedule.findMany({
+  1341→3305-      where: and(
+  1342→3306-        eq(baselinePmSchedule.baselineId, baseline.id),
+  1343→3307-        eq(baselinePmSchedule.trainId, train.id),
+  1344→3308-        gte(baselinePmSchedule.projectedDate, analysisDate)
+  1345→3309-      )
+  1346→3310-    });
+  1347→3311-    
+  1348→3312-    // Get current PM schedule
+  1349→3313-    const currentPMs = await this.db.query.pmSchedule.findMany({
+  1350→3314-      where: and(
+  1351→3315-        eq(pmSchedule.trainId, train.id),
+  1352→3316-        isNull(pmSchedule.scenarioId),
+  1353→3317-        inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+  1354→3318-        gte(pmSchedule.targetDate, analysisDate)
+  1355→3319-      )
+  1356→3320-    });
+  1357→3321-    
+  1358→3322-    // Calculate PM drift
+  1359→3323-    const pmDrifts: PMDrift[] = [];
+  1360→3324-    
+  1361→3325-    for (const baselinePM of baselinePMs) {
+  1362→3326-      const currentPM = currentPMs.find(
+  1363→3327-        p => p.pmTypeId === baselinePM.pmTypeId
+  1364→3328-      );
+  1365→3329-      
+  1366→3330-      if (currentPM) {
+  1367→3331-        const driftDays = differenceInDays(
+  1368→3332-          new Date(currentPM.targetDate),
+  1369→3333-          new Date(baselinePM.projectedDate)
+  1370→3334-        );
+  1371→3335-        
+  1372→3336-        pmDrifts.push({
+  1373→3337-          pmTypeId: baselinePM.pmTypeId,
+  1374→3338-          baselineDate: baselinePM.projectedDate,
+  1375→3339-          currentDate: currentPM.targetDate,
+  1376→3340-          driftDays,
+  1377→3341-          direction: driftDays > 0 ? 'LATER' : driftDays < 0 ? 'EARLIER' : 'ON_TRACK'
+  1378→--
+  1379→3351-      ? Math.max(...pmDrifts.map(p => Math.abs(p.driftDays)))
+  1380→3352-      : 0;
+  1381→3353-    
+  1382→3354-    // Determine if replan required
+  1383→3355-    const requiresReplan = 
+  1384→3356:      Math.abs(mileageDriftPct) > this.thresholds.mileageDriftPct ||
+  1385→3357-      maxPmDriftDays > this.thresholds.scheduleDriftDays;
+  1386→3358-    
+  1387→3359-    let replanReason: string | undefined;
+  1388→3360-    if (requiresReplan) {
+  1389→3361-      const reasons: string[] = [];
+  1390→3362:      if (Math.abs(mileageDriftPct) > this.thresholds.mileageDriftPct) {
+  1391→3363:        reasons.push(`Mileage drift ${mileageDriftPct.toFixed(1)}% exceeds ${this.thresholds.mileageDriftPct}% threshold`);
+  1392→3364-      }
+  1393→3365-      if (maxPmDriftDays > this.thresholds.scheduleDriftDays) {
+  1394→3366-        reasons.push(`PM schedule drift ${maxPmDriftDays} days exceeds ${this.thresholds.scheduleDriftDays} day threshold`);
+  1395→3367-      }
+  1396→3368-      replanReason = reasons.join('; ');
+  1397→3369-    }
+  1398→3370-    
+  1399→3371-    return {
+  1400→3372-      trainId: train.id,
+  1401→3373-      trainNumber: train.trainNumber,
+  1402→3374-      baselineProjectedKm: baselineKm,
+  1403→3375-      actualKm,
+  1404→3376:      mileageDriftKm,
+  1405→3377:      mileageDriftPct,
+  1406→3378-      pmDrifts,
+  1407→3379-      avgPmDriftDays,
+  1408→3380-      maxPmDriftDays,
+  1409→3381-      requiresReplan,
+  1410→3382-      replanReason
+  1411→3383-    };
+  1412→3384-  }
+  1413→3385-}
+  1414→3386-```
+  1415→3387-
+  1416→3388----
+  1417→3389-
+  1418→3390-## 4.9 Simulation Engine
+  1419→3391-
+  1420→3392-### 4.9.1 Purpose
+  1421→3393-
+  1422→3394-Enable what-if scenario analysis with persistent storage and comparison capabilities.
+  1423→3395-
+  1424→3396-### 4.9.2 Implementation
+  1425→3397-
+  1426→3398-```typescript
+  1427→3399-class SimulationEngine {
+  1428→3400-  /**
+  1429→3401-   * Create a new scenario branched from baseline or another scenario
+  1430→3402-   */
+  1431→3403-  async createScenario(
+  1432→3404-    name: string,
+  1433→3405-    description: string,
+  1434→3406-    forkFrom: { type: 'BASELINE' | 'SCENARIO'; id: string },
+  1435→3407-    userId: string
+  1436→3408-  ): Promise<Scenario> {
+  1437→3409-    const scenario = await this.db.insert(scenarios)
+  1438→3410-      .values({
+  1439→3411-        name,
+  1440→3412-        description,
+  1441→3413-        forkedFromBaselineId: forkFrom.type === 'BASELINE' ? forkFrom.id : null,
+  1442→3414-        forkedFromScenarioId: forkFrom.type === 'SCENARIO' ? forkFrom.id : null,
+  1443→3415-        status: 'ACTIVE',
+  1444→3416-        createdBy: userId,
+  1445→3417-        expiresAt: addDays(new Date(), 30)
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

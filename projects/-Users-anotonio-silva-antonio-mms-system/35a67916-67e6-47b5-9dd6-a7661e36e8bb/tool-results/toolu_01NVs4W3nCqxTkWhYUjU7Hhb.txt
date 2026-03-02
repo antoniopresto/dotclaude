@@ -1,0 +1,1252 @@
+     1→/**
+     2→ * MMS Strategic Planner Service
+     3→ *
+     4→ * Generates and maintains 1-10 year strategic plans using genetic algorithms,
+     5→ * constrained by capacity envelopes from the tactical model.
+     6→ *
+     7→ * Key responsibilities:
+     8→ * - Project PM requirements for all trains over 10-year horizon
+     9→ * - Generate quarterly constraint envelopes (track, labor, material)
+    10→ * - Run genetic algorithm to optimize PM allocations
+    11→ * - Validate plans against capacity constraints
+    12→ * - Calculate plan metrics and fitness scores
+    13→ *
+    14→ * The strategic planner creates long-term maintenance schedules that:
+    15→ * - Respect PM hierarchy (C4 satisfies C1/C2/C3)
+    16→ * - Handle dual triggers (mileage OR time)
+    17→ * - Balance workload across quarters
+    18→ * - Avoid bow-wave accumulation
+    19→ *
+    20→ * @see specs/004-domain-services.md Section 4.5
+    21→ */
+    22→
+    23→import { eq, and, desc, lte, isNull } from 'drizzle-orm';
+    24→import { addDays, addMonths, addYears, differenceInDays, format } from 'date-fns';
+    25→import { BaseService } from '../lib/services/base';
+    26→import {
+    27→  pmTypes,
+    28→  pmSchedule,
+    29→  trains,
+    30→  tracks,
+    31→  manhourCapacity,
+    32→  type PmType,
+    33→} from '../lib/db/schema';
+    34→import { getRouteUtilizationService } from './route-utilization';
+    35→
+    36→// =============================================================================
+    37→// Types
+    38→// =============================================================================
+    39→
+    40→/** Configuration for the genetic algorithm */
+    41→export interface StrategicPlannerConfig {
+    42→  horizonYears: number;
+    43→  granularity: 'MONTHLY' | 'QUARTERLY';
+    44→  populationSize: number;
+    45→  generations: number;
+    46→  mutationRate: number;
+    47→  eliteCount: number;
+    48→}
+    49→
+    50→/** Default configuration values */
+    51→export const DEFAULT_CONFIG: StrategicPlannerConfig = {
+    52→  horizonYears: 10,
+    53→  granularity: 'QUARTERLY',
+    54→  populationSize: 100,
+    55→  generations: 500,
+    56→  mutationRate: 0.1,
+    57→  eliteCount: 10,
+    58→};
+    59→
+    60→/** PM requirement projected over the horizon */
+    61→export interface PMRequirement {
+    62→  id: string;
+    63→  trainId: string;
+    64→  trainNumber: string;
+    65→  fleetId: string;
+    66→  pmTypeId: string;
+    67→  pmCode: string;
+    68→  projectedDate: Date;
+    69→  projectedMileageKm: number;
+    70→  triggerType: 'MILEAGE' | 'TIME';
+    71→  confidence: 'HISTORICAL' | 'ESTIMATED';
+    72→  estimatedHours: number;
+    73→  trackType: string;
+    74→  durationDays: number;
+    75→  constraintStart: Date;
+    76→  constraintEnd: Date;
+    77→}
+    78→
+    79→/** Strategic allocation result (chromosome gene) */
+    80→export interface StrategicAllocation {
+    81→  requirementId: string;
+    82→  trainId: string;
+    83→  trainNumber: string;
+    84→  pmTypeId: string;
+    85→  pmCode: string;
+    86→  targetQuarter: string; // e.g., '2028-Q2'
+    87→  targetDate: Date;
+    88→  estimatedHours: number;
+    89→  estimatedCost: number;
+    90→  depotId: string | null;
+    91→}
+    92→
+    93→/** Capacity envelope for a time period */
+    94→export interface ConstraintEnvelope {
+    95→  period: Date;
+    96→  quarterKey: string;
+    97→  trackCapacity: Array<{
+    98→    trackType: string;
+    99→    availableSlotDays: number;
+   100→    depotId: string;
+   101→  }>;
+   102→  laborCapacity: Array<{
+   103→    depotId: string;
+   104→    availableHours: number;
+   105→  }>;
+   106→  materialCapacity: Record<string, number>;
+   107→  totalAvailableHours: number;
+   108→  totalTrackSlots: number;
+   109→}
+   110→
+   111→/** Validation result for a strategic plan */
+   112→export interface PlanValidation {
+   113→  valid: boolean;
+   114→  violations: PlanViolation[];
+   115→  warnings: PlanWarning[];
+   116→  score: number;
+   117→}
+   118→
+   119→/** A constraint violation */
+   120→export interface PlanViolation {
+   121→  type: 'TRACK_CAPACITY' | 'LABOR_CAPACITY' | 'COMPLIANCE_WINDOW' | 'BOW_WAVE';
+   122→  quarter: string;
+   123→  description: string;
+   124→  severity: number;
+   125→}
+   126→
+   127→/** A warning (non-blocking) */
+   128→export interface PlanWarning {
+   129→  type: 'HIGH_UTILIZATION' | 'UNEVEN_DISTRIBUTION' | 'LATE_PM';
+   130→  quarter: string;
+   131→  description: string;
+   132→}
+   133→
+   134→/** Metrics for a strategic plan */
+   135→export interface PlanMetrics {
+   136→  totalPMs: number;
+   137→  totalHours: number;
+   138→  totalCost: number;
+   139→  averageQuarterlyLoad: number;
+   140→  loadVariance: number;
+   141→  complianceRate: number;
+   142→  bowWaveRisk: number;
+   143→  utilizationBalance: number;
+   144→}
+   145→
+   146→/** Complete strategic plan result */
+   147→export interface StrategicPlanResult {
+   148→  planId: string;
+   149→  generatedAt: Date;
+   150→  horizonStart: Date;
+   151→  horizonEnd: Date;
+   152→  config: StrategicPlannerConfig;
+   153→  plan: StrategicAllocation[];
+   154→  validation: PlanValidation;
+   155→  metrics: PlanMetrics;
+   156→  generationStats: GenerationStats[];
+   157→}
+   158→
+   159→/** Statistics for each GA generation */
+   160→export interface GenerationStats {
+   161→  generation: number;
+   162→  bestFitness: number;
+   163→  averageFitness: number;
+   164→  worstFitness: number;
+   165→}
+   166→
+   167→/** PM history entry for projection calculations */
+   168→interface PMHistory {
+   169→  id: string;
+   170→  trainId: string;
+   171→  pmTypeId: string;
+   172→  pmCode: string;
+   173→  completionDate: Date;
+   174→  mileageAtCompletion: number;
+   175→}
+   176→
+   177→/** Fleet state snapshot */
+   178→interface FleetState {
+   179→  trains: Array<{
+   180→    id: string;
+   181→    trainNumber: string;
+   182→    fleetId: string;
+   183→    currentMileageKm: number;
+   184→    commissioningDate: Date;
+   185→    fitnessStatus: string | null;
+   186→  }>;
+   187→}
+   188→
+   189→/** Progress callback for long-running operations */
+   190→export type ProgressCallback = (progress: {
+   191→  stage: string;
+   192→  percent: number;
+   193→  generation?: number;
+   194→  fitness?: number;
+   195→  message?: string;
+   196→}) => void;
+   197→
+   198→/** Request to generate a strategic plan */
+   199→export interface GeneratePlanRequest {
+   200→  horizonYears?: number;
+   201→  fleetId?: string;
+   202→  fromBaselineId?: string;
+   203→  populationSize?: number;
+   204→  generations?: number;
+   205→  onProgress?: ProgressCallback;
+   206→}
+   207→
+   208→// =============================================================================
+   209→// Singleton instance
+   210→// =============================================================================
+   211→
+   212→let instance: StrategicPlannerService | null = null;
+   213→
+   214→/**
+   215→ * Get the singleton StrategicPlannerService instance
+   216→ */
+   217→export function getStrategicPlannerService(): StrategicPlannerService {
+   218→  if (!instance) {
+   219→    instance = new StrategicPlannerService();
+   220→  }
+   221→  return instance;
+   222→}
+   223→
+   224→// =============================================================================
+   225→// Service Implementation
+   226→// =============================================================================
+   227→
+   228→export class StrategicPlannerService extends BaseService {
+   229→  constructor() {
+   230→    super({ name: 'StrategicPlannerService' });
+   231→  }
+   232→
+   233→  // ===========================================================================
+   234→  // Public Methods
+   235→  // ===========================================================================
+   236→
+   237→  /**
+   238→   * Generate a strategic plan for the specified horizon
+   239→   */
+   240→  async generatePlan(request: GeneratePlanRequest): Promise<StrategicPlanResult> {
+   241→    return this.traced(
+   242→      'generatePlan',
+   243→      async () => {
+   244→        const config: StrategicPlannerConfig = {
+   245→          ...DEFAULT_CONFIG,
+   246→          horizonYears: request.horizonYears ?? DEFAULT_CONFIG.horizonYears,
+   247→          populationSize: request.populationSize ?? DEFAULT_CONFIG.populationSize,
+   248→          generations: request.generations ?? DEFAULT_CONFIG.generations,
+   249→        };
+   250→
+   251→        const planId = crypto.randomUUID();
+   252→        const startTime = new Date();
+   253→        const horizonEnd = addYears(startTime, config.horizonYears);
+   254→        const generationStats: GenerationStats[] = [];
+   255→
+   256→        // Report progress
+   257→        const reportProgress = (stage: string, percent: number, extra?: Record<string, unknown>) => {
+   258→          if (request.onProgress) {
+   259→            request.onProgress({ stage, percent, ...extra });
+   260→          }
+   261→        };
+   262→
+   263→        reportProgress('INITIALIZING', 0, { message: 'Loading fleet state...' });
+   264→
+   265→        // 1. Load current fleet state
+   266→        const fleetState = await this.getFleetState(request.fleetId);
+   267→        this.log.info(
+   268→          { trainCount: fleetState.trains.length },
+   269→          'Loaded fleet state for strategic planning'
+   270→        );
+   271→
+   272→        reportProgress('PROJECTING', 10, { message: 'Projecting PM requirements...' });
+   273→
+   274→        // 2. Project PM requirements for each train
+   275→        const pmRequirements = await this.projectPMRequirements(
+   276→          fleetState,
+   277→          config.horizonYears,
+   278→          request.fromBaselineId
+   279→        );
+   280→        this.log.info(
+   281→          { pmCount: pmRequirements.length },
+   282→          'Projected PM requirements'
+   283→        );
+   284→
+   285→        reportProgress('GENERATING_ENVELOPES', 20, { message: 'Generating constraint envelopes...' });
+   286→
+   287→        // 3. Generate constraint envelopes for each quarter
+   288→        const envelopes = await this.generateEnvelopes(startTime, horizonEnd);
+   289→        this.log.info(
+   290→          { envelopeCount: envelopes.length },
+   291→          'Generated constraint envelopes'
+   292→        );
+   293→
+   294→        reportProgress('OPTIMIZING', 30, { message: 'Running genetic algorithm...' });
+   295→
+   296→        // 4. Run genetic algorithm
+   297→        const bestPlan = await this.runGeneticAlgorithm(
+   298→          pmRequirements,
+   299→          envelopes,
+   300→          config,
+   301→          (gen, fitness, avg) => {
+   302→            // Report every 50 generations
+   303→            if (gen % 50 === 0 || gen === config.generations - 1) {
+   304→              const percent = 30 + Math.round((gen / config.generations) * 60);
+   305→              reportProgress('OPTIMIZING', percent, {
+   306→                generation: gen,
+   307→                fitness,
+   308→                message: `Generation ${gen}/${config.generations}, Fitness: ${fitness.toFixed(2)}`,
+   309→              });
+   310→            }
+   311→            generationStats.push({
+   312→              generation: gen,
+   313→              bestFitness: fitness,
+   314→              averageFitness: avg,
+   315→              worstFitness: 0, // Calculated in GA
+   316→            });
+   317→          }
+   318→        );
+   319→
+   320→        reportProgress('VALIDATING', 95, { message: 'Validating plan...' });
+   321→
+   322→        // 5. Validate against constraint envelopes
+   323→        let validation = this.validatePlan(bestPlan, envelopes);
+   324→
+   325→        // 6. Attempt repair if invalid
+   326→        let finalPlan = bestPlan;
+   327→        if (!validation.valid) {
+   328→          this.log.warn(
+   329→            { violations: validation.violations.length },
+   330→            'Plan has violations, attempting repair'
+   331→          );
+   332→          finalPlan = this.repairPlan(bestPlan, validation, envelopes);
+   333→          validation = this.validatePlan(finalPlan, envelopes);
+   334→        }
+   335→
+   336→        // 7. Calculate metrics
+   337→        const metrics = this.calculateMetrics(finalPlan, envelopes);
+   338→
+   339→        reportProgress('COMPLETE', 100, { message: 'Strategic plan generated' });
+   340→
+   341→        return {
+   342→          planId,
+   343→          generatedAt: startTime,
+   344→          horizonStart: startTime,
+   345→          horizonEnd,
+   346→          config,
+   347→          plan: finalPlan,
+   348→          validation,
+   349→          metrics,
+   350→          generationStats,
+   351→        };
+   352→      },
+   353→      { 'planner.horizonYears': request.horizonYears ?? DEFAULT_CONFIG.horizonYears }
+   354→    );
+   355→  }
+   356→
+   357→  /**
+   358→   * Get capacity envelope for a specific quarter
+   359→   */
+   360→  async getQuarterEnvelope(
+   361→    quarterStart: Date,
+   362→    quarterEnd: Date,
+   363→    depotIds?: string[]
+   364→  ): Promise<ConstraintEnvelope> {
+   365→    return this.generateEnvelopeForPeriod(quarterStart, quarterEnd, depotIds);
+   366→  }
+   367→
+   368→  /**
+   369→   * Project PM requirements for specific trains
+   370→   */
+   371→  async projectTrainPMs(
+   372→    trainIds: string[],
+   373→    horizonYears: number = 10
+   374→  ): Promise<PMRequirement[]> {
+   375→    const requirements: PMRequirement[] = [];
+   376→
+   377→    for (const trainId of trainIds) {
+   378→      const train = await this.db.query.trains.findFirst({
+   379→        where: eq(trains.id, trainId),
+   380→      });
+   381→
+   382→      if (!train) continue;
+   383→
+   384→      // Convert to FleetState train format
+   385→      const trainState = {
+   386→        id: train.id,
+   387→        trainNumber: train.trainNumber,
+   388→        fleetId: train.fleetId,
+   389→        currentMileageKm: train.currentMileageKm ?? 0,
+   390→        commissioningDate: train.commissioningDate
+   391→          ? new Date(train.commissioningDate)
+   392→          : new Date(),
+   393→        fitnessStatus: train.fitnessStatus,
+   394→      };
+   395→
+   396→      const trainRules = await this.getPMRulesForFleet(train.fleetId);
+   397→      const trainHistory = await this.getPMHistoryForTrain(trainId);
+   398→      const dailyKm = await this.calculateDailyUtilization(trainState, trainHistory);
+   399→
+   400→      const trainProjections = await this.projectTrainPMsInternal(
+   401→        trainState,
+   402→        trainRules,
+   403→        trainHistory,
+   404→        addYears(new Date(), horizonYears),
+   405→        dailyKm
+   406→      );
+   407→
+   408→      requirements.push(...trainProjections);
+   409→    }
+   410→
+   411→    return requirements;
+   412→  }
+   413→
+   414→  // ===========================================================================
+   415→  // Private Methods - Fleet State
+   416→  // ===========================================================================
+   417→
+   418→  private async getFleetState(fleetId?: string): Promise<FleetState> {
+   419→    const trainData = await this.db.query.trains.findMany({
+   420→      where: fleetId ? eq(trains.fleetId, fleetId) : undefined,
+   421→    });
+   422→
+   423→    return {
+   424→      trains: trainData
+   425→        .filter((t) => t.fitnessStatus !== 'GROUNDED')
+   426→        .map((t) => ({
+   427→          id: t.id,
+   428→          trainNumber: t.trainNumber,
+   429→          fleetId: t.fleetId,
+   430→          currentMileageKm: t.currentMileageKm ?? 0,
+   431→          commissioningDate: t.commissioningDate
+   432→            ? new Date(t.commissioningDate)
+   433→            : new Date(),
+   434→          fitnessStatus: t.fitnessStatus,
+   435→        })),
+   436→    };
+   437→  }
+   438→
+   439→  // ===========================================================================
+   440→  // Private Methods - PM Projection
+   441→  // ===========================================================================
+   442→
+   443→  /**
+   444→   * Project PM requirements for all trains over the planning horizon
+   445→   */
+   446→  private async projectPMRequirements(
+   447→    fleetState: FleetState,
+   448→    horizonYears: number,
+   449→    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   450→    _fromBaselineId?: string
+   451→  ): Promise<PMRequirement[]> {
+   452→    const requirements: PMRequirement[] = [];
+   453→    const horizonEnd = addYears(new Date(), horizonYears);
+   454→
+   455→    for (const train of fleetState.trains) {
+   456→      const trainRules = await this.getPMRulesForFleet(train.fleetId);
+   457→      const trainHistory = await this.getPMHistoryForTrain(train.id);
+   458→      const dailyKm = await this.calculateDailyUtilization(train, trainHistory);
+   459→
+   460→      const trainProjections = await this.projectTrainPMsInternal(
+   461→        train,
+   462→        trainRules,
+   463→        trainHistory,
+   464→        horizonEnd,
+   465→        dailyKm
+   466→      );
+   467→
+   468→      requirements.push(...trainProjections);
+   469→    }
+   470→
+   471→    return requirements;
+   472→  }
+   473→
+   474→  /**
+   475→   * Project all PM events for a single train over the horizon
+   476→   */
+   477→  private async projectTrainPMsInternal(
+   478→    train: FleetState['trains'][0],
+   479→    pmRules: PmType[],
+   480→    pmHistory: PMHistory[],
+   481→    horizonEnd: Date,
+   482→    dailyKm: number
+   483→  ): Promise<PMRequirement[]> {
+   484→    const projections: PMRequirement[] = [];
+   485→    const workingHistory = [...pmHistory];
+   486→    let currentMileage = train.currentMileageKm;
+   487→    let currentDate = new Date();
+   488→
+   489→    // Project until we exceed horizon
+   490→    while (currentDate < horizonEnd) {
+   491→      // Find next PM due across all PM types
+   492→      let nextPM: {
+   493→        rule: PmType;
+   494→        date: Date;
+   495→        mileage: number;
+   496→        trigger: 'MILEAGE' | 'TIME';
+   497→      } | null = null;
+   498→
+   499→      for (const rule of pmRules) {
+   500→        if (!rule.active) continue;
+   501→
+   502→        const projection = this.calculateNextPMDue(
+   503→          train,
+   504→          rule,
+   505→          pmRules,
+   506→          workingHistory,
+   507→          currentMileage,
+   508→          currentDate,
+   509→          dailyKm
+   510→        );
+   511→
+   512→        if (!nextPM || projection.date < nextPM.date) {
+   513→          nextPM = {
+   514→            rule,
+   515→            date: projection.date,
+   516→            mileage: projection.mileage,
+   517→            trigger: projection.trigger,
+   518→          };
+   519→        }
+   520→      }
+   521→
+   522→      if (!nextPM || nextPM.date > horizonEnd) break;
+   523→
+   524→      // Calculate compliance window
+   525→      const windowDays = this.calculateWindowDays(nextPM.rule, dailyKm);
+   526→
+   527→      // Create requirement
+   528→      const requirement: PMRequirement = {
+   529→        id: crypto.randomUUID(),
+   530→        trainId: train.id,
+   531→        trainNumber: train.trainNumber,
+   532→        fleetId: train.fleetId,
+   533→        pmTypeId: nextPM.rule.id,
+   534→        pmCode: nextPM.rule.pmCode,
+   535→        projectedDate: nextPM.date,
+   536→        projectedMileageKm: nextPM.mileage,
+   537→        triggerType: nextPM.trigger,
+   538→        confidence: workingHistory.length > 0 ? 'HISTORICAL' : 'ESTIMATED',
+   539→        estimatedHours: Number(nextPM.rule.estimatedHours) || 8,
+   540→        trackType: nextPM.rule.trackType,
+   541→        durationDays: nextPM.rule.minTrackDays ?? 1,
+   542→        constraintStart: addDays(nextPM.date, -windowDays),
+   543→        constraintEnd: addDays(nextPM.date, windowDays),
+   544→      };
+   545→
+   546→      projections.push(requirement);
+   547→
+   548→      // Add to working history for cascading projection
+   549→      workingHistory.push({
+   550→        id: requirement.id,
+   551→        trainId: train.id,
+   552→        pmTypeId: nextPM.rule.id,
+   553→        pmCode: nextPM.rule.pmCode,
+   554→        completionDate: nextPM.date,
+   555→        mileageAtCompletion: nextPM.mileage,
+   556→      });
+   557→
+   558→      // Advance state past this PM
+   559→      const trackDays = nextPM.rule.minTrackDays ?? 1;
+   560→      currentDate = addDays(nextPM.date, trackDays);
+   561→      currentMileage = nextPM.mileage + trackDays * dailyKm * 0.1; // Small mileage during PM
+   562→    }
+   563→
+   564→    return projections;
+   565→  }
+   566→
+   567→  /**
+   568→   * Calculate when the next instance of a specific PM type is due
+   569→   *
+   570→   * Handles PM hierarchy (C4 satisfies C1/C2/C3) and cold start cases
+   571→   */
+   572→  private calculateNextPMDue(
+   573→    train: FleetState['trains'][0],
+   574→    targetRule: PmType,
+   575→    allRules: PmType[],
+   576→    history: PMHistory[],
+   577→    currentMileage: number,
+   578→    currentDate: Date,
+   579→    dailyKm: number
+   580→  ): { date: Date; mileage: number; trigger: 'MILEAGE' | 'TIME' } {
+   581→    // 1. Find all PM types that SATISFY the target PM
+   582→    const satisfyingCodes = this.getSatisfyingCodes(targetRule.pmCode, allRules);
+   583→
+   584→    // 2. Find the most recent PM that satisfies this requirement
+   585→    const lastSatisfying = history
+   586→      .filter((h) => satisfyingCodes.includes(h.pmCode))
+   587→      .sort((a, b) => b.mileageAtCompletion - a.mileageAtCompletion)[0];
+   588→
+   589→    // 3. Handle "Cold Start" - no PM history exists
+   590→    let lastMileage: number;
+   591→    let lastDate: Date;
+   592→
+   593→    if (lastSatisfying) {
+   594→      lastMileage = lastSatisfying.mileageAtCompletion;
+   595→      lastDate = lastSatisfying.completionDate;
+   596→    } else {
+   597→      // COLD START FIX: Create "virtual" last PM
+   598→      const intervalKm = targetRule.intervalKm ?? 180000;
+   599→      const cyclesCompleted = Math.floor(currentMileage / intervalKm);
+   600→
+   601→      if (cyclesCompleted > 0) {
+   602→        lastMileage = cyclesCompleted * intervalKm;
+   603→        const daysAgo = (currentMileage - lastMileage) / Math.max(dailyKm, 1);
+   604→        lastDate = addDays(currentDate, -Math.round(daysAgo));
+   605→      } else {
+   606→        lastMileage = 0;
+   607→        lastDate = train.commissioningDate;
+   608→      }
+   609→    }
+   610→
+   611→    // 4. Calculate mileage-based due date
+   612→    const intervalKm = targetRule.intervalKm ?? 180000;
+   613→    const kmSinceLast = currentMileage - lastMileage;
+   614→    const kmRemaining = Math.max(0, intervalKm - kmSinceLast);
+   615→    const daysUntilMileageDue = dailyKm > 0 ? kmRemaining / dailyKm : 365;
+   616→    const dateByMileage = addDays(currentDate, Math.round(daysUntilMileageDue));
+   617→    const mileageAtDue = currentMileage + kmRemaining;
+   618→
+   619→    // 5. Calculate time-based due date (if interval defined)
+   620→    let dateByTime: Date | null = null;
+   621→    if (targetRule.intervalMonths) {
+   622→      dateByTime = addMonths(lastDate, targetRule.intervalMonths);
+   623→    }
+   624→
+   625→    // 6. Return whichever comes first (dual trigger)
+   626→    if (dateByTime && dateByTime < dateByMileage) {
+   627→      const daysUntilTime = Math.max(0, differenceInDays(dateByTime, currentDate));
+   628→      const mileageAtTime = currentMileage + daysUntilTime * dailyKm;
+   629→      return { date: dateByTime, mileage: mileageAtTime, trigger: 'TIME' };
+   630→    } else {
+   631→      return { date: dateByMileage, mileage: mileageAtDue, trigger: 'MILEAGE' };
+   632→    }
+   633→  }
+   634→
+   635→  /**
+   636→   * Find all PM codes that satisfy a target PM code
+   637→   */
+   638→  private getSatisfyingCodes(targetCode: string, allRules: PmType[]): string[] {
+   639→    const result = [targetCode];
+   640→
+   641→    for (const rule of allRules) {
+   642→      if (rule.satisfiesCodes?.includes(targetCode)) {
+   643→        result.push(rule.pmCode);
+   644→      }
+   645→    }
+   646→
+   647→    return result;
+   648→  }
+   649→
+   650→  /**
+   651→   * Calculate daily mileage rate for a train
+   652→   */
+   653→  private async calculateDailyUtilization(
+   654→    train: FleetState['trains'][0],
+   655→    history: PMHistory[]
+   656→  ): Promise<number> {
+   657→    // Try to get from route utilization service
+   658→    try {
+   659→      const routeService = getRouteUtilizationService();
+   660→      const targetDate = format(new Date(), 'yyyy-MM-dd');
+   661→      const rate = await routeService.calculateDailyRate(train.id, targetDate);
+   662→      if (rate.dailyKm > 50 && rate.dailyKm < 500) {
+   663→        return rate.dailyKm;
+   664→      }
+   665→    } catch {
+   666→      // Fall through to calculation
+   667→    }
+   668→
+   669→    // Filter valid history entries
+   670→    const validHistory = history
+   671→      .filter((h) => h.mileageAtCompletion > 0)
+   672→      .sort((a, b) => b.completionDate.getTime() - a.completionDate.getTime());
+   673→
+   674→    // Try: Recent velocity between last 2 PMs
+   675→    if (validHistory.length >= 2) {
+   676→      const recent = validHistory[0];
+   677→      const previous = validHistory[1];
+   678→      const daysBetween = differenceInDays(recent.completionDate, previous.completionDate);
+   679→      const kmBetween = recent.mileageAtCompletion - previous.mileageAtCompletion;
+   680→
+   681→      if (daysBetween >= 14 && kmBetween > 0) {
+   682→        const rate = kmBetween / daysBetween;
+   683→        if (rate > 50 && rate < 500) {
+   684→          return rate;
+   685→        }
+   686→      }
+   687→    }
+   688→
+   689→    // Fallback: Lifetime average from commissioning
+   690→    const daysSinceCommission = differenceInDays(new Date(), train.commissioningDate);
+   691→    if (daysSinceCommission > 0 && train.currentMileageKm > 0) {
+   692→      return train.currentMileageKm / daysSinceCommission;
+   693→    }
+   694→
+   695→    // Last resort: Fleet typical value
+   696→    return 150; // Conservative metro average
+   697→  }
+   698→
+   699→  private calculateWindowDays(rule: PmType, dailyKm: number): number {
+   700→    const intervalKm = rule.intervalKm ?? 180000;
+   701→    const tolerancePct = Number(rule.lateTolerancePct ?? 10) / 100;
+   702→    return Math.round((intervalKm * tolerancePct) / Math.max(dailyKm, 1));
+   703→  }
+   704→
+   705→  private async getPMRulesForFleet(fleetId: string): Promise<PmType[]> {
+   706→    const today = format(new Date(), 'yyyy-MM-dd');
+   707→
+   708→    return this.db.query.pmTypes.findMany({
+   709→      where: and(
+   710→        eq(pmTypes.fleetId, fleetId),
+   711→        eq(pmTypes.active, true),
+   712→        lte(pmTypes.effectiveFrom, today),
+   713→        isNull(pmTypes.effectiveTo)
+   714→      ),
+   715→    });
+   716→  }
+   717→
+   718→  private async getPMHistoryForTrain(trainId: string): Promise<PMHistory[]> {
+   719→    const completed = await this.db.query.pmSchedule.findMany({
+   720→      where: and(
+   721→        eq(pmSchedule.trainId, trainId),
+   722→        eq(pmSchedule.status, 'COMPLETED'),
+   723→        isNull(pmSchedule.scenarioId)
+   724→      ),
+   725→      orderBy: desc(pmSchedule.completedAt),
+   726→    });
+   727→
+   728→    const pmTypeMap = new Map<string, string>();
+   729→    for (const pm of completed) {
+   730→      if (!pmTypeMap.has(pm.pmTypeId)) {
+   731→        const pmType = await this.db.query.pmTypes.findFirst({
+   732→          where: eq(pmTypes.id, pm.pmTypeId),
+   733→        });
+   734→        if (pmType) pmTypeMap.set(pm.pmTypeId, pmType.pmCode);
+   735→      }
+   736→    }
+   737→
+   738→    return completed.map((pm) => ({
+   739→      id: pm.id,
+   740→      trainId: pm.trainId,
+   741→      pmTypeId: pm.pmTypeId,
+   742→      pmCode: pmTypeMap.get(pm.pmTypeId) ?? 'UNKNOWN',
+   743→      completionDate: pm.completedAt ?? new Date(),
+   744→      mileageAtCompletion: pm.completedMileageKm ?? 0,
+   745→    }));
+   746→  }
+   747→
+   748→  // ===========================================================================
+   749→  // Private Methods - Constraint Envelopes
+   750→  // ===========================================================================
+   751→
+   752→  private async generateEnvelopes(
+   753→    startDate: Date,
+   754→    endDate: Date
+   755→  ): Promise<ConstraintEnvelope[]> {
+   756→    const envelopes: ConstraintEnvelope[] = [];
+   757→    const depotIds = await this.getAllDepotIds();
+   758→
+   759→    // Generate envelope for each quarter
+   760→    for (let q = 0; q < differenceInDays(endDate, startDate) / 90; q++) {
+   761→      const quarterStart = addMonths(startDate, q * 3);
+   762→      const quarterEnd = addMonths(quarterStart, 3);
+   763→
+   764→      if (quarterStart > endDate) break;
+   765→
+   766→      const envelope = await this.generateEnvelopeForPeriod(
+   767→        quarterStart,
+   768→        quarterEnd,
+   769→        depotIds
+   770→      );
+   771→
+   772→      envelopes.push(envelope);
+   773→    }
+   774→
+   775→    return envelopes;
+   776→  }
+   777→
+   778→  private async generateEnvelopeForPeriod(
+   779→    periodStart: Date,
+   780→    periodEnd: Date,
+   781→    depotIds?: string[]
+   782→  ): Promise<ConstraintEnvelope> {
+   783→    const quarterKey = this.getQuarterKey(periodStart);
+   784→    const daysInPeriod = differenceInDays(periodEnd, periodStart);
+   785→
+   786→    // Get all depots if not specified
+   787→    const depots = depotIds
+   788→      ? depotIds
+   789→      : await this.getAllDepotIds();
+   790→
+   791→    // Track capacity by depot and type
+   792→    const trackCapacity: ConstraintEnvelope['trackCapacity'] = [];
+   793→    for (const depotId of depots) {
+   794→      const trackData = await this.db.query.tracks.findMany({
+   795→        where: eq(tracks.depotId, depotId),
+   796→      });
+   797→
+   798→      const tracksByType = new Map<string, number>();
+   799→      for (const track of trackData) {
+   800→        const current = tracksByType.get(track.trackType) ?? 0;
+   801→        tracksByType.set(track.trackType, current + 1);
+   802→      }
+   803→
+   804→      for (const [trackType, count] of tracksByType) {
+   805→        trackCapacity.push({
+   806→          trackType,
+   807→          availableSlotDays: count * daysInPeriod * 0.85, // 85% utilization target
+   808→          depotId,
+   809→        });
+   810→      }
+   811→    }
+   812→
+   813→    // Labor capacity by depot
+   814→    const laborCapacity: ConstraintEnvelope['laborCapacity'] = [];
+   815→    for (const depotId of depots) {
+   816→      const capacity = await this.db.query.manhourCapacity.findFirst({
+   817→        where: eq(manhourCapacity.depotId, depotId),
+   818→      });
+   819→
+   820→      if (capacity) {
+   821→        const dailyHours =
+   822→          Number(capacity.dayShiftHours ?? 0) +
+   823→          Number(capacity.nightShiftHours ?? 0);
+   824→        laborCapacity.push({
+   825→          depotId,
+   826→          availableHours: dailyHours * daysInPeriod,
+   827→        });
+   828→      }
+   829→    }
+   830→
+   831→    const totalAvailableHours = laborCapacity.reduce((sum, l) => sum + l.availableHours, 0);
+   832→    const totalTrackSlots = trackCapacity.reduce((sum, t) => sum + t.availableSlotDays, 0);
+   833→
+   834→    return {
+   835→      period: periodStart,
+   836→      quarterKey,
+   837→      trackCapacity,
+   838→      laborCapacity,
+   839→      materialCapacity: {}, // Simplified - would need inventory integration
+   840→      totalAvailableHours,
+   841→      totalTrackSlots,
+   842→    };
+   843→  }
+   844→
+   845→  private async getAllDepotIds(): Promise<string[]> {
+   846→    const depotData = await this.db.query.depots.findMany();
+   847→    return depotData.map((d) => d.id);
+   848→  }
+   849→
+   850→  private getQuarterKey(date: Date): string {
+   851→    const year = date.getFullYear();
+   852→    const quarter = Math.floor(date.getMonth() / 3) + 1;
+   853→    return `${year}-Q${quarter}`;
+   854→  }
+   855→
+   856→  // ===========================================================================
+   857→  // Private Methods - Genetic Algorithm
+   858→  // ===========================================================================
+   859→
+   860→  private async runGeneticAlgorithm(
+   861→    requirements: PMRequirement[],
+   862→    envelopes: ConstraintEnvelope[],
+   863→    config: StrategicPlannerConfig,
+   864→    onGeneration?: (gen: number, bestFitness: number, avgFitness: number) => void
+   865→  ): Promise<StrategicAllocation[]> {
+   866→    // Initialize population
+   867→    let population = this.initializePopulation(requirements, envelopes, config.populationSize);
+   868→
+   869→    for (let gen = 0; gen < config.generations; gen++) {
+   870→      // Evaluate fitness
+   871→      const fitness = population.map((individual) =>
+   872→        this.evaluateFitness(individual, envelopes)
+   873→      );
+   874→
+   875→      const bestFitness = Math.max(...fitness);
+   876→      const avgFitness = fitness.reduce((a, b) => a + b, 0) / fitness.length;
+   877→
+   878→      if (onGeneration) {
+   879→        onGeneration(gen, bestFitness, avgFitness);
+   880→      }
+   881→
+   882→      // Selection
+   883→      const selected = this.tournamentSelection(population, fitness, config.populationSize);
+   884→
+   885→      // Crossover
+   886→      const offspring = this.crossover(selected, config.populationSize - config.eliteCount);
+   887→
+   888→      // Mutation
+   889→      const mutated = this.mutate(offspring, envelopes, config.mutationRate);
+   890→
+   891→      // Elitism - keep best individuals
+   892→      const elite = this.selectElite(population, fitness, config.eliteCount);
+   893→
+   894→      // New population
+   895→      population = [...elite, ...mutated];
+   896→    }
+   897→
+   898→    // Return best individual
+   899→    const finalFitness = population.map((i) => this.evaluateFitness(i, envelopes));
+   900→    const bestIndex = finalFitness.indexOf(Math.max(...finalFitness));
+   901→
+   902→    return population[bestIndex];
+   903→  }
+   904→
+   905→  private initializePopulation(
+   906→    requirements: PMRequirement[],
+   907→    envelopes: ConstraintEnvelope[],
+   908→    populationSize: number
+   909→  ): StrategicAllocation[][] {
+   910→    const population: StrategicAllocation[][] = [];
+   911→
+   912→    for (let i = 0; i < populationSize; i++) {
+   913→      const individual: StrategicAllocation[] = requirements.map((req) => {
+   914→        // Find valid quarters for this requirement
+   915→        const validQuarters = envelopes.filter(
+   916→          (e) => e.period >= req.constraintStart && e.period <= req.constraintEnd
+   917→        );
+   918→
+   919→        // Randomly select a quarter (or closest if none in window)
+   920→        let targetEnvelope: ConstraintEnvelope;
+   921→        if (validQuarters.length > 0) {
+   922→          targetEnvelope = validQuarters[Math.floor(Math.random() * validQuarters.length)];
+   923→        } else {
+   924→          // Find closest envelope to constraint window
+   925→          targetEnvelope = envelopes.reduce((closest, env) => {
+   926→            const distCurrent = Math.abs(env.period.getTime() - req.projectedDate.getTime());
+   927→            const distClosest = Math.abs(closest.period.getTime() - req.projectedDate.getTime());
+   928→            return distCurrent < distClosest ? env : closest;
+   929→          });
+   930→        }
+   931→
+   932→        return {
+   933→          requirementId: req.id,
+   934→          trainId: req.trainId,
+   935→          trainNumber: req.trainNumber,
+   936→          pmTypeId: req.pmTypeId,
+   937→          pmCode: req.pmCode,
+   938→          targetQuarter: targetEnvelope.quarterKey,
+   939→          targetDate: req.projectedDate,
+   940→          estimatedHours: req.estimatedHours,
+   941→          estimatedCost: req.estimatedHours * 75, // Rough cost estimate
+   942→          depotId: null,
+   943→        };
+   944→      });
+   945→
+   946→      population.push(individual);
+   947→    }
+   948→
+   949→    return population;
+   950→  }
+   951→
+   952→  private evaluateFitness(
+   953→    individual: StrategicAllocation[],
+   954→    envelopes: ConstraintEnvelope[]
+   955→  ): number {
+   956→    let fitness = 1000; // Start with base score
+   957→
+   958→    // Penalty for constraint envelope violations
+   959→    for (const envelope of envelopes) {
+   960→      const quarterAllocations = individual.filter(
+   961→        (a) => a.targetQuarter === envelope.quarterKey
+   962→      );
+   963→
+   964→      // Labor capacity check
+   965→      const totalHours = quarterAllocations.reduce((sum, a) => sum + a.estimatedHours, 0);
+   966→      if (totalHours > envelope.totalAvailableHours) {
+   967→        fitness -= (totalHours - envelope.totalAvailableHours) * 5;
+   968→      }
+   969→
+   970→      // Track capacity check (simplified)
+   971→      if (quarterAllocations.length > envelope.totalTrackSlots) {
+   972→        fitness -= (quarterAllocations.length - envelope.totalTrackSlots) * 10;
+   973→      }
+   974→    }
+   975→
+   976→    // Bonus for workload leveling
+   977→    const quarterHours = this.groupByQuarter(individual);
+   978→    const variance = this.calculateVariance(Object.values(quarterHours));
+   979→    fitness -= variance * 0.1; // Prefer even distribution
+   980→
+   981→    return Math.max(0, fitness);
+   982→  }
+   983→
+   984→  private tournamentSelection(
+   985→    population: StrategicAllocation[][],
+   986→    fitness: number[],
+   987→    targetSize: number
+   988→  ): StrategicAllocation[][] {
+   989→    const selected: StrategicAllocation[][] = [];
+   990→    const tournamentSize = 3;
+   991→
+   992→    while (selected.length < targetSize) {
+   993→      // Pick random tournament participants
+   994→      const participants: number[] = [];
+   995→      while (participants.length < tournamentSize) {
+   996→        const idx = Math.floor(Math.random() * population.length);
+   997→        if (!participants.includes(idx)) {
+   998→          participants.push(idx);
+   999→        }
+  1000→      }
+  1001→
+  1002→      // Select winner (highest fitness)
+  1003→      const winnerIdx = participants.reduce((best, current) =>
+  1004→        fitness[current] > fitness[best] ? current : best
+  1005→      );
+  1006→
+  1007→      selected.push([...population[winnerIdx]]);
+  1008→    }
+  1009→
+  1010→    return selected;
+  1011→  }
+  1012→
+  1013→  private crossover(
+  1014→    selected: StrategicAllocation[][],
+  1015→    offspringCount: number
+  1016→  ): StrategicAllocation[][] {
+  1017→    const offspring: StrategicAllocation[][] = [];
+  1018→
+  1019→    while (offspring.length < offspringCount) {
+  1020→      const parent1 = selected[Math.floor(Math.random() * selected.length)];
+  1021→      const parent2 = selected[Math.floor(Math.random() * selected.length)];
+  1022→
+  1023→      // Single-point crossover
+  1024→      const crossPoint = Math.floor(Math.random() * parent1.length);
+  1025→
+  1026→      const child = [
+  1027→        ...parent1.slice(0, crossPoint),
+  1028→        ...parent2.slice(crossPoint),
+  1029→      ];
+  1030→
+  1031→      offspring.push(child);
+  1032→    }
+  1033→
+  1034→    return offspring;
+  1035→  }
+  1036→
+  1037→  private mutate(
+  1038→    offspring: StrategicAllocation[][],
+  1039→    envelopes: ConstraintEnvelope[],
+  1040→    mutationRate: number
+  1041→  ): StrategicAllocation[][] {
+  1042→    return offspring.map((individual) =>
+  1043→      individual.map((allocation) => {
+  1044→        if (Math.random() < mutationRate) {
+  1045→          // Mutate: move to a different quarter
+  1046→          const randomEnvelope = envelopes[Math.floor(Math.random() * envelopes.length)];
+  1047→          return {
+  1048→            ...allocation,
+  1049→            targetQuarter: randomEnvelope.quarterKey,
+  1050→          };
+  1051→        }
+  1052→        return allocation;
+  1053→      })
+  1054→    );
+  1055→  }
+  1056→
+  1057→  private selectElite(
+  1058→    population: StrategicAllocation[][],
+  1059→    fitness: number[],
+  1060→    eliteCount: number
+  1061→  ): StrategicAllocation[][] {
+  1062→    const indexed = population.map((ind, i) => ({ ind, fit: fitness[i] }));
+  1063→    indexed.sort((a, b) => b.fit - a.fit);
+  1064→    return indexed.slice(0, eliteCount).map((x) => [...x.ind]);
+  1065→  }
+  1066→
+  1067→  private groupByQuarter(individual: StrategicAllocation[]): Record<string, number> {
+  1068→    const result: Record<string, number> = {};
+  1069→    for (const alloc of individual) {
+  1070→      result[alloc.targetQuarter] = (result[alloc.targetQuarter] ?? 0) + alloc.estimatedHours;
+  1071→    }
+  1072→    return result;
+  1073→  }
+  1074→
+  1075→  private calculateVariance(values: number[]): number {
+  1076→    if (values.length === 0) return 0;
+  1077→    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  1078→    const squaredDiffs = values.map((v) => Math.pow(v - mean, 2));
+  1079→    return squaredDiffs.reduce((a, b) => a + b, 0) / values.length;
+  1080→  }
+  1081→
+  1082→  // ===========================================================================
+  1083→  // Private Methods - Validation & Metrics
+  1084→  // ===========================================================================
+  1085→
+  1086→  private validatePlan(
+  1087→    plan: StrategicAllocation[],
+  1088→    envelopes: ConstraintEnvelope[]
+  1089→  ): PlanValidation {
+  1090→    const violations: PlanViolation[] = [];
+  1091→    const warnings: PlanWarning[] = [];
+  1092→
+  1093→    for (const envelope of envelopes) {
+  1094→      const quarterAllocations = plan.filter(
+  1095→        (a) => a.targetQuarter === envelope.quarterKey
+  1096→      );
+  1097→
+  1098→      // Check labor capacity
+  1099→      const totalHours = quarterAllocations.reduce((sum, a) => sum + a.estimatedHours, 0);
+  1100→      if (totalHours > envelope.totalAvailableHours) {
+  1101→        violations.push({
+  1102→          type: 'LABOR_CAPACITY',
+  1103→          quarter: envelope.quarterKey,
+  1104→          description: `Labor hours (${totalHours.toFixed(0)}) exceed capacity (${envelope.totalAvailableHours.toFixed(0)})`,
+  1105→          severity: (totalHours - envelope.totalAvailableHours) / envelope.totalAvailableHours,
+  1106→        });
+  1107→      } else if (totalHours > envelope.totalAvailableHours * 0.95) {
+  1108→        warnings.push({
+  1109→          type: 'HIGH_UTILIZATION',
+  1110→          quarter: envelope.quarterKey,
+  1111→          description: `High utilization (${((totalHours / envelope.totalAvailableHours) * 100).toFixed(1)}%)`,
+  1112→        });
+  1113→      }
+  1114→
+  1115→      // Check track capacity
+  1116→      if (quarterAllocations.length > envelope.totalTrackSlots) {
+  1117→        violations.push({
+  1118→          type: 'TRACK_CAPACITY',
+  1119→          quarter: envelope.quarterKey,
+  1120→          description: `PMs (${quarterAllocations.length}) exceed track slots (${envelope.totalTrackSlots.toFixed(0)})`,
+  1121→          severity: (quarterAllocations.length - envelope.totalTrackSlots) / envelope.totalTrackSlots,
+  1122→        });
+  1123→      }
+  1124→    }
+  1125→
+  1126→    // Check for bow wave (accumulation in later quarters)
+  1127→    const quarterLoads = this.groupByQuarter(plan);
+  1128→    const quarters = Object.keys(quarterLoads).sort();
+  1129→    if (quarters.length > 4) {
+  1130→      const firstHalf = quarters.slice(0, Math.floor(quarters.length / 2));
+  1131→      const secondHalf = quarters.slice(Math.floor(quarters.length / 2));
+  1132→
+  1133→      const firstHalfLoad = firstHalf.reduce((sum, q) => sum + (quarterLoads[q] ?? 0), 0);
+  1134→      const secondHalfLoad = secondHalf.reduce((sum, q) => sum + (quarterLoads[q] ?? 0), 0);
+  1135→
+  1136→      if (secondHalfLoad > firstHalfLoad * 1.5) {
+  1137→        violations.push({
+  1138→          type: 'BOW_WAVE',
+  1139→          quarter: 'OVERALL',
+  1140→          description: 'Maintenance accumulating in later periods (bow wave risk)',
+  1141→          severity: secondHalfLoad / firstHalfLoad - 1,
+  1142→        });
+  1143→      }
+  1144→    }
+  1145→
+  1146→    const score = 100 - violations.reduce((sum, v) => sum + v.severity * 20, 0);
+  1147→
+  1148→    return {
+  1149→      valid: violations.length === 0,
+  1150→      violations,
+  1151→      warnings,
+  1152→      score: Math.max(0, score),
+  1153→    };
+  1154→  }
+  1155→
+  1156→  private repairPlan(
+  1157→    plan: StrategicAllocation[],
+  1158→    validation: PlanValidation,
+  1159→    envelopes: ConstraintEnvelope[]
+  1160→  ): StrategicAllocation[] {
+  1161→    const repairedPlan = [...plan];
+  1162→
+  1163→    // Try to move allocations from overloaded quarters
+  1164→    for (const violation of validation.violations) {
+  1165→      if (violation.type === 'LABOR_CAPACITY' || violation.type === 'TRACK_CAPACITY') {
+  1166→        const overloadedQuarter = violation.quarter;
+  1167→        const overloadedAllocations = repairedPlan.filter(
+  1168→          (a) => a.targetQuarter === overloadedQuarter
+  1169→        );
+  1170→
+  1171→        // Find underutilized quarters
+  1172→        const quarterLoads = this.groupByQuarter(repairedPlan);
+  1173→        const underutilized = envelopes
+  1174→          .filter((e) => {
+  1175→            const load = quarterLoads[e.quarterKey] ?? 0;
+  1176→            return load < e.totalAvailableHours * 0.7;
+  1177→          })
+  1178→          .map((e) => e.quarterKey);
+  1179→
+  1180→        // Move some allocations
+  1181→        let movedCount = 0;
+  1182→        const targetMoves = Math.ceil(overloadedAllocations.length * 0.2);
+  1183→
+  1184→        for (let i = 0; i < repairedPlan.length && movedCount < targetMoves; i++) {
+  1185→          if (repairedPlan[i].targetQuarter === overloadedQuarter && underutilized.length > 0) {
+  1186→            repairedPlan[i] = {
+  1187→              ...repairedPlan[i],
+  1188→              targetQuarter: underutilized[Math.floor(Math.random() * underutilized.length)],
+  1189→            };
+  1190→            movedCount++;
+  1191→          }
+  1192→        }
+  1193→      }
+  1194→    }
+  1195→
+  1196→    return repairedPlan;
+  1197→  }
+  1198→
+  1199→  private calculateMetrics(
+  1200→    plan: StrategicAllocation[],
+  1201→    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  1202→    _envelopes: ConstraintEnvelope[]
+  1203→  ): PlanMetrics {
+  1204→    const totalPMs = plan.length;
+  1205→    const totalHours = plan.reduce((sum, a) => sum + a.estimatedHours, 0);
+  1206→    const totalCost = plan.reduce((sum, a) => sum + a.estimatedCost, 0);
+  1207→
+  1208→    const quarterLoads = this.groupByQuarter(plan);
+  1209→    const loadValues = Object.values(quarterLoads);
+  1210→    const averageQuarterlyLoad = loadValues.length > 0
+  1211→      ? loadValues.reduce((a, b) => a + b, 0) / loadValues.length
+  1212→      : 0;
+  1213→    const loadVariance = this.calculateVariance(loadValues);
+  1214→
+  1215→    // Calculate compliance rate (simplified)
+  1216→    const complianceRate = 0.95; // Would need actual constraint checking
+  1217→
+  1218→    // Calculate bow wave risk
+  1219→    const quarters = Object.keys(quarterLoads).sort();
+  1220→    let bowWaveRisk = 0;
+  1221→    if (quarters.length > 4) {
+  1222→      const firstHalf = quarters.slice(0, Math.floor(quarters.length / 2));
+  1223→      const secondHalf = quarters.slice(Math.floor(quarters.length / 2));
+  1224→
+  1225→      const firstHalfLoad = firstHalf.reduce((sum, q) => sum + (quarterLoads[q] ?? 0), 0);
+  1226→      const secondHalfLoad = secondHalf.reduce((sum, q) => sum + (quarterLoads[q] ?? 0), 0);
+  1227→
+  1228→      if (secondHalfLoad > firstHalfLoad) {
+  1229→        bowWaveRisk = Math.min(1, (secondHalfLoad / firstHalfLoad - 1) / 0.5);
+  1230→      }
+  1231→    }
+  1232→
+  1233→    // Calculate utilization balance (1 = perfectly balanced)
+  1234→    const utilizationBalance = 1 - Math.min(1, Math.sqrt(loadVariance) / averageQuarterlyLoad);
+  1235→
+  1236→    return {
+  1237→      totalPMs,
+  1238→      totalHours,
+  1239→      totalCost,
+  1240→      averageQuarterlyLoad,
+  1241→      loadVariance,
+  1242→      complianceRate,
+  1243→      bowWaveRisk,
+  1244→      utilizationBalance: isNaN(utilizationBalance) ? 0.5 : utilizationBalance,
+  1245→    };
+  1246→  }
+  1247→}
+  1248→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

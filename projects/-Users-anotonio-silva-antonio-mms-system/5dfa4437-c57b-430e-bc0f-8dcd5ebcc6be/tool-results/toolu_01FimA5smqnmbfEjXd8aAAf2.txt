@@ -1,0 +1,300 @@
+     1→# MMS Operational Guide
+     2→
+     3→## Quick Reference
+     4→
+     5→```bash
+     6→# Full stack (dev) - all services via Docker
+     7→cp .env.example .env
+     8→docker compose up -d
+     9→
+    10→# Hybrid (data in Docker, app local)
+    11→docker compose up -d postgres redis
+    12→bun install
+    13→bun run dev                # Frontend
+    14→bun run src/api/server.ts  # Backend (separate terminal)
+    15→
+    16→# Tests
+    17→bun test                    # Unit tests
+    18→bun test:watch             # Watch mode
+    19→bun run test:integration   # Integration (needs Docker)
+    20→
+    21→# Validation (run in order!)
+    22→bun run typecheck          # TypeScript strict
+    23→bun run lint               # ESLint
+    24→bun run build              # Full build
+    25→```
+    26→
+    27→## Validation Order (Backpressure)
+    28→
+    29→**IMPORTANT: Run these in order after implementing changes:**
+    30→
+    31→```bash
+    32→# 1. Unit tests for changed files
+    33→bun test <path-to-changed-file>
+    34→
+    35→# 2. TypeScript type checking
+    36→bun run typecheck
+    37→
+    38→# 3. Linting
+    39→bun run lint
+    40→
+    41→# 4. Full build
+    42→bun run build
+    43→
+    44→# 5. Integration tests (if touching API/DB/services/workers)
+    45→PORT=0 bun run test:integration
+    46→
+    47→# 6. E2E via Playwright MCP (if UI modified)
+    48→# Use mcp__playwright__* tools directly - see PROMPT_build.md step 103
+    49→```
+    50→
+    51→**Port Configuration:**
+    52→- Always use `PORT=0` for random port assignment
+    53→- Parse actual port from server startup output
+    54→- Never hardcode ports in tests
+    55→
+    56→All must pass before committing. 12-year contract demands production-grade quality gates.
+    57→
+    58→## Build & Run
+    59→
+    60→### Development Environment
+    61→
+    62→```bash
+    63→# Start infrastructure
+    64→docker-compose up -d postgres redis minio
+    65→
+    66→# Install dependencies
+    67→bun install
+    68→
+    69→# Run migrations
+    70→bun run db:migrate
+    71→
+    72→# Seed demo data (optional)
+    73→bun run db:seed
+    74→
+    75→# Start dev server
+    76→bun run dev
+    77→```
+    78→
+    79→### C++ Optimizer Build
+    80→
+    81→```bash
+    82→# Prerequisites (macOS)
+    83→brew install cmake or-tools nlohmann-json fmt
+    84→
+    85→# Build
+    86→cd mms-optimizer
+    87→cmake -B build -DCMAKE_BUILD_TYPE=Release
+    88→cmake --build build
+    89→
+    90→# Binary location: mms-optimizer/build/mms-optimizer
+    91→# Environment variable: MMS_OPTIMIZER_BINARY (default: ./mms-optimizer/build/mms-optimizer)
+    92→```
+    93→
+    94→### Docker Full Stack
+    95→
+    96→```bash
+    97→# Copy environment example
+    98→cp .env.example .env
+    99→
+   100→# Start all services
+   101→docker compose up -d
+   102→
+   103→# Start only data services (postgres + redis)
+   104→docker compose up -d postgres redis
+   105→
+   106→# Start with dev tools (pgAdmin, Redis Commander)
+   107→docker compose --profile tools up -d
+   108→
+   109→# View logs
+   110→docker compose logs -f backend
+   111→docker compose logs -f worker
+   112→
+   113→# Stop and remove volumes
+   114→docker compose down -v
+   115→
+   116→# Services and ports:
+   117→# - postgres:5432 (PostgreSQL 16 + TimescaleDB)
+   118→# - redis:6379 (Redis 7)
+   119→# - backend:3000 (Bun + Hono API)
+   120→# - frontend:5173 (Vite dev server)
+   121→# - worker (BullMQ workers, no port)
+   122→# - file-watcher (CSV watcher, no port)
+   123→# - redis-commander:8081 (tools profile)
+   124→# - pgadmin:8082 (tools profile)
+   125→```
+   126→
+   127→## Database
+   128→
+   129→### Migrations
+   130→```bash
+   131→bun run db:migrate              # Run pending
+   132→bun run db:migrate:status       # Check status
+   133→bun run db:rollback             # Rollback last
+   134→```
+   135→
+   136→### Drizzle Studio
+   137→```bash
+   138→bun run db:studio               # Opens at localhost:4983
+   139→```
+   140→
+   141→### Direct Access
+   142→```bash
+   143→docker exec -it mms-postgres psql -U mms -d mms_dev
+   144→```
+   145→
+   146→## Environment Variables
+   147→
+   148→```bash
+   149→# Required
+   150→DATABASE_URL=postgresql://mms:mms@localhost:5432/mms_dev
+   151→REDIS_URL=redis://localhost:6379
+   152→MINIO_ENDPOINT=localhost:9000
+   153→MINIO_ACCESS_KEY=mms
+   154→MINIO_SECRET_KEY=mms_secret
+   155→
+   156→# Optional
+   157→LOG_LEVEL=debug
+   158→MMS_OPTIMIZER_BINARY=./mms-optimizer/build/mms-optimizer
+   159→MAXIMO_API_URL=http://maximo.example.com/api
+   160→```
+   161→
+   162→## Codebase Patterns
+   163→
+   164→### Domain Services
+   165→- Location: `src/services/`
+   166→- Pattern: Class with injected dependencies
+   167→- All services emit OpenTelemetry traces
+   168→- Use Drizzle ORM for database access
+   169→
+   170→### API Routes
+   171→- Location: `src/api/routes/`
+   172→- Framework: Hono
+   173→- All routes have OpenAPI spec
+   174→- Use @belt/tools createSchema for validation
+   175→
+   176→### Workers
+   177→- Location: `src/workers/`
+   178→- Framework: BullMQ (Redis-backed)
+   179→- Central exports: `src/workers/index.ts`
+   180→- Use `registerWorker()` to create new workers
+   181→- 8 queues: ingestion, tactical_scheduler, strategic_planner, optimizer, manhour_leveling, drift_monitor, notification, report
+   182→
+   183→**Running Workers:**
+   184→```bash
+   185→# Start all workers
+   186→bun run src/workers/runner.ts
+   187→
+   188→# Start specific workers only
+   189→WORKERS=optimizer,drift_monitor bun run src/workers/runner.ts
+   190→
+   191→# Workers require Redis to be running
+   192→docker-compose up -d redis
+   193→```
+   194→
+   195→**Implemented Processors (All 9 production-ready):**
+   196→- `optimizer` - Run assignment optimization (C++ OR-Tools or TS fallback)
+   197→- `drift_monitor` - Baseline drift analysis
+   198→- `ingestion` - CSV mileage file processing
+   199→- `maximo_sync` - Bidirectional sync with Maximo (push/pull/full)
+   200→- `tactical_scheduler` - PM scheduling for 12-week horizon
+   201→- `strategic_planner` - Long-term PM planning (genetic algorithm)
+   202→- `manhour_leveling` - Workforce optimization across depots
+   203→- `notification` - Email notification delivery
+   204→- `report` - Excel/PDF report generation
+   205→
+   206→### Optimizer IPC
+   207→- Protocol: NDJSON over stdin/stdout
+   208→- Input: `{ type: "solve", data: {...} }`
+   209→- Output: `{ type: "progress" | "solution" | "error", ... }`
+   210→
+   211→### Validation & State Management (@belt/tools)
+   212→
+   213→> **CRITICAL**: See README.md for complete @belt/tools API reference
+   214→
+   215→**Schema Validation** (replaces Zod):
+   216→```typescript
+   217→import { createSchema, createType, InferType } from '@belt/tools';
+   218→
+   219→const TrainModel = createSchema({
+   220→  id: 'string',
+   221→  trainNumber: 'string',
+   222→  mileageKm: 'number',
+   223→  fitnessStatus: { enum: ['FIT', 'RESTRICTED', 'GROUNDED'] },
+   224→});
+   225→type Train = InferType<typeof TrainModel>;
+   226→const train = TrainModel.parse(data);
+   227→```
+   228→
+   229→**State Management** (replaces React hooks + zustand):
+   230→```typescript
+   231→import { createSlice, createMachine } from '@belt/tools';
+   232→
+   233→const fleetSlice = createSlice({
+   234→  id: 'fleet',
+   235→  initial: { trains: [], selected: null },
+   236→  cache: { policy: 'session' },
+   237→  reducers: {
+   238→    setTrains: (state, trains) => { state.trains = trains; },
+   239→  },
+   240→});
+   241→
+   242→const machine = createMachine({
+   243→  id: 'mms',
+   244→  slices: { fleet: fleetSlice },
+   245→  trackMetadata: false, // Critical for 60fps
+   246→});
+   247→
+   248→// In React component (NO useState/useEffect!)
+   249→const { state, actions } = machine.useMachine('fleet');
+   250→```
+   251→
+   252→### Forbidden Packages (enforced by .claude/hooks/)
+   253→
+   254→> These packages are BLOCKED by .claude/hooks/block-forbidden-packages.sh
+   255→
+   256→| Forbidden | Use Instead |
+   257→|-----------|-------------|
+   258→| zustand, redux, mobx, xstate | @belt/tools createMachine/createSlice |
+   259→| @mui, antd, @patternfly | @blueprintjs/core |
+   260→| tailwind | BlueprintJS styles |
+   261→| next.js | Vite SPA |
+   262→
+   263→### React Hook Restrictions (enforced by .agentrc.ts)
+   264→
+   265→> These React hooks are BLOCKED - use @belt/tools machine instead
+   266→
+   267→- ❌ useState, useEffect, useReducer, useContext
+   268→- ❌ useCallback, useMemo, useLayoutEffect
+   269→- ❌ useTransition, useDeferredValue
+   270→- ✅ useRef (explicitly allowed)
+   271→
+   272→## Common Issues
+   273→
+   274→### Port conflicts
+   275→```bash
+   276→lsof -i :5432  # Check postgres
+   277→lsof -i :6379  # Check redis
+   278→```
+   279→
+   280→### Database connection
+   281→```bash
+   282→# Reset completely
+   283→docker-compose down -v
+   284→docker-compose up -d postgres
+   285→bun run db:migrate
+   286→```
+   287→
+   288→### Optimizer not found
+   289→```bash
+   290→# Check binary exists
+   291→ls -la mms-optimizer/build/mms-optimizer
+   292→
+   293→# Rebuild if needed
+   294→cd mms-optimizer && cmake --build build --clean-first
+   295→```
+   296→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

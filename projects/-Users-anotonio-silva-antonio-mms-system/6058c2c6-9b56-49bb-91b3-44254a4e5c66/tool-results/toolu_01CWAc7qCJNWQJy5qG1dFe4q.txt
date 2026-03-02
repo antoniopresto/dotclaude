@@ -1,0 +1,2477 @@
+src/services/ingestion.ts:198:        } catch (error) {
+src/services/ingestion.ts:199:          errors.push(`Failed to read CSV: ${error instanceof Error ? error.message : 'Unknown error'}`);
+src/services/ingestion.ts:200:        }
+src/services/ingestion.ts:201:      }
+src/services/ingestion.ts:202:
+src/services/ingestion.ts:203:      const valid = errors.length === 0;
+src/services/ingestion.ts:204:      span.setAttribute('validation.valid', valid);
+src/services/ingestion.ts:205:      span.setAttribute('validation.errorCount', errors.length);
+src/services/ingestion.ts:206:
+src/services/ingestion.ts:207:      return {
+src/services/ingestion.ts:208:        valid,
+src/services/ingestion.ts:209:        errors,
+src/services/ingestion.ts:210:        warnings,
+src/services/ingestion.ts:211:        fileSize,
+src/services/ingestion.ts:212:      };
+src/services/ingestion.ts:213:    });
+src/services/ingestion.ts:214:  }
+src/services/ingestion.ts:215:
+src/services/ingestion.ts:216:  /**
+src/services/ingestion.ts:217:   * Read first N lines from a file
+src/services/ingestion.ts:218:   */
+src/services/ingestion.ts:219:  private readFirstLines(filePath: string, lineCount: number): string {
+src/services/ingestion.ts:220:    const content = fs.readFileSync(filePath, 'utf-8');
+src/services/ingestion.ts:221:    const lines = content.split('\n').slice(0, lineCount);
+src/services/ingestion.ts:222:    return lines.join('\n');
+src/services/ingestion.ts:223:  }
+src/services/ingestion.ts:224:
+src/services/ingestion.ts:225:  /**
+src/services/ingestion.ts:226:   * Validate CSV structure (headers and format)
+src/services/ingestion.ts:227:   */
+src/services/ingestion.ts:228:  private validateCsvStructure(csvSample: string): string[] {
+src/services/ingestion.ts:229:    const errors: string[] = [];
+src/services/ingestion.ts:230:
+src/services/ingestion.ts:231:    const parseResult = Papa.parse(csvSample, {
+src/services/ingestion.ts:232:      header: true,
+src/services/ingestion.ts:233:      skipEmptyLines: true,
+src/services/ingestion.ts:234:    });
+src/services/ingestion.ts:235:
+src/services/ingestion.ts:236:    if (parseResult.errors.length > 0) {
+src/services/ingestion.ts:237:      for (const error of parseResult.errors.slice(0, 5)) {
+src/services/ingestion.ts:238:        errors.push(`CSV parse error at row ${error.row ?? 'unknown'}: ${error.message}`);
+src/services/ingestion.ts:239:      }
+src/services/ingestion.ts:240:      return errors;
+src/services/ingestion.ts:241:    }
+src/services/ingestion.ts:242:
+src/services/ingestion.ts:243:    // Check required columns
+src/services/ingestion.ts:244:    const headers = parseResult.meta.fields ?? [];
+src/services/ingestion.ts:245:    const requiredColumns = ['train_number', 'reading_date', 'odometer_km'];
+src/services/ingestion.ts:246:
+src/services/ingestion.ts:247:    for (const col of requiredColumns) {
+src/services/ingestion.ts:248:      if (!headers.includes(col)) {
+src/services/ingestion.ts:249:        errors.push(`Missing required column: ${col}`);
+src/services/ingestion.ts:250:      }
+src/services/ingestion.ts:251:    }
+src/services/ingestion.ts:252:
+src/services/ingestion.ts:253:    return errors;
+src/services/ingestion.ts:254:  }
+src/services/ingestion.ts:255:
+src/services/ingestion.ts:256:  // ===========================================================================
+src/services/ingestion.ts:257:  // File Processing
+src/services/ingestion.ts:258:  // ===========================================================================
+src/services/ingestion.ts:259:
+src/services/ingestion.ts:260:  /**
+src/services/ingestion.ts:261:   * Queue a file for async processing
+src/services/ingestion.ts:262:   */
+src/services/ingestion.ts:263:  async queueFileForProcessing(
+src/services/ingestion.ts:264:    filePath: string,
+src/services/ingestion.ts:265:    uploadedBy?: string
+src/services/ingestion.ts:266:  ): Promise<{ jobId: string }> {
+src/services/ingestion.ts:267:    return this.traced('queueFileForProcessing', async (span) => {
+src/services/ingestion.ts:268:      span.setAttribute('file.path', filePath);
+src/services/ingestion.ts:269:
+src/services/ingestion.ts:270:      // Validate file first
+src/services/ingestion.ts:271:      const validation = await this.validateFile(filePath);
+src/services/ingestion.ts:272:
+src/services/ingestion.ts:273:      if (!validation.valid) {
+src/services/ingestion.ts:274:        throw new ValidationError('File validation failed', {
+src/services/ingestion.ts:275:          field: 'file',
+src/services/ingestion.ts:276:          context: {
+src/services/ingestion.ts:277:            errors: validation.errors,
+src/services/ingestion.ts:278:            warnings: validation.warnings,
+src/services/ingestion.ts:279:          },
+src/services/ingestion.ts:280:        });
+src/services/ingestion.ts:281:      }
+src/services/ingestion.ts:282:
+src/services/ingestion.ts:283:      const fileName = path.basename(filePath);
+src/services/ingestion.ts:284:      const jobData: IngestionJobData = {
+src/services/ingestion.ts:285:        filePath,
+src/services/ingestion.ts:286:        fileName,
+src/services/ingestion.ts:287:        fileSize: validation.fileSize,
+src/services/ingestion.ts:288:        uploadedBy,
+src/services/ingestion.ts:289:      };
+src/services/ingestion.ts:290:
+src/services/ingestion.ts:291:      const { id } = await addJob(
+src/services/ingestion.ts:292:        QUEUE_NAMES.INGESTION,
+src/services/ingestion.ts:293:        'process-mileage-csv',
+src/services/ingestion.ts:294:        jobData,
+src/services/ingestion.ts:295:        {
+src/services/ingestion.ts:296:          attempts: 3,
+src/services/ingestion.ts:297:          backoff: { type: 'exponential', delay: 5000 },
+src/services/ingestion.ts:298:        }
+src/services/ingestion.ts:299:      );
+src/services/ingestion.ts:300:
+src/services/ingestion.ts:301:      this.lastFileReceivedAt = new Date();
+src/services/ingestion.ts:302:
+src/services/ingestion.ts:303:      this.log.info(
+src/services/ingestion.ts:304:        { jobId: id, fileName, fileSize: validation.fileSize, uploadedBy },
+src/services/ingestion.ts:305:        'File queued for ingestion'
+src/services/ingestion.ts:306:      );
+src/services/ingestion.ts:307:
+src/services/ingestion.ts:308:      return { jobId: id };
+src/services/ingestion.ts:309:    });
+src/services/ingestion.ts:310:  }
+src/services/ingestion.ts:311:
+src/services/ingestion.ts:312:  /**
+src/services/ingestion.ts:313:   * Process a mileage CSV file (main ingestion entry point)
+src/services/ingestion.ts:314:   *
+src/services/ingestion.ts:315:   * This is the core method called by the ingestion worker.
+src/services/ingestion.ts:316:   */
+src/services/ingestion.ts:317:  async processFile(
+src/services/ingestion.ts:318:    filePath: string,
+src/services/ingestion.ts:319:    jobId: string = crypto.randomUUID()
+src/services/ingestion.ts:320:  ): Promise<IngestionResult> {
+src/services/ingestion.ts:321:    return this.traced('processFile', async (span) => {
+src/services/ingestion.ts:322:      const startTime = Date.now();
+src/services/ingestion.ts:323:      const fileName = path.basename(filePath);
+src/services/ingestion.ts:324:
+src/services/ingestion.ts:325:      span.setAttribute(MmsAttributes.INGESTION_FILE, fileName);
+src/services/ingestion.ts:326:      span.setAttribute(MmsAttributes.INGESTION_JOB_ID, jobId);
+src/services/ingestion.ts:327:
+src/services/ingestion.ts:328:      ingestionMetrics.filesReceived.inc();
+src/services/ingestion.ts:329:
+src/services/ingestion.ts:330:      const result: IngestionResult = {
+src/services/ingestion.ts:331:        jobId,
+src/services/ingestion.ts:332:        fileName,
+src/services/ingestion.ts:333:        totalRecords: 0,
+src/services/ingestion.ts:334:        validRecords: 0,
+src/services/ingestion.ts:335:        invalidRecords: 0,
+src/services/ingestion.ts:336:        anomalies: [],
+src/services/ingestion.ts:337:        meterEvents: [],
+src/services/ingestion.ts:338:        processingTimeMs: 0,
+src/services/ingestion.ts:339:        trainsUpdated: 0,
+src/services/ingestion.ts:340:        status: 'SUCCESS',
+src/services/ingestion.ts:341:      };
+src/services/ingestion.ts:342:
+src/services/ingestion.ts:343:      try {
+src/services/ingestion.ts:344:        // Parse CSV
+src/services/ingestion.ts:345:        const records = await this.parseCsv(filePath);
+src/services/ingestion.ts:346:        result.totalRecords = records.length;
+src/services/ingestion.ts:347:        span.setAttribute(MmsAttributes.INGESTION_RECORD_COUNT, records.length);
+src/services/ingestion.ts:348:
+src/services/ingestion.ts:349:        ingestionMetrics.recordsProcessed.inc(records.length);
+src/services/ingestion.ts:350:
+src/services/ingestion.ts:351:        if (records.length === 0) {
+src/services/ingestion.ts:352:          result.status = 'PARTIAL';
+src/services/ingestion.ts:353:          result.errorMessage = 'No valid records found in CSV';
+src/services/ingestion.ts:354:          this.log.warn({ fileName, jobId }, 'CSV file contains no valid records');
+src/services/ingestion.ts:355:          return result;
+src/services/ingestion.ts:356:        }
+src/services/ingestion.ts:357:
+src/services/ingestion.ts:358:        // Process in batches
+src/services/ingestion.ts:359:        const batches = this.chunk(records, BATCH_SIZE);
+src/services/ingestion.ts:360:        const trainIdsUpdated = new Set<string>();
+src/services/ingestion.ts:361:
+src/services/ingestion.ts:362:        for (const batch of batches) {
+src/services/ingestion.ts:363:          const batchResult = await this.processBatch(batch, fileName, result);
+src/services/ingestion.ts:364:          for (const trainId of batchResult.trainIdsUpdated) {
+src/services/ingestion.ts:365:            trainIdsUpdated.add(trainId);
+src/services/ingestion.ts:366:          }
+src/services/ingestion.ts:367:        }
+src/services/ingestion.ts:368:
+src/services/ingestion.ts:369:        result.trainsUpdated = trainIdsUpdated.size;
+src/services/ingestion.ts:370:
+src/services/ingestion.ts:371:        // Update train current mileage for all affected trains
+src/services/ingestion.ts:372:        await this.updateTrainMileage(records, trainIdsUpdated);
+src/services/ingestion.ts:373:
+src/services/ingestion.ts:374:        // Determine final status
+src/services/ingestion.ts:375:        if (result.invalidRecords > 0 && result.validRecords > 0) {
+src/services/ingestion.ts:376:          result.status = 'PARTIAL';
+src/services/ingestion.ts:377:        } else if (result.validRecords === 0) {
+src/services/ingestion.ts:378:          result.status = 'FAILED';
+src/services/ingestion.ts:379:          result.errorMessage = 'All records failed validation';
+src/services/ingestion.ts:380:        }
+src/services/ingestion.ts:381:
+src/services/ingestion.ts:382:        result.processingTimeMs = Date.now() - startTime;
+src/services/ingestion.ts:383:
+src/services/ingestion.ts:384:        span.setAttribute('result.validRecords', result.validRecords);
+src/services/ingestion.ts:385:        span.setAttribute('result.invalidRecords', result.invalidRecords);
+src/services/ingestion.ts:386:        span.setAttribute('result.anomalyCount', result.anomalies.length);
+src/services/ingestion.ts:387:        span.setAttribute('result.status', result.status);
+src/services/ingestion.ts:388:
+src/services/ingestion.ts:389:        recordIngestionComplete(result.status, result.processingTimeMs);
+src/services/ingestion.ts:390:
+src/services/ingestion.ts:391:        this.log.info(
+src/services/ingestion.ts:392:          {
+src/services/ingestion.ts:393:            jobId,
+src/services/ingestion.ts:394:            fileName,
+src/services/ingestion.ts:395:            totalRecords: result.totalRecords,
+src/services/ingestion.ts:396:            validRecords: result.validRecords,
+src/services/ingestion.ts:397:            invalidRecords: result.invalidRecords,
+src/services/ingestion.ts:398:            anomalies: result.anomalies.length,
+src/services/ingestion.ts:399:            trainsUpdated: result.trainsUpdated,
+src/services/ingestion.ts:400:            processingTimeMs: result.processingTimeMs,
+src/services/ingestion.ts:401:            status: result.status,
+src/services/ingestion.ts:402:          },
+src/services/ingestion.ts:403:          `Ingestion complete: ${result.validRecords}/${result.totalRecords} records processed`
+src/services/ingestion.ts:404:        );
+src/services/ingestion.ts:405:
+src/services/ingestion.ts:406:        return result;
+src/services/ingestion.ts:407:      } catch (error) {
+src/services/ingestion.ts:408:        result.processingTimeMs = Date.now() - startTime;
+src/services/ingestion.ts:409:        result.status = 'FAILED';
+src/services/ingestion.ts:410:        result.errorMessage = error instanceof Error ? error.message : 'Unknown error';
+src/services/ingestion.ts:411:
+src/services/ingestion.ts:412:        recordIngestionComplete('FAILED', result.processingTimeMs);
+src/services/ingestion.ts:413:
+src/services/ingestion.ts:414:        this.log.error(
+src/services/ingestion.ts:415:          { error, jobId, fileName },
+src/services/ingestion.ts:416:          `Ingestion failed: ${result.errorMessage}`
+src/services/ingestion.ts:417:        );
+src/services/ingestion.ts:418:
+src/services/ingestion.ts:419:        throw error;
+src/services/ingestion.ts:420:      }
+src/services/ingestion.ts:421:    });
+src/services/ingestion.ts:422:  }
+src/services/ingestion.ts:423:
+src/services/ingestion.ts:424:  /**
+src/services/ingestion.ts:425:   * Parse a CSV file and validate each row
+src/services/ingestion.ts:426:   */
+src/services/ingestion.ts:427:  private async parseCsv(filePath: string): Promise<ParsedMileageRecord[]> {
+src/services/ingestion.ts:428:    return this.traced('parseCsv', async (span) => {
+src/services/ingestion.ts:429:      span.setAttribute('file.path', filePath);
+src/services/ingestion.ts:430:
+src/services/ingestion.ts:431:      const content = fs.readFileSync(filePath, 'utf-8');
+src/services/ingestion.ts:432:
+src/services/ingestion.ts:433:      return new Promise<ParsedMileageRecord[]>((resolve, reject) => {
+src/services/ingestion.ts:434:        const records: ParsedMileageRecord[] = [];
+src/services/ingestion.ts:435:        let rowIndex = 0;
+src/services/ingestion.ts:436:
+src/services/ingestion.ts:437:        Papa.parse(content, {
+src/services/ingestion.ts:438:          header: true,
+src/services/ingestion.ts:439:          skipEmptyLines: true,
+src/services/ingestion.ts:440:          complete: (results) => {
+src/services/ingestion.ts:441:            span.setAttribute('parse.rowCount', results.data.length);
+src/services/ingestion.ts:442:
+src/services/ingestion.ts:443:            for (const row of results.data) {
+src/services/ingestion.ts:444:              rowIndex++;
+src/services/ingestion.ts:445:              const validation = this.validateRow(row, rowIndex);
+src/services/ingestion.ts:446:
+src/services/ingestion.ts:447:              if (validation.valid && validation.record) {
+src/services/ingestion.ts:448:                records.push(validation.record);
+src/services/ingestion.ts:449:              }
+src/services/ingestion.ts:450:            }
+src/services/ingestion.ts:451:
+src/services/ingestion.ts:452:            this.log.debug(
+src/services/ingestion.ts:453:              { filePath, totalRows: results.data.length, validRows: records.length },
+src/services/ingestion.ts:454:              'CSV parsing complete'
+src/services/ingestion.ts:455:            );
+src/services/ingestion.ts:456:
+src/services/ingestion.ts:457:            resolve(records);
+src/services/ingestion.ts:458:          },
+src/services/ingestion.ts:459:          error: (error: Error) => {
+src/services/ingestion.ts:460:            reject(new FileError(`CSV parse error: ${error.message}`, {
+src/services/ingestion.ts:461:              filePath,
+src/services/ingestion.ts:462:              operation: 'parse',
+src/services/ingestion.ts:463:            }));
+src/services/ingestion.ts:464:          },
+src/services/ingestion.ts:465:        });
+src/services/ingestion.ts:466:      });
+src/services/ingestion.ts:467:    });
+src/services/ingestion.ts:468:  }
+src/services/ingestion.ts:469:
+src/services/ingestion.ts:470:  /**
+src/services/ingestion.ts:471:   * Validate a single CSV row
+src/services/ingestion.ts:472:   */
+src/services/ingestion.ts:473:  private validateRow(
+src/services/ingestion.ts:474:    row: unknown,
+src/services/ingestion.ts:475:    rowIndex: number
+src/services/ingestion.ts:476:  ): RowValidationResult {
+src/services/ingestion.ts:477:    const parseResult = mileageCsvRowSchema.safeParse(row);
+src/services/ingestion.ts:478:
+src/services/ingestion.ts:479:    if (!parseResult.success) {
+src/services/ingestion.ts:480:      const errorMessages = parseResult.error.errors.map(e => e.message).join(', ');
+src/services/ingestion.ts:481:      return {
+src/services/ingestion.ts:482:        valid: false,
+src/services/ingestion.ts:483:        error: `Row ${rowIndex}: ${errorMessages}`,
+src/services/ingestion.ts:484:      };
+src/services/ingestion.ts:485:    }
+src/services/ingestion.ts:486:
+src/services/ingestion.ts:487:    const data = parseResult.data;
+src/services/ingestion.ts:488:
+src/services/ingestion.ts:489:    // Check for future dates
+src/services/ingestion.ts:490:    const readingDate = new Date(data.reading_date);
+src/services/ingestion.ts:491:    const today = new Date();
+src/services/ingestion.ts:492:    today.setHours(23, 59, 59, 999);
+src/services/ingestion.ts:493:
+src/services/ingestion.ts:494:    if (readingDate > today) {
+src/services/ingestion.ts:495:      return {
+src/services/ingestion.ts:496:        valid: false,
+src/services/ingestion.ts:497:        error: `Row ${rowIndex}: Reading date ${data.reading_date} is in the future`,
+src/services/ingestion.ts:498:        anomaly: {
+src/services/ingestion.ts:499:          trainNumber: data.train_number,
+src/services/ingestion.ts:500:          readingDate: data.reading_date,
+src/services/ingestion.ts:501:          type: 'FUTURE_DATE',
+src/services/ingestion.ts:502:          value: null,
+src/services/ingestion.ts:503:          message: `Reading date ${data.reading_date} is in the future`,
+src/services/ingestion.ts:504:          rawReading: data.odometer_km,
+src/services/ingestion.ts:505:        },
+src/services/ingestion.ts:506:      };
+src/services/ingestion.ts:507:    }
+src/services/ingestion.ts:508:
+src/services/ingestion.ts:509:    return {
+src/services/ingestion.ts:510:      valid: true,
+src/services/ingestion.ts:511:      record: {
+src/services/ingestion.ts:512:        trainNumber: data.train_number,
+src/services/ingestion.ts:513:        readingDate: data.reading_date,
+src/services/ingestion.ts:514:        odometerKm: data.odometer_km,
+src/services/ingestion.ts:515:        rowIndex,
+src/services/ingestion.ts:516:      },
+src/services/ingestion.ts:517:    };
+src/services/ingestion.ts:518:  }
+src/services/ingestion.ts:519:
+src/services/ingestion.ts:520:  /**
+src/services/ingestion.ts:521:   * Process a batch of records within a transaction
+src/services/ingestion.ts:522:   */
+src/services/ingestion.ts:523:  private async processBatch(
+src/services/ingestion.ts:524:    batch: ParsedMileageRecord[],
+src/services/ingestion.ts:525:    fileName: string,
+src/services/ingestion.ts:526:    result: IngestionResult
+src/services/ingestion.ts:527:  ): Promise<{ trainIdsUpdated: Set<string> }> {
+src/services/ingestion.ts:528:    return this.inTransaction('processBatch', async (tx, span) => {
+src/services/ingestion.ts:529:      span.setAttribute('batch.size', batch.length);
+src/services/ingestion.ts:530:
+src/services/ingestion.ts:531:      const trainIdsUpdated = new Set<string>();
+src/services/ingestion.ts:532:
+src/services/ingestion.ts:533:      for (const record of batch) {
+src/services/ingestion.ts:534:        try {
+src/services/ingestion.ts:535:          // Find train
+src/services/ingestion.ts:536:          const train = await tx.query.trains.findFirst({
+src/services/ingestion.ts:537:            where: eq(trains.trainNumber, record.trainNumber),
+src/services/ingestion.ts:538:          });
+src/services/ingestion.ts:539:
+src/services/ingestion.ts:540:          if (!train) {
+src/services/ingestion.ts:541:            result.invalidRecords++;
+src/services/ingestion.ts:542:            const anomaly: AnomalyRecord = {
+src/services/ingestion.ts:543:              trainNumber: record.trainNumber,
+src/services/ingestion.ts:544:              readingDate: record.readingDate,
+src/services/ingestion.ts:545:              type: 'UNKNOWN_TRAIN',
+src/services/ingestion.ts:546:              value: null,
+src/services/ingestion.ts:547:              message: `Train number '${record.trainNumber}' not found in database`,
+src/services/ingestion.ts:548:              rawReading: record.odometerKm,
+src/services/ingestion.ts:549:            };
+src/services/ingestion.ts:550:            result.anomalies.push(anomaly);
+src/services/ingestion.ts:551:            recordIngestionAnomaly('UNKNOWN_TRAIN');
+src/services/ingestion.ts:552:            continue;
+src/services/ingestion.ts:553:          }
+src/services/ingestion.ts:554:
+src/services/ingestion.ts:555:          // Get previous reading
+src/services/ingestion.ts:556:          const previousReading = await tx.query.mileageReadings.findFirst({
+src/services/ingestion.ts:557:            where: and(
+src/services/ingestion.ts:558:              eq(mileageReadings.trainId, train.id),
+src/services/ingestion.ts:559:              sql`${mileageReadings.readingDate} < ${record.readingDate}`
+src/services/ingestion.ts:560:            ),
+src/services/ingestion.ts:561:            orderBy: desc(mileageReadings.readingDate),
+src/services/ingestion.ts:562:          });
+src/services/ingestion.ts:563:
+src/services/ingestion.ts:564:          // Calculate adjusted value (handle meter events)
+src/services/ingestion.ts:565:          const adjustment = await this.getMeterAdjustment(tx, train.id, record.readingDate);
+src/services/ingestion.ts:566:          const adjustedReading = record.odometerKm + adjustment;
+src/services/ingestion.ts:567:
+src/services/ingestion.ts:568:          // Calculate daily km
+src/services/ingestion.ts:569:          let dailyKm: number | null = null;
+src/services/ingestion.ts:570:          let anomalyType: AnomalyType | null = null;
+src/services/ingestion.ts:571:          let anomalyMessage: string | null = null;
+src/services/ingestion.ts:572:
+src/services/ingestion.ts:573:          if (previousReading) {
+src/services/ingestion.ts:574:            dailyKm = adjustedReading - previousReading.adjustedReading;
+src/services/ingestion.ts:575:
+src/services/ingestion.ts:576:            // Anomaly detection
+src/services/ingestion.ts:577:            if (dailyKm < 0) {
+src/services/ingestion.ts:578:              anomalyType = 'NEGATIVE';
+src/services/ingestion.ts:579:              anomalyMessage = `Negative daily mileage: ${dailyKm} km (previous: ${previousReading.adjustedReading}, current: ${adjustedReading})`;
+src/services/ingestion.ts:580:
+src/services/ingestion.ts:581:              result.anomalies.push({
+src/services/ingestion.ts:582:                trainNumber: record.trainNumber,
+src/services/ingestion.ts:583:                readingDate: record.readingDate,
+src/services/ingestion.ts:584:                type: 'NEGATIVE',
+src/services/ingestion.ts:585:                value: dailyKm,
+src/services/ingestion.ts:586:                message: anomalyMessage,
+src/services/ingestion.ts:587:                rawReading: record.odometerKm,
+src/services/ingestion.ts:588:                previousReading: previousReading.adjustedReading,
+src/services/ingestion.ts:589:              });
+src/services/ingestion.ts:590:              recordIngestionAnomaly('NEGATIVE');
+src/services/ingestion.ts:591:            } else if (dailyKm > SPIKE_THRESHOLD_KM) {
+src/services/ingestion.ts:592:              anomalyType = 'SPIKE';
+src/services/ingestion.ts:593:              anomalyMessage = `Unusually high daily mileage: ${dailyKm} km (threshold: ${SPIKE_THRESHOLD_KM})`;
+src/services/ingestion.ts:594:
+src/services/ingestion.ts:595:              result.anomalies.push({
+src/services/ingestion.ts:596:                trainNumber: record.trainNumber,
+src/services/ingestion.ts:597:                readingDate: record.readingDate,
+src/services/ingestion.ts:598:                type: 'SPIKE',
+src/services/ingestion.ts:599:                value: dailyKm,
+src/services/ingestion.ts:600:                message: anomalyMessage,
+src/services/ingestion.ts:601:                rawReading: record.odometerKm,
+src/services/ingestion.ts:602:                previousReading: previousReading.adjustedReading,
+src/services/ingestion.ts:603:              });
+src/services/ingestion.ts:604:              recordIngestionAnomaly('SPIKE');
+src/services/ingestion.ts:605:            }
+src/services/ingestion.ts:606:          }
+src/services/ingestion.ts:607:
+src/services/ingestion.ts:608:          // Insert or update reading
+src/services/ingestion.ts:609:          await tx
+src/services/ingestion.ts:610:            .insert(mileageReadings)
+src/services/ingestion.ts:611:            .values({
+src/services/ingestion.ts:612:              trainId: train.id,
+src/services/ingestion.ts:613:              readingDate: record.readingDate,
+src/services/ingestion.ts:614:              rawReading: record.odometerKm,
+src/services/ingestion.ts:615:              adjustedReading,
+src/services/ingestion.ts:616:              dailyKm,
+src/services/ingestion.ts:617:              validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+src/services/ingestion.ts:618:              anomalyType: anomalyType ?? undefined,
+src/services/ingestion.ts:619:              anomalyNotes: anomalyMessage ?? undefined,
+src/services/ingestion.ts:620:              sourceFile: fileName,
+src/services/ingestion.ts:621:            })
+src/services/ingestion.ts:622:            .onConflictDoUpdate({
+src/services/ingestion.ts:623:              target: [mileageReadings.trainId, mileageReadings.readingDate],
+src/services/ingestion.ts:624:              set: {
+src/services/ingestion.ts:625:                rawReading: record.odometerKm,
+src/services/ingestion.ts:626:                adjustedReading,
+src/services/ingestion.ts:627:                dailyKm,
+src/services/ingestion.ts:628:                validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+src/services/ingestion.ts:629:                anomalyType: anomalyType ?? null,
+src/services/ingestion.ts:630:                anomalyNotes: anomalyMessage ?? null,
+src/services/ingestion.ts:631:                sourceFile: fileName,
+src/services/ingestion.ts:632:                ingestedAt: new Date(),
+src/services/ingestion.ts:633:              },
+src/services/ingestion.ts:634:            });
+src/services/ingestion.ts:635:
+src/services/ingestion.ts:636:          result.validRecords++;
+src/services/ingestion.ts:637:          trainIdsUpdated.add(train.id);
+src/services/ingestion.ts:638:        } catch (error) {
+src/services/ingestion.ts:639:          result.invalidRecords++;
+src/services/ingestion.ts:640:          this.log.warn(
+src/services/ingestion.ts:641:            { record, error: error instanceof Error ? error.message : 'Unknown error' },
+src/services/ingestion.ts:642:            'Record processing failed'
+src/services/ingestion.ts:643:          );
+src/services/ingestion.ts:644:        }
+src/services/ingestion.ts:645:      }
+src/services/ingestion.ts:646:
+src/services/ingestion.ts:647:      return { trainIdsUpdated };
+src/services/ingestion.ts:648:    });
+src/services/ingestion.ts:649:  }
+src/services/ingestion.ts:650:
+src/services/ingestion.ts:651:  /**
+src/services/ingestion.ts:652:   * Get cumulative meter adjustment for a train as of a given date
+src/services/ingestion.ts:653:   */
+src/services/ingestion.ts:654:  private async getMeterAdjustment(
+src/services/ingestion.ts:655:    tx: Parameters<Parameters<typeof this.inTransaction>[1]>[0],
+src/services/ingestion.ts:656:    trainId: string,
+src/services/ingestion.ts:657:    asOfDate: string
+src/services/ingestion.ts:658:  ): Promise<number> {
+src/services/ingestion.ts:659:    const events = await tx.query.meterEvents.findMany({
+src/services/ingestion.ts:660:      where: and(
+src/services/ingestion.ts:661:        eq(meterEvents.trainId, trainId),
+src/services/ingestion.ts:662:        lte(meterEvents.eventDate, asOfDate)
+src/services/ingestion.ts:663:      ),
+src/services/ingestion.ts:664:    });
+src/services/ingestion.ts:665:
+src/services/ingestion.ts:666:    return events.reduce((sum, e) => sum + (e.adjustmentKm ?? 0), 0);
+src/services/ingestion.ts:667:  }
+src/services/ingestion.ts:668:
+src/services/ingestion.ts:669:  /**
+src/services/ingestion.ts:670:   * Update train current mileage for all affected trains
+src/services/ingestion.ts:671:   */
+src/services/ingestion.ts:672:  private async updateTrainMileage(
+src/services/ingestion.ts:673:    records: ParsedMileageRecord[],
+src/services/ingestion.ts:674:    trainIds: Set<string>
+src/services/ingestion.ts:675:  ): Promise<void> {
+src/services/ingestion.ts:676:    return this.traced('updateTrainMileage', async (span) => {
+src/services/ingestion.ts:677:      span.setAttribute('trains.count', trainIds.size);
+src/services/ingestion.ts:678:
+src/services/ingestion.ts:679:      // Group records by train, find latest reading
+src/services/ingestion.ts:680:      const latestByTrain = new Map<string, ParsedMileageRecord>();
+src/services/ingestion.ts:681:
+src/services/ingestion.ts:682:      for (const record of records) {
+src/services/ingestion.ts:683:        const existing = latestByTrain.get(record.trainNumber);
+src/services/ingestion.ts:684:        if (!existing || record.readingDate > existing.readingDate) {
+src/services/ingestion.ts:685:          latestByTrain.set(record.trainNumber, record);
+src/services/ingestion.ts:686:        }
+src/services/ingestion.ts:687:      }
+src/services/ingestion.ts:688:
+src/services/ingestion.ts:689:      // Update train current_mileage for each affected train
+src/services/ingestion.ts:690:      for (const [trainNumber, record] of latestByTrain) {
+src/services/ingestion.ts:691:        await this.db
+src/services/ingestion.ts:692:          .update(trains)
+src/services/ingestion.ts:693:          .set({
+src/services/ingestion.ts:694:            currentMileageKm: record.odometerKm,
+src/services/ingestion.ts:695:            updatedAt: new Date(),
+src/services/ingestion.ts:696:          })
+src/services/ingestion.ts:697:          .where(eq(trains.trainNumber, trainNumber));
+src/services/ingestion.ts:698:      }
+src/services/ingestion.ts:699:
+src/services/ingestion.ts:700:      // Update fleet mileage targets
+src/services/ingestion.ts:701:      await this.db.execute(sql`SELECT update_fleet_mileage_targets()`);
+src/services/ingestion.ts:702:
+src/services/ingestion.ts:703:      this.log.info(
+src/services/ingestion.ts:704:        { trainsUpdated: latestByTrain.size },
+src/services/ingestion.ts:705:        'Train mileages updated'
+src/services/ingestion.ts:706:      );
+src/services/ingestion.ts:707:    });
+src/services/ingestion.ts:708:  }
+src/services/ingestion.ts:709:
+src/services/ingestion.ts:710:  // ===========================================================================
+src/services/ingestion.ts:711:  // Meter Event Management
+src/services/ingestion.ts:712:  // ===========================================================================
+src/services/ingestion.ts:713:
+src/services/ingestion.ts:714:  /**
+src/services/ingestion.ts:715:   * Create a meter event (for manual corrections or detected resets)
+src/services/ingestion.ts:716:   */
+src/services/ingestion.ts:717:  async createMeterEvent(
+src/services/ingestion.ts:718:    trainId: string,
+src/services/ingestion.ts:719:    eventType: 'RESET' | 'REPLACEMENT' | 'CALIBRATION' | 'SWAP',
+src/services/ingestion.ts:720:    eventDate: string,
+src/services/ingestion.ts:721:    oldReading: number,
+src/services/ingestion.ts:722:    newReading: number,
+src/services/ingestion.ts:723:    reason?: string,
+src/services/ingestion.ts:724:    createdBy?: string
+src/services/ingestion.ts:725:  ): Promise<MeterEventRecord> {
+src/services/ingestion.ts:726:    return this.inTransaction('createMeterEvent', async (tx, span) => {
+src/services/ingestion.ts:727:      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+src/services/ingestion.ts:728:      span.setAttribute('event.type', eventType);
+src/services/ingestion.ts:729:
+src/services/ingestion.ts:730:      // Verify train exists
+src/services/ingestion.ts:731:      const train = await tx.query.trains.findFirst({
+src/services/ingestion.ts:732:        where: eq(trains.id, trainId),
+src/services/ingestion.ts:733:      });
+src/services/ingestion.ts:734:
+src/services/ingestion.ts:735:      if (!train) {
+src/services/ingestion.ts:736:        throw new BusinessRuleError(`Train not found: ${trainId}`, {
+src/services/ingestion.ts:737:          rule: 'train_exists',
+src/services/ingestion.ts:738:          context: { trainId },
+src/services/ingestion.ts:739:        });
+src/services/ingestion.ts:740:      }
+src/services/ingestion.ts:741:
+src/services/ingestion.ts:742:      // Calculate adjustment (cumulative offset to maintain mileage continuity)
+src/services/ingestion.ts:743:      const adjustmentKm = oldReading - newReading;
+src/services/ingestion.ts:744:
+src/services/ingestion.ts:745:      // Insert meter event
+src/services/ingestion.ts:746:      const [event] = await tx
+src/services/ingestion.ts:747:        .insert(meterEvents)
+src/services/ingestion.ts:748:        .values({
+src/services/ingestion.ts:749:          trainId,
+src/services/ingestion.ts:750:          eventDate,
+src/services/ingestion.ts:751:          eventType,
+src/services/ingestion.ts:752:          oldMeterReading: oldReading,
+src/services/ingestion.ts:753:          newMeterReading: newReading,
+src/services/ingestion.ts:754:          adjustmentKm,
+src/services/ingestion.ts:755:          reason,
+src/services/ingestion.ts:756:          createdBy,
+src/services/ingestion.ts:757:        })
+src/services/ingestion.ts:758:        .returning();
+src/services/ingestion.ts:759:
+src/services/ingestion.ts:760:      this.log.info(
+src/services/ingestion.ts:761:        {
+src/services/ingestion.ts:762:          eventId: event.id,
+src/services/ingestion.ts:763:          trainId,
+src/services/ingestion.ts:764:          trainNumber: train.trainNumber,
+src/services/ingestion.ts:765:          eventType,
+src/services/ingestion.ts:766:          oldReading,
+src/services/ingestion.ts:767:          newReading,
+src/services/ingestion.ts:768:          adjustmentKm,
+src/services/ingestion.ts:769:        },
+src/services/ingestion.ts:770:        'Meter event created'
+src/services/ingestion.ts:771:      );
+src/services/ingestion.ts:772:
+src/services/ingestion.ts:773:      return {
+src/services/ingestion.ts:774:        trainNumber: train.trainNumber,
+src/services/ingestion.ts:775:        trainId,
+src/services/ingestion.ts:776:        eventDate,
+src/services/ingestion.ts:777:        eventType,
+src/services/ingestion.ts:778:        oldReading,
+src/services/ingestion.ts:779:        newReading,
+src/services/ingestion.ts:780:        adjustmentKm,
+src/services/ingestion.ts:781:      };
+src/services/ingestion.ts:782:    });
+src/services/ingestion.ts:783:  }
+src/services/ingestion.ts:784:
+src/services/ingestion.ts:785:  /**
+src/services/ingestion.ts:786:   * Get meter events for a train
+src/services/ingestion.ts:787:   */
+src/services/ingestion.ts:788:  async getMeterEvents(trainId: string): Promise<MeterEventRecord[]> {
+src/services/ingestion.ts:789:    return this.traced('getMeterEvents', async (span) => {
+src/services/ingestion.ts:790:      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+src/services/ingestion.ts:791:
+src/services/ingestion.ts:792:      const train = await this.db.query.trains.findFirst({
+src/services/ingestion.ts:793:        where: eq(trains.id, trainId),
+src/services/ingestion.ts:794:      });
+src/services/ingestion.ts:795:
+src/services/ingestion.ts:796:      if (!train) {
+src/services/ingestion.ts:797:        throw new BusinessRuleError(`Train not found: ${trainId}`, {
+src/services/ingestion.ts:798:          rule: 'train_exists',
+src/services/ingestion.ts:799:          context: { trainId },
+src/services/ingestion.ts:800:        });
+src/services/ingestion.ts:801:      }
+src/services/ingestion.ts:802:
+src/services/ingestion.ts:803:      const events = await this.db.query.meterEvents.findMany({
+src/services/ingestion.ts:804:        where: eq(meterEvents.trainId, trainId),
+src/services/ingestion.ts:805:        orderBy: desc(meterEvents.eventDate),
+src/services/ingestion.ts:806:      });
+src/services/ingestion.ts:807:
+src/services/ingestion.ts:808:      return events.map((e) => ({
+src/services/ingestion.ts:809:        trainNumber: train.trainNumber,
+src/services/ingestion.ts:810:        trainId: e.trainId,
+src/services/ingestion.ts:811:        eventDate: e.eventDate,
+src/services/ingestion.ts:812:        eventType: e.eventType as 'RESET' | 'REPLACEMENT' | 'CALIBRATION' | 'SWAP',
+src/services/ingestion.ts:813:        oldReading: e.oldMeterReading ?? 0,
+src/services/ingestion.ts:814:        newReading: e.newMeterReading ?? 0,
+src/services/ingestion.ts:815:        adjustmentKm: e.adjustmentKm ?? 0,
+src/services/ingestion.ts:816:      }));
+src/services/ingestion.ts:817:    });
+src/services/ingestion.ts:818:  }
+src/services/ingestion.ts:819:
+src/services/ingestion.ts:820:  // ===========================================================================
+src/services/ingestion.ts:821:  // Health Monitoring
+src/services/ingestion.ts:822:  // ===========================================================================
+src/services/ingestion.ts:823:
+src/services/ingestion.ts:824:  /**
+src/services/ingestion.ts:825:   * Check file arrival health
+src/services/ingestion.ts:826:   *
+src/services/ingestion.ts:827:   * Returns whether files have been received within the expected timeframe.
+src/services/ingestion.ts:828:   * Used by health check endpoints and alerting.
+src/services/ingestion.ts:829:   */
+src/services/ingestion.ts:830:  async checkFileArrivalHealth(): Promise<{
+src/services/ingestion.ts:831:    healthy: boolean;
+src/services/ingestion.ts:832:    lastFileAt: Date | null;
+src/services/ingestion.ts:833:    hoursSinceLastFile: number | null;
+src/services/ingestion.ts:834:    alertThresholdHours: number;
+src/services/ingestion.ts:835:  }> {
+src/services/ingestion.ts:836:    const alertThresholdHours = ALERT_THRESHOLD_HOURS;
+src/services/ingestion.ts:837:
+src/services/ingestion.ts:838:    if (!this.lastFileReceivedAt) {
+src/services/ingestion.ts:839:      return {
+src/services/ingestion.ts:840:        healthy: true, // No baseline yet
+src/services/ingestion.ts:841:        lastFileAt: null,
+src/services/ingestion.ts:842:        hoursSinceLastFile: null,
+src/services/ingestion.ts:843:        alertThresholdHours,
+src/services/ingestion.ts:844:      };
+src/services/ingestion.ts:845:    }
+src/services/ingestion.ts:846:
+src/services/ingestion.ts:847:    const hoursSinceLastFile =
+src/services/ingestion.ts:848:      (Date.now() - this.lastFileReceivedAt.getTime()) / (1000 * 60 * 60);
+src/services/ingestion.ts:849:
+src/services/ingestion.ts:850:    const healthy = hoursSinceLastFile <= alertThresholdHours;
+src/services/ingestion.ts:851:
+src/services/ingestion.ts:852:    return {
+src/services/ingestion.ts:853:      healthy,
+src/services/ingestion.ts:854:      lastFileAt: this.lastFileReceivedAt,
+src/services/ingestion.ts:855:      hoursSinceLastFile: Math.round(hoursSinceLastFile * 10) / 10,
+src/services/ingestion.ts:856:      alertThresholdHours,
+src/services/ingestion.ts:857:    };
+src/services/ingestion.ts:858:  }
+src/services/ingestion.ts:859:
+src/services/ingestion.ts:860:  /**
+src/services/ingestion.ts:861:   * Get ingestion statistics
+src/services/ingestion.ts:862:   */
+src/services/ingestion.ts:863:  async getIngestionStats(days: number = 7): Promise<{
+src/services/ingestion.ts:864:    totalFiles: number;
+src/services/ingestion.ts:865:    totalRecords: number;
+src/services/ingestion.ts:866:    totalAnomalies: number;
+src/services/ingestion.ts:867:    anomaliesByType: Record<string, number>;
+src/services/ingestion.ts:868:    averageRecordsPerFile: number;
+src/services/ingestion.ts:869:  }> {
+src/services/ingestion.ts:870:    return this.traced('getIngestionStats', async (span) => {
+src/services/ingestion.ts:871:      span.setAttribute('stats.days', days);
+src/services/ingestion.ts:872:
+src/services/ingestion.ts:873:      const since = new Date();
+src/services/ingestion.ts:874:      since.setDate(since.getDate() - days);
+src/services/ingestion.ts:875:
+src/services/ingestion.ts:876:      // Get anomaly counts by type
+src/services/ingestion.ts:877:      const anomalyStats = await this.db
+src/services/ingestion.ts:878:        .select({
+src/services/ingestion.ts:879:          anomalyType: mileageReadings.anomalyType,
+src/services/ingestion.ts:880:          count: sql<number>`count(*)::int`,
+src/services/ingestion.ts:881:        })
+src/services/ingestion.ts:882:        .from(mileageReadings)
+src/services/ingestion.ts:883:        .where(
+src/services/ingestion.ts:884:          and(
+src/services/ingestion.ts:885:            eq(mileageReadings.validationStatus, 'ANOMALY'),
+src/services/ingestion.ts:886:            sql`${mileageReadings.ingestedAt} >= ${since.toISOString()}`
+src/services/ingestion.ts:887:          )
+src/services/ingestion.ts:888:        )
+src/services/ingestion.ts:889:        .groupBy(mileageReadings.anomalyType);
+src/services/ingestion.ts:890:
+src/services/ingestion.ts:891:      const anomaliesByType: Record<string, number> = {};
+src/services/ingestion.ts:892:      let totalAnomalies = 0;
+src/services/ingestion.ts:893:
+src/services/ingestion.ts:894:      for (const stat of anomalyStats) {
+src/services/ingestion.ts:895:        const type = stat.anomalyType ?? 'UNKNOWN';
+src/services/ingestion.ts:896:        anomaliesByType[type] = stat.count;
+src/services/ingestion.ts:897:        totalAnomalies += stat.count;
+src/services/ingestion.ts:898:      }
+src/services/ingestion.ts:899:
+src/services/ingestion.ts:900:      // Get total records count
+src/services/ingestion.ts:901:      const [recordStats] = await this.db
+src/services/ingestion.ts:902:        .select({
+src/services/ingestion.ts:903:          total: sql<number>`count(*)::int`,
+src/services/ingestion.ts:904:          files: sql<number>`count(distinct ${mileageReadings.sourceFile})::int`,
+src/services/ingestion.ts:905:        })
+src/services/ingestion.ts:906:        .from(mileageReadings)
+src/services/ingestion.ts:907:        .where(sql`${mileageReadings.ingestedAt} >= ${since.toISOString()}`);
+src/services/ingestion.ts:908:
+src/services/ingestion.ts:909:      const totalRecords = recordStats?.total ?? 0;
+src/services/ingestion.ts:910:      const totalFiles = recordStats?.files ?? 0;
+src/services/ingestion.ts:911:
+src/services/ingestion.ts:912:      return {
+src/services/ingestion.ts:913:        totalFiles,
+src/services/ingestion.ts:914:        totalRecords,
+src/services/ingestion.ts:915:        totalAnomalies,
+src/services/ingestion.ts:916:        anomaliesByType,
+src/services/ingestion.ts:917:        averageRecordsPerFile: totalFiles > 0 ? Math.round(totalRecords / totalFiles) : 0,
+src/services/ingestion.ts:918:      };
+src/services/ingestion.ts:919:    });
+src/services/ingestion.ts:920:  }
+src/services/ingestion.ts:921:
+src/services/ingestion.ts:922:  // ===========================================================================
+src/services/ingestion.ts:923:  // Utility Methods
+src/services/ingestion.ts:924:  // ===========================================================================
+src/services/ingestion.ts:925:
+src/services/ingestion.ts:926:  /**
+src/services/ingestion.ts:927:   * Split array into chunks
+src/services/ingestion.ts:928:   */
+src/services/ingestion.ts:929:  private chunk<T>(array: T[], size: number): T[][] {
+src/services/ingestion.ts:930:    const chunks: T[][] = [];
+src/services/ingestion.ts:931:    for (let i = 0; i < array.length; i += size) {
+src/services/ingestion.ts:932:      chunks.push(array.slice(i, i + size));
+src/services/ingestion.ts:933:    }
+src/services/ingestion.ts:934:    return chunks;
+src/services/ingestion.ts:935:  }
+src/services/ingestion.ts:936:}
+src/services/ingestion.ts:937:
+src/services/ingestion.ts:938:// =============================================================================
+src/services/ingestion.ts:939:// Singleton Export
+src/services/ingestion.ts:940:// =============================================================================
+src/services/ingestion.ts:941:
+src/services/ingestion.ts:942:let ingestionServiceInstance: IngestionService | null = null;
+src/services/ingestion.ts:943:
+src/services/ingestion.ts:944:export function getIngestionService(): IngestionService {
+src/services/ingestion.ts:945:  if (!ingestionServiceInstance) {
+src/services/pm-scheduler.ts:1941:      } catch (error) {
+src/services/pm-scheduler.ts:1942:        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+src/services/pm-scheduler.ts:1943:        explanation.constraints.push(`Scheduling failed: ${errorMessage}`);
+src/services/pm-scheduler.ts:1944:
+src/services/pm-scheduler.ts:1945:        return {
+src/services/pm-scheduler.ts:1946:          trainId: pmDue.trainId,
+src/services/pm-scheduler.ts:1947:          trainNumber: pmDue.trainNumber,
+src/services/pm-scheduler.ts:1948:          pmTypeId: pmDue.pmTypeId,
+src/services/pm-scheduler.ts:1949:          pmCode: pmDue.pmCode,
+src/services/pm-scheduler.ts:1950:          status: 'BLOCKED',
+src/services/pm-scheduler.ts:1951:          targetDate: null,
+src/services/pm-scheduler.ts:1952:          targetMileageKm: null,
+src/services/pm-scheduler.ts:1953:          trackAllocation: selectedTrack,
+src/services/pm-scheduler.ts:1954:          materialConstraint: materialResult,
+src/services/pm-scheduler.ts:1955:          complianceWindow: pmDue.complianceWindow,
+src/services/pm-scheduler.ts:1956:          deferralReason: errorMessage,
+src/services/pm-scheduler.ts:1957:          warnings,
+src/services/pm-scheduler.ts:1958:          explanation,
+src/services/pm-scheduler.ts:1959:        };
+src/services/pm-scheduler.ts:1960:      }
+src/services/pm-scheduler.ts:1961:    }
+src/services/pm-scheduler.ts:1962:
+src/services/pm-scheduler.ts:1963:    return {
+src/services/pm-scheduler.ts:1964:      trainId: pmDue.trainId,
+src/services/pm-scheduler.ts:1965:      trainNumber: pmDue.trainNumber,
+src/services/pm-scheduler.ts:1966:      pmTypeId: pmDue.pmTypeId,
+src/services/pm-scheduler.ts:1967:      pmCode: pmDue.pmCode,
+src/services/pm-scheduler.ts:1968:      status: 'SCHEDULED',
+src/services/pm-scheduler.ts:1969:      targetDate,
+src/services/pm-scheduler.ts:1970:      targetMileageKm: Math.round(targetMileageKm),
+src/services/pm-scheduler.ts:1971:      trackAllocation: selectedTrack,
+src/services/pm-scheduler.ts:1972:      materialConstraint: materialResult,
+src/services/pm-scheduler.ts:1973:      complianceWindow: pmDue.complianceWindow,
+src/services/pm-scheduler.ts:1974:      deferralReason: null,
+src/services/pm-scheduler.ts:1975:      warnings,
+src/services/pm-scheduler.ts:1976:      explanation,
+src/services/pm-scheduler.ts:1977:    };
+src/services/pm-scheduler.ts:1978:  }
+src/services/pm-scheduler.ts:1979:
+src/services/pm-scheduler.ts:1980:  // ===========================================================================
+src/services/pm-scheduler.ts:1981:  // Query Methods
+src/services/pm-scheduler.ts:1982:  // ===========================================================================
+src/services/pm-scheduler.ts:1983:
+src/services/pm-scheduler.ts:1984:  /**
+src/services/pm-scheduler.ts:1985:   * Get PM schedule by ID with full details.
+src/services/pm-scheduler.ts:1986:   */
+src/services/pm-scheduler.ts:1987:  async getPm(pmScheduleId: string): Promise<PmWithDetails> {
+src/services/pm-scheduler.ts:1988:    return this.traced('getPm', async (span) => {
+src/services/pm-scheduler.ts:1989:      span.setAttribute('pm.scheduleId', pmScheduleId);
+src/services/pm-scheduler.ts:1990:
+src/services/pm-scheduler.ts:1991:      const pm = await this.db.query.pmSchedule.findFirst({
+src/services/pm-scheduler.ts:1992:        where: eq(pmSchedule.id, pmScheduleId),
+src/services/pm-scheduler.ts:1993:        with: {
+src/services/pm-scheduler.ts:1994:          train: true,
+src/services/pm-scheduler.ts:1995:          pmType: true,
+src/services/pm-scheduler.ts:1996:          assignedTrack: true,
+src/services/pm-scheduler.ts:1997:          assignedDepot: true,
+src/services/pm-scheduler.ts:1998:        },
+src/services/pm-scheduler.ts:1999:      });
+src/services/pm-scheduler.ts:2000:
+src/services/pm-scheduler.ts:2001:      if (!pm) {
+src/services/pm-scheduler.ts:2002:        throw new PmScheduleNotFoundError(pmScheduleId);
+src/services/pm-scheduler.ts:2003:      }
+src/services/pm-scheduler.ts:2004:
+src/services/pm-scheduler.ts:2005:      return pm as PmWithDetails;
+src/services/pm-scheduler.ts:2006:    });
+src/services/pm-scheduler.ts:2007:  }
+src/services/pm-scheduler.ts:2008:
+src/services/pm-scheduler.ts:2009:  /**
+src/services/pm-scheduler.ts:2010:   * Get PM history.
+src/services/pm-scheduler.ts:2011:   */
+src/services/pm-scheduler.ts:2012:  async getPmHistory(pmScheduleId: string) {
+src/services/pm-scheduler.ts:2013:    return this.traced('getPmHistory', async (span) => {
+src/services/pm-scheduler.ts:2014:      span.setAttribute('pm.scheduleId', pmScheduleId);
+src/services/pm-scheduler.ts:2015:
+src/services/pm-scheduler.ts:2016:      const history = await this.db.query.pmScheduleHistory.findMany({
+src/services/pm-scheduler.ts:2017:        where: eq(pmScheduleHistory.pmScheduleId, pmScheduleId),
+src/services/pm-scheduler.ts:2018:        orderBy: desc(pmScheduleHistory.changedAt),
+src/services/pm-scheduler.ts:2019:        with: {
+src/services/pm-scheduler.ts:2020:          changedByUser: true,
+src/services/pm-scheduler.ts:2021:        },
+src/services/pm-scheduler.ts:2022:      });
+src/services/pm-scheduler.ts:2023:
+src/services/pm-scheduler.ts:2024:      return history;
+src/services/pm-scheduler.ts:2025:    });
+src/services/pm-scheduler.ts:2026:  }
+src/services/pm-scheduler.ts:2027:
+src/services/pm-scheduler.ts:2028:  // ===========================================================================
+src/services/pm-scheduler.ts:2029:  // Helper Methods
+src/services/pm-scheduler.ts:2030:  // ===========================================================================
+src/services/pm-scheduler.ts:2031:
+src/services/pm-scheduler.ts:2032:  /**
+src/services/pm-scheduler.ts:2033:   * Get last completed PM of a type for a train.
+src/services/pm-scheduler.ts:2034:   */
+src/services/pm-scheduler.ts:2035:  private async getLastCompletedPm(
+src/services/pm-scheduler.ts:2036:    trainId: string,
+src/services/pm-scheduler.ts:2037:    pmTypeId: string
+src/services/pm-scheduler.ts:2038:  ): Promise<PmScheduleRecord | null> {
+src/services/pm-scheduler.ts:2039:    const lastPm = await this.db.query.pmSchedule.findFirst({
+src/services/pm-scheduler.ts:2040:      where: and(
+src/services/pm-scheduler.ts:2041:        eq(pmSchedule.trainId, trainId),
+src/services/pm-scheduler.ts:2042:        eq(pmSchedule.pmTypeId, pmTypeId),
+src/services/pm-scheduler.ts:2043:        eq(pmSchedule.status, 'COMPLETED'),
+src/services/pm-scheduler.ts:2044:        isNull(pmSchedule.scenarioId)
+src/services/pm-scheduler.ts:2045:      ),
+src/services/pm-scheduler.ts:2046:      orderBy: desc(pmSchedule.completedAt),
+src/services/pm-scheduler.ts:2047:    });
+src/services/pm-scheduler.ts:2048:
+src/services/pm-scheduler.ts:2049:    return lastPm ?? null;
+src/services/pm-scheduler.ts:2050:  }
+src/services/pm-scheduler.ts:2051:
+src/services/pm-scheduler.ts:2052:  /**
+src/services/pm-scheduler.ts:2053:   * Get average daily km for a train from recent mileage readings.
+src/services/pm-scheduler.ts:2054:   */
+src/services/pm-scheduler.ts:2055:  private async getAverageDailyKm(trainId: string): Promise<number> {
+src/services/pm-scheduler.ts:2056:    const thirtyDaysAgo = new Date();
+src/services/pm-scheduler.ts:2057:    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+src/services/pm-scheduler.ts:2058:
+src/services/pm-scheduler.ts:2059:    const readings = await this.db
+src/services/pm-scheduler.ts:2060:      .select({
+src/services/pm-scheduler.ts:2061:        avgDailyKm: sql<number>`AVG(${mileageReadings.dailyKm})`,
+src/services/pm-scheduler.ts:2062:      })
+src/services/pm-scheduler.ts:2063:      .from(mileageReadings)
+src/services/pm-scheduler.ts:2064:      .where(
+src/services/pm-scheduler.ts:2065:        and(
+src/services/pm-scheduler.ts:2066:          eq(mileageReadings.trainId, trainId),
+src/services/pm-scheduler.ts:2067:          gte(mileageReadings.readingDate, thirtyDaysAgo.toISOString().split('T')[0]),
+src/services/pm-scheduler.ts:2068:          eq(mileageReadings.validationStatus, 'VALID')
+src/services/pm-scheduler.ts:2069:        )
+src/services/pm-scheduler.ts:2070:      );
+src/services/pm-scheduler.ts:2071:
+src/services/pm-scheduler.ts:2072:    return readings[0]?.avgDailyKm ?? DEFAULT_DAILY_KM;
+src/services/pm-scheduler.ts:2073:  }
+src/services/pm-scheduler.ts:2074:
+src/services/pm-scheduler.ts:2075:  /**
+src/services/pm-scheduler.ts:2076:   * Find an alternative date for scheduling when service demand blocks the ideal date.
+src/services/pm-scheduler.ts:2077:   */
+src/services/pm-scheduler.ts:2078:  private async findAlternativeDateForServiceDemand(
+src/services/pm-scheduler.ts:2079:    trainId: string,
+src/services/pm-scheduler.ts:2080:    windowStart: string,
+src/services/pm-scheduler.ts:2081:    windowEnd: string
+src/services/pm-scheduler.ts:2082:  ): Promise<string | null> {
+src/services/pm-scheduler.ts:2083:    const start = new Date(windowStart);
+src/services/pm-scheduler.ts:2084:    const end = new Date(windowEnd);
+src/services/pm-scheduler.ts:2085:
+src/services/pm-scheduler.ts:2086:    // Try each day in the window
+src/services/pm-scheduler.ts:2087:    for (let d = start; d <= end; d.setDate(d.getDate() + 1)) {
+src/services/pm-scheduler.ts:2088:      const dateStr = d.toISOString().split('T')[0];
+src/services/pm-scheduler.ts:2089:      const { canSchedule } = await this.serviceDemandService.canScheduleTrainForMaintenance(
+src/services/pm-scheduler.ts:2090:        trainId,
+src/services/pm-scheduler.ts:2091:        dateStr
+src/services/pm-scheduler.ts:2092:      );
+src/services/pm-scheduler.ts:2093:
+src/services/pm-scheduler.ts:2094:      if (canSchedule) {
+src/services/pm-scheduler.ts:2095:        return dateStr;
+src/services/pm-scheduler.ts:2096:      }
+src/services/pm-scheduler.ts:2097:    }
+src/services/pm-scheduler.ts:2098:
+src/services/pm-scheduler.ts:2099:    return null;
+src/services/pm-scheduler.ts:2100:  }
+src/services/pm-scheduler.ts:2101:
+src/services/pm-scheduler.ts:2102:  /**
+src/services/pm-scheduler.ts:2103:   * Calculate track utilization percentage for a period.
+src/services/pm-scheduler.ts:2104:   */
+src/services/pm-scheduler.ts:2105:  private async calculateTrackUtilization(
+src/services/pm-scheduler.ts:2106:    startDate: string,
+src/services/pm-scheduler.ts:2107:    endDate: string,
+src/services/pm-scheduler.ts:2108:    depotId: string | null
+src/services/pm-scheduler.ts:2109:  ): Promise<number> {
+src/services/pm-scheduler.ts:2110:    // Get total track-days available
+src/services/pm-scheduler.ts:2111:    const trackConditions: SQL<unknown>[] = [
+src/services/pm-scheduler.ts:2112:      eq(tracks.active, true),
+src/services/pm-scheduler.ts:2113:      sql`${tracks.trackType} != 'STABLING'`,
+src/services/pm-scheduler.ts:2114:    ];
+src/services/pm-scheduler.ts:2115:
+src/services/pm-scheduler.ts:2116:    if (depotId) {
+src/services/pm-scheduler.ts:2117:      trackConditions.push(eq(tracks.depotId, depotId));
+src/services/pm-scheduler.ts:2118:    }
+src/services/pm-scheduler.ts:2119:
+src/services/pm-scheduler.ts:2120:    const trackCount = await this.db
+src/services/pm-scheduler.ts:2121:      .select({ count: count() })
+src/services/pm-scheduler.ts:2122:      .from(tracks)
+src/services/pm-scheduler.ts:2123:      .where(and(...trackConditions));
+src/services/pm-scheduler.ts:2124:
+src/services/pm-scheduler.ts:2125:    const totalTracks = trackCount[0]?.count ?? 0;
+src/services/pm-scheduler.ts:2126:    const daysBetween = Math.ceil(
+src/services/pm-scheduler.ts:2127:      (new Date(endDate).getTime() - new Date(startDate).getTime()) / (1000 * 60 * 60 * 24)
+src/services/pm-scheduler.ts:2128:    );
+src/services/pm-scheduler.ts:2129:    const totalTrackDays = totalTracks * daysBetween;
+src/services/pm-scheduler.ts:2130:
+src/services/pm-scheduler.ts:2131:    if (totalTrackDays === 0) return 0;
+src/services/pm-scheduler.ts:2132:
+src/services/pm-scheduler.ts:2133:    // Get scheduled PM track-days
+src/services/pm-scheduler.ts:2134:    const pmConditions: SQL<unknown>[] = [
+src/services/pm-scheduler.ts:2135:      inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+src/services/pm-scheduler.ts:2136:      isNull(pmSchedule.scenarioId),
+src/services/pm-scheduler.ts:2137:      gte(pmSchedule.targetDate, startDate),
+src/services/pm-scheduler.ts:2138:      lte(pmSchedule.targetDate, endDate),
+src/services/pm-scheduler.ts:2139:      sql`${pmSchedule.assignedTrackId} IS NOT NULL`,
+src/services/pm-scheduler.ts:2140:    ];
+src/services/pm-scheduler.ts:2141:
+src/services/pm-scheduler.ts:2142:    if (depotId) {
+src/services/pm-scheduler.ts:2143:      pmConditions.push(eq(pmSchedule.assignedDepotId, depotId));
+src/services/pm-scheduler.ts:2144:    }
+src/services/pm-scheduler.ts:2145:
+src/services/pm-scheduler.ts:2146:    const scheduledPms = await this.db.query.pmSchedule.findMany({
+src/services/pm-scheduler.ts:2147:      where: and(...pmConditions),
+src/services/pm-scheduler.ts:2148:      with: { pmType: true },
+src/services/pm-scheduler.ts:2149:    });
+src/services/pm-scheduler.ts:2150:
+src/services/pm-scheduler.ts:2151:    const usedTrackDays = scheduledPms.reduce((sum, pm) => {
+src/services/pm-scheduler.ts:2152:      const duration = pm.pmType?.minTrackDays ?? 1;
+src/services/pm-scheduler.ts:2153:      return sum + duration;
+src/services/pm-scheduler.ts:2154:    }, 0);
+src/services/pm-scheduler.ts:2155:
+src/services/pm-scheduler.ts:2156:    return Math.round((usedTrackDays / totalTrackDays) * 100);
+src/services/pm-scheduler.ts:2157:  }
+src/services/pm-scheduler.ts:2158:}
+src/services/pm-scheduler.ts:2159:
+src/services/pm-scheduler.ts:2160:// =============================================================================
+src/services/pm-scheduler.ts:2161:// Singleton Export
+src/services/pm-scheduler.ts:2162:// =============================================================================
+src/services/pm-scheduler.ts:2163:
+src/services/pm-scheduler.ts:2164:let pmSchedulerServiceInstance: PMSchedulerService | null = null;
+src/services/pm-scheduler.ts:2165:
+src/services/pm-scheduler.ts:2166:export function getPMSchedulerService(): PMSchedulerService {
+src/services/pm-scheduler.ts:2167:  if (!pmSchedulerServiceInstance) {
+src/services/ingestion.test.ts:38:  } catch {
+src/services/ingestion.test.ts:39:    return false;
+src/services/ingestion.test.ts:40:  }
+src/services/ingestion.test.ts:41:}
+src/services/ingestion.test.ts:42:
+src/services/ingestion.test.ts:43:// Create test directories and clean up
+src/services/ingestion.test.ts:44:function setupTestDirectories(): void {
+src/services/ingestion.test.ts:45:  [TEST_INBOX_PATH, TEST_PROCESSED_PATH].forEach((dir) => {
+src/services/ingestion.test.ts:46:    if (!fs.existsSync(dir)) {
+src/services/ingestion.test.ts:47:      fs.mkdirSync(dir, { recursive: true });
+src/services/ingestion.test.ts:48:    }
+src/services/ingestion.test.ts:49:  });
+src/services/ingestion.test.ts:50:}
+src/services/ingestion.test.ts:51:
+src/services/ingestion.test.ts:52:function cleanupTestDirectories(): void {
+src/services/ingestion.test.ts:53:  [TEST_INBOX_PATH, TEST_PROCESSED_PATH].forEach((dir) => {
+src/services/ingestion.test.ts:54:    if (fs.existsSync(dir)) {
+src/services/ingestion.test.ts:55:      fs.readdirSync(dir).forEach((file) => {
+src/services/ingestion.test.ts:56:        fs.unlinkSync(path.join(dir, file));
+src/services/ingestion.test.ts:57:      });
+src/services/ingestion.test.ts:58:    }
+src/services/ingestion.test.ts:59:  });
+src/services/ingestion.test.ts:60:}
+src/services/ingestion.test.ts:61:
+src/services/ingestion.test.ts:62:// Create a test CSV file
+src/services/ingestion.test.ts:63:function createTestCsv(
+src/services/ingestion.test.ts:64:  filename: string,
+src/services/ingestion.test.ts:65:  rows: Array<{ train_number: string; reading_date: string; odometer_km: number }>
+src/services/ingestion.test.ts:66:): string {
+src/services/ingestion.test.ts:67:  const header = 'train_number,reading_date,odometer_km';
+src/services/ingestion.test.ts:68:  const lines = rows.map((r) => `${r.train_number},${r.reading_date},${r.odometer_km}`);
+src/services/ingestion.test.ts:69:  const content = [header, ...lines].join('\n');
+src/services/ingestion.test.ts:70:
+src/services/ingestion.test.ts:71:  const filePath = path.join(TEST_INBOX_PATH, filename);
+src/services/ingestion.test.ts:72:  fs.writeFileSync(filePath, content);
+src/services/ingestion.test.ts:73:
+src/services/ingestion.test.ts:74:  return filePath;
+src/services/ingestion.test.ts:75:}
+src/services/ingestion.test.ts:76:
+src/services/ingestion.test.ts:77:// Create test data in database
+src/services/ingestion.test.ts:78:async function setupTestData(): Promise<void> {
+src/services/ingestion.test.ts:79:  if (!databaseAvailable) return;
+src/services/ingestion.test.ts:80:
+src/services/ingestion.test.ts:81:  // Create test depot
+src/services/ingestion.test.ts:82:  const [depot] = await db.insert(depots).values({
+src/services/ingestion.test.ts:83:    code: 'TEST-DEPOT',
+src/services/ingestion.test.ts:84:    name: 'Test Depot',
+src/services/ingestion.test.ts:85:    timezone: 'UTC',
+src/services/ingestion.test.ts:86:  }).returning();
+src/services/ingestion.test.ts:87:  testDepotId = depot.id;
+src/services/ingestion.test.ts:88:
+src/services/ingestion.test.ts:89:  // Create test fleet
+src/services/ingestion.test.ts:90:  const [fleet] = await db.insert(fleets).values({
+src/services/ingestion.test.ts:91:    code: 'TEST-FLEET',
+src/services/ingestion.test.ts:92:    name: 'Test Fleet',
+src/services/ingestion.test.ts:93:    manufacturer: 'Test Manufacturer',
+src/services/ingestion.test.ts:94:    carsPerTrain: 4,
+src/services/ingestion.test.ts:95:    baseDepotId: testDepotId,
+src/services/ingestion.test.ts:96:  }).returning();
+src/services/ingestion.test.ts:97:  testFleetId = fleet.id;
+src/services/ingestion.test.ts:98:
+src/services/ingestion.test.ts:99:  // Create test trains
+src/services/ingestion.test.ts:100:  for (let i = 1; i <= 3; i++) {
+src/services/ingestion.test.ts:101:    const [train] = await db.insert(trains).values({
+src/services/ingestion.test.ts:102:      trainNumber: `T00${i}`,
+src/services/ingestion.test.ts:103:      fleetId: testFleetId,
+src/services/ingestion.test.ts:104:      currentMileageKm: 100000 + (i * 10000),
+src/services/ingestion.test.ts:105:      fitnessStatus: 'FIT',
+src/services/ingestion.test.ts:106:      currentDepotId: testDepotId,
+src/services/ingestion.test.ts:107:      homeDepotId: testDepotId,
+src/services/ingestion.test.ts:108:    }).returning();
+src/services/ingestion.test.ts:109:    testTrainIds.push(train.id);
+src/services/ingestion.test.ts:110:  }
+src/services/ingestion.test.ts:111:}
+src/services/ingestion.test.ts:112:
+src/services/ingestion.test.ts:113:// Clean up test data
+src/services/ingestion.test.ts:114:async function cleanupTestData(): Promise<void> {
+src/services/ingestion.test.ts:115:  if (!databaseAvailable) return;
+src/services/ingestion.test.ts:116:
+src/services/ingestion.test.ts:117:  // Delete in reverse order of dependencies
+src/services/ingestion.test.ts:118:  if (testTrainIds.length > 0) {
+src/services/ingestion.test.ts:119:    await db.delete(mileageReadings).where(
+src/services/ingestion.test.ts:120:      sql`${mileageReadings.trainId} = ANY(${testTrainIds}::uuid[])`
+src/services/ingestion.test.ts:121:    );
+src/services/ingestion.test.ts:122:    await db.delete(meterEvents).where(
+src/services/ingestion.test.ts:123:      sql`${meterEvents.trainId} = ANY(${testTrainIds}::uuid[])`
+src/services/ingestion.test.ts:124:    );
+src/services/ingestion.test.ts:125:    await db.delete(trains).where(
+src/services/ingestion.test.ts:126:      sql`${trains.id} = ANY(${testTrainIds}::uuid[])`
+src/services/ingestion.test.ts:127:    );
+src/services/ingestion.test.ts:128:  }
+src/services/ingestion.test.ts:129:
+src/services/ingestion.test.ts:130:  if (testFleetId) {
+src/services/ingestion.test.ts:131:    await db.delete(fleets).where(eq(fleets.id, testFleetId));
+src/services/ingestion.test.ts:132:  }
+src/services/ingestion.test.ts:133:
+src/services/ingestion.test.ts:134:  if (testDepotId) {
+src/services/ingestion.test.ts:135:    await db.delete(depots).where(eq(depots.id, testDepotId));
+src/services/ingestion.test.ts:136:  }
+src/services/ingestion.test.ts:137:
+src/services/ingestion.test.ts:138:  testTrainIds = [];
+src/services/ingestion.test.ts:139:}
+src/services/ingestion.test.ts:140:
+src/services/ingestion.test.ts:141:// =============================================================================
+src/services/ingestion.test.ts:142:// Unit Tests (No Database Required)
+src/services/ingestion.test.ts:143:// =============================================================================
+src/services/ingestion.test.ts:144:
+src/services/ingestion.test.ts:145:describe('IngestionService', () => {
+src/services/ingestion.test.ts:146:  beforeAll(async () => {
+src/services/ingestion.test.ts:147:    databaseAvailable = await checkDatabaseConnection();
+src/services/ingestion.test.ts:148:    if (!databaseAvailable) {
+src/services/ingestion.test.ts:149:      console.log('Database not available - skipping integration tests');
+src/services/ingestion.test.ts:150:    }
+src/services/ingestion.test.ts:151:  });
+src/services/ingestion.test.ts:152:
+src/services/ingestion.test.ts:153:  beforeEach(() => {
+src/services/ingestion.test.ts:154:    service = new IngestionService();
+src/services/ingestion.test.ts:155:    setupTestDirectories();
+src/services/ingestion.test.ts:156:  });
+src/services/ingestion.test.ts:157:
+src/services/ingestion.test.ts:158:  afterEach(() => {
+src/services/ingestion.test.ts:159:    cleanupTestDirectories();
+src/services/ingestion.test.ts:160:  });
+src/services/ingestion.test.ts:161:
+src/services/ingestion.test.ts:162:  describe('File Validation (Unit Tests)', () => {
+src/services/ingestion.test.ts:163:    test('should reject non-existent file', async () => {
+src/services/ingestion.test.ts:164:      const result = await service.validateFile('/non/existent/file.csv');
+src/services/ingestion.test.ts:165:
+src/services/ingestion.test.ts:166:      expect(result.valid).toBe(false);
+src/services/ingestion.test.ts:167:      expect(result.errors).toContain('File not found: /non/existent/file.csv');
+src/services/ingestion.test.ts:168:    });
+src/services/ingestion.test.ts:169:
+src/services/ingestion.test.ts:170:    test('should reject empty file', async () => {
+src/services/ingestion.test.ts:171:      const filePath = path.join(TEST_INBOX_PATH, 'empty.csv');
+src/services/ingestion.test.ts:172:      fs.writeFileSync(filePath, '');
+src/services/ingestion.test.ts:173:
+src/services/ingestion.test.ts:174:      const result = await service.validateFile(filePath);
+src/services/ingestion.test.ts:175:
+src/services/ingestion.test.ts:176:      expect(result.valid).toBe(false);
+src/services/ingestion.test.ts:177:      expect(result.errors.some((e) => e.includes('empty'))).toBe(true);
+src/services/ingestion.test.ts:178:    });
+src/services/ingestion.test.ts:179:
+src/services/ingestion.test.ts:180:    test('should warn on incorrect filename pattern', async () => {
+src/services/ingestion.test.ts:181:      const filePath = path.join(TEST_INBOX_PATH, 'wrong_name.csv');
+src/services/ingestion.test.ts:182:      fs.writeFileSync(filePath, 'train_number,reading_date,odometer_km\nT001,2024-01-15,100000');
+src/services/ingestion.test.ts:183:
+src/services/ingestion.test.ts:184:      const result = await service.validateFile(filePath);
+src/services/ingestion.test.ts:185:
+src/services/ingestion.test.ts:186:      expect(result.warnings.some((w) => w.includes('expected pattern'))).toBe(true);
+src/services/ingestion.test.ts:187:    });
+src/services/ingestion.test.ts:188:
+src/services/ingestion.test.ts:189:    test('should reject file with missing required columns', async () => {
+src/services/ingestion.test.ts:190:      const filePath = path.join(TEST_INBOX_PATH, 'missing_columns.csv');
+src/services/ingestion.test.ts:191:      fs.writeFileSync(filePath, 'train_number,date\nT001,2024-01-15');
+src/services/ingestion.test.ts:192:
+src/services/ingestion.test.ts:193:      const result = await service.validateFile(filePath);
+src/services/ingestion.test.ts:194:
+src/services/ingestion.test.ts:195:      expect(result.valid).toBe(false);
+src/services/ingestion.test.ts:196:      expect(result.errors.some((e) => e.includes('Missing required column'))).toBe(true);
+src/services/ingestion.test.ts:197:    });
+src/services/ingestion.test.ts:198:
+src/services/ingestion.test.ts:199:    test('should accept valid CSV file', async () => {
+src/services/ingestion.test.ts:200:      const filePath = path.join(TEST_INBOX_PATH, 'mileage_20240115.csv');
+src/services/ingestion.test.ts:201:      fs.writeFileSync(filePath, 'train_number,reading_date,odometer_km\nT001,2024-01-15,100000');
+src/services/ingestion.test.ts:202:
+src/services/ingestion.test.ts:203:      const result = await service.validateFile(filePath);
+src/services/ingestion.test.ts:204:
+src/services/ingestion.test.ts:205:      expect(result.valid).toBe(true);
+src/services/ingestion.test.ts:206:      expect(result.errors.length).toBe(0);
+src/services/ingestion.test.ts:207:    });
+src/services/ingestion.test.ts:208:
+src/services/ingestion.test.ts:209:    test('should accept valid CSV file with multiple columns', async () => {
+src/services/ingestion.test.ts:210:      const filePath = path.join(TEST_INBOX_PATH, 'mileage_20240115.csv');
+src/services/ingestion.test.ts:211:      fs.writeFileSync(
+src/services/ingestion.test.ts:212:        filePath,
+src/services/ingestion.test.ts:213:        'train_number,reading_date,odometer_km,extra_col\nT001,2024-01-15,100000,value'
+src/services/ingestion.test.ts:214:      );
+src/services/ingestion.test.ts:215:
+src/services/ingestion.test.ts:216:      const result = await service.validateFile(filePath);
+src/services/ingestion.test.ts:217:
+src/services/ingestion.test.ts:218:      expect(result.valid).toBe(true);
+src/services/ingestion.test.ts:219:    });
+src/services/ingestion.test.ts:220:  });
+src/services/ingestion.test.ts:221:
+src/services/ingestion.test.ts:222:  describe('Health Monitoring (Unit Tests)', () => {
+src/services/ingestion.test.ts:223:    test('should report healthy when no files received yet', async () => {
+src/services/ingestion.test.ts:224:      const health = await service.checkFileArrivalHealth();
+src/services/ingestion.test.ts:225:
+src/services/ingestion.test.ts:226:      expect(health.healthy).toBe(true);
+src/services/ingestion.test.ts:227:      expect(health.lastFileAt).toBeNull();
+src/services/ingestion.test.ts:228:    });
+src/services/ingestion.test.ts:229:  });
+src/services/ingestion.test.ts:230:});
+src/services/ingestion.test.ts:231:
+src/services/ingestion.test.ts:232:// =============================================================================
+src/services/ingestion.test.ts:233:// Integration Tests (Database Required)
+src/services/ingestion.test.ts:234:// =============================================================================
+src/services/ingestion.test.ts:235:
+src/services/ingestion.test.ts:236:describe('IngestionService Integration Tests', () => {
+src/services/ingestion.test.ts:237:  beforeAll(async () => {
+src/services/ingestion.test.ts:238:    databaseAvailable = await checkDatabaseConnection();
+src/services/ingestion.test.ts:239:  });
+src/services/ingestion.test.ts:240:
+src/services/ingestion.test.ts:241:  beforeEach(async () => {
+src/services/ingestion.test.ts:242:    if (!databaseAvailable) return;
+src/services/ingestion.test.ts:243:
+src/services/ingestion.test.ts:244:    service = new IngestionService();
+src/services/ingestion.test.ts:245:    setupTestDirectories();
+src/services/ingestion.test.ts:246:  });
+src/services/ingestion.test.ts:247:
+src/services/ingestion.test.ts:248:  afterEach(async () => {
+src/services/ingestion.test.ts:249:    cleanupTestDirectories();
+src/services/ingestion.test.ts:250:    await cleanupTestData();
+src/services/ingestion.test.ts:251:  });
+src/services/ingestion.test.ts:252:
+src/services/ingestion.test.ts:253:  describe('CSV Parsing', () => {
+src/services/ingestion.test.ts:254:    test('should parse valid CSV rows', async () => {
+src/services/ingestion.test.ts:255:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:256:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:257:        return;
+src/services/ingestion.test.ts:258:      }
+src/services/ingestion.test.ts:259:
+src/services/ingestion.test.ts:260:      await setupTestData();
+src/services/ingestion.test.ts:261:
+src/services/ingestion.test.ts:262:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:263:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:264:        { train_number: 'T002', reading_date: '2024-01-15', odometer_km: 110500 },
+src/services/ingestion.test.ts:265:      ]);
+src/services/ingestion.test.ts:266:
+src/services/ingestion.test.ts:267:      const result = await service.processFile(filePath, 'test-job-1');
+src/services/ingestion.test.ts:268:
+src/services/ingestion.test.ts:269:      expect(result.totalRecords).toBe(2);
+src/services/ingestion.test.ts:270:      expect(result.validRecords).toBe(2);
+src/services/ingestion.test.ts:271:      expect(result.invalidRecords).toBe(0);
+src/services/ingestion.test.ts:272:      expect(result.status).toBe('SUCCESS');
+src/services/ingestion.test.ts:273:    });
+src/services/ingestion.test.ts:274:
+src/services/ingestion.test.ts:275:    test('should handle unknown train numbers', async () => {
+src/services/ingestion.test.ts:276:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:277:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:278:        return;
+src/services/ingestion.test.ts:279:      }
+src/services/ingestion.test.ts:280:
+src/services/ingestion.test.ts:281:      await setupTestData();
+src/services/ingestion.test.ts:282:
+src/services/ingestion.test.ts:283:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:284:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:285:        { train_number: 'UNKNOWN', reading_date: '2024-01-15', odometer_km: 999999 },
+src/services/ingestion.test.ts:286:      ]);
+src/services/ingestion.test.ts:287:
+src/services/ingestion.test.ts:288:      const result = await service.processFile(filePath, 'test-job-2');
+src/services/ingestion.test.ts:289:
+src/services/ingestion.test.ts:290:      expect(result.totalRecords).toBe(2);
+src/services/ingestion.test.ts:291:      expect(result.validRecords).toBe(1);
+src/services/ingestion.test.ts:292:      expect(result.invalidRecords).toBe(1);
+src/services/ingestion.test.ts:293:      expect(result.anomalies.some((a) => a.type === 'UNKNOWN_TRAIN')).toBe(true);
+src/services/ingestion.test.ts:294:      expect(result.status).toBe('PARTIAL');
+src/services/ingestion.test.ts:295:    });
+src/services/ingestion.test.ts:296:  });
+src/services/ingestion.test.ts:297:
+src/services/ingestion.test.ts:298:  describe('Anomaly Detection', () => {
+src/services/ingestion.test.ts:299:    test('should detect negative daily mileage', async () => {
+src/services/ingestion.test.ts:300:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:301:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:302:        return;
+src/services/ingestion.test.ts:303:      }
+src/services/ingestion.test.ts:304:
+src/services/ingestion.test.ts:305:      await setupTestData();
+src/services/ingestion.test.ts:306:
+src/services/ingestion.test.ts:307:      // First, insert a baseline reading
+src/services/ingestion.test.ts:308:      await db.insert(mileageReadings).values({
+src/services/ingestion.test.ts:309:        trainId: testTrainIds[0]!,
+src/services/ingestion.test.ts:310:        readingDate: '2024-01-14',
+src/services/ingestion.test.ts:311:        rawReading: 100000,
+src/services/ingestion.test.ts:312:        adjustedReading: 100000,
+src/services/ingestion.test.ts:313:        dailyKm: 300,
+src/services/ingestion.test.ts:314:        validationStatus: 'VALID',
+src/services/ingestion.test.ts:315:        sourceFile: 'test.csv',
+src/services/ingestion.test.ts:316:      });
+src/services/ingestion.test.ts:317:
+src/services/ingestion.test.ts:318:      // Now process a file with lower mileage
+src/services/ingestion.test.ts:319:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:320:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 99500 },
+src/services/ingestion.test.ts:321:      ]);
+src/services/ingestion.test.ts:322:
+src/services/ingestion.test.ts:323:      const result = await service.processFile(filePath, 'test-job-4');
+src/services/ingestion.test.ts:324:
+src/services/ingestion.test.ts:325:      expect(result.anomalies.length).toBeGreaterThan(0);
+src/services/ingestion.test.ts:326:      expect(result.anomalies.some((a) => a.type === 'NEGATIVE')).toBe(true);
+src/services/ingestion.test.ts:327:    });
+src/services/ingestion.test.ts:328:
+src/services/ingestion.test.ts:329:    test('should detect spike in daily mileage', async () => {
+src/services/ingestion.test.ts:330:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:331:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:332:        return;
+src/services/ingestion.test.ts:333:      }
+src/services/ingestion.test.ts:334:
+src/services/ingestion.test.ts:335:      await setupTestData();
+src/services/ingestion.test.ts:336:
+src/services/ingestion.test.ts:337:      // First, insert a baseline reading
+src/services/ingestion.test.ts:338:      await db.insert(mileageReadings).values({
+src/services/ingestion.test.ts:339:        trainId: testTrainIds[0]!,
+src/services/ingestion.test.ts:340:        readingDate: '2024-01-14',
+src/services/ingestion.test.ts:341:        rawReading: 100000,
+src/services/ingestion.test.ts:342:        adjustedReading: 100000,
+src/services/ingestion.test.ts:343:        dailyKm: 300,
+src/services/ingestion.test.ts:344:        validationStatus: 'VALID',
+src/services/ingestion.test.ts:345:        sourceFile: 'test.csv',
+src/services/ingestion.test.ts:346:      });
+src/services/ingestion.test.ts:347:
+src/services/ingestion.test.ts:348:      // Now process a file with spike (>1000km daily)
+src/services/ingestion.test.ts:349:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:350:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 101500 },
+src/services/ingestion.test.ts:351:      ]);
+src/services/ingestion.test.ts:352:
+src/services/ingestion.test.ts:353:      const result = await service.processFile(filePath, 'test-job-5');
+src/services/ingestion.test.ts:354:
+src/services/ingestion.test.ts:355:      expect(result.anomalies.length).toBeGreaterThan(0);
+src/services/ingestion.test.ts:356:      expect(result.anomalies.some((a) => a.type === 'SPIKE')).toBe(true);
+src/services/ingestion.test.ts:357:    });
+src/services/ingestion.test.ts:358:  });
+src/services/ingestion.test.ts:359:
+src/services/ingestion.test.ts:360:  describe('Mileage Reading Updates', () => {
+src/services/ingestion.test.ts:361:    test('should insert new mileage readings', async () => {
+src/services/ingestion.test.ts:362:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:363:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:364:        return;
+src/services/ingestion.test.ts:365:      }
+src/services/ingestion.test.ts:366:
+src/services/ingestion.test.ts:367:      await setupTestData();
+src/services/ingestion.test.ts:368:
+src/services/ingestion.test.ts:369:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:370:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:371:      ]);
+src/services/ingestion.test.ts:372:
+src/services/ingestion.test.ts:373:      await service.processFile(filePath, 'test-job-7');
+src/services/ingestion.test.ts:374:
+src/services/ingestion.test.ts:375:      // Verify reading was inserted
+src/services/ingestion.test.ts:376:      const readings = await db.query.mileageReadings.findMany({
+src/services/ingestion.test.ts:377:        where: eq(mileageReadings.trainId, testTrainIds[0]!),
+src/services/ingestion.test.ts:378:      });
+src/services/ingestion.test.ts:379:
+src/services/ingestion.test.ts:380:      expect(readings.length).toBe(1);
+src/services/ingestion.test.ts:381:      expect(readings[0]!.rawReading).toBe(100500);
+src/services/ingestion.test.ts:382:      expect(readings[0]!.adjustedReading).toBe(100500);
+src/services/ingestion.test.ts:383:    });
+src/services/ingestion.test.ts:384:
+src/services/ingestion.test.ts:385:    test('should update existing mileage reading on duplicate', async () => {
+src/services/ingestion.test.ts:386:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:387:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:388:        return;
+src/services/ingestion.test.ts:389:      }
+src/services/ingestion.test.ts:390:
+src/services/ingestion.test.ts:391:      await setupTestData();
+src/services/ingestion.test.ts:392:
+src/services/ingestion.test.ts:393:      // Insert first reading
+src/services/ingestion.test.ts:394:      const filePath1 = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:395:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:396:      ]);
+src/services/ingestion.test.ts:397:      await service.processFile(filePath1, 'test-job-8a');
+src/services/ingestion.test.ts:398:
+src/services/ingestion.test.ts:399:      // Update with corrected value
+src/services/ingestion.test.ts:400:      const filePath2 = createTestCsv('mileage_20240115_v2.csv', [
+src/services/ingestion.test.ts:401:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100600 },
+src/services/ingestion.test.ts:402:      ]);
+src/services/ingestion.test.ts:403:      await service.processFile(filePath2, 'test-job-8b');
+src/services/ingestion.test.ts:404:
+src/services/ingestion.test.ts:405:      // Verify reading was updated (not duplicated)
+src/services/ingestion.test.ts:406:      const readings = await db.query.mileageReadings.findMany({
+src/services/ingestion.test.ts:407:        where: eq(mileageReadings.trainId, testTrainIds[0]!),
+src/services/ingestion.test.ts:408:      });
+src/services/ingestion.test.ts:409:
+src/services/ingestion.test.ts:410:      expect(readings.length).toBe(1);
+src/services/ingestion.test.ts:411:      expect(readings[0]!.rawReading).toBe(100600);
+src/services/ingestion.test.ts:412:    });
+src/services/ingestion.test.ts:413:
+src/services/ingestion.test.ts:414:    test('should update train current mileage', async () => {
+src/services/ingestion.test.ts:415:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:416:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:417:        return;
+src/services/ingestion.test.ts:418:      }
+src/services/ingestion.test.ts:419:
+src/services/ingestion.test.ts:420:      await setupTestData();
+src/services/ingestion.test.ts:421:
+src/services/ingestion.test.ts:422:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:423:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 150000 },
+src/services/ingestion.test.ts:424:      ]);
+src/services/ingestion.test.ts:425:
+src/services/ingestion.test.ts:426:      await service.processFile(filePath, 'test-job-9');
+src/services/ingestion.test.ts:427:
+src/services/ingestion.test.ts:428:      // Verify train mileage was updated
+src/services/ingestion.test.ts:429:      const train = await db.query.trains.findFirst({
+src/services/ingestion.test.ts:430:        where: eq(trains.id, testTrainIds[0]!),
+src/services/ingestion.test.ts:431:      });
+src/services/ingestion.test.ts:432:
+src/services/ingestion.test.ts:433:      expect(train!.currentMileageKm).toBe(150000);
+src/services/ingestion.test.ts:434:    });
+src/services/ingestion.test.ts:435:  });
+src/services/ingestion.test.ts:436:
+src/services/ingestion.test.ts:437:  describe('Meter Events', () => {
+src/services/ingestion.test.ts:438:    test('should create meter event', async () => {
+src/services/ingestion.test.ts:439:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:440:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:441:        return;
+src/services/ingestion.test.ts:442:      }
+src/services/ingestion.test.ts:443:
+src/services/ingestion.test.ts:444:      await setupTestData();
+src/services/ingestion.test.ts:445:
+src/services/ingestion.test.ts:446:      const result = await service.createMeterEvent(
+src/services/ingestion.test.ts:447:        testTrainIds[0]!,
+src/services/ingestion.test.ts:448:        'RESET',
+src/services/ingestion.test.ts:449:        '2024-01-15',
+src/services/ingestion.test.ts:450:        100000,
+src/services/ingestion.test.ts:451:        0,
+src/services/ingestion.test.ts:452:        'Meter replacement after maintenance',
+src/services/ingestion.test.ts:453:        undefined
+src/services/ingestion.test.ts:454:      );
+src/services/ingestion.test.ts:455:
+src/services/ingestion.test.ts:456:      expect(result.trainNumber).toBe('T001');
+src/services/ingestion.test.ts:457:      expect(result.eventType).toBe('RESET');
+src/services/ingestion.test.ts:458:      expect(result.adjustmentKm).toBe(100000); // old - new = 100000 - 0
+src/services/ingestion.test.ts:459:
+src/services/ingestion.test.ts:460:      // Verify event was stored
+src/services/ingestion.test.ts:461:      const events = await service.getMeterEvents(testTrainIds[0]!);
+src/services/ingestion.test.ts:462:      expect(events.length).toBe(1);
+src/services/ingestion.test.ts:463:      expect(events[0]!.adjustmentKm).toBe(100000);
+src/services/ingestion.test.ts:464:    });
+src/services/ingestion.test.ts:465:
+src/services/ingestion.test.ts:466:    test('should apply meter adjustment to readings', async () => {
+src/services/ingestion.test.ts:467:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:468:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:469:        return;
+src/services/ingestion.test.ts:470:      }
+src/services/ingestion.test.ts:471:
+src/services/ingestion.test.ts:472:      await setupTestData();
+src/services/ingestion.test.ts:473:
+src/services/ingestion.test.ts:474:      // Create meter event (meter reset from 100000 to 0)
+src/services/ingestion.test.ts:475:      await service.createMeterEvent(
+src/services/ingestion.test.ts:476:        testTrainIds[0]!,
+src/services/ingestion.test.ts:477:        'RESET',
+src/services/ingestion.test.ts:478:        '2024-01-14',
+src/services/ingestion.test.ts:479:        100000,
+src/services/ingestion.test.ts:480:        0,
+src/services/ingestion.test.ts:481:        'Meter reset'
+src/services/ingestion.test.ts:482:      );
+src/services/ingestion.test.ts:483:
+src/services/ingestion.test.ts:484:      // Insert reading after reset
+src/services/ingestion.test.ts:485:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:486:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 300 },
+src/services/ingestion.test.ts:487:      ]);
+src/services/ingestion.test.ts:488:
+src/services/ingestion.test.ts:489:      await service.processFile(filePath, 'test-job-10');
+src/services/ingestion.test.ts:490:
+src/services/ingestion.test.ts:491:      // Verify adjusted reading accounts for meter event
+src/services/ingestion.test.ts:492:      const readings = await db.query.mileageReadings.findMany({
+src/services/ingestion.test.ts:493:        where: eq(mileageReadings.trainId, testTrainIds[0]!),
+src/services/ingestion.test.ts:494:      });
+src/services/ingestion.test.ts:495:
+src/services/ingestion.test.ts:496:      expect(readings.length).toBe(1);
+src/services/ingestion.test.ts:497:      expect(readings[0]!.rawReading).toBe(300);
+src/services/ingestion.test.ts:498:      expect(readings[0]!.adjustedReading).toBe(100300); // 300 + 100000 adjustment
+src/services/ingestion.test.ts:499:    });
+src/services/ingestion.test.ts:500:  });
+src/services/ingestion.test.ts:501:
+src/services/ingestion.test.ts:502:  describe('Batch Processing', () => {
+src/services/ingestion.test.ts:503:    test('should process multiple trains in batch', async () => {
+src/services/ingestion.test.ts:504:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:505:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:506:        return;
+src/services/ingestion.test.ts:507:      }
+src/services/ingestion.test.ts:508:
+src/services/ingestion.test.ts:509:      await setupTestData();
+src/services/ingestion.test.ts:510:
+src/services/ingestion.test.ts:511:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:512:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:513:        { train_number: 'T002', reading_date: '2024-01-15', odometer_km: 110500 },
+src/services/ingestion.test.ts:514:        { train_number: 'T003', reading_date: '2024-01-15', odometer_km: 120500 },
+src/services/ingestion.test.ts:515:      ]);
+src/services/ingestion.test.ts:516:
+src/services/ingestion.test.ts:517:      const result = await service.processFile(filePath, 'test-job-11');
+src/services/ingestion.test.ts:518:
+src/services/ingestion.test.ts:519:      expect(result.totalRecords).toBe(3);
+src/services/ingestion.test.ts:520:      expect(result.validRecords).toBe(3);
+src/services/ingestion.test.ts:521:      expect(result.trainsUpdated).toBe(3);
+src/services/ingestion.test.ts:522:      expect(result.status).toBe('SUCCESS');
+src/services/ingestion.test.ts:523:    });
+src/services/ingestion.test.ts:524:
+src/services/ingestion.test.ts:525:    test('should continue processing after individual record failure', async () => {
+src/services/ingestion.test.ts:526:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:527:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:528:        return;
+src/services/ingestion.test.ts:529:      }
+src/services/ingestion.test.ts:530:
+src/services/ingestion.test.ts:531:      await setupTestData();
+src/services/ingestion.test.ts:532:
+src/services/ingestion.test.ts:533:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:534:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:535:        { train_number: 'UNKNOWN', reading_date: '2024-01-15', odometer_km: 999999 },
+src/services/ingestion.test.ts:536:        { train_number: 'T002', reading_date: '2024-01-15', odometer_km: 110500 },
+src/services/ingestion.test.ts:537:      ]);
+src/services/ingestion.test.ts:538:
+src/services/ingestion.test.ts:539:      const result = await service.processFile(filePath, 'test-job-12');
+src/services/ingestion.test.ts:540:
+src/services/ingestion.test.ts:541:      expect(result.totalRecords).toBe(3);
+src/services/ingestion.test.ts:542:      expect(result.validRecords).toBe(2);
+src/services/ingestion.test.ts:543:      expect(result.invalidRecords).toBe(1);
+src/services/ingestion.test.ts:544:      expect(result.status).toBe('PARTIAL');
+src/services/ingestion.test.ts:545:    });
+src/services/ingestion.test.ts:546:  });
+src/services/ingestion.test.ts:547:
+src/services/ingestion.test.ts:548:  describe('Statistics', () => {
+src/services/ingestion.test.ts:549:    test('should return ingestion statistics', async () => {
+src/services/ingestion.test.ts:550:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:551:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:552:        return;
+src/services/ingestion.test.ts:553:      }
+src/services/ingestion.test.ts:554:
+src/services/ingestion.test.ts:555:      await setupTestData();
+src/services/ingestion.test.ts:556:
+src/services/ingestion.test.ts:557:      // Process a file first
+src/services/ingestion.test.ts:558:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:559:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:560:      ]);
+src/services/ingestion.test.ts:561:      await service.processFile(filePath, 'test-job-14');
+src/services/ingestion.test.ts:562:
+src/services/ingestion.test.ts:563:      const stats = await service.getIngestionStats(7);
+src/services/ingestion.test.ts:564:
+src/services/ingestion.test.ts:565:      expect(stats.totalRecords).toBeGreaterThanOrEqual(1);
+src/services/ingestion.test.ts:566:      expect(typeof stats.totalFiles).toBe('number');
+src/services/ingestion.test.ts:567:      expect(typeof stats.averageRecordsPerFile).toBe('number');
+src/services/ingestion.test.ts:568:    });
+src/services/ingestion.test.ts:569:  });
+src/services/ingestion.test.ts:570:
+src/services/ingestion.test.ts:571:  describe('Result Status Determination', () => {
+src/services/ingestion.test.ts:572:    test('should return SUCCESS when all records valid', async () => {
+src/services/ingestion.test.ts:573:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:574:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:575:        return;
+src/services/ingestion.test.ts:576:      }
+src/services/ingestion.test.ts:577:
+src/services/ingestion.test.ts:578:      await setupTestData();
+src/services/ingestion.test.ts:579:
+src/services/ingestion.test.ts:580:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:581:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:582:      ]);
+src/services/ingestion.test.ts:583:
+src/services/ingestion.test.ts:584:      const result = await service.processFile(filePath, 'test-job-15');
+src/services/ingestion.test.ts:585:
+src/services/ingestion.test.ts:586:      expect(result.status).toBe('SUCCESS');
+src/services/ingestion.test.ts:587:    });
+src/services/ingestion.test.ts:588:
+src/services/ingestion.test.ts:589:    test('should return PARTIAL when some records invalid', async () => {
+src/services/ingestion.test.ts:590:      if (!databaseAvailable) {
+src/services/ingestion.test.ts:591:        console.log('Skipping: Database not available');
+src/services/ingestion.test.ts:592:        return;
+src/services/ingestion.test.ts:593:      }
+src/services/ingestion.test.ts:594:
+src/services/ingestion.test.ts:595:      await setupTestData();
+src/services/ingestion.test.ts:596:
+src/services/ingestion.test.ts:597:      const filePath = createTestCsv('mileage_20240115.csv', [
+src/services/ingestion.test.ts:598:        { train_number: 'T001', reading_date: '2024-01-15', odometer_km: 100500 },
+src/services/ingestion.test.ts:599:        { train_number: 'UNKNOWN', reading_date: '2024-01-15', odometer_km: 999999 },
+src/services/ingestion.test.ts:600:      ]);
+src/services/ingestion.test.ts:601:
+src/services/ingestion.test.ts:602:      const result = await service.processFile(filePath, 'test-job-16');
+src/services/ingestion.test.ts:603:
+src/services/ingestion.test.ts:604:      expect(result.status).toBe('PARTIAL');
+src/services/ingestion.test.ts:605:    });
+src/services/ingestion.test.ts:606:
+src/services/ingestion.test.ts:607:    test('should return FAILED when all records invalid', async () => {
+src/services/ingestion.test.ts:608:      if (!databaseAvailable) {
+src/lib/services/base.ts:132:        } catch (error) {
+src/lib/services/base.ts:133:          const durationMs = Date.now() - startTime;
+src/lib/services/base.ts:134:          const mmsError = toMmsError(error);
+src/lib/services/base.ts:135:
+src/lib/services/base.ts:136:          this.log.error(
+src/lib/services/base.ts:137:            {
+src/lib/services/base.ts:138:              operation: operationName,
+src/lib/services/base.ts:139:              durationMs,
+src/lib/services/base.ts:140:              error: mmsError.toJSON(),
+src/lib/services/base.ts:141:              ...getTraceContext(),
+src/lib/services/base.ts:142:            },
+src/lib/services/base.ts:143:            `Failed ${operationName}: ${mmsError.message}`
+src/lib/services/base.ts:144:          );
+src/lib/services/base.ts:145:
+src/lib/services/base.ts:146:          throw mmsError;
+src/lib/services/base.ts:147:        }
+src/lib/services/base.ts:148:      },
+src/lib/services/base.ts:149:      {
+src/lib/services/base.ts:150:        kind: SpanKind.INTERNAL,
+src/lib/services/base.ts:151:        tracer: this.tracer,
+src/lib/services/base.ts:152:        attributes: {
+src/lib/services/base.ts:153:          'service.name': this.serviceName,
+src/lib/services/base.ts:154:          'operation.name': operationName,
+src/lib/services/base.ts:155:          ...attributes,
+src/lib/services/base.ts:156:        },
+src/lib/services/base.ts:157:      }
+src/lib/services/base.ts:158:    );
+src/lib/services/base.ts:159:  }
+src/lib/services/base.ts:160:
+src/lib/services/base.ts:161:  /**
+src/lib/services/base.ts:162:   * Execute a sync operation with tracing
+src/lib/services/base.ts:163:   */
+src/lib/services/base.ts:164:  protected tracedSync<T>(
+src/lib/services/base.ts:165:    operationName: string,
+src/lib/services/base.ts:166:    fn: (span: Span) => T,
+src/lib/services/base.ts:167:    attributes?: Attributes
+src/lib/services/base.ts:168:  ): T {
+src/lib/services/base.ts:169:    const spanName = `${this.serviceName}.${operationName}`;
+src/lib/services/base.ts:170:
+src/lib/services/base.ts:171:    return withSpanSync(
+src/lib/services/base.ts:172:      spanName,
+src/lib/services/base.ts:173:      (span) => {
+src/lib/services/base.ts:174:        const startTime = Date.now();
+src/lib/services/base.ts:175:
+src/lib/services/base.ts:176:        try {
+src/lib/services/base.ts:177:          const result = fn(span);
+src/lib/services/base.ts:178:
+src/lib/services/base.ts:179:          const durationMs = Date.now() - startTime;
+src/lib/services/base.ts:180:          this.log.debug(
+src/lib/services/base.ts:181:            { operation: operationName, durationMs, ...getTraceContext() },
+src/lib/services/base.ts:182:            `Completed ${operationName} in ${durationMs}ms`
+src/lib/services/base.ts:183:          );
+src/lib/services/base.ts:184:
+src/lib/services/base.ts:185:          return result;
+src/lib/services/base.ts:186:        } catch (error) {
+src/lib/services/base.ts:187:          const durationMs = Date.now() - startTime;
+src/lib/services/base.ts:188:          const mmsError = toMmsError(error);
+src/lib/services/base.ts:189:
+src/lib/services/base.ts:190:          this.log.error(
+src/lib/services/base.ts:191:            {
+src/lib/services/base.ts:192:              operation: operationName,
+src/lib/services/base.ts:193:              durationMs,
+src/lib/services/base.ts:194:              error: mmsError.toJSON(),
+src/lib/services/base.ts:195:              ...getTraceContext(),
+src/lib/services/base.ts:196:            },
+src/lib/services/base.ts:197:            `Failed ${operationName}: ${mmsError.message}`
+src/lib/services/base.ts:198:          );
+src/lib/services/base.ts:199:
+src/lib/services/base.ts:200:          throw mmsError;
+src/lib/services/base.ts:201:        }
+src/lib/services/base.ts:202:      },
+src/lib/services/base.ts:203:      {
+src/lib/services/base.ts:204:        kind: SpanKind.INTERNAL,
+src/lib/services/base.ts:205:        tracer: this.tracer,
+src/lib/services/base.ts:206:        attributes: {
+src/lib/services/base.ts:207:          'service.name': this.serviceName,
+src/lib/services/base.ts:208:          'operation.name': operationName,
+src/lib/services/base.ts:209:          ...attributes,
+src/lib/services/base.ts:210:        },
+src/lib/services/base.ts:211:      }
+src/lib/services/base.ts:212:    );
+src/lib/services/base.ts:213:  }
+src/lib/services/base.ts:214:
+src/lib/services/base.ts:215:  /**
+src/lib/services/base.ts:216:   * Execute a database transaction with tracing
+src/lib/services/base.ts:217:   *
+src/lib/services/base.ts:218:   * Automatically commits on success, rolls back on error.
+src/lib/services/base.ts:219:   * Creates a child span for the transaction.
+src/lib/services/base.ts:220:   *
+src/lib/services/base.ts:221:   * @param operationName - Name of the operation
+src/lib/services/base.ts:222:   * @param fn - Function to execute within the transaction
+src/lib/services/base.ts:223:   */
+src/lib/services/base.ts:224:  protected async inTransaction<T>(
+src/lib/services/base.ts:225:    operationName: string,
+src/lib/services/base.ts:226:    fn: (tx: Transaction, span: Span) => Promise<T>
+src/lib/services/base.ts:227:  ): Promise<T> {
+src/lib/services/base.ts:228:    return this.traced(
+src/lib/services/base.ts:229:      `${operationName}.transaction`,
+src/lib/services/base.ts:230:      async (span) => {
+src/lib/services/base.ts:231:        span.setAttribute(MmsAttributes.DB_OPERATION, 'transaction');
+src/lib/services/base.ts:232:        addSpanEvent('transaction.begin', undefined, span);
+src/lib/services/base.ts:233:
+src/lib/services/base.ts:234:        try {
+src/lib/services/base.ts:235:          const result = await withTransaction(async (tx) => fn(tx, span));
+src/lib/services/base.ts:236:          addSpanEvent('transaction.commit', undefined, span);
+src/lib/services/base.ts:237:          return result;
+src/lib/services/base.ts:238:        } catch (error) {
+src/lib/services/base.ts:239:          addSpanEvent('transaction.rollback', undefined, span);
+src/lib/services/base.ts:240:          throw error;
+src/lib/services/base.ts:241:        }
+src/lib/services/base.ts:242:      },
+src/lib/services/base.ts:243:      { [MmsAttributes.DB_OPERATION]: 'transaction' }
+src/lib/services/base.ts:244:    );
+src/lib/services/base.ts:245:  }
+src/lib/services/base.ts:246:
+src/lib/services/base.ts:247:  /**
+src/lib/services/base.ts:248:   * Wrap an operation result with timing and error info
+src/lib/services/base.ts:249:   */
+src/lib/services/base.ts:250:  protected async safeExecute<T>(
+src/lib/services/base.ts:251:    operationName: string,
+src/lib/services/base.ts:252:    fn: () => Promise<T>
+src/lib/services/base.ts:253:  ): Promise<OperationResult<T>> {
+src/lib/services/base.ts:254:    const startTime = Date.now();
+src/lib/services/base.ts:255:
+src/lib/services/base.ts:256:    try {
+src/lib/services/base.ts:257:      const data = await fn();
+src/lib/services/base.ts:258:      return {
+src/lib/services/base.ts:259:        success: true,
+src/lib/services/base.ts:260:        data,
+src/lib/services/base.ts:261:        durationMs: Date.now() - startTime,
+src/lib/services/base.ts:262:      };
+src/lib/services/base.ts:263:    } catch (error) {
+src/lib/services/base.ts:264:      const mmsError = toMmsError(error);
+src/lib/services/base.ts:265:      return {
+src/lib/services/base.ts:266:        success: false,
+src/lib/services/base.ts:267:        error: mmsError,
+src/lib/services/base.ts:268:        durationMs: Date.now() - startTime,
+src/lib/services/base.ts:269:      };
+src/lib/services/base.ts:270:    }
+src/lib/services/base.ts:271:  }
+src/lib/services/base.ts:272:
+src/lib/services/base.ts:273:  /**
+src/lib/services/base.ts:274:   * Record a domain event on the current span
+src/lib/services/base.ts:275:   */
+src/lib/services/base.ts:276:  protected recordEvent(
+src/lib/services/base.ts:277:    name: string,
+src/lib/services/base.ts:278:    attributes?: Attributes,
+src/lib/services/base.ts:279:    span?: Span
+src/lib/services/base.ts:280:  ): void {
+src/lib/services/base.ts:281:    addSpanEvent(name, attributes, span);
+src/lib/services/base.ts:282:    this.log.debug({ event: name, ...attributes }, `Event: ${name}`);
+src/lib/services/base.ts:283:  }
+src/lib/services/base.ts:284:
+src/lib/services/base.ts:285:  /**
+src/lib/services/base.ts:286:   * Record an error in logs and traces
+src/lib/services/base.ts:287:   */
+src/lib/services/base.ts:288:  protected recordError(error: Error | unknown, span?: Span): void {
+src/lib/services/base.ts:289:    const mmsError = toMmsError(error);
+src/lib/services/base.ts:290:    pinoLogError(this.log, mmsError instanceof Error ? mmsError : new Error(String(error)));
+src/lib/services/base.ts:291:    if (span) {
+src/lib/services/base.ts:292:      recordSpanError(span, error);
+src/lib/services/base.ts:293:    }
+src/lib/services/base.ts:294:  }
+src/lib/services/base.ts:295:
+src/lib/services/base.ts:296:  /**
+src/lib/services/base.ts:297:   * Create a child logger with additional context
+src/lib/services/base.ts:298:   */
+src/lib/services/base.ts:299:  protected childLogger(context: Record<string, unknown>): Logger {
+src/lib/db/connection.ts:78:  } catch {
+src/lib/db/connection.ts:79:    return false;
+src/lib/db/connection.ts:80:  }
+src/lib/db/connection.ts:81:}
+src/lib/db/connection.ts:82:
+src/lib/db/connection.ts:83:/**
+src/lib/db/connection.ts:84: * Graceful shutdown
+src/lib/db/connection.ts:85: *
+src/lib/db/connection.ts:86: * Close all database connections gracefully.
+src/lib/db/connection.ts:87: * Call this during application shutdown.
+src/lib/db/connection.ts:88: */
+src/lib/db/connection.ts:89:export async function closeDatabaseConnection(): Promise<void> {
+src/lib/db/connection.ts:90:  await sql.end();
+src/lib/db/connection.ts:91:}
+src/lib/db/connection.ts:92:
+src/lib/db/connection.ts:93:/**
+src/lib/db/connection.ts:94: * Database transaction helper
+src/lib/db/connection.ts:95: *
+src/lib/db/connection.ts:96: * Executes a function within a database transaction.
+src/lib/db/connection.ts:97: * Automatically commits on success or rolls back on error.
+src/lib/db/connection.ts:98: *
+src/lib/db/connection.ts:99: * @example
+src/lib/db/connection.ts:100: * const result = await withTransaction(async (tx) => {
+src/lib/db/connection.ts:101: *   await tx.insert(trains).values({ ... });
+src/lib/db/connection.ts:102: *   await tx.insert(pmSchedule).values({ ... });
+src/lib/db/connection.ts:103: *   return { success: true };
+src/lib/db/connection.ts:104: * });
+src/lib/db/connection.ts:105: */
+src/lib/db/connection.ts:106:export type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+src/lib/db/connection.ts:107:
+src/lib/db/connection.ts:108:export async function withTransaction<T>(
+src/lib/db/connection.ts:109:  fn: (tx: Transaction) => Promise<T>
+src/lib/db/connection.ts:110:): Promise<T> {
+src/lib/redis/connection.ts:97:  } catch {
+src/lib/redis/connection.ts:98:    return false;
+src/lib/redis/connection.ts:99:  }
+src/lib/redis/connection.ts:100:}
+src/lib/redis/connection.ts:101:
+src/lib/redis/connection.ts:102:/**
+src/lib/redis/connection.ts:103: * Close all Redis connections
+src/lib/redis/connection.ts:104: * Call during graceful shutdown
+src/lib/redis/connection.ts:105: */
+src/lib/redis/connection.ts:106:export async function closeRedisConnections(): Promise<void> {
+src/lib/redis/connection.ts:107:  const closePromises: Promise<void>[] = [];
+src/lib/redis/connection.ts:108:
+src/lib/redis/connection.ts:109:  if (redisClient) {
+src/lib/redis/connection.ts:110:    closePromises.push(
+src/lib/redis/connection.ts:111:      redisClient.quit().then(() => {
+src/lib/redis/connection.ts:112:        redisClient = null;
+src/lib/redis/connection.ts:113:      })
+src/lib/redis/connection.ts:114:    );
+src/lib/redis/connection.ts:115:  }
+src/lib/redis/connection.ts:116:
+src/lib/redis/connection.ts:117:  if (bullmqConnection) {
+src/lib/redis/connection.ts:118:    closePromises.push(
+src/lib/redis/connection.ts:119:      bullmqConnection.quit().then(() => {
+src/lib/redis/connection.ts:120:        bullmqConnection = null;
+src/lib/redis/connection.ts:121:      })
+src/lib/redis/connection.ts:122:    );
+src/lib/redis/connection.ts:123:  }
+src/lib/redis/connection.ts:124:
+src/lib/redis/connection.ts:125:  await Promise.all(closePromises);
+src/lib/redis/connection.ts:126:  console.info('[Redis] All connections closed');
+src/lib/redis/connection.ts:127:}
+src/lib/redis/connection.ts:128:
+src/lib/redis/connection.ts:129:/**
+src/lib/redis/connection.ts:130: * Cache utilities
+src/lib/redis/connection.ts:131: */
+src/lib/redis/connection.ts:132:export const cache = {
+src/lib/redis/connection.ts:133:  /**
+src/lib/redis/connection.ts:134:   * Get cached value
+src/lib/redis/connection.ts:135:   */
+src/lib/redis/connection.ts:136:  async get<T>(key: string): Promise<T | null> {
+src/lib/redis/connection.ts:137:    const client = getRedisClient();
+src/lib/redis/connection.ts:138:    const value = await client.get(key);
+src/lib/redis/connection.ts:139:    if (!value) return null;
+src/lib/redis/connection.ts:140:    try {
+src/lib/redis/connection.ts:141:      return JSON.parse(value) as T;
+src/lib/redis/connection.ts:142:    } catch {
+src/lib/redis/connection.ts:143:      return value as unknown as T;
+src/lib/redis/connection.ts:144:    }
+src/lib/redis/connection.ts:145:  },
+src/lib/redis/connection.ts:146:
+src/lib/redis/connection.ts:147:  /**
+src/lib/redis/connection.ts:148:   * Set cached value with optional TTL
+src/lib/redis/connection.ts:149:   */
+src/lib/redis/connection.ts:150:  async set<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
+src/lib/redis/connection.ts:151:    const client = getRedisClient();
+src/lib/redis/connection.ts:152:    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+src/lib/redis/connection.ts:153:    if (ttlSeconds) {
+src/lib/redis/connection.ts:154:      await client.setex(key, ttlSeconds, serialized);
+src/lib/redis/connection.ts:155:    } else {
+src/lib/redis/connection.ts:156:      await client.set(key, serialized);
+src/lib/redis/connection.ts:157:    }
+src/lib/redis/connection.ts:158:  },
+src/lib/redis/connection.ts:159:
+src/lib/redis/connection.ts:160:  /**
+src/lib/redis/connection.ts:161:   * Delete cached value
+src/lib/redis/connection.ts:162:   */
+src/lib/redis/connection.ts:163:  async del(key: string): Promise<void> {
+src/lib/redis/connection.ts:164:    const client = getRedisClient();
+src/lib/redis/connection.ts:165:    await client.del(key);
+src/lib/redis/connection.ts:166:  },
+src/lib/redis/connection.ts:167:
+src/lib/redis/connection.ts:168:  /**
+src/lib/redis/connection.ts:169:   * Delete multiple keys by pattern
+src/lib/redis/connection.ts:170:   */
+src/lib/redis/connection.ts:171:  async delByPattern(pattern: string): Promise<number> {
+src/lib/utils/transaction.ts:101:      } catch (error) {
+src/lib/utils/transaction.ts:102:        addSpanEvent('transaction.rollback', {
+src/lib/utils/transaction.ts:103:          'db.transaction.error': error instanceof Error ? error.message : String(error),
+src/lib/utils/transaction.ts:104:        });
+src/lib/utils/transaction.ts:105:        throw error;
+src/lib/utils/transaction.ts:106:      }
+src/lib/utils/transaction.ts:107:    },
+src/lib/utils/transaction.ts:108:    { kind: SpanKind.CLIENT }
+src/lib/utils/transaction.ts:109:  );
+src/lib/utils/transaction.ts:110:}
+src/lib/utils/transaction.ts:111:
+src/lib/utils/transaction.ts:112:/**
+src/lib/utils/transaction.ts:113: * Execute transaction without tracing (internal)
+src/lib/utils/transaction.ts:114: */
+src/lib/utils/transaction.ts:115:async function executeTransaction<T>(
+src/lib/utils/transaction.ts:116:  fn: (tx: Transaction) => Promise<T>,
+src/lib/utils/transaction.ts:117:  opts: Required<TransactionOptions>
+src/lib/utils/transaction.ts:118:): Promise<TransactionResult<T>> {
+src/lib/utils/transaction.ts:119:  const startTime = Date.now();
+src/lib/utils/transaction.ts:120:
+src/lib/utils/transaction.ts:121:  // Create timeout promise
+src/lib/utils/transaction.ts:122:  const timeoutPromise = new Promise<never>((_, reject) => {
+src/lib/utils/transaction.ts:123:    setTimeout(() => {
+src/lib/utils/transaction.ts:124:      reject(
+src/lib/utils/transaction.ts:125:        new TimeoutError(`Transaction timed out after ${opts.timeoutMs}ms`, {
+src/lib/utils/transaction.ts:126:          operation: opts.operationName,
+src/lib/utils/transaction.ts:127:          timeoutMs: opts.timeoutMs,
+src/lib/utils/transaction.ts:128:        })
+src/lib/utils/transaction.ts:129:      );
+src/lib/utils/transaction.ts:130:    }, opts.timeoutMs);
+src/lib/utils/transaction.ts:131:  });
+src/lib/utils/transaction.ts:132:
+src/lib/utils/transaction.ts:133:  try {
+src/lib/utils/transaction.ts:134:    // Race between transaction and timeout
+src/lib/utils/transaction.ts:135:    const data = await Promise.race([
+src/lib/utils/transaction.ts:136:      db.transaction(async (tx) => fn(tx)),
+src/lib/utils/transaction.ts:137:      timeoutPromise,
+src/lib/utils/transaction.ts:138:    ]);
+src/lib/utils/transaction.ts:139:
+src/lib/utils/transaction.ts:140:    return {
+src/lib/utils/transaction.ts:141:      data,
+src/lib/utils/transaction.ts:142:      durationMs: Date.now() - startTime,
+src/lib/utils/transaction.ts:143:    };
+src/lib/utils/transaction.ts:144:  } catch (error) {
+src/lib/utils/transaction.ts:145:    const durationMs = Date.now() - startTime;
+src/lib/utils/transaction.ts:146:
+src/lib/utils/transaction.ts:147:    // Enhance error with context
+src/lib/utils/transaction.ts:148:    if (error instanceof TimeoutError) {
+src/lib/utils/transaction.ts:149:      throw error;
+src/lib/utils/transaction.ts:150:    }
+src/lib/utils/transaction.ts:151:
+src/lib/utils/transaction.ts:152:    if (error instanceof Error) {
+src/lib/utils/transaction.ts:153:      logger.error(
+src/lib/utils/transaction.ts:154:        {
+src/lib/utils/transaction.ts:155:          operation: opts.operationName,
+src/lib/utils/transaction.ts:156:          durationMs,
+src/lib/utils/transaction.ts:157:          error: error.message,
+src/lib/utils/transaction.ts:158:        },
+src/lib/utils/transaction.ts:159:        'Transaction failed'
+src/lib/utils/transaction.ts:160:      );
+src/lib/utils/transaction.ts:161:
+src/lib/utils/transaction.ts:162:      throw new DatabaseError(`Transaction failed: ${error.message}`, {
+src/lib/utils/transaction.ts:163:        operation: opts.operationName,
+src/lib/utils/transaction.ts:164:        durationMs,
+src/lib/utils/transaction.ts:165:        originalError: error.name,
+src/lib/utils/transaction.ts:166:      });
+src/lib/utils/transaction.ts:167:    }
+src/lib/utils/transaction.ts:168:
+src/lib/utils/transaction.ts:169:    throw error;
+src/lib/utils/transaction.ts:170:  }
+src/lib/utils/transaction.ts:171:}
+src/lib/utils/transaction.ts:172:
+src/lib/utils/transaction.ts:173:/**
+src/lib/utils/transaction.ts:174: * Simple transaction wrapper (non-traced)
+src/lib/utils/transaction.ts:175: *
+src/lib/utils/transaction.ts:176: * Use this for simple operations where tracing overhead is unnecessary.
+src/lib/utils/transaction.ts:177: */
+src/lib/utils/transaction.ts:178:export async function simpleTransaction<T>(
+src/lib/utils/transaction.ts:179:  fn: (tx: Transaction) => Promise<T>
+src/lib/utils/transaction.ts:180:): Promise<T> {
+src/lib/utils/transaction.ts:181:  return db.transaction(async (tx) => fn(tx));
+src/lib/utils/transaction.ts:182:}
+src/lib/utils/transaction.ts:183:
+src/lib/utils/transaction.ts:184:/**
+src/lib/utils/transaction.ts:185: * Execute multiple operations in a single transaction with individual error handling
+src/lib/utils/transaction.ts:186: *
+src/lib/utils/transaction.ts:187: * Useful for batch operations where you want to collect errors but continue processing.
+src/lib/utils/transaction.ts:188: * The transaction only commits if all operations succeed.
+src/lib/utils/transaction.ts:189: *
+src/lib/utils/transaction.ts:190: * @example
+src/lib/utils/transaction.ts:191: * ```typescript
+src/lib/utils/transaction.ts:192: * const results = await batchTransaction([
+src/lib/utils/transaction.ts:193: *   (tx) => tx.insert(trains).values(train1),
+src/lib/utils/transaction.ts:194: *   (tx) => tx.insert(trains).values(train2),
+src/lib/utils/transaction.ts:195: *   (tx) => tx.insert(trains).values(train3),
+src/lib/utils/transaction.ts:196: * ]);
+src/lib/utils/transaction.ts:197: * // results contains success/error for each operation
+src/lib/utils/transaction.ts:198: * ```
+src/lib/utils/transaction.ts:199: */
+src/lib/utils/transaction.ts:200:export interface BatchResult<T> {
+src/lib/utils/transaction.ts:201:  index: number;
+src/lib/utils/transaction.ts:202:  success: boolean;
+src/lib/utils/transaction.ts:203:  data?: T;
+src/lib/utils/transaction.ts:204:  error?: Error;
+src/lib/utils/transaction.ts:205:}
+src/lib/utils/transaction.ts:206:
+src/lib/utils/transaction.ts:207:export async function batchTransaction<T>(
+src/lib/utils/transaction.ts:208:  operations: Array<(tx: Transaction) => Promise<T>>,
+src/lib/utils/transaction.ts:209:  options?: TransactionOptions
+src/lib/utils/transaction.ts:210:): Promise<BatchResult<T>[]> {
+src/lib/utils/transaction.ts:211:  const opts = { ...DEFAULT_OPTIONS, ...options, operationName: options?.operationName ?? 'batch' };
+src/lib/utils/transaction.ts:212:
+src/lib/utils/transaction.ts:213:  const result = await tracedTransaction<BatchResult<T>[]>(
+src/lib/utils/transaction.ts:214:    async (tx) => {
+src/lib/utils/transaction.ts:215:      const results: BatchResult<T>[] = [];
+src/lib/utils/transaction.ts:216:
+src/lib/utils/transaction.ts:217:      for (let i = 0; i < operations.length; i++) {
+src/lib/utils/transaction.ts:218:        const operation = operations[i];
+src/lib/utils/transaction.ts:219:        if (!operation) continue;
+src/lib/utils/transaction.ts:220:
+src/lib/utils/transaction.ts:221:        try {
+src/lib/utils/transaction.ts:222:          const data = await operation(tx);
+src/lib/utils/transaction.ts:223:          results.push({ index: i, success: true, data });
+src/lib/utils/transaction.ts:224:        } catch (error) {
+src/lib/utils/transaction.ts:225:          // In a strict batch, any error should fail the whole transaction
+src/lib/utils/transaction.ts:226:          // Re-throw to trigger rollback
+src/lib/utils/transaction.ts:227:          results.push({
+src/lib/utils/transaction.ts:228:            index: i,
+src/lib/utils/transaction.ts:229:            success: false,
+src/lib/utils/transaction.ts:230:            error: error instanceof Error ? error : new Error(String(error)),
+src/lib/utils/transaction.ts:231:          });
+src/lib/utils/transaction.ts:232:          throw error;
+src/lib/utils/transaction.ts:233:        }
+src/lib/utils/transaction.ts:234:      }
+src/lib/utils/transaction.ts:235:
+src/lib/utils/transaction.ts:236:      return results;
+src/lib/utils/transaction.ts:237:    },
+src/lib/utils/transaction.ts:238:    opts
+src/lib/utils/transaction.ts:239:  );
+src/lib/utils/transaction.ts:240:
+src/lib/utils/transaction.ts:241:  return result.data;
+src/lib/utils/transaction.ts:242:}
+src/lib/utils/transaction.ts:243:
+src/lib/utils/transaction.ts:244:/**
+src/lib/utils/transaction.ts:245: * Execute a read-only query (no transaction needed, but with tracing)
+src/lib/utils/transaction.ts:246: */
+src/lib/utils/transaction.ts:247:export async function tracedQuery<T>(
+src/lib/utils/transaction.ts:248:  operationName: string,
+src/lib/utils/transaction.ts:249:  fn: (database: Database) => Promise<T>
+src/lib/utils/transaction.ts:250:): Promise<T> {
+src/lib/utils/transaction.ts:251:  return withSpan(
+src/lib/utils/transaction.ts:252:    `db.query.${operationName}`,
+src/lib/utils/transaction.ts:253:    async (span) => {
+src/lib/tracing/index.ts:168:  } catch (error) {
+src/lib/tracing/index.ts:169:    recordSpanError(span, error);
+src/lib/tracing/index.ts:170:    throw error;
+src/lib/tracing/index.ts:171:  } finally {
+src/lib/tracing/index.ts:172:    span.end();
+src/lib/tracing/index.ts:173:  }
+src/lib/tracing/index.ts:174:}
+src/lib/tracing/index.ts:175:
+src/lib/tracing/index.ts:176:/**
+src/lib/tracing/index.ts:177: * Synchronous version of withSpan
+src/lib/tracing/index.ts:178: */
+src/lib/tracing/index.ts:179:export function withSpanSync<T>(
+src/lib/tracing/index.ts:180:  name: string,
+src/lib/tracing/index.ts:181:  fn: (span: Span) => T,
+src/lib/tracing/index.ts:182:  options?: SpanOptions & { tracer?: Tracer }
+src/lib/tracing/index.ts:183:): T {
+src/lib/tracing/index.ts:184:  const tracer = options?.tracer ?? getTracer();
+src/lib/tracing/index.ts:185:  const span = tracer.startSpan(name, {
+src/lib/tracing/index.ts:186:    kind: SpanKind.INTERNAL,
+src/lib/tracing/index.ts:187:    ...options,
+src/lib/tracing/index.ts:188:    attributes: {
+src/lib/tracing/index.ts:189:      ...getServiceAttributes(),
+src/lib/tracing/index.ts:190:      ...options?.attributes,
+src/lib/tracing/index.ts:191:    },
+src/lib/tracing/index.ts:192:  });
+src/lib/tracing/index.ts:193:
+src/lib/tracing/index.ts:194:  const ctx = trace.setSpan(context.active(), span);
+src/lib/tracing/index.ts:195:
+src/lib/tracing/index.ts:196:  try {
+src/lib/tracing/index.ts:197:    const result = context.with(ctx, () => fn(span));
+src/lib/tracing/index.ts:198:    span.setStatus({ code: SpanStatusCode.OK });
+src/lib/tracing/index.ts:199:    return result;
+src/lib/tracing/index.ts:200:  } catch (error) {
+src/lib/tracing/index.ts:201:    recordSpanError(span, error);
+src/lib/tracing/index.ts:202:    throw error;
+src/lib/tracing/index.ts:203:  } finally {
+src/lib/tracing/index.ts:204:    span.end();
+src/lib/tracing/index.ts:205:  }
+src/lib/tracing/index.ts:206:}
+src/lib/tracing/index.ts:207:
+src/lib/tracing/index.ts:208:/**
+src/lib/tracing/index.ts:209: * Record an error on a span
+src/lib/tracing/index.ts:210: */
+src/lib/tracing/index.ts:211:export function recordSpanError(span: Span, error: unknown): void {
+src/lib/tracing/index.ts:212:  span.setStatus({
+src/lib/tracing/index.ts:213:    code: SpanStatusCode.ERROR,
+src/lib/tracing/index.ts:214:    message: error instanceof Error ? error.message : String(error),
+src/lib/tracing/index.ts:215:  });
+src/lib/tracing/index.ts:216:
+src/lib/tracing/index.ts:217:  if (error instanceof Error) {
+src/lib/tracing/index.ts:218:    span.recordException(error);
+src/lib/tracing/index.ts:219:
+src/lib/tracing/index.ts:220:    // Add MMS error attributes if available
+src/lib/tracing/index.ts:221:    const mmsError = error as Error & { code?: string; statusCode?: number };
+src/lib/tracing/index.ts:222:    if (mmsError.code) {
+src/lib/tracing/index.ts:223:      span.setAttribute(MmsAttributes.ERROR_CODE, mmsError.code);
+src/lib/tracing/index.ts:224:    }
+src/lib/tracing/index.ts:225:    if (mmsError.statusCode) {
+src/lib/tracing/index.ts:226:      span.setAttribute('http.status_code', mmsError.statusCode);
+src/lib/tracing/index.ts:227:    }
+src/lib/tracing/index.ts:228:    span.setAttribute(MmsAttributes.ERROR_TYPE, error.name);
+src/lib/tracing/index.ts:229:  }
+src/lib/tracing/index.ts:230:}
+src/lib/tracing/index.ts:231:
+src/lib/tracing/index.ts:232:/**
+src/lib/tracing/index.ts:233: * Add an event to the current span
+src/lib/tracing/index.ts:234: */
+src/lib/tracing/index.ts:235:export function addSpanEvent(
+src/lib/tracing/index.ts:236:  name: string,
+src/lib/tracing/index.ts:237:  attributes?: Attributes,
+src/lib/tracing/index.ts:238:  span?: Span
+src/lib/tracing/index.ts:239:): void {
+src/lib/tracing/index.ts:240:  const currentSpan = span ?? trace.getActiveSpan();
+src/lib/tracing/index.ts:241:  currentSpan?.addEvent(name, attributes);
+src/lib/tracing/index.ts:242:}
+src/lib/tracing/index.ts:243:
+src/lib/tracing/index.ts:244:/**
+src/lib/tracing/index.ts:245: * Get the current active span
+src/lib/tracing/index.ts:246: */
+src/lib/tracing/index.ts:247:export function getActiveSpan(): Span | undefined {
+src/lib/tracing/index.ts:248:  return trace.getActiveSpan();
+src/lib/tracing/index.ts:249:}
+src/lib/tracing/index.ts:250:
+src/lib/tracing/index.ts:251:/**
+src/lib/tracing/index.ts:252: * Get the current trace ID (for correlation with logs)
+src/lib/tracing/index.ts:253: */
+src/lib/tracing/index.ts:254:export function getTraceId(): string | undefined {
+src/lib/tracing/index.ts:255:  return getActiveSpan()?.spanContext().traceId;
+src/lib/tracing/index.ts:256:}
+src/lib/tracing/index.ts:257:
+src/lib/tracing/index.ts:258:/**
+src/lib/tracing/index.ts:259: * Get the current span ID
+src/lib/tracing/index.ts:260: */
+src/lib/tracing/index.ts:261:export function getSpanId(): string | undefined {
+src/lib/tracing/index.ts:262:  return getActiveSpan()?.spanContext().spanId;
+src/lib/tracing/index.ts:263:}
+src/lib/tracing/index.ts:264:
+src/lib/tracing/index.ts:265:/**
+src/lib/tracing/index.ts:266: * Create a trace context object for logging
+src/lib/tracing/index.ts:267: */
+src/lib/tracing/index.ts:268:export function getTraceContext(): { traceId?: string; spanId?: string } {
+src/lib/tracing/index.ts:269:  const span = getActiveSpan();
+src/lib/tracing/index.ts:270:  if (!span) return {};
+src/lib/tracing/index.ts:271:
+src/lib/tracing/index.ts:272:  const ctx = span.spanContext();
+src/lib/tracing/index.ts:273:  return {
+src/lib/tracing/index.ts:274:    traceId: ctx.traceId,
+src/lib/tracing/index.ts:275:    spanId: ctx.spanId,
+src/lib/tracing/index.ts:276:  };
+src/lib/tracing/index.ts:277:}
+src/lib/tracing/index.ts:278:
+src/lib/tracing/index.ts:279:/**
+src/lib/tracing/index.ts:280: * Execute a function within the context of an existing span
+src/lib/tracing/index.ts:281: */
+src/lib/tracing/index.ts:282:export async function withContext<T>(
+src/lib/tracing/index.ts:283:  ctx: Context,
+src/lib/tracing/index.ts:284:  fn: () => Promise<T>
+src/lib/tracing/index.ts:285:): Promise<T> {
+src/lib/tracing/index.ts:286:  return context.with(ctx, fn);
+src/lib/tracing/index.ts:287:}
+src/lib/tracing/index.ts:288:
+src/lib/tracing/index.ts:289:/**
+src/lib/tracing/index.ts:290: * Create a linked span (for async operations that continue from another trace)
+src/lib/tracing/index.ts:291: */
+src/lib/tracing/index.ts:292:export function createLinkedSpan(
+src/lib/tracing/index.ts:293:  name: string,
+src/lib/tracing/index.ts:294:  parentSpan: Span,
+src/lib/tracing/index.ts:295:  options?: SpanOptions
+src/lib/tracing/index.ts:296:): Span {
+src/lib/tracing/index.ts:297:  const tracer = getTracer();
+src/lib/tracing/index.ts:298:  return tracer.startSpan(name, {
+src/lib/tracing/index.ts:299:    ...options,
+src/lib/tracing/index.ts:300:    links: [
+src/lib/tracing/index.ts:301:      ...(options?.links ?? []),
+src/lib/tracing/index.ts:302:      { context: parentSpan.spanContext() },
+src/lib/tracing/index.ts:303:    ],
+src/lib/tracing/index.ts:304:    attributes: {
+src/lib/utils/resilience.ts:204:        } catch (error) {
+src/lib/utils/resilience.ts:205:          lastError = error;
+src/lib/utils/resilience.ts:206:
+src/lib/utils/resilience.ts:207:          // Check if we should retry
+src/lib/utils/resilience.ts:208:          const shouldRetry = attempt < opts.maxAttempts && (opts.isRetryable?.(error) ?? true);
+src/lib/utils/resilience.ts:209:
+src/lib/utils/resilience.ts:210:          if (!shouldRetry) {
+src/lib/utils/resilience.ts:211:            addSpanEvent('retry.exhausted', {
+src/lib/utils/resilience.ts:212:              attempt,
+src/lib/utils/resilience.ts:213:              error: error instanceof Error ? error.message : String(error),
+src/lib/utils/resilience.ts:214:              retryable: opts.isRetryable?.(error) ?? true,
+src/lib/utils/resilience.ts:215:            });
+src/lib/utils/resilience.ts:216:            throw error;
+src/lib/utils/resilience.ts:217:          }
+src/lib/utils/resilience.ts:218:
+src/lib/utils/resilience.ts:219:          // Calculate delay
+src/lib/utils/resilience.ts:220:          const delayMs = calculateDelay(attempt, opts);
+src/lib/utils/resilience.ts:221:
+src/lib/utils/resilience.ts:222:          addSpanEvent('retry.waiting', {
+src/lib/utils/resilience.ts:223:            attempt,
+src/lib/utils/resilience.ts:224:            delayMs,
+src/lib/utils/resilience.ts:225:            error: error instanceof Error ? error.message : String(error),
+src/lib/utils/resilience.ts:226:          });
+src/lib/utils/resilience.ts:227:
+src/lib/utils/resilience.ts:228:          // Invoke callback if provided
+src/lib/utils/resilience.ts:229:          opts.onRetry?.(error, attempt, delayMs);
+src/lib/utils/resilience.ts:230:
+src/lib/utils/resilience.ts:231:          logger.warn(
+src/lib/utils/resilience.ts:232:            {
+src/lib/utils/resilience.ts:233:              operation: name,
+src/lib/utils/resilience.ts:234:              attempt,
+src/lib/utils/resilience.ts:235:              nextAttempt: attempt + 1,
+src/lib/utils/resilience.ts:236:              delayMs,
+src/lib/utils/resilience.ts:237:              error: error instanceof Error ? error.message : String(error),
+src/lib/utils/resilience.ts:238:            },
+src/lib/utils/resilience.ts:239:            `Retry attempt ${attempt}/${opts.maxAttempts} failed, waiting ${delayMs}ms`
+src/lib/utils/resilience.ts:240:          );
+src/lib/utils/resilience.ts:241:
+src/lib/utils/resilience.ts:242:          await sleep(delayMs);
+src/lib/utils/resilience.ts:243:        }
+src/lib/utils/resilience.ts:244:      }
+src/lib/utils/resilience.ts:245:
+src/lib/utils/resilience.ts:246:      // Should never reach here, but TypeScript needs this
+src/lib/utils/resilience.ts:247:      throw lastError;
+src/lib/utils/resilience.ts:248:    },
+src/lib/utils/resilience.ts:249:    { kind: SpanKind.INTERNAL }
+src/lib/utils/resilience.ts:250:  );
+src/lib/utils/resilience.ts:251:}
+src/lib/utils/resilience.ts:252:
+src/lib/utils/resilience.ts:253:// =============================================================================
+src/lib/utils/resilience.ts:254:// Circuit Breaker Implementation
+src/lib/utils/resilience.ts:255:// =============================================================================
+src/lib/utils/resilience.ts:256:
+src/lib/utils/resilience.ts:257:/**
+src/lib/utils/resilience.ts:258: * Circuit breaker states
+src/lib/utils/resilience.ts:259: */
+src/lib/utils/resilience.ts:260:export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+src/lib/utils/resilience.ts:261:
+src/lib/utils/resilience.ts:262:/**
+src/lib/utils/resilience.ts:263: * Circuit breaker configuration
+src/lib/utils/resilience.ts:264: */
+src/lib/utils/resilience.ts:265:export interface CircuitBreakerConfig {
+src/lib/utils/resilience.ts:266:  /** Number of failures before opening the circuit */
+src/lib/utils/resilience.ts:267:  failureThreshold: number;
+src/lib/utils/resilience.ts:268:  /** Number of successes in half-open state to close circuit */
+src/lib/utils/resilience.ts:269:  successThreshold: number;
+src/lib/utils/resilience.ts:270:  /** Time to wait before transitioning from OPEN to HALF_OPEN (ms) */
+src/lib/utils/resilience.ts:271:  resetTimeoutMs: number;
+src/lib/utils/resilience.ts:272:  /** Function to determine if an error counts as a failure */
+src/lib/utils/resilience.ts:273:  isFailure?: (error: unknown) => boolean;
+src/lib/utils/resilience.ts:274:  /** Callback when circuit state changes */
+src/lib/utils/resilience.ts:275:  onStateChange?: (from: CircuitState, to: CircuitState) => void;
+src/lib/utils/resilience.ts:276:}
+src/lib/utils/resilience.ts:277:
+src/lib/utils/resilience.ts:278:/**
+src/lib/utils/resilience.ts:279: * Default circuit breaker configuration
+src/lib/utils/resilience.ts:280: */
+src/lib/utils/resilience.ts:281:export const DEFAULT_CIRCUIT_BREAKER_CONFIG: CircuitBreakerConfig = {
+src/lib/utils/resilience.ts:282:  failureThreshold: 5,
+src/lib/utils/resilience.ts:283:  successThreshold: 3,
+src/lib/utils/resilience.ts:284:  resetTimeoutMs: 30000,
+src/lib/utils/resilience.ts:285:  isFailure: () => true,
+src/lib/utils/resilience.ts:286:};
+src/lib/utils/resilience.ts:287:
+src/lib/utils/resilience.ts:288:/**
+src/lib/utils/resilience.ts:289: * Circuit breaker metrics
+src/lib/utils/resilience.ts:290: */
+src/lib/utils/resilience.ts:291:export interface CircuitBreakerMetrics {
+src/lib/utils/resilience.ts:292:  state: CircuitState;
+src/lib/utils/resilience.ts:293:  failures: number;
+src/lib/utils/resilience.ts:294:  successes: number;
+src/lib/utils/resilience.ts:295:  lastFailureTime: Date | null;
+src/lib/utils/resilience.ts:296:  lastSuccessTime: Date | null;
+src/lib/utils/resilience.ts:297:  totalRequests: number;
+src/lib/utils/resilience.ts:298:  totalFailures: number;
+src/lib/utils/resilience.ts:299:  totalSuccesses: number;
+src/lib/utils/resilience.ts:300:}
+src/lib/utils/resilience.ts:301:
+src/lib/utils/resilience.ts:302:/**
+src/lib/utils/resilience.ts:303: * Circuit Breaker implementation
+src/lib/utils/resilience.ts:304: *
+src/lib/utils/resilience.ts:305: * Prevents cascading failures by stopping requests to a failing service.
+src/lib/utils/resilience.ts:306: * Implements the standard circuit breaker pattern:
+src/lib/utils/resilience.ts:307: * - CLOSED: Normal operation, requests flow through
+src/lib/utils/resilience.ts:308: * - OPEN: Failures exceeded threshold, requests fail fast
+src/lib/utils/resilience.ts:309: * - HALF_OPEN: Testing if service has recovered
+src/lib/utils/resilience.ts:310: *
+src/lib/utils/resilience.ts:311: * @example
+src/lib/utils/resilience.ts:312: * ```typescript
+src/lib/utils/resilience.ts:313: * const maximoBreaker = new CircuitBreaker({
+src/lib/utils/resilience.ts:314: *   failureThreshold: 5,
+src/lib/utils/resilience.ts:315: *   resetTimeoutMs: 30000,
+src/lib/utils/resilience.ts:316: *   onStateChange: (from, to) => {
+src/lib/utils/resilience.ts:317: *     logger.warn({ from, to }, 'Maximo circuit breaker state changed');
+src/lib/utils/resilience.ts:318: *   }
+src/lib/utils/resilience.ts:319: * }, 'maximo');
+src/lib/utils/resilience.ts:320: *
+src/lib/utils/resilience.ts:321: * // In service
+src/lib/utils/resilience.ts:322: * const result = await maximoBreaker.execute(
+src/lib/utils/resilience.ts:323: *   async () => fetchFromMaximo('/api/workorders')
+src/lib/utils/resilience.ts:324: * );
+src/lib/utils/resilience.ts:325: * ```
+src/lib/utils/resilience.ts:326: */
+src/lib/utils/resilience.ts:327:export class CircuitBreaker {
+src/lib/utils/resilience.ts:328:  private state: CircuitState = 'CLOSED';
+src/lib/utils/resilience.ts:329:  private failures = 0;
+src/lib/utils/resilience.ts:330:  private successes = 0;
+src/lib/utils/resilience.ts:331:  private lastFailureTime: Date | null = null;
+src/lib/utils/resilience.ts:332:  private lastSuccessTime: Date | null = null;
+src/lib/utils/resilience.ts:333:  private totalRequests = 0;
+src/lib/utils/resilience.ts:334:  private totalFailures = 0;
+src/lib/utils/resilience.ts:335:  private totalSuccesses = 0;
+src/lib/utils/resilience.ts:336:  private readonly config: CircuitBreakerConfig;
+src/lib/utils/resilience.ts:337:  private readonly name: string;
+src/lib/utils/resilience.ts:338:  private readonly log: typeof logger;
+src/lib/utils/resilience.ts:339:
+src/lib/utils/resilience.ts:340:  constructor(config: Partial<CircuitBreakerConfig> = {}, name = 'default') {
+src/lib/utils/resilience.ts:341:    this.config = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...config };
+src/lib/utils/resilience.ts:342:    this.name = name;
+src/lib/utils/resilience.ts:343:    this.log = logger.child({ circuitBreaker: name });
+src/lib/utils/resilience.ts:344:  }
+src/lib/utils/resilience.ts:345:
+src/lib/utils/resilience.ts:346:  /**
+src/lib/utils/resilience.ts:347:   * Execute a function through the circuit breaker
+src/lib/utils/resilience.ts:348:   */
+src/lib/utils/resilience.ts:349:  async execute<T>(fn: () => Promise<T>): Promise<T> {
+src/lib/utils/resilience.ts:350:    return withSpan(
+src/lib/utils/resilience.ts:351:      `circuitBreaker.${this.name}`,
+src/lib/utils/resilience.ts:352:      async (span) => {
+src/lib/utils/resilience.ts:353:        span.setAttribute('circuit_breaker.name', this.name);
+src/lib/utils/resilience.ts:354:        span.setAttribute('circuit_breaker.state', this.state);
+src/lib/utils/resilience.ts:355:
+src/lib/utils/resilience.ts:356:        this.totalRequests++;
+src/lib/utils/resilience.ts:357:
+src/lib/utils/resilience.ts:358:        // Check if circuit should transition from OPEN to HALF_OPEN
+src/lib/utils/resilience.ts:359:        this.checkResetTimeout();
+src/lib/utils/resilience.ts:360:
+src/lib/utils/resilience.ts:361:        // If circuit is OPEN, fail fast
+src/lib/utils/resilience.ts:362:        if (this.state === 'OPEN') {
+src/lib/utils/resilience.ts:363:          addSpanEvent('circuit_breaker.rejected', { state: this.state });
+src/lib/utils/resilience.ts:364:          throw new ServiceUnavailableError(
+src/lib/utils/resilience.ts:365:            `Circuit breaker ${this.name} is OPEN. Service unavailable.`,
+src/lib/utils/resilience.ts:366:            { retryAfter: Math.ceil(this.config.resetTimeoutMs / 1000) }
+src/lib/utils/resilience.ts:367:          );
+src/lib/utils/resilience.ts:368:        }
+src/lib/utils/resilience.ts:369:
+src/lib/utils/resilience.ts:370:        try {
+src/lib/utils/resilience.ts:371:          const result = await fn();
+src/lib/utils/resilience.ts:372:          this.recordSuccess();
+src/lib/utils/resilience.ts:373:          addSpanEvent('circuit_breaker.success', { state: this.state });
+src/lib/utils/resilience.ts:374:          return result;
+src/lib/utils/resilience.ts:375:        } catch (error) {
+src/lib/utils/resilience.ts:376:          if (this.config.isFailure?.(error) ?? true) {
+src/lib/utils/resilience.ts:377:            this.recordFailure();
+src/lib/utils/resilience.ts:378:            addSpanEvent('circuit_breaker.failure', {
+src/lib/utils/resilience.ts:379:              state: this.state,
+src/lib/utils/resilience.ts:380:              failures: this.failures,
+src/lib/utils/resilience.ts:381:            });
+src/lib/utils/resilience.ts:382:          }
+src/lib/utils/resilience.ts:383:          throw error;
+src/lib/utils/resilience.ts:384:        }
+src/lib/utils/resilience.ts:385:      },
+src/lib/utils/resilience.ts:386:      { kind: SpanKind.INTERNAL }
+src/lib/utils/resilience.ts:387:    );
+src/lib/utils/resilience.ts:388:  }
+src/lib/utils/resilience.ts:389:
+src/lib/utils/resilience.ts:390:  /**
+src/lib/utils/resilience.ts:391:   * Check if the reset timeout has elapsed and transition to HALF_OPEN
+src/lib/utils/resilience.ts:392:   */
+src/lib/utils/resilience.ts:393:  private checkResetTimeout(): void {
+src/lib/utils/resilience.ts:394:    if (this.state !== 'OPEN' || !this.lastFailureTime) return;
+src/lib/utils/resilience.ts:395:
+src/lib/utils/resilience.ts:396:    const elapsed = Date.now() - this.lastFailureTime.getTime();
+src/lib/utils/resilience.ts:397:    if (elapsed >= this.config.resetTimeoutMs) {
+src/lib/utils/resilience.ts:398:      this.transition('HALF_OPEN');
+src/lib/utils/resilience.ts:399:    }
+src/lib/utils/resilience.ts:400:  }
+src/lib/utils/resilience.ts:401:
+src/lib/utils/resilience.ts:402:  /**
+src/lib/utils/resilience.ts:403:   * Record a successful execution
+src/lib/utils/resilience.ts:404:   */
+src/lib/utils/resilience.ts:405:  private recordSuccess(): void {
+src/lib/utils/resilience.ts:406:    this.successes++;
+src/lib/utils/resilience.ts:407:    this.totalSuccesses++;
+src/lib/utils/resilience.ts:408:    this.lastSuccessTime = new Date();
+src/lib/utils/resilience.ts:409:
+src/lib/utils/resilience.ts:410:    if (this.state === 'HALF_OPEN') {
+src/lib/utils/resilience.ts:411:      if (this.successes >= this.config.successThreshold) {
+src/lib/utils/resilience.ts:412:        this.transition('CLOSED');
+src/lib/utils/resilience.ts:413:      }
+src/lib/utils/resilience.ts:414:    } else if (this.state === 'CLOSED') {
+src/lib/utils/resilience.ts:415:      // Reset failure count on success in CLOSED state
+src/lib/utils/resilience.ts:416:      this.failures = 0;
+src/lib/utils/resilience.ts:417:    }
+src/lib/utils/resilience.ts:418:  }
+src/lib/utils/resilience.ts:419:
+src/lib/utils/resilience.ts:420:  /**
+src/lib/utils/resilience.ts:421:   * Record a failed execution
+src/lib/utils/resilience.ts:422:   */
+src/lib/utils/resilience.ts:423:  private recordFailure(): void {
+src/lib/utils/resilience.ts:424:    this.failures++;
+src/lib/utils/resilience.ts:425:    this.totalFailures++;
+src/lib/utils/resilience.ts:426:    this.lastFailureTime = new Date();
+src/lib/utils/resilience.ts:427:    this.successes = 0; // Reset success count on failure
+src/lib/utils/resilience.ts:428:
+src/lib/utils/resilience.ts:429:    if (this.state === 'HALF_OPEN') {
+src/lib/utils/resilience.ts:430:      // Any failure in HALF_OPEN opens the circuit again
+src/lib/utils/resilience.ts:431:      this.transition('OPEN');
+src/lib/utils/resilience.ts:432:    } else if (this.state === 'CLOSED') {
+src/lib/utils/resilience.ts:433:      if (this.failures >= this.config.failureThreshold) {
+src/lib/utils/resilience.ts:434:        this.transition('OPEN');
+src/lib/utils/resilience.ts:435:      }
+src/lib/utils/resilience.ts:436:    }
+src/lib/utils/resilience.ts:437:  }
+src/lib/utils/resilience.ts:438:
+src/lib/utils/resilience.ts:439:  /**
+src/lib/utils/resilience.ts:440:   * Transition to a new state
+src/lib/utils/resilience.ts:441:   */
+src/lib/utils/resilience.ts:442:  private transition(to: CircuitState): void {
+src/lib/utils/resilience.ts:443:    const from = this.state;
+src/lib/utils/resilience.ts:444:    if (from === to) return;
+src/lib/utils/resilience.ts:445:
+src/lib/utils/resilience.ts:446:    this.log.info({ from, to }, `Circuit breaker transitioning: ${from} -> ${to}`);
+src/lib/utils/resilience.ts:447:
+src/lib/utils/resilience.ts:448:    this.state = to;
+src/lib/utils/resilience.ts:449:    this.failures = 0;
+src/lib/utils/resilience.ts:450:    this.successes = 0;
+src/lib/utils/resilience.ts:451:
+src/lib/utils/resilience.ts:452:    this.config.onStateChange?.(from, to);
+src/lib/utils/resilience.ts:453:  }
+src/lib/utils/resilience.ts:454:
+src/lib/utils/resilience.ts:455:  /**
+src/lib/utils/resilience.ts:456:   * Get current circuit breaker metrics
+src/lib/utils/resilience.ts:457:   */
+src/lib/utils/resilience.ts:458:  getMetrics(): CircuitBreakerMetrics {
+src/lib/utils/resilience.ts:459:    return {
+src/lib/utils/resilience.ts:460:      state: this.state,
+src/lib/utils/resilience.ts:461:      failures: this.failures,
+src/lib/utils/resilience.ts:462:      successes: this.successes,
+src/lib/utils/resilience.ts:463:      lastFailureTime: this.lastFailureTime,
+src/lib/utils/resilience.ts:464:      lastSuccessTime: this.lastSuccessTime,
+src/lib/utils/resilience.ts:465:      totalRequests: this.totalRequests,
+src/lib/utils/resilience.ts:466:      totalFailures: this.totalFailures,
+src/lib/utils/resilience.ts:467:      totalSuccesses: this.totalSuccesses,
+src/lib/utils/resilience.ts:468:    };
+src/lib/utils/resilience.ts:469:  }
+src/lib/utils/resilience.ts:470:
+src/lib/utils/resilience.ts:471:  /**
+src/lib/utils/resilience.ts:472:   * Get current state
+src/lib/utils/resilience.ts:473:   */
+src/lib/utils/resilience.ts:474:  getState(): CircuitState {
+src/lib/utils/resilience.ts:475:    this.checkResetTimeout();
+src/lib/utils/resilience.ts:476:    return this.state;
+src/lib/utils/resilience.ts:477:  }
+src/lib/utils/resilience.ts:478:
+src/lib/utils/resilience.ts:479:  /**
+src/lib/utils/resilience.ts:480:   * Manually reset the circuit breaker to CLOSED state
+src/lib/utils/resilience.ts:481:   * Use with caution - primarily for testing or manual intervention
+src/lib/utils/resilience.ts:482:   */
+src/lib/utils/resilience.ts:483:  reset(): void {
+src/lib/utils/resilience.ts:484:    this.log.warn('Circuit breaker manually reset');
+src/lib/utils/resilience.ts:485:    this.state = 'CLOSED';
+src/lib/utils/resilience.ts:486:    this.failures = 0;
+src/lib/utils/resilience.ts:487:    this.successes = 0;
+src/lib/utils/resilience.ts:488:  }
+src/lib/utils/resilience.ts:489:
+src/lib/utils/resilience.ts:490:  /**
+src/lib/utils/resilience.ts:491:   * Manually open the circuit
+src/lib/utils/resilience.ts:492:   * Use for graceful degradation scenarios
+src/lib/utils/resilience.ts:493:   */
+src/lib/utils/resilience.ts:494:  open(): void {
+src/lib/utils/resilience.ts:495:    this.log.warn('Circuit breaker manually opened');
+src/lib/utils/resilience.ts:496:    this.transition('OPEN');
+src/lib/utils/resilience.ts:497:    this.lastFailureTime = new Date();
+src/lib/utils/resilience.ts:498:  }
+src/lib/utils/resilience.ts:499:}
+src/lib/utils/resilience.ts:500:
+src/lib/utils/resilience.ts:501:// =============================================================================
+src/lib/utils/resilience.ts:502:// Combined Retry + Circuit Breaker
+src/lib/utils/resilience.ts:503:// =============================================================================
+src/lib/utils/resilience.ts:504:
+src/lib/utils/resilience.ts:505:/**
+src/lib/utils/resilience.ts:506: * Execute a function with both retry logic and circuit breaker protection
+src/lib/utils/resilience.ts:507: *
+src/lib/utils/resilience.ts:508: * The circuit breaker wraps the retry logic, so if the circuit is open,
+src/lib/utils/resilience.ts:509: * no retries will be attempted.
+src/lib/utils/resilience.ts:510: *
+src/lib/utils/resilience.ts:511: * @example
+src/lib/utils/resilience.ts:512: * ```typescript
+src/lib/utils/resilience.ts:513: * const result = await withResilience(
+src/lib/utils/resilience.ts:514: *   async () => fetchFromMaximo('/api/workorders'),
+src/lib/utils/resilience.ts:515: *   maximoCircuitBreaker,
+src/lib/utils/resilience.ts:516: *   EXTERNAL_SERVICE_RETRY_CONFIG,
+src/lib/utils/resilience.ts:517: *   'fetchWorkOrders'
+src/lib/utils/resilience.ts:518: * );
+src/lib/utils/resilience.ts:519: * ```
+src/lib/utils/resilience.ts:520: */
+src/lib/utils/resilience.ts:521:export async function withResilience<T>(
+src/lib/utils/resilience.ts:522:  fn: () => Promise<T>,
+src/lib/utils/resilience.ts:523:  circuitBreaker: CircuitBreaker,
+src/lib/utils/resilience.ts:524:  retryConfig?: Partial<RetryConfig>,
+src/lib/utils/resilience.ts:525:  operationName?: string
+src/lib/utils/resilience.ts:526:): Promise<T> {
+src/lib/utils/resilience.ts:527:  return circuitBreaker.execute(async () => withRetry(fn, retryConfig, operationName));
+src/lib/utils/resilience.ts:528:}
+src/lib/utils/resilience.ts:529:
+src/lib/utils/resilience.ts:530:// =============================================================================
+src/lib/utils/resilience.ts:531:// Timeout Utility
+src/lib/utils/resilience.ts:532:// =============================================================================
+src/lib/utils/resilience.ts:533:
+src/lib/utils/resilience.ts:534:/**
+src/lib/utils/resilience.ts:535: * Execute a function with a timeout
+src/lib/utils/resilience.ts:536: *
+src/lib/utils/resilience.ts:537: * @example
+src/lib/utils/resilience.ts:538: * ```typescript
+src/lib/utils/resilience.ts:539: * const result = await withTimeout(
+src/lib/utils/resilience.ts:540: *   async () => slowOperation(),
+src/lib/utils/resilience.ts:541: *   5000,
+src/lib/utils/resilience.ts:542: *   'slowOperation'
+src/lib/utils/resilience.ts:543: * );
+src/lib/utils/resilience.ts:544: * ```
+src/lib/utils/resilience.ts:545: */
+src/lib/utils/resilience.ts:546:export async function withTimeout<T>(
+src/lib/utils/resilience.ts:547:  fn: () => Promise<T>,
+src/lib/utils/resilience.ts:548:  timeoutMs: number,
+src/lib/utils/resilience.ts:549:  operationName?: string
+src/lib/utils/resilience.ts:550:): Promise<T> {
+src/lib/utils/resilience.ts:551:  const name = operationName ?? 'operation';
+src/lib/utils/resilience.ts:552:
+src/lib/utils/resilience.ts:553:  return new Promise((resolve, reject) => {
+src/lib/utils/resilience.ts:554:    const timer = setTimeout(() => {
+src/lib/utils/resilience.ts:555:      reject(
+src/lib/utils/resilience.ts:556:        new TimeoutError(`Operation ${name} timed out after ${timeoutMs}ms`, {
+src/lib/utils/resilience.ts:557:          operation: name,
+src/lib/utils/resilience.ts:558:          timeoutMs,
+src/lib/utils/resilience.ts:559:        })
+src/lib/utils/resilience.ts:560:      );
+src/lib/utils/resilience.ts:561:    }, timeoutMs);
+src/lib/utils/resilience.ts:562:
+src/lib/utils/resilience.ts:563:    fn()
+src/lib/utils/resilience.ts:564:      .then((result) => {
+src/lib/utils/resilience.ts:565:        clearTimeout(timer);
+src/lib/utils/resilience.ts:566:        resolve(result);
+src/lib/utils/resilience.ts:567:      })
+src/lib/utils/resilience.ts:568:      .catch((error) => {

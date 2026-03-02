@@ -1,0 +1,1113 @@
+     1→# Metro Fleet Mileage Management System
+     2→# Part 7: Integration Specifications
+     3→
+     4→**Document Version:** 2.0  
+     5→**Status:** APPROVED FOR DEVELOPMENT
+     6→
+     7→---
+     8→
+     9→## 7.1 Integration Overview
+    10→
+    11→```
+    12→┌─────────────────────────────────────────────────────────────────────────────────┐
+    13→│                           EXTERNAL SYSTEMS                                       │
+    14→│                                                                                  │
+    15→│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐      │
+    16→│  │   MAXIMO    │    │    OCC      │    │    ERP      │    │   EMAIL     │      │
+    17→│  │   (CMMS)    │    │  (Control)  │    │  (Finance)  │    │  (SMTP)     │      │
+    18→│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘    └──────┬──────┘      │
+    19→│         │                  │                  │                  │              │
+    20→│         │ Work Orders      │ Run Sheets       │ Cost Data        │ Alerts       │
+    21→│         │ Asset Data       │ Assignments      │ Budget           │ Reports      │
+    22→│         │ PM History       │ Actuals          │ Invoices         │              │
+    23→│         │                  │                  │                  │              │
+    24→├─────────┼──────────────────┼──────────────────┼──────────────────┼──────────────┤
+    25→│         │                  │                  │                  │              │
+    26→│         ▼                  ▼                  ▼                  ▼              │
+    27→│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+    28→│  │                    INTEGRATION LAYER                                     │   │
+    29→│  │                                                                         │   │
+    30→│  │   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐              │   │
+    31→│  │   │  File    │  │  REST    │  │  Event   │  │  Email   │              │   │
+    32→│  │   │  Watcher │  │  Client  │  │  Queue   │  │  Service │              │   │
+    33→│  │   └──────────┘  └──────────┘  └──────────┘  └──────────┘              │   │
+    34→│  │                                                                         │   │
+    35→│  └─────────────────────────────────────────────────────────────────────────┘   │
+    36→│         │                                                                       │
+    37→│         ▼                                                                       │
+    38→│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+    39→│  │                    MMS CORE SYSTEM                                       │   │
+    40→│  └─────────────────────────────────────────────────────────────────────────┘   │
+    41→│                                                                                  │
+    42→└─────────────────────────────────────────────────────────────────────────────────┘
+    43→```
+    44→
+    45→---
+    46→
+    47→## 7.2 Integration Phasing
+    48→
+    49→| Phase | Timeline | Integrations | Method |
+    50→|-------|----------|--------------|--------|
+    51→| **Phase 1** | Months 1-6 | Mileage CSV Import | File drop |
+    52→| | | Run Assignment Export | CSV export |
+    53→| | | Email Notifications | SMTP |
+    54→| **Phase 2** | Months 7-12 | Maximo Read | REST API |
+    55→| | | Inventory Snapshot | CSV/API |
+    56→| | | Cost Data Import | CSV |
+    57→| **Phase 3** | Months 13-18 | Maximo Bidirectional | REST API + Webhooks |
+    58→| | | OCC Integration | Real-time API |
+    59→| | | ERP Integration | REST API |
+    60→
+    61→---
+    62→
+    63→## 7.3 Mileage Data Ingestion
+    64→
+    65→### 7.3.1 CSV File Format
+    66→
+    67→**Filename Pattern:** `mileage_YYYYMMDD.csv`  
+    68→**Encoding:** UTF-8  
+    69→**Delimiter:** Comma  
+    70→**Header:** Required
+    71→
+    72→```csv
+    73→train_number,reading_date,odometer_km,source
+    74→1001,2026-01-14,245152,ATS
+    75→1002,2026-01-14,248523,ATS
+    76→1003,2026-01-14,242087,ATS
+    77→```
+    78→
+    79→### 7.3.2 Field Specifications
+    80→
+    81→| Field | Type | Required | Validation |
+    82→|-------|------|----------|------------|
+    83→| `train_number` | string | Yes | Must exist in trains table |
+    84→| `reading_date` | date | Yes | Format: YYYY-MM-DD, not future |
+    85→| `odometer_km` | integer | Yes | Positive, ≤ previous + 2000 |
+    86→| `source` | string | No | Default: 'CSV' |
+    87→
+    88→### 7.3.3 Validation Rules
+    89→
+    90→```typescript
+    91→interface MileageValidationRules {
+    92→  // Format validation
+    93→  maxFileSize: '10MB';
+    94→  requiredColumns: ['train_number', 'reading_date', 'odometer_km'];
+    95→  dateFormat: 'YYYY-MM-DD';
+    96→  
+    97→  // Business validation
+    98→  maxDailyIncrease: 2000;           // km - anything more is anomaly
+    99→  maxDailyDecrease: 0;              // Negative not allowed without meter event
+   100→  duplicateHandling: 'UPDATE';       // UPDATE or REJECT
+   101→  unknownTrainHandling: 'QUARANTINE'; // QUARANTINE or REJECT_FILE
+   102→  
+   103→  // Timing
+   104→  expectedArrivalWindow: {
+   105→    start: '05:00',                 // Local time
+   106→    end: '07:00'
+   107→  };
+   108→  alertIfMissingAfter: '08:00';
+   109→}
+   110→```
+   111→
+   112→### 7.3.4 Error Handling
+   113→
+   114→```typescript
+   115→interface IngestionError {
+   116→  severity: 'WARNING' | 'ERROR' | 'CRITICAL';
+   117→  code: string;
+   118→  message: string;
+   119→  row?: number;
+   120→  field?: string;
+   121→  value?: any;
+   122→  action: 'SKIP_ROW' | 'QUARANTINE_FILE' | 'ALERT_ADMIN';
+   123→}
+   124→
+   125→const ERROR_CODES = {
+   126→  // File-level errors
+   127→  'FILE_001': { severity: 'CRITICAL', message: 'File size exceeds limit' },
+   128→  'FILE_002': { severity: 'CRITICAL', message: 'Invalid file format' },
+   129→  'FILE_003': { severity: 'ERROR', message: 'Missing required columns' },
+   130→  
+   131→  // Row-level errors
+   132→  'ROW_001': { severity: 'ERROR', message: 'Unknown train number' },
+   133→  'ROW_002': { severity: 'WARNING', message: 'Future date not allowed' },
+   134→  'ROW_003': { severity: 'WARNING', message: 'Negative daily mileage' },
+   135→  'ROW_004': { severity: 'WARNING', message: 'Spike detected (>2000km/day)' },
+   136→  'ROW_005': { severity: 'ERROR', message: 'Invalid odometer value' },
+   137→  
+   138→  // System errors
+   139→  'SYS_001': { severity: 'CRITICAL', message: 'Database connection failed' },
+   140→  'SYS_002': { severity: 'ERROR', message: 'Transaction rollback' }
+   141→};
+   142→```
+   143→
+   144→---
+   145→
+   146→## 7.4 Maximo Integration
+   147→
+   148→### 7.4.1 Integration Architecture
+   149→
+   150→```
+   151→┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+   152→│                 │         │                 │         │                 │
+   153→│      MMS        │◄───────►│   Integration   │◄───────►│     Maximo      │
+   154→│                 │         │     Service     │         │                 │
+   155→│                 │         │                 │         │                 │
+   156→└─────────────────┘         └─────────────────┘         └─────────────────┘
+   157→        │                           │                           │
+   158→        │                           │                           │
+   159→   ┌────┴────┐                ┌────┴────┐                ┌────┴────┐
+   160→   │ Shadow  │                │ Transform│               │  REST   │
+   161→   │ Records │                │ & Map    │               │  API    │
+   162→   └─────────┘                └──────────┘               └─────────┘
+   163→```
+   164→
+   165→### 7.4.2 Shadow Record Pattern
+   166→
+   167→MMS maintains "shadow records" that mirror Maximo work orders, allowing operations to continue if Maximo is unavailable.
+   168→
+   169→```typescript
+   170→interface MaximoShadowRecord {
+   171→  mmsId: string;                    // MMS primary key
+   172→  maximoWoId: string | null;        // Maximo work order ID (null if not synced)
+   173→  syncStatus: 'PENDING' | 'SYNCED' | 'CONFLICT' | 'ERROR';
+   174→  lastSyncAt: Date | null;
+   175→  lastSyncError: string | null;
+   176→  
+   177→  // MMS data (source of truth for scheduling)
+   178→  mmsData: {
+   179→    trainId: string;
+   180→    pmTypeCode: string;
+   181→    targetDate: Date;
+   182→    status: string;
+   183→  };
+   184→  
+   185→  // Maximo data (for reconciliation)
+   186→  maximoData: {
+   187→    status: string;
+   188→    actualStart: Date | null;
+   189→    actualFinish: Date | null;
+   190→    actualLabor: number | null;
+   191→  } | null;
+   192→}
+   193→```
+   194→
+   195→### 7.4.3 Maximo REST API Endpoints
+   196→
+   197→**Base URL:** `https://maximo.metro.example/maximo/oslc`
+   198→
+   199→| Operation | Method | Endpoint | Purpose |
+   200→|-----------|--------|----------|---------|
+   201→| Get Work Order | GET | `/os/mxwo/{wonum}` | Fetch WO details |
+   202→| Create Work Order | POST | `/os/mxwo` | Create new WO |
+   203→| Update Work Order | POST | `/os/mxwo/{wonum}` | Update WO status |
+   204→| List Work Orders | GET | `/os/mxwo` | Query WOs by filter |
+   205→| Get Asset | GET | `/os/mxasset/{assetnum}` | Fetch asset (train) |
+   206→| List Inventory | GET | `/os/mxinventory` | Query inventory |
+   207→
+   208→### 7.4.4 Work Order Creation
+   209→
+   210→When MMS schedules a PM, it creates a shadow record. On sync:
+   211→
+   212→```typescript
+   213→interface MaximoWorkOrderCreate {
+   214→  // Required fields
+   215→  siteid: string;                  // 'METRO'
+   216→  woclass: string;                 // 'WORKORDER'
+   217→  worktype: string;                // 'PM'
+   218→  assetnum: string;                // Train number
+   219→  description: string;             // PM description
+   220→  schedstart: string;              // ISO 8601 date
+   221→  schedfinish: string;             // ISO 8601 date
+   222→  
+   223→  // Optional fields
+   224→  location: string;                // Depot code
+   225→  estlabhrs: number;               // Estimated hours
+   226→  pmnum: string;                   // PM type reference
+   227→  
+   228→  // Custom fields (metro-specific)
+   229→  mms_schedule_id: string;         // Link back to MMS
+   230→  mms_constraint_start: string;    // Compliance window start
+   231→  mms_constraint_end: string;      // Compliance window end
+   232→}
+   233→
+   234→// Example
+   235→const createWorkOrder = async (pm: PMSchedule): Promise<string> => {
+   236→  const payload: MaximoWorkOrderCreate = {
+   237→    siteid: 'METRO',
+   238→    woclass: 'WORKORDER',
+   239→    worktype: 'PM',
+   240→    assetnum: pm.train.trainNumber,
+   241→    description: `${pm.pmType.pmCode} - ${pm.pmType.pmName}`,
+   242→    schedstart: pm.targetDate.toISOString(),
+   243→    schedfinish: addDays(pm.targetDate, pm.pmType.minTrackDays).toISOString(),
+   244→    location: pm.assignedDepot.code,
+   245→    estlabhrs: pm.assignedHours,
+   246→    pmnum: pm.pmType.pmCode,
+   247→    mms_schedule_id: pm.id,
+   248→    mms_constraint_start: pm.constraintStart.toISOString(),
+   249→    mms_constraint_end: pm.constraintEnd.toISOString()
+   250→  };
+   251→  
+   252→  const response = await maximoClient.post('/os/mxwo', payload);
+   253→  return response.data.wonum;
+   254→};
+   255→```
+   256→
+   257→### 7.4.5 Work Order Status Mapping
+   258→
+   259→| Maximo Status | MMS Status | Sync Action | MMS Edit Lock |
+   260→|---------------|------------|-------------|---------------|
+   261→| WAPPR | SCHEDULED | None (initial state) | ❌ Unlocked |
+   262→| APPR | SCHEDULED | None | ❌ Unlocked |
+   263→| INPRG | IN_PROGRESS | Update MMS status | ✅ **LOCKED** |
+   264→| COMP | COMPLETED | Update MMS, record actuals | ✅ **LOCKED** |
+   265→| CLOSE | COMPLETED | Final state | ✅ **LOCKED** |
+   266→| CAN | CANCELLED | Update MMS status | ✅ **LOCKED** |
+   267→
+   268→### 7.4.6 Status-Based Edit Locking
+   269→
+   270→**CRITICAL:** When a Maximo work order is in progress (INPRG), the corresponding PM record in MMS must be **read-only**. This prevents race conditions where a planner reschedules a PM that technicians are actively working on.
+   271→
+   272→```typescript
+   273→/**
+   274→ * Validate PM edit request against Maximo status.
+   275→ * MUST be called before any PM schedule modification.
+   276→ * 
+   277→ * This addresses the race condition where:
+   278→ * 1. Technician opens work order on tablet (Maximo status = INPRG)
+   279→ * 2. Planner reschedules PM in MMS (unaware of in-progress work)
+   280→ * 3. Maximo sync fails or overwrites technician's work
+   281→ * 
+   282→ * Operational reality MUST override planning data.
+   283→ */
+   284→class PMEditValidator {
+   285→  async validateEdit(pmId: string): Promise<EditValidationResult> {
+   286→    const pm = await this.getPMWithShadow(pmId);
+   287→    
+   288→    // Check 1: Maximo status lock
+   289→    if (pm.shadowRecord?.maximoData?.status) {
+   290→      const lockedStatuses = ['INPRG', 'COMP', 'CLOSE', 'CAN'];
+   291→      
+   292→      if (lockedStatuses.includes(pm.shadowRecord.maximoData.status)) {
+   293→        return {
+   294→          valid: false,
+   295→          reason: 'MAXIMO_STATUS_LOCK',
+   296→          message: `Cannot modify: Work order is ${this.formatStatus(pm.shadowRecord.maximoData.status)} in Maximo`,
+   297→          maximoStatus: pm.shadowRecord.maximoData.status,
+   298→          maximoWonum: pm.maximoWoId,
+   299→          suggestion: pm.shadowRecord.maximoData.status === 'INPRG' 
+   300→            ? 'Wait for technicians to complete work, or contact supervisor to cancel in Maximo first'
+   301→            : 'This PM has been completed/cancelled. Create a new PM if rescheduling is needed.'
+   302→        };
+   303→      }
+   304→    }
+   305→    
+   306→    // Check 2: Pending sync conflict
+   307→    if (pm.shadowRecord?.syncStatus === 'CONFLICT') {
+   308→      return {
+   309→        valid: false,
+   310→        reason: 'SYNC_CONFLICT',
+   311→        message: 'Unresolved sync conflict exists. Resolve before editing.',
+   312→        suggestion: 'Go to Integration > Conflicts to resolve'
+   313→      };
+   314→    }
+   315→    
+   316→    // Check 3: Baseline lock (optional, if locked in current baseline)
+   317→    if (pm.lockedInBaseline) {
+   318→      return {
+   319→        valid: false,
+   320→        reason: 'BASELINE_LOCK',
+   321→        message: 'PM is locked in published baseline',
+   322→        suggestion: 'Unlock in baseline editor or create scenario to test changes'
+   323→      };
+   324→    }
+   325→    
+   326→    return { valid: true };
+   327→  }
+   328→  
+   329→  private formatStatus(status: string): string {
+   330→    const statusLabels: Record<string, string> = {
+   331→      'INPRG': 'In Progress',
+   332→      'COMP': 'Completed',
+   333→      'CLOSE': 'Closed',
+   334→      'CAN': 'Cancelled'
+   335→    };
+   336→    return statusLabels[status] || status;
+   337→  }
+   338→}
+   339→
+   340→interface EditValidationResult {
+   341→  valid: boolean;
+   342→  reason?: 'MAXIMO_STATUS_LOCK' | 'SYNC_CONFLICT' | 'BASELINE_LOCK';
+   343→  message?: string;
+   344→  maximoStatus?: string;
+   345→  maximoWonum?: string;
+   346→  suggestion?: string;
+   347→}
+   348→```
+   349→
+   350→**API Integration:**
+   351→
+   352→All PM modification endpoints MUST call this validator:
+   353→
+   354→```typescript
+   355→// In PM Schedule API (Part 5)
+   356→app.patch('/api/v1/pm-schedule/:id', async (req, res) => {
+   357→  const validation = await pmEditValidator.validateEdit(req.params.id);
+   358→  
+   359→  if (!validation.valid) {
+   360→    return res.status(423).json({  // 423 Locked
+   361→      error: validation.reason,
+   362→      message: validation.message,
+   363→      suggestion: validation.suggestion,
+   364→      maximoStatus: validation.maximoStatus
+   365→    });
+   366→  }
+   367→  
+   368→  // Proceed with update...
+   369→});
+   370→```
+   371→
+   372→**Canvas UI Integration:**
+   373→
+   374→When displaying PM blocks, check lock status and show visual indicator:
+   375→
+   376→```typescript
+   377→// In Canvas layer (Part 6)
+   378→function getPMBlockStyle(pm: PMSchedule): PMBlockStyle {
+   379→  if (pm.shadowRecord?.maximoData?.status === 'INPRG') {
+   380→    return {
+   381→      cursor: 'not-allowed',
+   382→      opacity: 0.7,
+   383→      border: '2px dashed #F59E0B',  // Amber dashed = in progress
+   384→      draggable: false,
+   385→      tooltip: 'In Progress in Maximo - cannot reschedule'
+   386→    };
+   387→  }
+   388→  // ... normal styling
+   389→}
+   390→```
+   391→
+   392→### 7.4.7 Bidirectional Sync Logic
+   393→
+   394→```typescript
+   395→class MaximoSyncService {
+   396→  /**
+   397→   * Push MMS changes to Maximo
+   398→   */
+   399→  async pushToMaximo(pmId: string): Promise<SyncResult> {
+   400→    const pm = await this.getPMWithShadow(pmId);
+   401→    
+   402→    if (!pm.maximoWoId) {
+   403→      // Create new work order
+   404→      const wonum = await this.createWorkOrder(pm);
+   405→      await this.updateShadowRecord(pm.id, { 
+   406→        maximoWoId: wonum, 
+   407→        syncStatus: 'SYNCED' 
+   408→      });
+   409→      return { action: 'CREATED', wonum };
+   410→    }
+   411→    
+   412→    // Update existing work order
+   413→    const maximoWO = await this.getMaximoWorkOrder(pm.maximoWoId);
+   414→    
+   415→    if (maximoWO.status === 'INPRG' || maximoWO.status === 'COMP') {
+   416→      // Cannot update in-progress or completed WOs
+   417→      return { action: 'SKIPPED', reason: 'WO already in progress' };
+   418→    }
+   419→    
+   420→    // Check for conflicts
+   421→    if (new Date(maximoWO.changedate) > pm.shadowRecord.lastSyncAt) {
+   422→      await this.updateShadowRecord(pm.id, { syncStatus: 'CONFLICT' });
+   423→      return { action: 'CONFLICT', maximoData: maximoWO };
+   424→    }
+   425→    
+   426→    // Push update
+   427→    await this.updateWorkOrder(pm.maximoWoId, {
+   428→      schedstart: pm.targetDate.toISOString(),
+   429→      schedfinish: addDays(pm.targetDate, pm.pmType.minTrackDays).toISOString(),
+   430→      location: pm.assignedDepot.code
+   431→    });
+   432→    
+   433→    await this.updateShadowRecord(pm.id, { 
+   434→      syncStatus: 'SYNCED',
+   435→      lastSyncAt: new Date()
+   436→    });
+   437→    
+   438→    return { action: 'UPDATED', wonum: pm.maximoWoId };
+   439→  }
+   440→  
+   441→  /**
+   442→   * Pull Maximo changes to MMS
+   443→   */
+   444→  async pullFromMaximo(): Promise<PullResult> {
+   445→    // Get recently modified work orders
+   446→    const modifiedSince = await this.getLastPullTimestamp();
+   447→    const workOrders = await this.queryMaximoWorkOrders({
+   448→      worktype: 'PM',
+   449→      changedate: `>${modifiedSince.toISOString()}`
+   450→    });
+   451→    
+   452→    const results: PullResult = {
+   453→      processed: 0,
+   454→      updated: 0,
+   455→      conflicts: 0,
+   456→      errors: 0
+   457→    };
+   458→    
+   459→    for (const wo of workOrders) {
+   460→      results.processed++;
+   461→      
+   462→      try {
+   463→        const pm = await this.findPMByMaximoId(wo.wonum);
+   464→        
+   465→        if (!pm) {
+   466→          // Work order not managed by MMS
+   467→          continue;
+   468→        }
+   469→        
+   470→        // Status change
+   471→        if (wo.status !== pm.shadowRecord.maximoData?.status) {
+   472→          await this.handleStatusChange(pm, wo);
+   473→          results.updated++;
+   474→        }
+   475→        
+   476→        // Actuals recorded
+   477→        if (wo.actlabhrs && !pm.actualHours) {
+   478→          await this.recordActuals(pm, wo);
+   479→          results.updated++;
+   480→        }
+   481→        
+   482→      } catch (error) {
+   483→        results.errors++;
+   484→        this.logger.error({ wo, error }, 'Pull processing failed');
+   485→      }
+   486→    }
+   487→    
+   488→    await this.setLastPullTimestamp(new Date());
+   489→    return results;
+   490→  }
+   491→  
+   492→  /**
+   493→   * Resolve sync conflict
+   494→   */
+   495→  async resolveConflict(
+   496→    pmId: string, 
+   497→    resolution: 'USE_MMS' | 'USE_MAXIMO'
+   498→  ): Promise<void> {
+   499→    const pm = await this.getPMWithShadow(pmId);
+   500→    
+   501→    if (resolution === 'USE_MMS') {
+   502→      // Force push MMS data to Maximo
+   503→      await this.updateWorkOrder(pm.maximoWoId, {
+   504→        schedstart: pm.targetDate.toISOString(),
+   505→        schedfinish: addDays(pm.targetDate, pm.pmType.minTrackDays).toISOString()
+   506→      }, { force: true });
+   507→    } else {
+   508→      // Apply Maximo data to MMS
+   509→      const maximoWO = await this.getMaximoWorkOrder(pm.maximoWoId);
+   510→      await this.updatePMFromMaximo(pm.id, maximoWO);
+   511→    }
+   512→    
+   513→    await this.updateShadowRecord(pm.id, { 
+   514→      syncStatus: 'SYNCED',
+   515→      lastSyncAt: new Date()
+   516→    });
+   517→  }
+   518→}
+   519→```
+   520→
+   521→### 7.4.7 Inventory Integration
+   522→
+   523→```typescript
+   524→interface InventorySnapshotConfig {
+   525→  syncFrequency: 'HOURLY' | 'DAILY';
+   526→  depots: string[];
+   527→  partCategories: string[];  // Filter to maintenance-relevant parts
+   528→}
+   529→
+   530→class InventoryIntegration {
+   531→  async syncInventory(): Promise<void> {
+   532→    for (const depot of this.config.depots) {
+   533→      const inventory = await this.maximoClient.queryInventory({
+   534→        siteid: 'METRO',
+   535→        location: depot,
+   536→        category: { $in: this.config.partCategories }
+   537→      });
+   538→      
+   539→      for (const item of inventory) {
+   540→        await this.db.upsert(inventoryPositions, {
+   541→          depotId: this.getDepotId(depot),
+   542→          partNumber: item.itemnum,
+   543→          partDescription: item.description,
+   544→          quantityOnHand: item.curbal,
+   545→          quantityReserved: item.reservedqty,
+   546→          quantityOnOrder: item.onorderqty,
+   547→          reorderPoint: item.reorder,
+   548→          unitCost: item.avgcost,
+   549→          lastSyncAt: new Date(),
+   550→          sourceSystem: 'MAXIMO'
+   551→        });
+   552→      }
+   553→    }
+   554→  }
+   555→}
+   556→```
+   557→
+   558→---
+   559→
+   560→## 7.5 OCC Integration
+   561→
+   562→### 7.5.1 Run Assignment Export
+   563→
+   564→Export optimized run assignments for OCC consumption.
+   565→
+   566→**Output Format:** CSV  
+   567→**Delivery:** SFTP drop or REST API POST
+   568→
+   569→```csv
+   570→date,train_number,route_code,depot_start,depot_end,start_time,end_time
+   571→2026-01-15,1001,NSL,BIS,BIS,05:30,23:30
+   572→2026-01-15,1002,NSL,BIS,BIS,05:30,23:30
+   573→2026-01-15,1003,EWL,ULU,ULU,05:45,23:15
+   574→```
+   575→
+   576→### 7.5.2 Actual Mileage Feedback
+   577→
+   578→Receive actual mileage from OCC system for reconciliation.
+   579→
+   580→```typescript
+   581→interface OCCMileageFeedback {
+   582→  date: string;
+   583→  trainNumber: string;
+   584→  routeCode: string;
+   585→  actualKm: number;
+   586→  scheduledKm: number;
+   587→  variance: number;
+   588→  notes?: string;
+   589→}
+   590→```
+   591→
+   592→---
+   593→
+   594→## 7.6 Email Notification System
+   595→
+   596→### 7.6.1 SMTP Configuration
+   597→
+   598→```typescript
+   599→interface SMTPConfig {
+   600→  host: string;
+   601→  port: number;
+   602→  secure: boolean;
+   603→  auth: {
+   604→    user: string;
+   605→    pass: string;  // From secrets manager
+   606→  };
+   607→  from: {
+   608→    name: string;  // 'MMS Notifications'
+   609→    address: string;  // 'mms-noreply@metro.example'
+   610→  };
+   611→}
+   612→```
+   613→
+   614→### 7.6.2 Notification Types
+   615→
+   616→| Type | Trigger | Recipients | Template |
+   617→|------|---------|------------|----------|
+   618→| `DRIFT_ALERT` | Drift threshold exceeded | Planners | drift_alert.html |
+   619→| `OVERLOAD_WARNING` | Week utilization >100% | Depot managers | overload_warning.html |
+   620→| `PM_REMINDER` | PM due in 7 days | Depot managers | pm_reminder.html |
+   621→| `BASELINE_PUBLISHED` | New baseline published | All planners | baseline_published.html |
+   622→| `OPTIMIZER_FAILED` | Optimizer job failed | System admins | optimizer_failed.html |
+   623→| `FILE_MISSING` | No mileage file received | Data team | file_missing.html |
+   624→| `MATERIAL_SHORTAGE` | Blocking parts unavailable | Procurement | material_shortage.html |
+   625→
+   626→### 7.6.3 Notification Templates
+   627→
+   628→```html
+   629→<!-- drift_alert.html -->
+   630→<!DOCTYPE html>
+   631→<html>
+   632→<head>
+   633→  <style>
+   634→    .alert-box { background: #FEF3C7; border-left: 4px solid #F59E0B; padding: 16px; }
+   635→    .metric { font-size: 24px; font-weight: bold; }
+   636→    .train-list { margin-top: 16px; }
+   637→    .train-item { padding: 8px; border-bottom: 1px solid #E5E7EB; }
+   638→  </style>
+   639→</head>
+   640→<body>
+   641→  <h1>Baseline Drift Alert</h1>
+   642→  
+   643→  <div class="alert-box">
+   644→    <p><strong>{{trainCount}} trains</strong> have exceeded the drift threshold and may require replanning.</p>
+   645→  </div>
+   646→  
+   647→  <h2>Summary</h2>
+   648→  <table>
+   649→    <tr>
+   650→      <td>Baseline:</td>
+   651→      <td>{{baselineName}} ({{baselineVersion}})</td>
+   652→    </tr>
+   653→    <tr>
+   654→      <td>Analysis Date:</td>
+   655→      <td>{{analysisDate}}</td>
+   656→    </tr>
+   657→    <tr>
+   658→      <td>Fleet Avg Drift:</td>
+   659→      <td class="metric">{{avgDriftPct}}%</td>
+   660→    </tr>
+   661→  </table>
+   662→  
+   663→  <h2>Trains Requiring Attention</h2>
+   664→  <div class="train-list">
+   665→    {{#each trains}}
+   666→    <div class="train-item">
+   667→      <strong>Train {{trainNumber}}</strong> - {{driftPct}}% drift
+   668→      <br/>
+   669→      <small>Recommendation: {{recommendation}}</small>
+   670→    </div>
+   671→    {{/each}}
+   672→  </div>
+   673→  
+   674→  <p>
+   675→    <a href="{{dashboardUrl}}">View in Dashboard</a>
+   676→  </p>
+   677→</body>
+   678→</html>
+   679→```
+   680→
+   681→### 7.6.4 Notification Preferences
+   682→
+   683→```typescript
+   684→interface UserNotificationPreferences {
+   685→  userId: string;
+   686→  email: string;
+   687→  
+   688→  // By notification type
+   689→  preferences: {
+   690→    DRIFT_ALERT: { enabled: boolean; minSeverity: 'LOW' | 'MEDIUM' | 'HIGH' };
+   691→    OVERLOAD_WARNING: { enabled: boolean; depots: string[] };
+   692→    PM_REMINDER: { enabled: boolean; daysBeforeDue: number };
+   693→    BASELINE_PUBLISHED: { enabled: boolean };
+   694→    // ...
+   695→  };
+   696→  
+   697→  // Digest settings
+   698→  digestMode: 'IMMEDIATE' | 'DAILY_DIGEST' | 'WEEKLY_DIGEST';
+   699→  digestTime: string;  // HH:mm in user timezone
+   700→  timezone: string;
+   701→}
+   702→```
+   703→
+   704→---
+   705→
+   706→## 7.7 Report Generation
+   707→
+   708→### 7.7.1 Report Types
+   709→
+   710→| Report | Format | Schedule | Description |
+   711→|--------|--------|----------|-------------|
+   712→| Weekly Compliance | PDF | Monday 06:00 | PM compliance status by depot |
+   713→| Monthly TCO | Excel | 1st of month | Cost breakdown by category |
+   714→| Fleet Mileage | Excel | Daily 08:00 | Mileage readings and anomalies |
+   715→| Man-hour Projection | PDF | Monday 06:00 | 12-week workload forecast |
+   716→| Drift Analysis | PDF | Daily 07:00 | Baseline comparison summary |
+   717→
+   718→### 7.7.2 Report Generation Service
+   719→
+   720→```typescript
+   721→class ReportGenerationService {
+   722→  async generateReport(
+   723→    type: ReportType,
+   724→    params: ReportParams
+   725→  ): Promise<GeneratedReport> {
+   726→    const template = await this.loadTemplate(type);
+   727→    const data = await this.fetchReportData(type, params);
+   728→    
+   729→    switch (template.format) {
+   730→      case 'PDF':
+   731→        return this.generatePDF(template, data);
+   732→      case 'XLSX':
+   733→        return this.generateExcel(template, data);
+   734→      default:
+   735→        throw new Error(`Unsupported format: ${template.format}`);
+   736→    }
+   737→  }
+   738→  
+   739→  private async generatePDF(
+   740→    template: ReportTemplate,
+   741→    data: any
+   742→  ): Promise<GeneratedReport> {
+   743→    // Use Puppeteer for PDF generation
+   744→    const html = await this.renderTemplate(template.htmlTemplate, data);
+   745→    
+   746→    const browser = await puppeteer.launch({ headless: true });
+   747→    const page = await browser.newPage();
+   748→    await page.setContent(html);
+   749→    
+   750→    const pdfBuffer = await page.pdf({
+   751→      format: 'A4',
+   752→      margin: { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' },
+   753→      printBackground: true
+   754→    });
+   755→    
+   756→    await browser.close();
+   757→    
+   758→    // Store in MinIO
+   759→    const filename = `${template.name}_${format(new Date(), 'yyyyMMdd_HHmmss')}.pdf`;
+   760→    const url = await this.storage.upload(filename, pdfBuffer);
+   761→    
+   762→    return {
+   763→      filename,
+   764→      url,
+   765→      expiresAt: addDays(new Date(), 7),
+   766→      sizeBytes: pdfBuffer.length
+   767→    };
+   768→  }
+   769→  
+   770→  private async generateExcel(
+   771→    template: ReportTemplate,
+   772→    data: any
+   773→  ): Promise<GeneratedReport> {
+   774→    // Use ExcelJS for Excel generation
+   775→    const workbook = new ExcelJS.Workbook();
+   776→    
+   777→    for (const sheetDef of template.sheets) {
+   778→      const sheet = workbook.addWorksheet(sheetDef.name);
+   779→      
+   780→      // Add headers
+   781→      sheet.addRow(sheetDef.columns.map(c => c.header));
+   782→      
+   783→      // Add data rows
+   784→      const sheetData = data[sheetDef.dataKey];
+   785→      for (const row of sheetData) {
+   786→        sheet.addRow(sheetDef.columns.map(c => row[c.key]));
+   787→      }
+   788→      
+   789→      // Apply formatting
+   790→      this.applyExcelFormatting(sheet, sheetDef);
+   791→    }
+   792→    
+   793→    const buffer = await workbook.xlsx.writeBuffer();
+   794→    
+   795→    const filename = `${template.name}_${format(new Date(), 'yyyyMMdd_HHmmss')}.xlsx`;
+   796→    const url = await this.storage.upload(filename, buffer);
+   797→    
+   798→    return {
+   799→      filename,
+   800→      url,
+   801→      expiresAt: addDays(new Date(), 7),
+   802→      sizeBytes: buffer.length
+   803→    };
+   804→  }
+   805→}
+   806→```
+   807→
+   808→---
+   809→
+   810→## 7.8 Authentication Integration
+   811→
+   812→### 7.8.1 SSO Support (Future)
+   813→
+   814→```typescript
+   815→interface SSOConfig {
+   816→  provider: 'SAML' | 'OIDC';
+   817→  
+   818→  // SAML Configuration
+   819→  saml?: {
+   820→    entryPoint: string;
+   821→    issuer: string;
+   822→    cert: string;
+   823→    callbackUrl: string;
+   824→  };
+   825→  
+   826→  // OIDC Configuration
+   827→  oidc?: {
+   828→    issuer: string;
+   829→    clientId: string;
+   830→    clientSecret: string;
+   831→    redirectUri: string;
+   832→    scope: string[];
+   833→  };
+   834→  
+   835→  // Attribute mapping
+   836→  attributeMapping: {
+   837→    email: string;
+   838→    firstName: string;
+   839→    lastName: string;
+   840→    groups: string;
+   841→  };
+   842→  
+   843→  // Group to role mapping
+   844→  groupRoleMapping: {
+   845→    [group: string]: string[];  // group -> roles
+   846→  };
+   847→}
+   848→```
+   849→
+   850→### 7.8.2 API Key Authentication
+   851→
+   852→For system-to-system integration:
+   853→
+   854→```typescript
+   855→interface APIKeyConfig {
+   856→  keyId: string;
+   857→  hashedKey: string;
+   858→  name: string;
+   859→  permissions: string[];
+   860→  rateLimit: number;  // requests per minute
+   861→  allowedIPs: string[];
+   862→  expiresAt: Date;
+   863→}
+   864→
+   865→// Usage in headers
+   866→// Authorization: ApiKey <key_id>:<api_key>
+   867→```
+   868→
+   869→---
+   870→
+   871→## 7.9 Data Export Formats
+   872→
+   873→### 7.9.1 PM Schedule Export
+   874→
+   875→```json
+   876→{
+   877→  "exportDate": "2026-01-14T10:00:00Z",
+   878→  "exportType": "PM_SCHEDULE",
+   879→  "filters": {
+   880→    "depotId": "depot-bishan",
+   881→    "dateRange": {
+   882→      "from": "2026-01-01",
+   883→      "to": "2026-12-31"
+   884→    }
+   885→  },
+   886→  "data": [
+   887→    {
+   888→      "pmId": "pm-001",
+   889→      "trainNumber": "1001",
+   890→      "fleetCode": "KS",
+   891→      "pmCode": "C2",
+   892→      "pmName": "C2 Inspection",
+   893→      "targetDate": "2026-02-15",
+   894→      "status": "SCHEDULED",
+   895→      "depotCode": "BIS",
+   896→      "trackNumber": "T1",
+   897→      "estimatedHours": 24,
+   898→      "constraintStart": "2026-02-01",
+   899→      "constraintEnd": "2026-02-28",
+   900→      "isLocked": false,
+   901→      "maximoWoId": null
+   902→    }
+   903→  ]
+   904→}
+   905→```
+   906→
+   907→### 7.9.2 Fleet Status Export
+   908→
+   909→```json
+   910→{
+   911→  "exportDate": "2026-01-14T10:00:00Z",
+   912→  "exportType": "FLEET_STATUS",
+   913→  "data": {
+   914→    "summary": {
+   915→      "totalTrains": 128,
+   916→      "fitTrains": 124,
+   917→      "restrictedTrains": 3,
+   918→      "groundedTrains": 1,
+   919→      "avgMileageKm": 246500,
+   920→      "mileageStdDev": 12500
+   921→    },
+   922→    "trains": [
+   923→      {
+   924→        "trainNumber": "1001",
+   925→        "fleetCode": "KS",
+   926→        "currentMileageKm": 245000,
+   927→        "fitnessStatus": "FIT",
+   928→        "currentDepot": "BIS",
+   929→        "nextPM": {
+   930→          "pmCode": "C2",
+   931→          "targetDate": "2026-02-15",
+   932→          "daysUntilDue": 32
+   933→        }
+   934→      }
+   935→    ]
+   936→  }
+   937→}
+   938→```
+   939→
+   940→---
+   941→
+   942→## 7.10 Error Handling and Retry Logic
+   943→
+   944→### 7.10.1 Retry Configuration
+   945→
+   946→```typescript
+   947→interface RetryConfig {
+   948→  maxAttempts: number;
+   949→  initialDelayMs: number;
+   950→  maxDelayMs: number;
+   951→  backoffMultiplier: number;
+   952→  retryableErrors: string[];
+   953→}
+   954→
+   955→const INTEGRATION_RETRY_CONFIGS: Record<string, RetryConfig> = {
+   956→  maximo: {
+   957→    maxAttempts: 5,
+   958→    initialDelayMs: 1000,
+   959→    maxDelayMs: 60000,
+   960→    backoffMultiplier: 2,
+   961→    retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT', '503', '504']
+   962→  },
+   963→  email: {
+   964→    maxAttempts: 3,
+   965→    initialDelayMs: 5000,
+   966→    maxDelayMs: 30000,
+   967→    backoffMultiplier: 2,
+   968→    retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT']
+   969→  },
+   970→  fileIngestion: {
+   971→    maxAttempts: 3,
+   972→    initialDelayMs: 1000,
+   973→    maxDelayMs: 10000,
+   974→    backoffMultiplier: 2,
+   975→    retryableErrors: ['EBUSY', 'ENOENT']
+   976→  }
+   977→};
+   978→```
+   979→
+   980→### 7.10.2 Circuit Breaker
+   981→
+   982→```typescript
+   983→interface CircuitBreakerConfig {
+   984→  failureThreshold: number;    // Failures before opening
+   985→  successThreshold: number;    // Successes before closing
+   986→  timeout: number;             // Time in open state before half-open (ms)
+   987→}
+   988→
+   989→class CircuitBreaker {
+   990→  private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+   991→  private failures = 0;
+   992→  private successes = 0;
+   993→  private lastFailureTime: Date | null = null;
+   994→  
+   995→  async execute<T>(fn: () => Promise<T>): Promise<T> {
+   996→    if (this.state === 'OPEN') {
+   997→      if (Date.now() - this.lastFailureTime!.getTime() > this.config.timeout) {
+   998→        this.state = 'HALF_OPEN';
+   999→      } else {
+  1000→        throw new Error('Circuit breaker is OPEN');
+  1001→      }
+  1002→    }
+  1003→    
+  1004→    try {
+  1005→      const result = await fn();
+  1006→      this.onSuccess();
+  1007→      return result;
+  1008→    } catch (error) {
+  1009→      this.onFailure();
+  1010→      throw error;
+  1011→    }
+  1012→  }
+  1013→  
+  1014→  private onSuccess() {
+  1015→    this.failures = 0;
+  1016→    if (this.state === 'HALF_OPEN') {
+  1017→      this.successes++;
+  1018→      if (this.successes >= this.config.successThreshold) {
+  1019→        this.state = 'CLOSED';
+  1020→        this.successes = 0;
+  1021→      }
+  1022→    }
+  1023→  }
+  1024→  
+  1025→  private onFailure() {
+  1026→    this.failures++;
+  1027→    this.lastFailureTime = new Date();
+  1028→    if (this.failures >= this.config.failureThreshold) {
+  1029→      this.state = 'OPEN';
+  1030→    }
+  1031→  }
+  1032→}
+  1033→```
+  1034→
+  1035→---
+  1036→
+  1037→## 7.11 Integration Monitoring
+  1038→
+  1039→### 7.11.1 Health Checks
+  1040→
+  1041→```typescript
+  1042→interface IntegrationHealthCheck {
+  1043→  name: string;
+  1044→  type: 'MAXIMO' | 'SMTP' | 'FILE_SYSTEM' | 'DATABASE';
+  1045→  endpoint?: string;
+  1046→  checkInterval: number;  // ms
+  1047→  timeout: number;        // ms
+  1048→  healthyThreshold: number;
+  1049→  unhealthyThreshold: number;
+  1050→}
+  1051→
+  1052→const HEALTH_CHECKS: IntegrationHealthCheck[] = [
+  1053→  {
+  1054→    name: 'Maximo API',
+  1055→    type: 'MAXIMO',
+  1056→    endpoint: '/maximo/oslc/ping',
+  1057→    checkInterval: 60000,
+  1058→    timeout: 5000,
+  1059→    healthyThreshold: 2,
+  1060→    unhealthyThreshold: 3
+  1061→  },
+  1062→  {
+  1063→    name: 'SMTP Server',
+  1064→    type: 'SMTP',
+  1065→    checkInterval: 300000,
+  1066→    timeout: 10000,
+  1067→    healthyThreshold: 1,
+  1068→    unhealthyThreshold: 2
+  1069→  },
+  1070→  {
+  1071→    name: 'Mileage Inbox',
+  1072→    type: 'FILE_SYSTEM',
+  1073→    endpoint: '/data/inbox',
+  1074→    checkInterval: 60000,
+  1075→    timeout: 1000,
+  1076→    healthyThreshold: 1,
+  1077→    unhealthyThreshold: 3
+  1078→  }
+  1079→];
+  1080→```
+  1081→
+  1082→### 7.11.2 Integration Metrics
+  1083→
+  1084→```typescript
+  1085→const INTEGRATION_METRICS = {
+  1086→  // Maximo
+  1087→  'integration.maximo.requests_total': Counter,
+  1088→  'integration.maximo.request_duration_ms': Histogram,
+  1089→  'integration.maximo.errors_total': Counter,
+  1090→  'integration.maximo.circuit_breaker_state': Gauge,
+  1091→  
+  1092→  // File Ingestion
+  1093→  'integration.ingestion.files_processed_total': Counter,
+  1094→  'integration.ingestion.records_processed_total': Counter,
+  1095→  'integration.ingestion.errors_total': Counter,
+  1096→  'integration.ingestion.processing_duration_ms': Histogram,
+  1097→  
+  1098→  // Email
+  1099→  'integration.email.sent_total': Counter,
+  1100→  'integration.email.failed_total': Counter,
+  1101→  'integration.email.send_duration_ms': Histogram,
+  1102→  
+  1103→  // Sync Status
+  1104→  'integration.sync.pending_records': Gauge,
+  1105→  'integration.sync.conflict_records': Gauge,
+  1106→  'integration.sync.last_sync_timestamp': Gauge
+  1107→};
+  1108→```
+  1109→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

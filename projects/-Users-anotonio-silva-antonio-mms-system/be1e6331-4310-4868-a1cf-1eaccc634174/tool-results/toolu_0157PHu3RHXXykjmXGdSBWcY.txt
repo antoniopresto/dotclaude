@@ -1,0 +1,1264 @@
+     1→/**
+     2→ * MMS Infinite Canvas
+     3→ *
+     4→ * The main canvas component that renders PM schedule data at different zoom levels.
+     5→ * Uses deck.gl for strategic view (WebGL) and Konva for tactical/operational views (Canvas 2D).
+     6→ *
+     7→ * Zoom Level Rendering:
+     8→ * - STRATEGIC (0-4): deck.gl WebGL heatmap
+     9→ * - TACTICAL_WIDE (4-8): deck.gl WebGL compressed blocks
+    10→ * - TACTICAL (8-12): Konva HTML5 Canvas Gantt
+    11→ * - OPERATIONAL (12-16): Konva HTML5 Canvas detailed cards
+    12→ * - DETAIL (16+): React DOM overlay
+    13→ *
+    14→ * Based on specs/006-user-interface.md Section 6.3.
+    15→ */
+    16→
+    17→import { useRef } from 'react';
+    18→import { Card, NonIdealState, Spinner, Tag, Button, ButtonGroup, OverlayToaster, Intent, Position } from '@blueprintjs/core';
+    19→
+    20→import { useCanvas, useCanvasData, useFleet, usePm, useUi, loadStrategicData, loadTacticalData, loadTacticalWideData, loadOperationalData, loadDetailData } from '../../store';
+    21→import type { CanvasSliceState } from '../../store/slices/canvas';
+    22→import type { CanvasDataState } from '../../store/slices/canvas';
+    23→import type { FleetSliceState } from '../../store/slices/fleet';
+    24→import type { PmSliceState } from '../../store/slices/pm';
+    25→import type { UiSliceState } from '../../store/slices/ui';
+    26→import type { ZoomLevel } from '../../store/types';
+    27→import { StrategicHeatmapLayer, TacticalWideLayer, TacticalGanttLayer, OperationalDetailLayer, DetailCardOverlay, type HeatmapCell, type PmBlock, type OperationalPmBlock, type DragValidationState, type PmMoveImpact } from './layers';
+    28→import { DragConfirmationDialog } from './DragConfirmationDialog';
+    29→import { quickValidatePmMove, createDebouncedValidation, getPmMoveImpact, commitPmMove, createCanvasKeyboardHandler, type KeyboardHandlerCallbacks } from './utils';
+    30→import { KeyboardShortcutsDialog } from '../KeyboardShortcutsDialog';
+    31→
+    32→// Toaster helper for showing notifications
+    33→// Uses the static show method which handles async creation
+    34→async function showToast(options: {
+    35→  intent: typeof Intent[keyof typeof Intent];
+    36→  icon: 'error' | 'tick' | 'warning-sign' | 'info-sign';
+    37→  message: string;
+    38→  timeout: number;
+    39→}): Promise<void> {
+    40→  const toaster = await OverlayToaster.createAsync({ position: Position.TOP_RIGHT });
+    41→  toaster.show(options);
+    42→}
+    43→
+    44→/** Default canvas dimensions when container size is not available */
+    45→const DEFAULT_CANVAS_WIDTH = 1200;
+    46→const DEFAULT_CANVAS_HEIGHT = 800;
+    47→
+    48→// Drag confirmation state interface
+    49→interface DragConfirmState {
+    50→  isOpen: boolean;
+    51→  pmId: string | null;
+    52→  pmCode: string;
+    53→  trainNumber: string;
+    54→  sourceDate: string;
+    55→  targetDate: string;
+    56→  impact: PmMoveImpact | null;
+    57→  isLoadingImpact: boolean;
+    58→}
+    59→
+    60→const initialDragConfirmState: DragConfirmState = {
+    61→  isOpen: false,
+    62→  pmId: null,
+    63→  pmCode: '',
+    64→  trainNumber: '',
+    65→  sourceDate: '',
+    66→  targetDate: '',
+    67→  impact: null,
+    68→  isLoadingImpact: false,
+    69→};
+    70→
+    71→export function InfiniteCanvas() {
+    72→  const { state: canvasStateRaw, actions: canvasActions } = useCanvas();
+    73→  const { state: canvasDataStateRaw, actions: canvasDataActions } = useCanvasData();
+    74→  const { state: fleetStateRaw } = useFleet();
+    75→  const { state: pmStateRaw, actions: pmActions } = usePm();
+    76→  const { state: uiStateRaw, actions: uiActions } = useUi();
+    77→
+    78→  const canvasState = canvasStateRaw as unknown as CanvasSliceState;
+    79→  const canvasDataState = canvasDataStateRaw as unknown as CanvasDataState;
+    80→  const fleetState = fleetStateRaw as unknown as FleetSliceState;
+    81→  const pmState = pmStateRaw as unknown as PmSliceState;
+    82→  const uiState = uiStateRaw as unknown as UiSliceState;
+    83→
+    84→  const { zoom, zoomLevel, viewport, isPanning, layers } = canvasState;
+    85→  const {
+    86→    strategicData, strategicLoading, strategicError, fromYear, toYear,
+    87→    tacticalWideData, tacticalWideLoading, tacticalWideError, tacticalWideFromDate, tacticalWideToDate,
+    88→    tacticalData, tacticalLoading, tacticalError, tacticalFromDate, tacticalToDate,
+    89→    operationalData, operationalLoading, operationalError, operationalFromDate, operationalToDate,
+    90→    detailData, detailLoading, detailError, detailFromDate, detailToDate, detailExpandedPmIds
+    91→  } = canvasDataState;
+    92→  const isLoading = fleetState.trains.length === 0;
+    93→
+    94→  const tooltipPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+    95→  const tooltipRef = useRef<HTMLDivElement>(null);
+    96→
+    97→  // Drag state refs
+    98→  const dragValidationRef = useRef<DragValidationState | null>(null);
+    99→  const draggingPmRef = useRef<{
+   100→    pmId: string;
+   101→    pmCode: string;
+   102→    trainId: string;
+   103→    trainNumber: string;
+   104→    sourceDate: string;
+   105→    constraintStart: string;
+   106→    constraintEnd: string;
+   107→    isLocked: boolean;
+   108→  } | null>(null);
+   109→  const dragConfirmRef = useRef<DragConfirmState>(initialDragConfirmState);
+   110→
+   111→  // Create debounced API validation
+   112→  const debouncedValidationRef = useRef(
+   113→    createDebouncedValidation((result) => {
+   114→      dragValidationRef.current = result;
+   115→      if (draggingPmRef.current) {
+   116→        pmActions.setDragValidation({
+   117→          isValid: result.isValid,
+   118→          message: result.message,
+   119→          violations: result.violations,
+   120→        });
+   121→      }
+   122→    }, { delay: 150 })
+   123→  );
+   124→
+   125→  // Ref for container to handle focus
+   126→  const containerRef = useRef<HTMLDivElement>(null);
+   127→
+   128→  // ==========================================================================
+   129→  // Keyboard Handler Callbacks
+   130→  // ==========================================================================
+   131→
+   132→  const keyboardCallbacksRef = useRef<KeyboardHandlerCallbacks>({
+   133→    // Navigation
+   134→    onPan: (direction, amount) => {
+   135→      const delta = { dx: 0, dy: 0 };
+   136→      switch (direction) {
+   137→        case 'up':
+   138→          delta.dy = -amount;
+   139→          break;
+   140→        case 'down':
+   141→          delta.dy = amount;
+   142→          break;
+   143→        case 'left':
+   144→          delta.dx = -amount;
+   145→          break;
+   146→        case 'right':
+   147→          delta.dx = amount;
+   148→          break;
+   149→      }
+   150→      canvasActions.pan(delta);
+   151→    },
+   152→    onGoToToday: () => {
+   153→      canvasActions.goToToday();
+   154→    },
+   155→
+   156→    // Zoom
+   157→    onZoomIn: () => {
+   158→      canvasActions.zoomIn(1.2);
+   159→    },
+   160→    onZoomOut: () => {
+   161→      canvasActions.zoomOut(1.2);
+   162→    },
+   163→    onSetZoomLevel: (level: ZoomLevel) => {
+   164→      canvasActions.setZoomLevel(level);
+   165→    },
+   166→
+   167→    // Selection
+   168→    onClearSelection: () => {
+   169→      canvasActions.clearSelection();
+   170→    },
+   171→    onToggleSelection: () => {
+   172→      // Toggle multi-select mode
+   173→      canvasActions.setMultiSelect(!canvasState.selection.isMultiSelect);
+   174→    },
+   175→    onActivateSelected: () => {
+   176→      // Activate selected PM - for now, zoom to tactical view showing the PM
+   177→      const selectedPmId = canvasState.selection.selectedPmIds[0];
+   178→      if (selectedPmId) {
+   179→        // Zoom to tactical view to see PM details
+   180→        canvasActions.setZoomLevel('TACTICAL');
+   181→      }
+   182→    },
+   183→
+   184→    // Editing
+   185→    onToggleLock: () => {
+   186→      const selectedPmId = canvasState.selection.selectedPmIds[0];
+   187→      if (selectedPmId) {
+   188→        // In production, this would call the API to lock/unlock
+   189→        void showToast({
+   190→          intent: Intent.PRIMARY,
+   191→          icon: 'info-sign',
+   192→          message: 'Lock/unlock PM feature - API integration pending',
+   193→          timeout: 3000,
+   194→        });
+   195→      }
+   196→    },
+   197→    onDeleteSelected: () => {
+   198→      const selectedPmId = canvasState.selection.selectedPmIds[0];
+   199→      if (selectedPmId) {
+   200→        // In production, this would open a confirmation dialog
+   201→        uiActions.openModal({ type: 'confirm-delete-pm', data: { pmId: selectedPmId } });
+   202→      }
+   203→    },
+   204→
+   205→    // Dialogs
+   206→    onShowKeyboardHelp: () => {
+   207→      uiActions.showKeyboardShortcutsDialog();
+   208→    },
+   209→    onCloseDialog: () => {
+   210→      // Close any open dialog
+   211→      if (uiState.keyboardShortcutsDialogOpen) {
+   212→        uiActions.hideKeyboardShortcutsDialog();
+   213→      } else if (uiState.modal.isOpen) {
+   214→        uiActions.closeModal();
+   215→      }
+   216→    },
+   217→
+   218→    // State queries
+   219→    isShortcutsEnabled: () => uiState.shortcutsEnabled,
+   220→    hasOpenDialog: () => uiState.modal.isOpen || uiState.keyboardShortcutsDialogOpen || dragConfirmRef.current.isOpen,
+   221→    isDragging: () => pmState.drag.isDragging,
+   222→    getSelectedPmId: () => canvasState.selection.selectedPmIds[0] || null,
+   223→  });
+   224→
+   225→  // Update ref values on each render (refs don't cause re-renders)
+   226→  keyboardCallbacksRef.current.isShortcutsEnabled = () => uiState.shortcutsEnabled;
+   227→  keyboardCallbacksRef.current.hasOpenDialog = () => uiState.modal.isOpen || uiState.keyboardShortcutsDialogOpen || dragConfirmRef.current.isOpen;
+   228→  keyboardCallbacksRef.current.isDragging = () => pmState.drag.isDragging;
+   229→  keyboardCallbacksRef.current.getSelectedPmId = () => canvasState.selection.selectedPmIds[0] || null;
+   230→
+   231→  // Create keyboard handler
+   232→  const handleKeyDown = createCanvasKeyboardHandler(keyboardCallbacksRef.current);
+   233→
+   234→  const handleWheel = (event: React.WheelEvent) => {
+   235→    event.preventDefault();
+   236→    const delta = event.deltaY > 0 ? -0.5 : 0.5;
+   237→    const newZoom = Math.max(0, Math.min(20, zoom + delta));
+   238→    canvasActions.setZoom(newZoom);
+   239→  };
+   240→
+   241→  const handleMouseDown = (event: React.MouseEvent) => {
+   242→    if (event.button === 0) {
+   243→      canvasActions.startPanning();
+   244→    }
+   245→  };
+   246→
+   247→  const handleMouseUp = () => {
+   248→    canvasActions.stopPanning();
+   249→  };
+   250→
+   251→  const handleMouseMove = (event: React.MouseEvent) => {
+   252→    if (isPanning) {
+   253→      canvasActions.pan({
+   254→        dx: -event.movementX,
+   255→        dy: -event.movementY,
+   256→      });
+   257→    }
+   258→    tooltipPosRef.current = { x: event.clientX, y: event.clientY };
+   259→  };
+   260→
+   261→  const handleLoadStrategicData = () => {
+   262→    loadStrategicData(canvasDataActions, {
+   263→      fromYear,
+   264→      toYear,
+   265→    });
+   266→  };
+   267→
+   268→  const handleLoadTacticalWideData = () => {
+   269→    loadTacticalWideData(canvasDataActions, {
+   270→      fromDate: tacticalWideFromDate,
+   271→      toDate: tacticalWideToDate,
+   272→    });
+   273→  };
+   274→
+   275→  const handleLoadTacticalData = () => {
+   276→    loadTacticalData(canvasDataActions, {
+   277→      fromWeek: tacticalFromDate,
+   278→      toWeek: tacticalToDate,
+   279→    });
+   280→  };
+   281→
+   282→  const handleLoadOperationalData = () => {
+   283→    loadOperationalData(canvasDataActions, {
+   284→      fromDate: operationalFromDate,
+   285→      toDate: operationalToDate,
+   286→    });
+   287→  };
+   288→
+   289→  const handleLoadDetailData = () => {
+   290→    loadDetailData(canvasDataActions, {
+   291→      fromDate: detailFromDate,
+   292→      toDate: detailToDate,
+   293→    });
+   294→  };
+   295→
+   296→  const handleDetailPmSelect = (pmId: string) => {
+   297→    canvasActions.selectPm(pmId);
+   298→  };
+   299→
+   300→  const handleDetailPmExpand = (pmId: string) => {
+   301→    canvasDataActions.expandDetailPm(pmId);
+   302→  };
+   303→
+   304→  const handleDetailPmCollapse = (pmId: string) => {
+   305→    canvasDataActions.collapseDetailPm(pmId);
+   306→  };
+   307→
+   308→  const handleDetailPmEdit = (pmId: string, field: string) => {
+   309→    // In production, this would dispatch an edit action to the PM service
+   310→    console.log(`Edit PM ${pmId} field ${field}`);
+   311→  };
+   312→
+   313→  const handleDetailPmLock = (pmId: string) => {
+   314→    // In production, this would dispatch a lock action
+   315→    console.log(`Lock PM ${pmId}`);
+   316→  };
+   317→
+   318→  const handleDetailPmUnlock = (pmId: string) => {
+   319→    // In production, this would dispatch an unlock action
+   320→    console.log(`Unlock PM ${pmId}`);
+   321→  };
+   322→
+   323→  const handleDetailViewHistory = (pmId: string) => {
+   324→    // In production, this would open a history panel
+   325→    console.log(`View history for PM ${pmId}`);
+   326→  };
+   327→
+   328→  // ==========================================================================
+   329→  // Drag-and-Drop Handlers
+   330→  // ==========================================================================
+   331→
+   332→  const handlePmDragStart = (pmId: string, sourceDate: string) => {
+   333→    // Find PM in tactical data
+   334→    const pm = tacticalData?.pmBlocks.find(p => p.pmId === pmId);
+   335→    if (!pm) return;
+   336→
+   337→    // Store drag info
+   338→    draggingPmRef.current = {
+   339→      pmId,
+   340→      pmCode: pm.pmCode,
+   341→      trainId: pm.trainId,
+   342→      trainNumber: pm.trainNumber,
+   343→      sourceDate,
+   344→      constraintStart: pm.constraintStart,
+   345→      constraintEnd: pm.constraintEnd,
+   346→      isLocked: pm.isLocked,
+   347→    };
+   348→
+   349→    // Initialize drag state in PM slice
+   350→    pmActions.startDrag({ pmId, sourceDate });
+   351→
+   352→    // Set initial validation (quick check)
+   353→    const quickResult = quickValidatePmMove({
+   354→      pmId,
+   355→      currentDate: sourceDate,
+   356→      targetDate: sourceDate,
+   357→      trainId: pm.trainId,
+   358→      constraintStart: pm.constraintStart,
+   359→      constraintEnd: pm.constraintEnd,
+   360→      isLocked: pm.isLocked,
+   361→    });
+   362→    dragValidationRef.current = quickResult;
+   363→    pmActions.setDragValidation({
+   364→      isValid: quickResult.isValid,
+   365→      message: quickResult.message,
+   366→      violations: quickResult.violations,
+   367→    });
+   368→  };
+   369→
+   370→  const handlePmDragMove = (pmId: string, targetDate: string) => {
+   371→    const dragInfo = draggingPmRef.current;
+   372→    if (!dragInfo || dragInfo.pmId !== pmId) return;
+   373→
+   374→    // Update target date in PM slice
+   375→    pmActions.updateDragTarget(targetDate);
+   376→
+   377→    // Quick client-side validation
+   378→    const quickResult = quickValidatePmMove({
+   379→      pmId,
+   380→      currentDate: dragInfo.sourceDate,
+   381→      targetDate,
+   382→      trainId: dragInfo.trainId,
+   383→      constraintStart: dragInfo.constraintStart,
+   384→      constraintEnd: dragInfo.constraintEnd,
+   385→      isLocked: dragInfo.isLocked,
+   386→    });
+   387→    dragValidationRef.current = quickResult;
+   388→    pmActions.setDragValidation({
+   389→      isValid: quickResult.isValid,
+   390→      message: quickResult.message,
+   391→      violations: quickResult.violations,
+   392→    });
+   393→
+   394→    // If quick validation passes, trigger debounced API validation
+   395→    if (quickResult.isValid && targetDate !== dragInfo.sourceDate) {
+   396→      debouncedValidationRef.current.validate({
+   397→        pmId,
+   398→        currentDate: dragInfo.sourceDate,
+   399→        targetDate,
+   400→        trainId: dragInfo.trainId,
+   401→      });
+   402→    }
+   403→  };
+   404→
+   405→  const handlePmDragEnd = async (pmId: string, targetDate: string) => {
+   406→    const dragInfo = draggingPmRef.current;
+   407→    if (!dragInfo || dragInfo.pmId !== pmId) {
+   408→      // Clear drag state
+   409→      pmActions.cancelDrag();
+   410→      draggingPmRef.current = null;
+   411→      return;
+   412→    }
+   413→
+   414→    // Cancel pending validation
+   415→    debouncedValidationRef.current.cancel();
+   416→
+   417→    // If no change, just cancel
+   418→    if (targetDate === dragInfo.sourceDate) {
+   419→      pmActions.cancelDrag();
+   420→      draggingPmRef.current = null;
+   421→      return;
+   422→    }
+   423→
+   424→    // Final quick validation
+   425→    const finalValidation = quickValidatePmMove({
+   426→      pmId,
+   427→      currentDate: dragInfo.sourceDate,
+   428→      targetDate,
+   429→      trainId: dragInfo.trainId,
+   430→      constraintStart: dragInfo.constraintStart,
+   431→      constraintEnd: dragInfo.constraintEnd,
+   432→      isLocked: dragInfo.isLocked,
+   433→    });
+   434→
+   435→    // If invalid, snap back and show toast
+   436→    if (!finalValidation.isValid) {
+   437→      pmActions.cancelDrag();
+   438→      draggingPmRef.current = null;
+   439→      void showToast({
+   440→        intent: Intent.DANGER,
+   441→        icon: 'error',
+   442→        message: finalValidation.message || 'Cannot reschedule: constraint violation',
+   443→        timeout: 5000,
+   444→      });
+   445→      return;
+   446→    }
+   447→
+   448→    // Open confirmation dialog
+   449→    dragConfirmRef.current = {
+   450→      isOpen: true,
+   451→      pmId,
+   452→      pmCode: dragInfo.pmCode,
+   453→      trainNumber: dragInfo.trainNumber,
+   454→      sourceDate: dragInfo.sourceDate,
+   455→      targetDate,
+   456→      impact: null,
+   457→      isLoadingImpact: true,
+   458→    };
+   459→    // Force re-render by ending drag with commit=false (optimistic update)
+   460→    pmActions.endDrag(false);
+   461→
+   462→    // Load impact assessment
+   463→    try {
+   464→      const impact = await getPmMoveImpact({
+   465→        pmId,
+   466→        currentDate: dragInfo.sourceDate,
+   467→        targetDate,
+   468→        trainId: dragInfo.trainId,
+   469→      });
+   470→      dragConfirmRef.current = {
+   471→        ...dragConfirmRef.current,
+   472→        impact,
+   473→        isLoadingImpact: false,
+   474→      };
+   475→    } catch {
+   476→      dragConfirmRef.current = {
+   477→        ...dragConfirmRef.current,
+   478→        isLoadingImpact: false,
+   479→      };
+   480→    }
+   481→
+   482→    // Keep draggingPmRef for the confirmation dialog
+   483→  };
+   484→
+   485→  const handleDragConfirm = async () => {
+   486→    const confirmState = dragConfirmRef.current;
+   487→    const dragInfo = draggingPmRef.current;
+   488→
+   489→    if (!confirmState.pmId || !dragInfo) {
+   490→      handleDragCancel();
+   491→      return;
+   492→    }
+   493→
+   494→    try {
+   495→      // Commit the move to API
+   496→      await commitPmMove({
+   497→        pmId: confirmState.pmId,
+   498→        currentDate: confirmState.sourceDate,
+   499→        targetDate: confirmState.targetDate,
+   500→        trainId: dragInfo.trainId,
+   501→        reason: 'Manual reschedule via canvas drag-and-drop',
+   502→      });
+   503→
+   504→      // Confirm move in PM slice (updates local state)
+   505→      pmActions.confirmMove(confirmState.pmId);
+   506→
+   507→      // Show success toast
+   508→      void showToast({
+   509→        intent: Intent.SUCCESS,
+   510→        icon: 'tick',
+   511→        message: `${confirmState.pmCode} rescheduled to ${confirmState.targetDate}`,
+   512→        timeout: 3000,
+   513→      });
+   514→
+   515→      // Reload tactical data to reflect changes
+   516→      handleLoadTacticalData();
+   517→    } catch (error) {
+   518→      // Reject move (revert to original date)
+   519→      pmActions.rejectMove(confirmState.pmId);
+   520→
+   521→      // Show error toast
+   522→      void showToast({
+   523→        intent: Intent.DANGER,
+   524→        icon: 'error',
+   525→        message: error instanceof Error ? error.message : 'Failed to reschedule PM',
+   526→        timeout: 5000,
+   527→      });
+   528→    } finally {
+   529→      // Close dialog and clear state
+   530→      dragConfirmRef.current = initialDragConfirmState;
+   531→      draggingPmRef.current = null;
+   532→    }
+   533→  };
+   534→
+   535→  const handleDragCancel = () => {
+   536→    const confirmState = dragConfirmRef.current;
+   537→
+   538→    // Revert the move if pending
+   539→    if (confirmState.pmId) {
+   540→      pmActions.rejectMove(confirmState.pmId);
+   541→    }
+   542→
+   543→    // Clear state
+   544→    dragConfirmRef.current = initialDragConfirmState;
+   545→    draggingPmRef.current = null;
+   546→  };
+   547→
+   548→  const handlePmBlockHover = (pm: PmBlock | null) => {
+   549→    if (tooltipRef.current) {
+   550→      if (pm) {
+   551→        tooltipRef.current.style.display = 'block';
+   552→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   553→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   554→        tooltipRef.current.innerHTML = `
+   555→          <div style="font-weight: 600; margin-bottom: 4px;">
+   556→            ${pm.pmCode} - ${pm.trainNumber}
+   557→          </div>
+   558→          <div style="color: #64748b;">
+   559→            <div>Date: <strong>${pm.targetDate}</strong></div>
+   560→            <div>Duration: <strong>${pm.durationDays} day${pm.durationDays > 1 ? 's' : ''}</strong></div>
+   561→            <div>Status: <strong>${pm.status}</strong></div>
+   562→            ${pm.depotCode ? `<div>Depot: <strong>${pm.depotCode}</strong></div>` : ''}
+   563→            ${pm.trackNumber ? `<div>Track: <strong>${pm.trackNumber}</strong></div>` : ''}
+   564→            ${pm.estimatedHours ? `<div>Hours: <strong>${pm.estimatedHours}h</strong></div>` : ''}
+   565→            ${pm.isLocked ? '<div style="color: #d97706;">🔒 Locked</div>' : ''}
+   566→          </div>
+   567→        `;
+   568→      } else {
+   569→        tooltipRef.current.style.display = 'none';
+   570→      }
+   571→    }
+   572→  };
+   573→
+   574→  const handlePmBlockClick = (pmId: string) => {
+   575→    canvasActions.selectPm(pmId);
+   576→  };
+   577→
+   578→  // Tactical-Wide block handlers
+   579→  const handleTacticalWideBlockHover = (block: { pmId: string; trainNumber: string; pmCode: string; targetDate: string; status: string; durationWeeks: number; isLocked: boolean } | null) => {
+   580→    if (tooltipRef.current) {
+   581→      if (block) {
+   582→        tooltipRef.current.style.display = 'block';
+   583→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   584→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   585→        tooltipRef.current.innerHTML = `
+   586→          <div style="font-weight: 600; margin-bottom: 4px;">
+   587→            ${block.pmCode} - ${block.trainNumber}
+   588→          </div>
+   589→          <div style="color: #64748b;">
+   590→            <div>Date: <strong>${block.targetDate}</strong></div>
+   591→            <div>Status: <strong>${block.status}</strong></div>
+   592→            <div>Duration: <strong>~${block.durationWeeks} week(s)</strong></div>
+   593→            ${block.isLocked ? '<div style="color: #d97706;">🔒 Locked</div>' : ''}
+   594→          </div>
+   595→        `;
+   596→      } else {
+   597→        tooltipRef.current.style.display = 'none';
+   598→      }
+   599→    }
+   600→  };
+   601→
+   602→  const handleTacticalWideBlockClick = (block: { pmId: string }) => {
+   603→    canvasActions.selectPm(block.pmId);
+   604→  };
+   605→
+   606→  const handleMonthClick = (month: number, year: number) => {
+   607→    // Zoom into tactical view for the clicked month
+   608→    canvasActions.setZoom(10); // Move to TACTICAL zoom level
+   609→    const startDate = new Date(year, month, 1);
+   610→    const endDate = new Date(year, month + 3, 0); // 3 months view
+   611→    canvasActions.setViewport({
+   612→      startDate: startDate.toISOString().split('T')[0],
+   613→      endDate: endDate.toISOString().split('T')[0],
+   614→    });
+   615→  };
+   616→
+   617→  const handleCellHover = (cell: HeatmapCell | null) => {
+   618→    if (tooltipRef.current) {
+   619→      if (cell) {
+   620→        tooltipRef.current.style.display = 'block';
+   621→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   622→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   623→        tooltipRef.current.innerHTML = `
+   624→          <div style="font-weight: 600; margin-bottom: 4px;">
+   625→            Train ${cell.trainNumber} - ${cell.year}
+   626→          </div>
+   627→          <div style="color: #64748b;">
+   628→            <div>PM Count: <strong>${cell.pmCount}</strong></div>
+   629→            <div>Total Hours: <strong>${cell.totalHours.toFixed(1)}h</strong></div>
+   630→            ${cell.completedCount > 0 ? `<div>Completed: <strong>${cell.completedCount}</strong></div>` : ''}
+   631→            ${cell.lockedCount > 0 ? `<div>Locked: <strong>${cell.lockedCount}</strong></div>` : ''}
+   632→          </div>
+   633→        `;
+   634→      } else {
+   635→        tooltipRef.current.style.display = 'none';
+   636→      }
+   637→    }
+   638→  };
+   639→
+   640→  const handleCellClick = (cell: HeatmapCell) => {
+   641→    canvasActions.setZoom(6);
+   642→    canvasActions.setViewport({
+   643→      startDate: `${cell.year}-01-01`,
+   644→      endDate: `${cell.year}-12-31`,
+   645→      trainIds: [cell.trainId],
+   646→    });
+   647→  };
+   648→
+   649→  const handleYearClick = (year: number) => {
+   650→    canvasActions.setZoom(6);
+   651→    canvasActions.setViewport({
+   652→      startDate: `${year}-01-01`,
+   653→      endDate: `${year}-12-31`,
+   654→    });
+   655→  };
+   656→
+   657→  const handleOperationalPmHover = (pm: OperationalPmBlock | null) => {
+   658→    if (tooltipRef.current) {
+   659→      if (pm) {
+   660→        tooltipRef.current.style.display = 'block';
+   661→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   662→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   663→        const materialInfo = pm.materials.length > 0
+   664→          ? pm.materials.map(m => `${m.status === 'AVAILABLE' ? '✓' : '⚠'} ${m.materialName}`).slice(0, 3).join('<br/>')
+   665→          : '<span style="color: #94a3b8; font-style: italic;">No materials required</span>';
+   666→        tooltipRef.current.innerHTML = `
+   667→          <div style="font-weight: 600; margin-bottom: 8px;">
+   668→            ${pm.pmCode} - ${pm.trainNumber}
+   669→          </div>
+   670→          <div style="color: #64748b;">
+   671→            <div><strong>${pm.pmDescription}</strong></div>
+   672→            <div style="margin-top: 4px;">Date: <strong>${pm.targetDate} - ${pm.endDate}</strong></div>
+   673→            <div>Duration: <strong>${pm.durationDays} day${pm.durationDays > 1 ? 's' : ''}</strong></div>
+   674→            <div>Status: <strong>${pm.status}</strong></div>
+   675→            ${pm.depotCode ? `<div>Depot: <strong>${pm.depotCode}</strong></div>` : ''}
+   676→            ${pm.trackNumber ? `<div>Track: <strong>${pm.trackNumber}</strong></div>` : ''}
+   677→            ${pm.estimatedHours ? `<div>Hours: <strong>${pm.estimatedHours}h</strong></div>` : ''}
+   678→            ${pm.assignedShift ? `<div>Shift: <strong>${pm.assignedShift}</strong></div>` : ''}
+   679→            ${pm.isLocked ? '<div style="color: #d97706; margin-top: 4px;">🔒 Locked in Maximo</div>' : ''}
+   680→            <div style="margin-top: 8px; border-top: 1px solid #e2e8f0; padding-top: 8px;">
+   681→              <strong>Materials:</strong><br/>
+   682→              ${materialInfo}
+   683→            </div>
+   684→          </div>
+   685→        `;
+   686→      } else {
+   687→        tooltipRef.current.style.display = 'none';
+   688→      }
+   689→    }
+   690→  };
+   691→
+   692→  const renderContent = () => {
+   693→    if (isLoading) {
+   694→      return (
+   695→        <NonIdealState
+   696→          icon={<Spinner size={48} />}
+   697→          title="Loading fleet data..."
+   698→          description="Fetching trains and PM schedule"
+   699→        />
+   700→      );
+   701→    }
+   702→
+   703→    if (fleetState.trains.length === 0) {
+   704→      return (
+   705→        <NonIdealState
+   706→          icon="train"
+   707→          title="No trains found"
+   708→          description="No trains match the current filters"
+   709→        />
+   710→      );
+   711→    }
+   712→
+   713→    if (zoomLevel === 'STRATEGIC') {
+   714→      if (strategicLoading) {
+   715→        return (
+   716→          <NonIdealState
+   717→            icon={<Spinner size={48} />}
+   718→            title="Loading strategic view..."
+   719→            description="Fetching PM density data"
+   720→          />
+   721→        );
+   722→      }
+   723→
+   724→      if (strategicError) {
+   725→        return (
+   726→          <NonIdealState
+   727→            icon="error"
+   728→            title="Error loading strategic view"
+   729→            description={strategicError}
+   730→            action={
+   731→              <Button intent="primary" onClick={handleLoadStrategicData}>
+   732→                Retry
+   733→              </Button>
+   734→            }
+   735→          />
+   736→        );
+   737→      }
+   738→
+   739→      if (!strategicData) {
+   740→        return (
+   741→          <NonIdealState
+   742→            icon="heat-grid"
+   743→            title="Strategic View"
+   744→            description="Load PM density heatmap for multi-year planning"
+   745→            action={
+   746→              <ButtonGroup>
+   747→                <Button intent="primary" onClick={handleLoadStrategicData}>
+   748→                  Load Strategic Data
+   749→                </Button>
+   750→              </ButtonGroup>
+   751→            }
+   752→          >
+   753→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   754→              <p>Shows 10-year PM density across {fleetState.trains.length} trains</p>
+   755→            </div>
+   756→          </NonIdealState>
+   757→        );
+   758→      }
+   759→
+   760→      return (
+   761→        <>
+   762→          <StrategicHeatmapLayer
+   763→            data={strategicData}
+   764→            fromYear={fromYear}
+   765→            toYear={toYear}
+   766→            width="100%"
+   767→            height="100%"
+   768→            onCellHover={handleCellHover}
+   769→            onCellClick={handleCellClick}
+   770→            onYearClick={handleYearClick}
+   771→          />
+   772→          <div
+   773→            ref={tooltipRef}
+   774→            style={{
+   775→              display: 'none',
+   776→              position: 'fixed',
+   777→              backgroundColor: 'white',
+   778→              border: '1px solid #e2e8f0',
+   779→              borderRadius: '6px',
+   780→              padding: '8px 12px',
+   781→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   782→              pointerEvents: 'none',
+   783→              zIndex: 100,
+   784→              fontSize: '12px',
+   785→              lineHeight: 1.5,
+   786→            }}
+   787→          />
+   788→        </>
+   789→      );
+   790→    }
+   791→
+   792→    if (zoomLevel === 'TACTICAL_WIDE') {
+   793→      if (tacticalWideLoading) {
+   794→        return (
+   795→          <NonIdealState
+   796→            icon={<Spinner size={48} />}
+   797→            title="Loading tactical-wide view..."
+   798→            description="Fetching yearly PM schedule data"
+   799→          />
+   800→        );
+   801→      }
+   802→
+   803→      if (tacticalWideError) {
+   804→        return (
+   805→          <NonIdealState
+   806→            icon="error"
+   807→            title="Error loading tactical-wide view"
+   808→            description={tacticalWideError}
+   809→            action={
+   810→              <Button intent="primary" onClick={handleLoadTacticalWideData}>
+   811→                Retry
+   812→              </Button>
+   813→            }
+   814→          />
+   815→        );
+   816→      }
+   817→
+   818→      if (!tacticalWideData) {
+   819→        return (
+   820→          <NonIdealState
+   821→            icon="calendar"
+   822→            title="Tactical Wide View"
+   823→            description="Load 1-year PM schedule with monthly granularity"
+   824→            action={
+   825→              <ButtonGroup>
+   826→                <Button intent="primary" onClick={handleLoadTacticalWideData}>
+   827→                  Load Tactical Wide Data
+   828→                </Button>
+   829→              </ButtonGroup>
+   830→            }
+   831→          >
+   832→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   833→              <p>Shows PM schedule from {tacticalWideFromDate} to {tacticalWideToDate}</p>
+   834→              <p>Monthly granularity with compressed Gantt blocks</p>
+   835→            </div>
+   836→          </NonIdealState>
+   837→        );
+   838→      }
+   839→
+   840→      return (
+   841→        <>
+   842→          <TacticalWideLayer
+   843→            data={tacticalWideData}
+   844→            fromDate={new Date(tacticalWideFromDate)}
+   845→            toDate={new Date(tacticalWideToDate)}
+   846→            width="100%"
+   847→            height="100%"
+   848→            selectedPmIds={canvasState.selection.selectedPmIds}
+   849→            onBlockHover={handleTacticalWideBlockHover}
+   850→            onBlockClick={handleTacticalWideBlockClick}
+   851→            onMonthClick={handleMonthClick}
+   852→          />
+   853→          <div
+   854→            ref={tooltipRef}
+   855→            style={{
+   856→              display: 'none',
+   857→              position: 'fixed',
+   858→              backgroundColor: 'white',
+   859→              border: '1px solid #e2e8f0',
+   860→              borderRadius: '6px',
+   861→              padding: '8px 12px',
+   862→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   863→              pointerEvents: 'none',
+   864→              zIndex: 100,
+   865→              fontSize: '12px',
+   866→              lineHeight: 1.5,
+   867→            }}
+   868→          />
+   869→        </>
+   870→      );
+   871→    }
+   872→
+   873→    if (zoomLevel === 'TACTICAL') {
+   874→      if (tacticalLoading) {
+   875→        return (
+   876→          <NonIdealState
+   877→            icon={<Spinner size={48} />}
+   878→            title="Loading tactical view..."
+   879→            description="Fetching PM schedule data"
+   880→          />
+   881→        );
+   882→      }
+   883→
+   884→      if (tacticalError) {
+   885→        return (
+   886→          <NonIdealState
+   887→            icon="error"
+   888→            title="Error loading tactical view"
+   889→            description={tacticalError}
+   890→            action={
+   891→              <Button intent="primary" onClick={handleLoadTacticalData}>
+   892→                Retry
+   893→              </Button>
+   894→            }
+   895→          />
+   896→        );
+   897→      }
+   898→
+   899→      if (!tacticalData) {
+   900→        return (
+   901→          <NonIdealState
+   902→            icon="gantt-chart"
+   903→            title="Tactical View"
+   904→            description="Load 12-week PM schedule Gantt chart"
+   905→            action={
+   906→              <ButtonGroup>
+   907→                <Button intent="primary" onClick={handleLoadTacticalData}>
+   908→                  Load Tactical Data
+   909→                </Button>
+   910→              </ButtonGroup>
+   911→            }
+   912→          >
+   913→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   914→              <p>Shows PM schedule from {tacticalFromDate} to {tacticalToDate}</p>
+   915→            </div>
+   916→          </NonIdealState>
+   917→        );
+   918→      }
+   919→
+   920→      // Build train order from tactical data
+   921→      const trainIds = Array.from(new Set(tacticalData.pmBlocks.map(pm => pm.trainId)));
+   922→      const containerWidth = DEFAULT_CANVAS_WIDTH;
+   923→      const containerHeight = DEFAULT_CANVAS_HEIGHT;
+   924→
+   925→      return (
+   926→        <>
+   927→          <TacticalGanttLayer
+   928→            data={tacticalData}
+   929→            trainOrder={trainIds}
+   930→            fromDate={new Date(tacticalFromDate)}
+   931→            toDate={new Date(tacticalToDate)}
+   932→            width={containerWidth}
+   933→            height={containerHeight}
+   934→            selectedPmIds={canvasState.selection.selectedPmIds}
+   935→            draggingPmId={pmState.drag.isDragging ? pmState.drag.pmId : null}
+   936→            dragValidation={pmState.drag.isDragging ? {
+   937→              isValid: pmState.drag.isValid,
+   938→              message: pmState.drag.validationMessage,
+   939→              violations: pmState.drag.constraintViolations,
+   940→            } : null}
+   941→            onPmClick={handlePmBlockClick}
+   942→            onPmHover={handlePmBlockHover}
+   943→            onPmDragStart={handlePmDragStart}
+   944→            onPmDragMove={handlePmDragMove}
+   945→            onPmDragEnd={handlePmDragEnd}
+   946→            showConstraintWalls={layers.complianceWindows}
+   947→            showGrid={true}
+   948→          />
+   949→          <div
+   950→            ref={tooltipRef}
+   951→            style={{
+   952→              display: 'none',
+   953→              position: 'fixed',
+   954→              backgroundColor: 'white',
+   955→              border: '1px solid #e2e8f0',
+   956→              borderRadius: '6px',
+   957→              padding: '8px 12px',
+   958→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   959→              pointerEvents: 'none',
+   960→              zIndex: 100,
+   961→              fontSize: '12px',
+   962→              lineHeight: 1.5,
+   963→            }}
+   964→          />
+   965→        </>
+   966→      );
+   967→    }
+   968→
+   969→    // OPERATIONAL and DETAIL zoom levels
+   970→    if (zoomLevel === 'OPERATIONAL') {
+   971→      if (operationalLoading) {
+   972→        return (
+   973→          <NonIdealState
+   974→            icon={<Spinner size={48} />}
+   975→            title="Loading operational view..."
+   976→            description="Fetching detailed PM schedule data"
+   977→          />
+   978→        );
+   979→      }
+   980→
+   981→      if (operationalError) {
+   982→        return (
+   983→          <NonIdealState
+   984→            icon="error"
+   985→            title="Error loading operational view"
+   986→            description={operationalError}
+   987→            action={
+   988→              <Button intent="primary" onClick={handleLoadOperationalData}>
+   989→                Retry
+   990→              </Button>
+   991→            }
+   992→          />
+   993→        );
+   994→      }
+   995→
+   996→      if (!operationalData) {
+   997→        return (
+   998→          <NonIdealState
+   999→            icon="id-number"
+  1000→            title="Operational View"
+  1001→            description="Load 4-week detailed PM cards with material status"
+  1002→            action={
+  1003→              <ButtonGroup>
+  1004→                <Button intent="primary" onClick={handleLoadOperationalData}>
+  1005→                  Load Operational Data
+  1006→                </Button>
+  1007→              </ButtonGroup>
+  1008→            }
+  1009→          >
+  1010→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+  1011→              <p>Shows PM schedule from {operationalFromDate} to {operationalToDate}</p>
+  1012→              <p>Daily granularity with detailed PM cards</p>
+  1013→            </div>
+  1014→          </NonIdealState>
+  1015→        );
+  1016→      }
+  1017→
+  1018→      const containerWidth = DEFAULT_CANVAS_WIDTH;
+  1019→      const containerHeight = DEFAULT_CANVAS_HEIGHT;
+  1020→
+  1021→      return (
+  1022→        <>
+  1023→          <OperationalDetailLayer
+  1024→            data={operationalData}
+  1025→            fromDate={new Date(operationalFromDate)}
+  1026→            toDate={new Date(operationalToDate)}
+  1027→            width={containerWidth}
+  1028→            height={containerHeight}
+  1029→            selectedPmIds={canvasState.selection.selectedPmIds}
+  1030→            onPmClick={handlePmBlockClick}
+  1031→            onPmHover={handleOperationalPmHover}
+  1032→            showGrid={true}
+  1033→          />
+  1034→          <div
+  1035→            ref={tooltipRef}
+  1036→            style={{
+  1037→              display: 'none',
+  1038→              position: 'fixed',
+  1039→              backgroundColor: 'white',
+  1040→              border: '1px solid #e2e8f0',
+  1041→              borderRadius: '6px',
+  1042→              padding: '12px 16px',
+  1043→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+  1044→              pointerEvents: 'none',
+  1045→              zIndex: 100,
+  1046→              fontSize: '12px',
+  1047→              lineHeight: 1.6,
+  1048→              maxWidth: '350px',
+  1049→            }}
+  1050→          />
+  1051→        </>
+  1052→      );
+  1053→    }
+  1054→
+  1055→    // DETAIL view (zoom 16+) - React DOM overlay with full PM editing
+  1056→    if (detailLoading) {
+  1057→      return (
+  1058→        <NonIdealState
+  1059→          icon={<Spinner size={48} />}
+  1060→          title="Loading detail view..."
+  1061→          description="Fetching detailed PM data with history"
+  1062→        />
+  1063→      );
+  1064→    }
+  1065→
+  1066→    if (detailError) {
+  1067→      return (
+  1068→        <NonIdealState
+  1069→          icon="error"
+  1070→          title="Error loading detail view"
+  1071→          description={detailError}
+  1072→          action={
+  1073→            <Button intent="primary" onClick={handleLoadDetailData}>
+  1074→              Retry
+  1075→            </Button>
+  1076→          }
+  1077→        />
+  1078→      );
+  1079→    }
+  1080→
+  1081→    if (!detailData) {
+  1082→      return (
+  1083→        <NonIdealState
+  1084→          icon="document"
+  1085→          title="Detail View"
+  1086→          description="Load 1-week PM schedule with full editing capabilities"
+  1087→          action={
+  1088→            <ButtonGroup>
+  1089→              <Button intent="primary" onClick={handleLoadDetailData}>
+  1090→                Load Detail Data
+  1091→              </Button>
+  1092→            </ButtonGroup>
+  1093→          }
+  1094→        >
+  1095→          <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+  1096→            <p>Shows PM schedule from {detailFromDate} to {detailToDate}</p>
+  1097→            <ul style={{ textAlign: 'left', maxWidth: '300px', margin: '8px auto' }}>
+  1098→              <li>Full PM editing interface</li>
+  1099→              <li>Constraint validation feedback</li>
+  1100→              <li>Material availability status</li>
+  1101→              <li>Change history timeline</li>
+  1102→            </ul>
+  1103→          </div>
+  1104→        </NonIdealState>
+  1105→      );
+  1106→    }
+  1107→
+  1108→    return (
+  1109→      <DetailCardOverlay
+  1110→        data={detailData}
+  1111→        fromDate={new Date(detailFromDate)}
+  1112→        toDate={new Date(detailToDate)}
+  1113→        width={DEFAULT_CANVAS_WIDTH}
+  1114→        height={DEFAULT_CANVAS_HEIGHT}
+  1115→        selectedPmIds={canvasState.selection.selectedPmIds}
+  1116→        expandedPmIds={detailExpandedPmIds}
+  1117→        onPmSelect={handleDetailPmSelect}
+  1118→        onPmExpand={handleDetailPmExpand}
+  1119→        onPmCollapse={handleDetailPmCollapse}
+  1120→        onPmEdit={handleDetailPmEdit}
+  1121→        onPmLock={handleDetailPmLock}
+  1122→        onPmUnlock={handleDetailPmUnlock}
+  1123→        onViewHistory={handleDetailViewHistory}
+  1124→      />
+  1125→    );
+  1126→  };
+  1127→
+  1128→  return (
+  1129→    <div
+  1130→      ref={containerRef}
+  1131→      className="mms-canvas"
+  1132→      tabIndex={0}
+  1133→      style={{
+  1134→        flex: 1,
+  1135→        position: 'relative',
+  1136→        overflow: 'hidden',
+  1137→        backgroundColor: 'var(--pt-app-background-color, #f5f8fa)',
+  1138→        cursor: isPanning ? 'grabbing' : 'grab',
+  1139→        outline: 'none', // Remove focus outline (a11y handled by visible focus indicators)
+  1140→      }}
+  1141→      onWheel={handleWheel}
+  1142→      onMouseDown={handleMouseDown}
+  1143→      onMouseUp={handleMouseUp}
+  1144→      onMouseLeave={handleMouseUp}
+  1145→      onMouseMove={handleMouseMove}
+  1146→      onKeyDown={handleKeyDown}
+  1147→    >
+  1148→      <div
+  1149→        style={{
+  1150→          position: 'absolute',
+  1151→          top: 0,
+  1152→          left: 0,
+  1153→          right: 0,
+  1154→          bottom: 0,
+  1155→          transform: `translate(${-canvasState.panX}px, ${-canvasState.panY}px)`,
+  1156→          transition: isPanning ? 'none' : 'transform 0.1s ease-out',
+  1157→        }}
+  1158→      >
+  1159→        {renderContent()}
+  1160→      </div>
+  1161→
+  1162→      <div style={{
+  1163→        position: 'absolute',
+  1164→        top: '12px',
+  1165→        right: '12px',
+  1166→        zIndex: 10,
+  1167→      }}>
+  1168→        <Card elevation={1} style={{ padding: '8px 12px' }}>
+  1169→          <div style={{ fontSize: '11px', color: 'var(--pt-text-muted)', marginBottom: '4px' }}>
+  1170→            Zoom Level
+  1171→          </div>
+  1172→          <div style={{ fontSize: '14px', fontWeight: 600 }}>
+  1173→            {zoomLevel.replace('_', ' ')}
+  1174→          </div>
+  1175→          <div style={{ fontSize: '11px', fontFamily: 'monospace' }}>
+  1176→            {zoom.toFixed(1)} / 20
+  1177→          </div>
+  1178→        </Card>
+  1179→      </div>
+  1180→
+  1181→      <div style={{
+  1182→        position: 'absolute',
+  1183→        bottom: '12px',
+  1184→        left: '12px',
+  1185→        zIndex: 10,
+  1186→      }}>
+  1187→        <Card elevation={1} style={{ padding: '8px 12px' }}>
+  1188→          <div style={{ fontSize: '11px' }}>
+  1189→            <span style={{ color: 'var(--pt-text-muted)' }}>Viewport: </span>
+  1190→            <span style={{ fontFamily: 'monospace' }}>
+  1191→              {viewport.startDate} to {viewport.endDate}
+  1192→            </span>
+  1193→          </div>
+  1194→          <div style={{ fontSize: '11px' }}>
+  1195→            <span style={{ color: 'var(--pt-text-muted)' }}>Trains: </span>
+  1196→            <span>{viewport.trainIds.length || 'All'}</span>
+  1197→          </div>
+  1198→        </Card>
+  1199→      </div>
+  1200→
+  1201→      {(canvasState.layers.manhourOverlay || canvasState.layers.driftOverlay || canvasState.layers.baselineShadow) && (
+  1202→        <div style={{
+  1203→          position: 'absolute',
+  1204→          top: '12px',
+  1205→          left: '12px',
+  1206→          zIndex: 10,
+  1207→          display: 'flex',
+  1208→          gap: '4px',
+  1209→        }}>
+  1210→          {canvasState.layers.manhourOverlay && (
+  1211→            <Tag intent="primary" icon="chart">Man-hours</Tag>
+  1212→          )}
+  1213→          {canvasState.layers.driftOverlay && (
+  1214→            <Tag intent="warning" icon="delta">Drift</Tag>
+  1215→          )}
+  1216→          {canvasState.layers.baselineShadow && (
+  1217→            <Tag minimal icon="git-commit">Baseline</Tag>
+  1218→          )}
+  1219→        </div>
+  1220→      )}
+  1221→
+  1222→      {/* Drag Confirmation Dialog */}
+  1223→      <DragConfirmationDialog
+  1224→        isOpen={dragConfirmRef.current.isOpen}
+  1225→        pmCode={dragConfirmRef.current.pmCode}
+  1226→        trainNumber={dragConfirmRef.current.trainNumber}
+  1227→        sourceDate={dragConfirmRef.current.sourceDate}
+  1228→        targetDate={dragConfirmRef.current.targetDate}
+  1229→        impact={dragConfirmRef.current.impact}
+  1230→        violations={pmState.drag.constraintViolations}
+  1231→        isLoading={dragConfirmRef.current.isLoadingImpact}
+  1232→        onConfirm={handleDragConfirm}
+  1233→        onCancel={handleDragCancel}
+  1234→      />
+  1235→
+  1236→      {/* Keyboard Shortcuts Dialog */}
+  1237→      <KeyboardShortcutsDialog />
+  1238→
+  1239→      {/* Keyboard shortcut hint in corner */}
+  1240→      <div style={{
+  1241→        position: 'absolute',
+  1242→        bottom: '12px',
+  1243→        right: '12px',
+  1244→        zIndex: 10,
+  1245→        fontSize: '11px',
+  1246→        color: 'var(--pt-text-muted)',
+  1247→        opacity: 0.7,
+  1248→      }}>
+  1249→        Press <kbd style={{
+  1250→          padding: '2px 6px',
+  1251→          backgroundColor: 'rgba(0,0,0,0.1)',
+  1252→          borderRadius: '3px',
+  1253→          fontFamily: 'monospace',
+  1254→          fontSize: '10px',
+  1255→        }}>?</kbd> for keyboard shortcuts
+  1256→      </div>
+  1257→    </div>
+  1258→  );
+  1259→}
+  1260→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

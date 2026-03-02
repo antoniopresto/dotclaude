@@ -1,0 +1,1597 @@
+     1→/**
+     2→ * MMS Man-hour Leveling Service
+     3→ *
+     4→ * Projects workforce requirements and generates adjustment recommendations
+     5→ * to balance workload across time periods. Prevents overload/underutilization
+     6→ * of depot maintenance resources over the tactical planning horizon.
+     7→ *
+     8→ * Key responsibilities:
+     9→ * - Calculate raw man-hour projections from PM schedule
+    10→ * - Identify overloaded and underutilized weeks
+    11→ * - Apply leveling strategies in priority order
+    12→ * - Persist projections and adjustments
+    13→ * - Support approval workflow for adjustments
+    14→ *
+    15→ * Leveling Strategies (priority order):
+    16→ * 1. ADVANCE_PM (1.1x cost, LOW risk, max 40h/week)
+    17→ * 2. DEFER_PM (1.05x cost, LOW risk, max 40h/week)
+    18→ * 3. ADD_OVERTIME (1.5x cost, NO risk, max 80h/week)
+    19→ * 4. CROSS_DEPOT (1.3x cost, MEDIUM risk, max 60h/week)
+    20→ * 5. ADD_CONTRACTOR (2.0x cost, MEDIUM risk, max 100h/week)
+    21→ * 6. MANUAL_REVIEW (flagged for high unresolvable overload)
+    22→ *
+    23→ * Utilization Targets:
+    24→ * - Target: 85%
+    25→ * - Minimum: 70% (underutilized below this)
+    26→ * - Maximum: 100% (overloaded above this)
+    27→ *
+    28→ * @see specs/004-domain-services.md Section 4.6
+    29→ */
+    30→
+    31→import {
+    32→  eq,
+    33→  and,
+    34→  gte,
+    35→  lte,
+    36→  desc,
+    37→  asc,
+    38→  sql,
+    39→  inArray,
+    40→  isNull,
+    41→  or,
+    42→  count,
+    43→  type SQL,
+    44→} from 'drizzle-orm';
+    45→import {
+    46→  addDays,
+    47→  addWeeks,
+    48→  startOfWeek,
+    49→  endOfWeek,
+    50→  format,
+    51→  differenceInWeeks,
+    52→  parseISO,
+    53→  isBefore,
+    54→  isAfter,
+    55→} from 'date-fns';
+    56→import { BaseService } from '../lib/services/base';
+    57→import {
+    58→  manhourCapacity,
+    59→  manhourProjections,
+    60→  manhourAdjustments,
+    61→  pmSchedule,
+    62→  pmTypes,
+    63→  depots,
+    64→  trains,
+    65→  laborRates,
+    66→  type ManhourCapacity,
+    67→  type ManhourProjection,
+    68→  type ManhourAdjustment,
+    69→} from '../lib/db/schema';
+    70→import { NotFoundError, ValidationError, ConflictError } from '../lib/errors';
+    71→
+    72→// =============================================================================
+    73→// Constants
+    74→// =============================================================================
+    75→
+    76→/** Minimum utilization percentage (underutilized below this) */
+    77→const MIN_UTILIZATION = 0.7;
+    78→
+    79→/** Maximum utilization percentage (overloaded above this) */
+    80→const MAX_UTILIZATION = 1.0;
+    81→
+    82→/** Default base labor rate per hour (SGD) */
+    83→const DEFAULT_BASE_RATE = 85;
+    84→
+    85→/** Minimum meaningful shift in hours (don't bother with tiny adjustments) */
+    86→const MIN_SHIFT_HOURS = 8;
+    87→
+    88→/** Minimum overtime hours to add */
+    89→const MIN_OVERTIME_HOURS = 4;
+    90→
+    91→// =============================================================================
+    92→// Types
+    93→// =============================================================================
+    94→
+    95→/** Leveling strategy types */
+    96→export type AdjustmentType =
+    97→  | 'ADVANCE_PM'
+    98→  | 'DEFER_PM'
+    99→  | 'ADD_OVERTIME'
+   100→  | 'CROSS_DEPOT'
+   101→  | 'ADD_CONTRACTOR'
+   102→  | 'MANUAL_REVIEW';
+   103→
+   104→/** Risk levels for adjustments */
+   105→export type RiskLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
+   106→
+   107→/** Adjustment status in workflow */
+   108→export type AdjustmentStatus = 'PROPOSED' | 'APPROVED' | 'REJECTED' | 'APPLIED';
+   109→
+   110→/** Leveling strategy configuration */
+   111→export interface LevelingStrategy {
+   112→  type: AdjustmentType;
+   113→  priority: number;
+   114→  maxHoursPerWeek: number;
+   115→  costMultiplier: number;
+   116→  riskLevel: RiskLevel;
+   117→}
+   118→
+   119→/** All leveling strategies in priority order */
+   120→export const LEVELING_STRATEGIES: LevelingStrategy[] = [
+   121→  { type: 'ADVANCE_PM', priority: 1, maxHoursPerWeek: 40, costMultiplier: 1.1, riskLevel: 'LOW' },
+   122→  { type: 'DEFER_PM', priority: 2, maxHoursPerWeek: 40, costMultiplier: 1.05, riskLevel: 'LOW' },
+   123→  { type: 'ADD_OVERTIME', priority: 3, maxHoursPerWeek: 80, costMultiplier: 1.5, riskLevel: 'NONE' },
+   124→  { type: 'CROSS_DEPOT', priority: 4, maxHoursPerWeek: 60, costMultiplier: 1.3, riskLevel: 'MEDIUM' },
+   125→  {
+   126→    type: 'ADD_CONTRACTOR',
+   127→    priority: 5,
+   128→    maxHoursPerWeek: 100,
+   129→    costMultiplier: 2.0,
+   130→    riskLevel: 'MEDIUM',
+   131→  },
+   132→];
+   133→
+   134→/** Time period for projections */
+   135→export interface LevelingTimePeriod {
+   136→  start: Date;
+   137→  end: Date;
+   138→}
+   139→
+   140→/** Required hours breakdown */
+   141→export interface RequiredHours {
+   142→  pm: number;
+   143→  corrective: number;
+   144→  overhaul: number;
+   145→  total: number;
+   146→}
+   147→
+   148→/** Available hours breakdown */
+   149→export interface AvailableHours {
+   150→  regular: number;
+   151→  overtime: number;
+   152→  total: number;
+   153→}
+   154→
+   155→/** Projection data for a single week/period */
+   156→export interface ProjectionData {
+   157→  depotId: string;
+   158→  depotCode?: string;
+   159→  week: Date;
+   160→  granularity: 'WEEKLY' | 'MONTHLY';
+   161→  required: RequiredHours;
+   162→  available: AvailableHours;
+   163→  variance: number;
+   164→  utilizationPct: number;
+   165→  isOverloaded: boolean;
+   166→  isUnderutilized: boolean;
+   167→}
+   168→
+   169→/** Proposed adjustment */
+   170→export interface ProposedAdjustment {
+   171→  type: AdjustmentType;
+   172→  sourcePeriod: LevelingTimePeriod;
+   173→  targetPeriod?: LevelingTimePeriod;
+   174→  hoursAdjusted: number;
+   175→  affectedPMs: string[];
+   176→  affectedTrains: string[];
+   177→  costImpact: number;
+   178→  riskLevel: RiskLevel;
+   179→  reason: string;
+   180→}
+   181→
+   182→/** Leveling metrics */
+   183→export interface LevelingMetrics {
+   184→  avgUtilization: number;
+   185→  minUtilization: number;
+   186→  maxUtilization: number;
+   187→  overloadedWeeks: number;
+   188→  underutilizedWeeks: number;
+   189→  totalRequiredHours: number;
+   190→  totalAvailableHours: number;
+   191→}
+   192→
+   193→/** Improvement summary after leveling */
+   194→export interface LevelingImprovement {
+   195→  utilizationDelta: number;
+   196→  overloadedWeeksReduced: number;
+   197→  underutilizedWeeksReduced: number;
+   198→  totalCostImpact: number;
+   199→}
+   200→
+   201→/** Labor capacity check result */
+   202→export interface LaborCapacityResult {
+   203→  hasCapacity: boolean;
+   204→  depotId: string;
+   205→  weekStart: string;
+   206→  weekEnd: string;
+   207→  currentScheduledHours: number;
+   208→  additionalHours: number;
+   209→  totalRequiredHours: number;
+   210→  availableHours: {
+   211→    regular: number;
+   212→    overtime: number;
+   213→    total: number;
+   214→  };
+   215→  remainingCapacity: number;
+   216→  utilizationPct: number;
+   217→  isOverloaded: boolean;
+   218→  message: string;
+   219→}
+   220→
+   221→/** Full leveling result */
+   222→export interface LevelingResult {
+   223→  projectionRunId: string;
+   224→  generatedAt: Date;
+   225→  horizonWeeks: number;
+   226→  depotIds: string[];
+   227→  original: {
+   228→    projections: ProjectionData[];
+   229→    metrics: LevelingMetrics;
+   230→  };
+   231→  leveled: {
+   232→    projections: ProjectionData[];
+   233→    metrics: LevelingMetrics;
+   234→  };
+   235→  adjustments: ProposedAdjustment[];
+   236→  improvement: LevelingImprovement;
+   237→}
+   238→
+   239→/** PM shiftable info */
+   240→interface ShiftablePM {
+   241→  id: string;
+   242→  trainId: string;
+   243→  pmTypeCode: string;
+   244→  estimatedHours: number;
+   245→  currentDate: Date;
+   246→  constraintStart: Date;
+   247→  constraintEnd: Date;
+   248→}
+   249→
+   250→/** Depot with capacity for cross-depot leveling */
+   251→interface DepotWithCapacity {
+   252→  depotId: string;
+   253→  depotCode: string;
+   254→  depotName: string;
+   255→  availableHours: number;
+   256→}
+   257→
+   258→/** Request for generating projections */
+   259→export interface GenerateProjectionsRequest {
+   260→  horizonWeeks?: number;
+   261→  depotIds?: string[];
+   262→  granularity?: 'WEEKLY' | 'MONTHLY';
+   263→}
+   264→
+   265→/** Capacity configuration request */
+   266→export interface UpdateCapacityRequest {
+   267→  depotId: string;
+   268→  effectiveFrom: Date;
+   269→  effectiveTo?: Date;
+   270→  dayShiftHours: number;
+   271→  nightShiftHours?: number;
+   272→  weekendHours?: number;
+   273→  techniciansDay: number;
+   274→  techniciansNight?: number;
+   275→  specialists?: number;
+   276→  maxOvertimePct?: number;
+   277→  minUtilizationPct?: number;
+   278→  targetUtilizationPct?: number;
+   279→  notes?: string;
+   280→}
+   281→
+   282→/** Filters for querying projections */
+   283→export interface ProjectionFilters {
+   284→  depotId?: string;
+   285→  fromDate?: Date;
+   286→  toDate?: Date;
+   287→  isOverloaded?: boolean;
+   288→  isUnderutilized?: boolean;
+   289→  projectionRunId?: string;
+   290→}
+   291→
+   292→/** Filters for querying adjustments */
+   293→export interface AdjustmentFilters {
+   294→  depotId?: string;
+   295→  status?: AdjustmentStatus;
+   296→  type?: AdjustmentType;
+   297→  fromDate?: Date;
+   298→  toDate?: Date;
+   299→}
+   300→
+   301→/** Paginated result */
+   302→export interface PaginatedResult<T> {
+   303→  data: T[];
+   304→  total: number;
+   305→  page: number;
+   306→  pageSize: number;
+   307→}
+   308→
+   309→// =============================================================================
+   310→// Service Singleton
+   311→// =============================================================================
+   312→
+   313→let serviceInstance: ManHourLevelingService | null = null;
+   314→
+   315→/**
+   316→ * Get singleton instance of ManHourLevelingService
+   317→ */
+   318→export function getManHourLevelingService(): ManHourLevelingService {
+   319→  if (!serviceInstance) {
+   320→    serviceInstance = new ManHourLevelingService();
+   321→  }
+   322→  return serviceInstance;
+   323→}
+   324→
+   325→// =============================================================================
+   326→// Service Implementation
+   327→// =============================================================================
+   328→
+   329→/**
+   330→ * ManHourLevelingService
+   331→ *
+   332→ * Projects workforce requirements and generates adjustment recommendations
+   333→ * to balance workload across time periods.
+   334→ */
+   335→export class ManHourLevelingService extends BaseService {
+   336→  constructor() {
+   337→    super({ name: 'man-hour-leveling-service' });
+   338→  }
+   339→
+   340→  // ===========================================================================
+   341→  // Main Operations
+   342→  // ===========================================================================
+   343→
+   344→  /**
+   345→   * Generate projections and leveling recommendations
+   346→   *
+   347→   * This is the main entry point for the leveling engine.
+   348→   * It calculates raw projections, identifies imbalances, generates adjustments,
+   349→   * and persists the results.
+   350→   */
+   351→  async generateProjections(request: GenerateProjectionsRequest = {}): Promise<LevelingResult> {
+   352→    const horizonWeeks = request.horizonWeeks ?? 12;
+   353→    const granularity = request.granularity ?? 'WEEKLY';
+   354→
+   355→    return this.traced(
+   356→      'generateProjections',
+   357→      async (span) => {
+   358→        span.setAttribute('mms.manhour.horizon_weeks', horizonWeeks);
+   359→        span.setAttribute('mms.manhour.granularity', granularity);
+   360→
+   361→        const runId = crypto.randomUUID();
+   362→        span.setAttribute('mms.manhour.run_id', runId);
+   363→
+   364→        // 1. Get depots to process
+   365→        const depotIds = await this.resolveDepotIds(request.depotIds);
+   366→        if (depotIds.length === 0) {
+   367→          throw new ValidationError('No depots found for projection');
+   368→        }
+   369→        span.setAttribute('mms.manhour.depot_count', depotIds.length);
+   370→
+   371→        // 2. Calculate raw projections
+   372→        const rawProjections = await this.calculateRawProjections(
+   373→          depotIds,
+   374→          horizonWeeks,
+   375→          granularity
+   376→        );
+   377→
+   378→        // 3. Identify imbalances
+   379→        const imbalances = this.identifyImbalances(rawProjections);
+   380→        span.setAttribute('overloadedWeeks', imbalances.overloaded.length);
+   381→        span.setAttribute('underutilizedWeeks', imbalances.underutilized.length);
+   382→
+   383→        // 4. Generate adjustments using multiple strategies
+   384→        const adjustments = await this.generateAdjustments(rawProjections);
+   385→        span.setAttribute('adjustmentCount', adjustments.length);
+   386→
+   387→        // 5. Apply adjustments to get leveled projections
+   388→        const leveledProjections = this.applyAdjustments(rawProjections, adjustments);
+   389→
+   390→        // 6. Calculate metrics
+   391→        const originalMetrics = this.calculateMetrics(rawProjections);
+   392→        const leveledMetrics = this.calculateMetrics(leveledProjections);
+   393→
+   394→        // 7. Persist projections and adjustments
+   395→        await this.persistProjections(runId, rawProjections, adjustments);
+   396→
+   397→        // 8. Build result
+   398→        const improvement: LevelingImprovement = {
+   399→          utilizationDelta: leveledMetrics.avgUtilization - originalMetrics.avgUtilization,
+   400→          overloadedWeeksReduced: originalMetrics.overloadedWeeks - leveledMetrics.overloadedWeeks,
+   401→          underutilizedWeeksReduced:
+   402→            originalMetrics.underutilizedWeeks - leveledMetrics.underutilizedWeeks,
+   403→          totalCostImpact: adjustments.reduce((sum, a) => sum + a.costImpact, 0),
+   404→        };
+   405→
+   406→        this.log.info(
+   407→          {
+   408→            runId,
+   409→            horizonWeeks,
+   410→            depotCount: depotIds.length,
+   411→            adjustmentCount: adjustments.length,
+   412→            improvement,
+   413→          },
+   414→          'Generated man-hour projections'
+   415→        );
+   416→
+   417→        return {
+   418→          projectionRunId: runId,
+   419→          generatedAt: new Date(),
+   420→          horizonWeeks,
+   421→          depotIds,
+   422→          original: { projections: rawProjections, metrics: originalMetrics },
+   423→          leveled: { projections: leveledProjections, metrics: leveledMetrics },
+   424→          adjustments,
+   425→          improvement,
+   426→        };
+   427→      },
+   428→      { 'mms.manhour.requested_depots': request.depotIds?.length ?? 0 }
+   429→    );
+   430→  }
+   431→
+   432→  /**
+   433→   * Get projections for a specific depot and time range
+   434→   */
+   435→  async getProjections(
+   436→    filters: ProjectionFilters,
+   437→    page = 1,
+   438→    pageSize = 50
+   439→  ): Promise<PaginatedResult<ManhourProjection>> {
+   440→    return this.traced('getProjections', async () => {
+   441→      const conditions: SQL<unknown>[] = [];
+   442→
+   443→      if (filters.depotId) {
+   444→        conditions.push(eq(manhourProjections.depotId, filters.depotId));
+   445→      }
+   446→      if (filters.fromDate) {
+   447→        conditions.push(gte(manhourProjections.periodStart, format(filters.fromDate, 'yyyy-MM-dd')));
+   448→      }
+   449→      if (filters.toDate) {
+   450→        conditions.push(lte(manhourProjections.periodEnd, format(filters.toDate, 'yyyy-MM-dd')));
+   451→      }
+   452→      if (filters.projectionRunId) {
+   453→        conditions.push(eq(manhourProjections.projectionRunId, filters.projectionRunId));
+   454→      }
+   455→
+   456→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   457→
+   458→      const [projections, totalResult] = await Promise.all([
+   459→        this.db.query.manhourProjections.findMany({
+   460→          where: whereClause,
+   461→          orderBy: [asc(manhourProjections.periodStart)],
+   462→          limit: pageSize,
+   463→          offset: (page - 1) * pageSize,
+   464→        }),
+   465→        this.db.select({ count: count() }).from(manhourProjections).where(whereClause),
+   466→      ]);
+   467→
+   468→      return {
+   469→        data: projections,
+   470→        total: totalResult[0]?.count ?? 0,
+   471→        page,
+   472→        pageSize,
+   473→      };
+   474→    });
+   475→  }
+   476→
+   477→  /**
+   478→   * Get adjustments with optional filters
+   479→   */
+   480→  async getAdjustments(
+   481→    filters: AdjustmentFilters,
+   482→    page = 1,
+   483→    pageSize = 50
+   484→  ): Promise<PaginatedResult<ManhourAdjustment>> {
+   485→    return this.traced('getAdjustments', async () => {
+   486→      const conditions: SQL<unknown>[] = [];
+   487→
+   488→      if (filters.status) {
+   489→        conditions.push(eq(manhourAdjustments.status, filters.status));
+   490→      }
+   491→      if (filters.type) {
+   492→        conditions.push(eq(manhourAdjustments.adjustmentType, filters.type));
+   493→      }
+   494→      if (filters.fromDate) {
+   495→        conditions.push(
+   496→          gte(manhourAdjustments.sourcePeriodStart, format(filters.fromDate, 'yyyy-MM-dd'))
+   497→        );
+   498→      }
+   499→      if (filters.toDate) {
+   500→        conditions.push(
+   501→          lte(manhourAdjustments.sourcePeriodEnd, format(filters.toDate, 'yyyy-MM-dd'))
+   502→        );
+   503→      }
+   504→
+   505→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   506→
+   507→      const [adjustments, totalResult] = await Promise.all([
+   508→        this.db.query.manhourAdjustments.findMany({
+   509→          where: whereClause,
+   510→          orderBy: [desc(manhourAdjustments.createdAt)],
+   511→          limit: pageSize,
+   512→          offset: (page - 1) * pageSize,
+   513→        }),
+   514→        this.db.select({ count: count() }).from(manhourAdjustments).where(whereClause),
+   515→      ]);
+   516→
+   517→      return {
+   518→        data: adjustments,
+   519→        total: totalResult[0]?.count ?? 0,
+   520→        page,
+   521→        pageSize,
+   522→      };
+   523→    });
+   524→  }
+   525→
+   526→  /**
+   527→   * Approve an adjustment
+   528→   */
+   529→  async approveAdjustment(adjustmentId: string, userId: string): Promise<ManhourAdjustment> {
+   530→    return this.inTransaction('approveAdjustment', async (tx, span) => {
+   531→      span.setAttribute('adjustmentId', adjustmentId);
+   532→      span.setAttribute('userId', userId);
+   533→
+   534→      // Get adjustment
+   535→      const adjustment = await tx.query.manhourAdjustments.findFirst({
+   536→        where: eq(manhourAdjustments.id, adjustmentId),
+   537→      });
+   538→
+   539→      if (!adjustment) {
+   540→        throw new NotFoundError(`Adjustment ${adjustmentId} not found`);
+   541→      }
+   542→
+   543→      if (adjustment.status !== 'PROPOSED') {
+   544→        throw new ConflictError(
+   545→          `Cannot approve adjustment in ${adjustment.status} status`,
+   546→          { errorCode: 'ADJUSTMENT_STATUS_INVALID', currentStatus: adjustment.status }
+   547→        );
+   548→      }
+   549→
+   550→      // Update status
+   551→      const [updated] = await tx
+   552→        .update(manhourAdjustments)
+   553→        .set({
+   554→          status: 'APPROVED',
+   555→          approvedBy: userId,
+   556→          approvedAt: new Date(),
+   557→        })
+   558→        .where(eq(manhourAdjustments.id, adjustmentId))
+   559→        .returning();
+   560→
+   561→      this.log.info({ adjustmentId, userId, type: adjustment.adjustmentType }, 'Adjustment approved');
+   562→
+   563→      return updated;
+   564→    });
+   565→  }
+   566→
+   567→  /**
+   568→   * Reject an adjustment
+   569→   */
+   570→  async rejectAdjustment(
+   571→    adjustmentId: string,
+   572→    userId: string,
+   573→    reason: string
+   574→  ): Promise<ManhourAdjustment> {
+   575→    return this.inTransaction('rejectAdjustment', async (tx, span) => {
+   576→      span.setAttribute('adjustmentId', adjustmentId);
+   577→      span.setAttribute('userId', userId);
+   578→
+   579→      // Get adjustment
+   580→      const adjustment = await tx.query.manhourAdjustments.findFirst({
+   581→        where: eq(manhourAdjustments.id, adjustmentId),
+   582→      });
+   583→
+   584→      if (!adjustment) {
+   585→        throw new NotFoundError(`Adjustment ${adjustmentId} not found`);
+   586→      }
+   587→
+   588→      if (adjustment.status !== 'PROPOSED') {
+   589→        throw new ConflictError(
+   590→          `Cannot reject adjustment in ${adjustment.status} status`,
+   591→          { errorCode: 'ADJUSTMENT_STATUS_INVALID', currentStatus: adjustment.status }
+   592→        );
+   593→      }
+   594→
+   595→      // Update status
+   596→      const [updated] = await tx
+   597→        .update(manhourAdjustments)
+   598→        .set({
+   599→          status: 'REJECTED',
+   600→          approvedBy: userId,
+   601→          approvedAt: new Date(),
+   602→          rejectionReason: reason,
+   603→        })
+   604→        .where(eq(manhourAdjustments.id, adjustmentId))
+   605→        .returning();
+   606→
+   607→      this.log.info(
+   608→        { adjustmentId, userId, type: adjustment.adjustmentType, reason },
+   609→        'Adjustment rejected'
+   610→      );
+   611→
+   612→      return updated;
+   613→    });
+   614→  }
+   615→
+   616→  // ===========================================================================
+   617→  // Capacity Management
+   618→  // ===========================================================================
+   619→
+   620→  /**
+   621→   * Get capacity configuration for a depot
+   622→   */
+   623→  async getCapacity(depotId: string, asOfDate?: Date): Promise<ManhourCapacity | null> {
+   624→    return this.traced('getCapacity', async (span) => {
+   625→      span.setAttribute('mms.depot.id', depotId);
+   626→
+   627→      const dateStr = format(asOfDate ?? new Date(), 'yyyy-MM-dd');
+   628→
+   629→      const capacity = await this.db.query.manhourCapacity.findFirst({
+   630→        where: and(
+   631→          eq(manhourCapacity.depotId, depotId),
+   632→          lte(manhourCapacity.effectiveFrom, dateStr),
+   633→          or(isNull(manhourCapacity.effectiveTo), gte(manhourCapacity.effectiveTo, dateStr))
+   634→        ),
+   635→        orderBy: [desc(manhourCapacity.effectiveFrom)],
+   636→      });
+   637→
+   638→      return capacity ?? null;
+   639→    });
+   640→  }
+   641→
+   642→  /**
+   643→   * Update or create capacity configuration
+   644→   */
+   645→  async updateCapacity(request: UpdateCapacityRequest): Promise<ManhourCapacity> {
+   646→    return this.inTransaction('updateCapacity', async (tx, span) => {
+   647→      span.setAttribute('mms.depot.id', request.depotId);
+   648→
+   649→      // Check depot exists
+   650→      const depot = await tx.query.depots.findFirst({
+   651→        where: eq(depots.id, request.depotId),
+   652→      });
+   653→
+   654→      if (!depot) {
+   655→        throw new NotFoundError(`Depot ${request.depotId} not found`);
+   656→      }
+   657→
+   658→      // Close any existing capacity that overlaps
+   659→      const effectiveFromStr = format(request.effectiveFrom, 'yyyy-MM-dd');
+   660→      await tx
+   661→        .update(manhourCapacity)
+   662→        .set({
+   663→          effectiveTo: format(addDays(request.effectiveFrom, -1), 'yyyy-MM-dd'),
+   664→          updatedAt: new Date(),
+   665→        })
+   666→        .where(
+   667→          and(
+   668→            eq(manhourCapacity.depotId, request.depotId),
+   669→            lte(manhourCapacity.effectiveFrom, effectiveFromStr),
+   670→            or(isNull(manhourCapacity.effectiveTo), gte(manhourCapacity.effectiveTo, effectiveFromStr))
+   671→          )
+   672→        );
+   673→
+   674→      // Insert new capacity
+   675→      const [newCapacity] = await tx
+   676→        .insert(manhourCapacity)
+   677→        .values({
+   678→          depotId: request.depotId,
+   679→          effectiveFrom: effectiveFromStr,
+   680→          effectiveTo: request.effectiveTo ? format(request.effectiveTo, 'yyyy-MM-dd') : null,
+   681→          dayShiftHours: String(request.dayShiftHours),
+   682→          nightShiftHours: String(request.nightShiftHours ?? 0),
+   683→          weekendHours: String(request.weekendHours ?? 0),
+   684→          techniciansDay: request.techniciansDay,
+   685→          techniciansNight: request.techniciansNight ?? 0,
+   686→          specialists: request.specialists ?? 0,
+   687→          maxOvertimePct: String(request.maxOvertimePct ?? 20),
+   688→          minUtilizationPct: String(request.minUtilizationPct ?? 70),
+   689→          targetUtilizationPct: String(request.targetUtilizationPct ?? 85),
+   690→          notes: request.notes,
+   691→        })
+   692→        .returning();
+   693→
+   694→      this.log.info(
+   695→        { depotId: request.depotId, effectiveFrom: effectiveFromStr },
+   696→        'Updated depot capacity configuration'
+   697→      );
+   698→
+   699→      return newCapacity;
+   700→    });
+   701→  }
+   702→
+   703→  /**
+   704→   * Check if depot has available labor capacity for additional hours.
+   705→   *
+   706→   * This method validates that scheduling a PM with the given hours
+   707→   * will not exceed the depot's weekly capacity for the target week.
+   708→   *
+   709→   * @param depotId - Target depot
+   710→   * @param targetDate - Date for the PM
+   711→   * @param additionalHours - Hours required for the PM
+   712→   * @returns Capacity check result with availability status and details
+   713→   */
+   714→  async checkLaborCapacity(
+   715→    depotId: string,
+   716→    targetDate: Date | string,
+   717→    additionalHours: number
+   718→  ): Promise<LaborCapacityResult> {
+   719→    return this.traced('checkLaborCapacity', async (span) => {
+   720→      span.setAttribute('mms.depot.id', depotId);
+   721→      span.setAttribute('mms.manhour.additional_hours', additionalHours);
+   722→
+   723→      const targetDateObj = typeof targetDate === 'string' ? parseISO(targetDate) : targetDate;
+   724→      const weekStart = startOfWeek(targetDateObj, { weekStartsOn: 1 });
+   725→      const weekEnd = endOfWeek(weekStart, { weekStartsOn: 1 });
+   726→
+   727→      span.setAttribute('mms.manhour.week_start', format(weekStart, 'yyyy-MM-dd'));
+   728→
+   729→      // Get current capacity configuration
+   730→      const capacity = await this.getCapacity(depotId, targetDateObj);
+   731→      const weeklyCapacity = this.calculateWeeklyCapacity(capacity);
+   732→
+   733→      // Get currently scheduled hours for the week
+   734→      const currentScheduledHours = await this.getPmHoursForPeriod(depotId, weekStart, weekEnd);
+   735→
+   736→      // Calculate totals
+   737→      const totalRequiredHours = currentScheduledHours + additionalHours;
+   738→      const totalAvailableHours = weeklyCapacity.regular + weeklyCapacity.overtime;
+   739→      const utilizationPct = totalAvailableHours > 0 ? totalRequiredHours / totalAvailableHours : 1;
+   740→      const remainingCapacity = totalAvailableHours - currentScheduledHours;
+   741→      const hasCapacity = additionalHours <= remainingCapacity && utilizationPct <= MAX_UTILIZATION;
+   742→
+   743→      const result: LaborCapacityResult = {
+   744→        hasCapacity,
+   745→        depotId,
+   746→        weekStart: format(weekStart, 'yyyy-MM-dd'),
+   747→        weekEnd: format(weekEnd, 'yyyy-MM-dd'),
+   748→        currentScheduledHours,
+   749→        additionalHours,
+   750→        totalRequiredHours,
+   751→        availableHours: {
+   752→          regular: weeklyCapacity.regular,
+   753→          overtime: weeklyCapacity.overtime,
+   754→          total: totalAvailableHours,
+   755→        },
+   756→        remainingCapacity,
+   757→        utilizationPct,
+   758→        isOverloaded: utilizationPct > MAX_UTILIZATION,
+   759→        message: hasCapacity
+   760→          ? `Depot has ${remainingCapacity.toFixed(1)} hours available (${(utilizationPct * 100).toFixed(1)}% utilization after scheduling)`
+   761→          : `Depot capacity exceeded: ${totalRequiredHours.toFixed(1)} hours required vs ${totalAvailableHours.toFixed(1)} available (${(utilizationPct * 100).toFixed(1)}% utilization)`,
+   762→      };
+   763→
+   764→      span.setAttribute('mms.manhour.has_capacity', hasCapacity);
+   765→      span.setAttribute('mms.manhour.utilization_pct', utilizationPct);
+   766→
+   767→      if (!hasCapacity) {
+   768→        this.log.warn(
+   769→          {
+   770→            depotId,
+   771→            weekStart: result.weekStart,
+   772→            currentHours: currentScheduledHours,
+   773→            additionalHours,
+   774→            totalRequired: totalRequiredHours,
+   775→            available: totalAvailableHours,
+   776→            utilizationPct,
+   777→          },
+   778→          'Depot labor capacity exceeded'
+   779→        );
+   780→      }
+   781→
+   782→      return result;
+   783→    });
+   784→  }
+   785→
+   786→  // ===========================================================================
+   787→  // Private: Projection Calculation
+   788→  // ===========================================================================
+   789→
+   790→  private async resolveDepotIds(requestedIds?: string[]): Promise<string[]> {
+   791→    if (requestedIds && requestedIds.length > 0) {
+   792→      return requestedIds;
+   793→    }
+   794→
+   795→    // Get all active depots
+   796→    const allDepots = await this.db.query.depots.findMany({
+   797→      columns: { id: true },
+   798→    });
+   799→
+   800→    return allDepots.map((d) => d.id);
+   801→  }
+   802→
+   803→  /**
+   804→   * Calculate raw man-hour projections from PM schedule
+   805→   */
+   806→  private async calculateRawProjections(
+   807→    depotIds: string[],
+   808→    horizonWeeks: number,
+   809→    granularity: 'WEEKLY' | 'MONTHLY'
+   810→  ): Promise<ProjectionData[]> {
+   811→    const projections: ProjectionData[] = [];
+   812→    const now = new Date();
+   813→    const startDate = startOfWeek(now, { weekStartsOn: 1 }); // Monday
+   814→
+   815→    // Get depot info
+   816→    const depotList = await this.db.query.depots.findMany({
+   817→      where: inArray(depots.id, depotIds),
+   818→    });
+   819→    const depotMap = new Map(depotList.map((d) => [d.id, d]));
+   820→
+   821→    for (const depotId of depotIds) {
+   822→      const depot = depotMap.get(depotId);
+   823→      if (!depot) continue;
+   824→
+   825→      // Get capacity for depot
+   826→      const capacity = await this.getCapacity(depotId);
+   827→      const weeklyCapacity = this.calculateWeeklyCapacity(capacity);
+   828→
+   829→      for (let weekOffset = 0; weekOffset < horizonWeeks; weekOffset++) {
+   830→        const weekStart = addWeeks(startDate, weekOffset);
+   831→        const weekEnd = endOfWeek(weekStart, { weekStartsOn: 1 });
+   832→
+   833→        // Get PM hours for this week
+   834→        const pmHours = await this.getPmHoursForPeriod(depotId, weekStart, weekEnd);
+   835→
+   836→        // Calculate available hours
+   837→        const regularHours = weeklyCapacity.regular;
+   838→        const overtimeMax =
+   839→          regularHours * (capacity ? parseFloat(capacity.maxOvertimePct ?? '20') / 100 : 0.2);
+   840→
+   841→        const required: RequiredHours = {
+   842→          pm: pmHours,
+   843→          corrective: 0, // TODO: Integrate with unavailability events
+   844→          overhaul: 0, // TODO: Separate overhaul tracking
+   845→          total: pmHours,
+   846→        };
+   847→
+   848→        const available: AvailableHours = {
+   849→          regular: regularHours,
+   850→          overtime: overtimeMax,
+   851→          total: regularHours + overtimeMax,
+   852→        };
+   853→
+   854→        const variance = available.total - required.total;
+   855→        const utilizationPct = available.total > 0 ? required.total / available.total : 0;
+   856→
+   857→        projections.push({
+   858→          depotId,
+   859→          depotCode: depot.code,
+   860→          week: weekStart,
+   861→          granularity,
+   862→          required,
+   863→          available,
+   864→          variance,
+   865→          utilizationPct,
+   866→          isOverloaded: utilizationPct > MAX_UTILIZATION,
+   867→          isUnderutilized: utilizationPct < MIN_UTILIZATION,
+   868→        });
+   869→      }
+   870→    }
+   871→
+   872→    return projections;
+   873→  }
+   874→
+   875→  /**
+   876→   * Calculate weekly capacity from configuration
+   877→   */
+   878→  private calculateWeeklyCapacity(
+   879→    capacity: ManhourCapacity | null
+   880→  ): { regular: number; overtime: number } {
+   881→    if (!capacity) {
+   882→      // Default capacity when not configured
+   883→      return { regular: 200, overtime: 40 };
+   884→    }
+   885→
+   886→    const dayHours = parseFloat(capacity.dayShiftHours ?? '0');
+   887→    const nightHours = parseFloat(capacity.nightShiftHours ?? '0');
+   888→    const weekendHours = parseFloat(capacity.weekendHours ?? '0');
+   889→    const maxOvertimePct = parseFloat(capacity.maxOvertimePct ?? '20') / 100;
+   890→
+   891→    const regular = dayHours * 5 + nightHours * 5 + weekendHours * 2;
+   892→    const overtime = regular * maxOvertimePct;
+   893→
+   894→    return { regular, overtime };
+   895→  }
+   896→
+   897→  /**
+   898→   * Get total PM hours for a time period
+   899→   */
+   900→  private async getPmHoursForPeriod(
+   901→    depotId: string,
+   902→    startDate: Date,
+   903→    endDate: Date
+   904→  ): Promise<number> {
+   905→    const startStr = format(startDate, 'yyyy-MM-dd');
+   906→    const endStr = format(endDate, 'yyyy-MM-dd');
+   907→
+   908→    // Get scheduled PMs for the period
+   909→    const scheduledPMs = await this.db
+   910→      .select({
+   911→        pmTypeId: pmSchedule.pmTypeId,
+   912→        count: count(),
+   913→      })
+   914→      .from(pmSchedule)
+   915→      .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   916→      .where(
+   917→        and(
+   918→          eq(trains.currentDepotId, depotId),
+   919→          gte(pmSchedule.targetDate, startStr),
+   920→          lte(pmSchedule.targetDate, endStr),
+   921→          eq(pmSchedule.status, 'SCHEDULED'),
+   922→          isNull(pmSchedule.scenarioId) // Only real schedule, not scenarios
+   923→        )
+   924→      )
+   925→      .groupBy(pmSchedule.pmTypeId);
+   926→
+   927→    if (scheduledPMs.length === 0) {
+   928→      return 0;
+   929→    }
+   930→
+   931→    // Get estimated hours for each PM type
+   932→    const pmTypeIds = scheduledPMs.map((p) => p.pmTypeId);
+   933→    const pmTypeHours = await this.db.query.pmTypes.findMany({
+   934→      where: inArray(pmTypes.id, pmTypeIds),
+   935→      columns: { id: true, estimatedHours: true },
+   936→    });
+   937→
+   938→    const hoursMap = new Map(pmTypeHours.map((pt) => [pt.id, parseFloat(pt.estimatedHours ?? '0')]));
+   939→
+   940→    // Calculate total hours
+   941→    let totalHours = 0;
+   942→    for (const pm of scheduledPMs) {
+   943→      const hours = hoursMap.get(pm.pmTypeId) ?? 0;
+   944→      totalHours += hours * pm.count;
+   945→    }
+   946→
+   947→    return totalHours;
+   948→  }
+   949→
+   950→  // ===========================================================================
+   951→  // Private: Imbalance Detection
+   952→  // ===========================================================================
+   953→
+   954→  /**
+   955→   * Identify overloaded and underutilized weeks
+   956→   */
+   957→  private identifyImbalances(projections: ProjectionData[]): {
+   958→    overloaded: ProjectionData[];
+   959→    underutilized: ProjectionData[];
+   960→  } {
+   961→    return {
+   962→      overloaded: projections.filter((p) => p.isOverloaded),
+   963→      underutilized: projections.filter((p) => p.isUnderutilized),
+   964→    };
+   965→  }
+   966→
+   967→  // ===========================================================================
+   968→  // Private: Adjustment Generation
+   969→  // ===========================================================================
+   970→
+   971→  /**
+   972→   * Generate adjustments to level workload
+   973→   */
+   974→  private async generateAdjustments(
+   975→    projections: ProjectionData[]
+   976→  ): Promise<ProposedAdjustment[]> {
+   977→    const adjustments: ProposedAdjustment[] = [];
+   978→
+   979→    // Group projections by depot
+   980→    const byDepot = this.groupByDepot(projections);
+   981→
+   982→    for (const depotProjections of byDepot.values()) {
+   983→      const overloaded = depotProjections.filter((p) => p.isOverloaded);
+   984→      const underutilized = depotProjections.filter((p) => p.isUnderutilized);
+   985→
+   986→      // Track remaining capacity in underutilized weeks
+   987→      const underutilizedCapacity = new Map(
+   988→        underutilized.map((p) => [
+   989→          p.week.toISOString(),
+   990→          p.available.total - p.required.total,
+   991→        ])
+   992→      );
+   993→
+   994→      for (const overWeek of overloaded) {
+   995→        let remainingExcess = overWeek.required.total - overWeek.available.total;
+   996→
+   997→        // Try each strategy in priority order
+   998→        for (const strategy of LEVELING_STRATEGIES) {
+   999→          if (remainingExcess <= 0) break;
+  1000→
+  1001→          const adjustment = await this.tryStrategy(
+  1002→            strategy,
+  1003→            overWeek,
+  1004→            underutilized,
+  1005→            underutilizedCapacity,
+  1006→            depotProjections,
+  1007→            remainingExcess
+  1008→          );
+  1009→
+  1010→          if (adjustment) {
+  1011→            adjustments.push(adjustment);
+  1012→            remainingExcess -= adjustment.hoursAdjusted;
+  1013→
+  1014→            // Update underutilized capacity if we used some
+  1015→            if (
+  1016→              adjustment.targetPeriod &&
+  1017→              (adjustment.type === 'ADVANCE_PM' || adjustment.type === 'DEFER_PM')
+  1018→            ) {
+  1019→              const key = adjustment.targetPeriod.start.toISOString();
+  1020→              const current = underutilizedCapacity.get(key) ?? 0;
+  1021→              underutilizedCapacity.set(key, current - adjustment.hoursAdjusted);
+  1022→            }
+  1023→          }
+  1024→        }
+  1025→
+  1026→        // If still overloaded, flag for manual review
+  1027→        if (remainingExcess > 0) {
+  1028→          adjustments.push({
+  1029→            type: 'MANUAL_REVIEW',
+  1030→            sourcePeriod: {
+  1031→              start: overWeek.week,
+  1032→              end: addDays(overWeek.week, 7),
+  1033→            },
+  1034→            hoursAdjusted: 0,
+  1035→            affectedPMs: [],
+  1036→            affectedTrains: [],
+  1037→            costImpact: 0,
+  1038→            riskLevel: 'HIGH',
+  1039→            reason: `Unable to resolve ${remainingExcess.toFixed(0)}h overload - requires manual intervention`,
+  1040→          });
+  1041→        }
+  1042→      }
+  1043→    }
+  1044→
+  1045→    return adjustments;
+  1046→  }
+  1047→
+  1048→  /**
+  1049→   * Try a specific leveling strategy
+  1050→   */
+  1051→  private async tryStrategy(
+  1052→    strategy: LevelingStrategy,
+  1053→    overloadedWeek: ProjectionData,
+  1054→    underutilizedWeeks: ProjectionData[],
+  1055→    underutilizedCapacity: Map<string, number>,
+  1056→    allProjections: ProjectionData[],
+  1057→    excessHours: number
+  1058→  ): Promise<ProposedAdjustment | null> {
+  1059→    const maxHours = Math.min(strategy.maxHoursPerWeek, excessHours);
+  1060→    const baseRate = await this.getBaseRate(overloadedWeek.depotId);
+  1061→
+  1062→    switch (strategy.type) {
+  1063→      case 'ADVANCE_PM':
+  1064→      case 'DEFER_PM':
+  1065→        return this.tryShiftPmStrategy(
+  1066→          strategy,
+  1067→          overloadedWeek,
+  1068→          underutilizedWeeks,
+  1069→          underutilizedCapacity,
+  1070→          maxHours,
+  1071→          baseRate
+  1072→        );
+  1073→
+  1074→      case 'ADD_OVERTIME':
+  1075→        return this.tryOvertimeStrategy(strategy, overloadedWeek, maxHours, baseRate);
+  1076→
+  1077→      case 'CROSS_DEPOT':
+  1078→        return this.tryCrossDepotStrategy(strategy, overloadedWeek, maxHours, baseRate);
+  1079→
+  1080→      case 'ADD_CONTRACTOR':
+  1081→        return this.tryContractorStrategy(strategy, overloadedWeek, maxHours, baseRate);
+  1082→
+  1083→      default:
+  1084→        return null;
+  1085→    }
+  1086→  }
+  1087→
+  1088→  /**
+  1089→   * Try ADVANCE_PM or DEFER_PM strategy
+  1090→   */
+  1091→  private async tryShiftPmStrategy(
+  1092→    strategy: LevelingStrategy,
+  1093→    overloadedWeek: ProjectionData,
+  1094→    underutilizedWeeks: ProjectionData[],
+  1095→    underutilizedCapacity: Map<string, number>,
+  1096→    maxHours: number,
+  1097→    baseRate: number
+  1098→  ): Promise<ProposedAdjustment | null> {
+  1099→    const direction = strategy.type === 'ADVANCE_PM' ? -1 : 1;
+  1100→
+  1101→    // Find candidate weeks (before for ADVANCE, after for DEFER)
+  1102→    const candidates = underutilizedWeeks
+  1103→      .filter((w) => {
+  1104→        const weekDiff = differenceInWeeks(w.week, overloadedWeek.week);
+  1105→        const remainingCapacity = underutilizedCapacity.get(w.week.toISOString()) ?? 0;
+  1106→        return (
+  1107→          w.depotId === overloadedWeek.depotId &&
+  1108→          weekDiff * direction > 0 &&
+  1109→          Math.abs(weekDiff) <= 4 &&
+  1110→          remainingCapacity > MIN_SHIFT_HOURS
+  1111→        );
+  1112→      })
+  1113→      .sort(
+  1114→        (a, b) =>
+  1115→          Math.abs(differenceInWeeks(a.week, overloadedWeek.week)) -
+  1116→          Math.abs(differenceInWeeks(b.week, overloadedWeek.week))
+  1117→      );
+  1118→
+  1119→    for (const candidate of candidates) {
+  1120→      const availableCapacity = underutilizedCapacity.get(candidate.week.toISOString()) ?? 0;
+  1121→      const shiftHours = Math.min(maxHours, availableCapacity * 0.8);
+  1122→
+  1123→      if (shiftHours >= MIN_SHIFT_HOURS) {
+  1124→        // Find PMs that can be shifted
+  1125→        const shiftablePMs = await this.findShiftablePMs(
+  1126→          overloadedWeek,
+  1127→          candidate,
+  1128→          shiftHours,
+  1129→          strategy.type as 'ADVANCE_PM' | 'DEFER_PM'
+  1130→        );
+  1131→
+  1132→        if (shiftablePMs.length > 0) {
+  1133→          const actualHours = shiftablePMs.reduce((sum, pm) => sum + pm.estimatedHours, 0);
+  1134→
+  1135→          const weekNumSource = format(overloadedWeek.week, 'ww');
+  1136→          const weekNumTarget = format(candidate.week, 'ww');
+  1137→          const action = strategy.type === 'DEFER_PM' ? 'Defer' : 'Advance';
+  1138→
+  1139→          return {
+  1140→            type: strategy.type,
+  1141→            sourcePeriod: {
+  1142→              start: overloadedWeek.week,
+  1143→              end: addDays(overloadedWeek.week, 7),
+  1144→            },
+  1145→            targetPeriod: {
+  1146→              start: candidate.week,
+  1147→              end: addDays(candidate.week, 7),
+  1148→            },
+  1149→            hoursAdjusted: actualHours,
+  1150→            affectedPMs: shiftablePMs.map((pm) => pm.id),
+  1151→            affectedTrains: [...new Set(shiftablePMs.map((pm) => pm.trainId))],
+  1152→            costImpact: actualHours * baseRate * (strategy.costMultiplier - 1),
+  1153→            riskLevel: strategy.riskLevel,
+  1154→            reason: `${action} ${actualHours.toFixed(0)}h (${shiftablePMs.length} PMs) from Week ${weekNumSource} to Week ${weekNumTarget}`,
+  1155→          };
+  1156→        }
+  1157→      }
+  1158→    }
+  1159→
+  1160→    return null;
+  1161→  }
+  1162→
+  1163→  /**
+  1164→   * Try ADD_OVERTIME strategy
+  1165→   */
+  1166→  private tryOvertimeStrategy(
+  1167→    strategy: LevelingStrategy,
+  1168→    overloadedWeek: ProjectionData,
+  1169→    maxHours: number,
+  1170→    baseRate: number
+  1171→  ): ProposedAdjustment | null {
+  1172→    const availableOvertime = overloadedWeek.available.overtime;
+  1173→    const overtimeHours = Math.min(maxHours, availableOvertime);
+  1174→
+  1175→    if (overtimeHours >= MIN_OVERTIME_HOURS) {
+  1176→      const weekNum = format(overloadedWeek.week, 'ww');
+  1177→
+  1178→      return {
+  1179→        type: 'ADD_OVERTIME',
+  1180→        sourcePeriod: {
+  1181→          start: overloadedWeek.week,
+  1182→          end: addDays(overloadedWeek.week, 7),
+  1183→        },
+  1184→        targetPeriod: {
+  1185→          start: overloadedWeek.week,
+  1186→          end: addDays(overloadedWeek.week, 7),
+  1187→        },
+  1188→        hoursAdjusted: overtimeHours,
+  1189→        affectedPMs: [],
+  1190→        affectedTrains: [],
+  1191→        costImpact: overtimeHours * baseRate * (strategy.costMultiplier - 1),
+  1192→        riskLevel: strategy.riskLevel,
+  1193→        reason: `Add ${overtimeHours.toFixed(0)}h overtime in Week ${weekNum}`,
+  1194→      };
+  1195→    }
+  1196→
+  1197→    return null;
+  1198→  }
+  1199→
+  1200→  /**
+  1201→   * Try CROSS_DEPOT strategy
+  1202→   */
+  1203→  private async tryCrossDepotStrategy(
+  1204→    strategy: LevelingStrategy,
+  1205→    overloadedWeek: ProjectionData,
+  1206→    maxHours: number,
+  1207→    baseRate: number
+  1208→  ): Promise<ProposedAdjustment | null> {
+  1209→    const otherDepots = await this.findDepotsWithCapacity(
+  1210→      overloadedWeek.week,
+  1211→      maxHours,
+  1212→      overloadedWeek.depotId
+  1213→    );
+  1214→
+  1215→    if (otherDepots.length > 0) {
+  1216→      const best = otherDepots[0];
+  1217→      const weekNum = format(overloadedWeek.week, 'ww');
+  1218→
+  1219→      return {
+  1220→        type: 'CROSS_DEPOT',
+  1221→        sourcePeriod: {
+  1222→          start: overloadedWeek.week,
+  1223→          end: addDays(overloadedWeek.week, 7),
+  1224→        },
+  1225→        targetPeriod: {
+  1226→          start: overloadedWeek.week,
+  1227→          end: addDays(overloadedWeek.week, 7),
+  1228→        },
+  1229→        hoursAdjusted: best.availableHours,
+  1230→        affectedPMs: [],
+  1231→        affectedTrains: [],
+  1232→        costImpact: best.availableHours * baseRate * (strategy.costMultiplier - 1),
+  1233→        riskLevel: strategy.riskLevel,
+  1234→        reason: `Request ${best.availableHours.toFixed(0)}h support from ${best.depotName} in Week ${weekNum}`,
+  1235→      };
+  1236→    }
+  1237→
+  1238→    return null;
+  1239→  }
+  1240→
+  1241→  /**
+  1242→   * Try ADD_CONTRACTOR strategy
+  1243→   */
+  1244→  private tryContractorStrategy(
+  1245→    strategy: LevelingStrategy,
+  1246→    overloadedWeek: ProjectionData,
+  1247→    maxHours: number,
+  1248→    baseRate: number
+  1249→  ): ProposedAdjustment {
+  1250→    const weekNum = format(overloadedWeek.week, 'ww');
+  1251→
+  1252→    return {
+  1253→      type: 'ADD_CONTRACTOR',
+  1254→      sourcePeriod: {
+  1255→        start: overloadedWeek.week,
+  1256→        end: addDays(overloadedWeek.week, 7),
+  1257→      },
+  1258→      targetPeriod: {
+  1259→        start: overloadedWeek.week,
+  1260→        end: addDays(overloadedWeek.week, 7),
+  1261→      },
+  1262→      hoursAdjusted: maxHours,
+  1263→      affectedPMs: [],
+  1264→      affectedTrains: [],
+  1265→      costImpact: maxHours * baseRate * (strategy.costMultiplier - 1),
+  1266→      riskLevel: strategy.riskLevel,
+  1267→      reason: `Engage contractor for ${maxHours.toFixed(0)}h in Week ${weekNum}`,
+  1268→    };
+  1269→  }
+  1270→
+  1271→  /**
+  1272→   * Find PMs that can be shifted to another week
+  1273→   */
+  1274→  private async findShiftablePMs(
+  1275→    fromWeek: ProjectionData,
+  1276→    toWeek: ProjectionData,
+  1277→    targetHours: number,
+  1278→    strategy: 'ADVANCE_PM' | 'DEFER_PM'
+  1279→  ): Promise<ShiftablePM[]> {
+  1280→    const fromStart = format(fromWeek.week, 'yyyy-MM-dd');
+  1281→    const fromEnd = format(addDays(fromWeek.week, 6), 'yyyy-MM-dd');
+  1282→
+  1283→    // Get PMs in the overloaded week
+  1284→    const scheduledPMs = await this.db
+  1285→      .select({
+  1286→        id: pmSchedule.id,
+  1287→        trainId: pmSchedule.trainId,
+  1288→        pmTypeId: pmSchedule.pmTypeId,
+  1289→        targetDate: pmSchedule.targetDate,
+  1290→        constraintStart: pmSchedule.constraintStart,
+  1291→        constraintEnd: pmSchedule.constraintEnd,
+  1292→        isLocked: pmSchedule.isLocked,
+  1293→      })
+  1294→      .from(pmSchedule)
+  1295→      .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+  1296→      .where(
+  1297→        and(
+  1298→          eq(trains.currentDepotId, fromWeek.depotId),
+  1299→          gte(pmSchedule.targetDate, fromStart),
+  1300→          lte(pmSchedule.targetDate, fromEnd),
+  1301→          inArray(pmSchedule.status, ['SCHEDULED']), // Not CONFIRMED, IN_PROGRESS, or COMPLETED
+  1302→          eq(pmSchedule.isLocked, false), // Not locked
+  1303→          isNull(pmSchedule.scenarioId) // Real schedule
+  1304→        )
+  1305→      );
+  1306→
+  1307→    if (scheduledPMs.length === 0) {
+  1308→      return [];
+  1309→    }
+  1310→
+  1311→    // Get PM type info
+  1312→    const pmTypeIds = [...new Set(scheduledPMs.map((p) => p.pmTypeId))];
+  1313→    const pmTypeInfo = await this.db.query.pmTypes.findMany({
+  1314→      where: inArray(pmTypes.id, pmTypeIds),
+  1315→      columns: { id: true, pmCode: true, estimatedHours: true },
+  1316→    });
+  1317→    const typeMap = new Map(pmTypeInfo.map((pt) => [pt.id, pt]));
+  1318→
+  1319→    // Filter PMs that can be shifted to target week
+  1320→    const shiftablePMs: ShiftablePM[] = [];
+  1321→    let accumulatedHours = 0;
+  1322→
+  1323→    for (const pm of scheduledPMs) {
+  1324→      if (accumulatedHours >= targetHours) break;
+  1325→
+  1326→      const pmType = typeMap.get(pm.pmTypeId);
+  1327→      if (!pmType) continue;
+  1328→
+  1329→      const constraintStart = pm.constraintStart ? parseISO(pm.constraintStart) : null;
+  1330→      const constraintEnd = pm.constraintEnd ? parseISO(pm.constraintEnd) : null;
+  1331→
+  1332→      // Check if target week is within compliance window
+  1333→      const targetDate = strategy === 'ADVANCE_PM' ? toWeek.week : addDays(toWeek.week, 6);
+  1334→
+  1335→      const withinWindow =
+  1336→        (!constraintStart || !isBefore(targetDate, constraintStart)) &&
+  1337→        (!constraintEnd || !isAfter(targetDate, constraintEnd));
+  1338→
+  1339→      if (withinWindow) {
+  1340→        const hours = parseFloat(pmType.estimatedHours ?? '0');
+  1341→        shiftablePMs.push({
+  1342→          id: pm.id,
+  1343→          trainId: pm.trainId,
+  1344→          pmTypeCode: pmType.pmCode,
+  1345→          estimatedHours: hours,
+  1346→          currentDate: parseISO(pm.targetDate),
+  1347→          constraintStart: constraintStart ?? new Date(0),
+  1348→          constraintEnd: constraintEnd ?? new Date(9999, 11, 31),
+  1349→        });
+  1350→        accumulatedHours += hours;
+  1351→      }
+  1352→    }
+  1353→
+  1354→    return shiftablePMs;
+  1355→  }
+  1356→
+  1357→  /**
+  1358→   * Find other depots with available capacity
+  1359→   */
+  1360→  private async findDepotsWithCapacity(
+  1361→    week: Date,
+  1362→    minHours: number,
+  1363→    excludeDepotId: string
+  1364→  ): Promise<DepotWithCapacity[]> {
+  1365→    // Get all depots except the excluded one
+  1366→    const otherDepots = await this.db.query.depots.findMany({
+  1367→      where: sql`${depots.id} != ${excludeDepotId}`,
+  1368→    });
+  1369→
+  1370→    const results: DepotWithCapacity[] = [];
+  1371→
+  1372→    for (const depot of otherDepots) {
+  1373→      const capacity = await this.getCapacity(depot.id, week);
+  1374→      if (!capacity) continue;
+  1375→
+  1376→      // Get PM hours for this depot/week
+  1377→      const pmHours = await this.getPmHoursForPeriod(depot.id, week, addDays(week, 6));
+  1378→
+  1379→      // Calculate available capacity
+  1380→      const weeklyCapacity = this.calculateWeeklyCapacity(capacity);
+  1381→      const availableHours = weeklyCapacity.regular + weeklyCapacity.overtime - pmHours;
+  1382→
+  1383→      if (availableHours >= minHours) {
+  1384→        results.push({
+  1385→          depotId: depot.id,
+  1386→          depotCode: depot.code,
+  1387→          depotName: depot.name,
+  1388→          availableHours: Math.min(availableHours, minHours),
+  1389→        });
+  1390→      }
+  1391→    }
+  1392→
+  1393→    // Sort by available hours (descending)
+  1394→    return results.sort((a, b) => b.availableHours - a.availableHours);
+  1395→  }
+  1396→
+  1397→  /**
+  1398→   * Get base labor rate for a depot
+  1399→   */
+  1400→  private async getBaseRate(depotId?: string): Promise<number> {
+  1401→    if (!depotId) {
+  1402→      return DEFAULT_BASE_RATE;
+  1403→    }
+  1404→
+  1405→    const rate = await this.db.query.laborRates.findFirst({
+  1406→      where: and(
+  1407→        eq(laborRates.depotId, depotId),
+  1408→        lte(laborRates.effectiveFrom, format(new Date(), 'yyyy-MM-dd')),
+  1409→        or(isNull(laborRates.effectiveTo), gte(laborRates.effectiveTo, format(new Date(), 'yyyy-MM-dd')))
+  1410→      ),
+  1411→      orderBy: [desc(laborRates.effectiveFrom)],
+  1412→    });
+  1413→
+  1414→    return rate ? parseFloat(rate.regularHourlyRate ?? String(DEFAULT_BASE_RATE)) : DEFAULT_BASE_RATE;
+  1415→  }
+  1416→
+  1417→  // ===========================================================================
+  1418→  // Private: Apply Adjustments & Calculate Metrics
+  1419→  // ===========================================================================
+  1420→
+  1421→  /**
+  1422→   * Apply adjustments to projections (simulation, not persisted)
+  1423→   */
+  1424→  private applyAdjustments(
+  1425→    projections: ProjectionData[],
+  1426→    adjustments: ProposedAdjustment[]
+  1427→  ): ProjectionData[] {
+  1428→    // Create deep copy
+  1429→    const leveled = projections.map((p) => ({
+  1430→      ...p,
+  1431→      required: { ...p.required },
+  1432→      available: { ...p.available },
+  1433→    }));
+  1434→
+  1435→    // Build lookup by week
+  1436→    const weekMap = new Map(leveled.map((p) => [p.week.toISOString(), p]));
+  1437→
+  1438→    for (const adj of adjustments) {
+  1439→      if (adj.type === 'MANUAL_REVIEW') continue;
+  1440→
+  1441→      const sourceKey = adj.sourcePeriod.start.toISOString();
+  1442→      const source = weekMap.get(sourceKey);
+  1443→
+  1444→      if (adj.type === 'ADVANCE_PM' || adj.type === 'DEFER_PM') {
+  1445→        // Move hours from source to target
+  1446→        if (source && adj.targetPeriod) {
+  1447→          const targetKey = adj.targetPeriod.start.toISOString();
+  1448→          const target = weekMap.get(targetKey);
+  1449→
+  1450→          if (target) {
+  1451→            source.required.pm -= adj.hoursAdjusted;
+  1452→            source.required.total -= adj.hoursAdjusted;
+  1453→            target.required.pm += adj.hoursAdjusted;
+  1454→            target.required.total += adj.hoursAdjusted;
+  1455→          }
+  1456→        }
+  1457→      } else if (adj.type === 'ADD_OVERTIME') {
+  1458→        // Increase available hours in source
+  1459→        if (source) {
+  1460→          // Overtime is already counted in available.total
+  1461→          // No change needed to projected available hours
+  1462→        }
+  1463→      } else if (adj.type === 'CROSS_DEPOT' || adj.type === 'ADD_CONTRACTOR') {
+  1464→        // Reduce required hours in source (work transferred out)
+  1465→        if (source) {
+  1466→          source.required.total -= adj.hoursAdjusted;
+  1467→        }
+  1468→      }
+  1469→    }
+  1470→
+  1471→    // Recalculate metrics for all weeks
+  1472→    for (const p of leveled) {
+  1473→      p.variance = p.available.total - p.required.total;
+  1474→      p.utilizationPct = p.available.total > 0 ? p.required.total / p.available.total : 0;
+  1475→      p.isOverloaded = p.utilizationPct > MAX_UTILIZATION;
+  1476→      p.isUnderutilized = p.utilizationPct < MIN_UTILIZATION;
+  1477→    }
+  1478→
+  1479→    return leveled;
+  1480→  }
+  1481→
+  1482→  /**
+  1483→   * Calculate aggregate metrics
+  1484→   */
+  1485→  private calculateMetrics(projections: ProjectionData[]): LevelingMetrics {
+  1486→    if (projections.length === 0) {
+  1487→      return {
+  1488→        avgUtilization: 0,
+  1489→        minUtilization: 0,
+  1490→        maxUtilization: 0,
+  1491→        overloadedWeeks: 0,
+  1492→        underutilizedWeeks: 0,
+  1493→        totalRequiredHours: 0,
+  1494→        totalAvailableHours: 0,
+  1495→      };
+  1496→    }
+  1497→
+  1498→    const utilizations = projections.map((p) => p.utilizationPct);
+  1499→
+  1500→    return {
+  1501→      avgUtilization: utilizations.reduce((a, b) => a + b, 0) / utilizations.length,
+  1502→      minUtilization: Math.min(...utilizations),
+  1503→      maxUtilization: Math.max(...utilizations),
+  1504→      overloadedWeeks: projections.filter((p) => p.isOverloaded).length,
+  1505→      underutilizedWeeks: projections.filter((p) => p.isUnderutilized).length,
+  1506→      totalRequiredHours: projections.reduce((sum, p) => sum + p.required.total, 0),
+  1507→      totalAvailableHours: projections.reduce((sum, p) => sum + p.available.total, 0),
+  1508→    };
+  1509→  }
+  1510→
+  1511→  /**
+  1512→   * Group projections by depot
+  1513→   */
+  1514→  private groupByDepot(projections: ProjectionData[]): Map<string, ProjectionData[]> {
+  1515→    const result = new Map<string, ProjectionData[]>();
+  1516→
+  1517→    for (const p of projections) {
+  1518→      const existing = result.get(p.depotId) ?? [];
+  1519→      existing.push(p);
+  1520→      result.set(p.depotId, existing);
+  1521→    }
+  1522→
+  1523→    return result;
+  1524→  }
+  1525→
+  1526→  // ===========================================================================
+  1527→  // Private: Persistence
+  1528→  // ===========================================================================
+  1529→
+  1530→  /**
+  1531→   * Persist projections and adjustments to database
+  1532→   */
+  1533→  private async persistProjections(
+  1534→    runId: string,
+  1535→    projections: ProjectionData[],
+  1536→    adjustments: ProposedAdjustment[]
+  1537→  ): Promise<void> {
+  1538→    await this.inTransaction('persistProjections', async (tx, span) => {
+  1539→      span.setAttribute('projectionRunId', runId);
+  1540→      span.setAttribute('projectionCount', projections.length);
+  1541→      span.setAttribute('adjustmentCount', adjustments.length);
+  1542→
+  1543→      // Insert projections
+  1544→      for (const p of projections) {
+  1545→        const [inserted] = await tx
+  1546→          .insert(manhourProjections)
+  1547→          .values({
+  1548→            projectionRunId: runId,
+  1549→            depotId: p.depotId,
+  1550→            periodStart: format(p.week, 'yyyy-MM-dd'),
+  1551→            periodEnd: format(addDays(p.week, 6), 'yyyy-MM-dd'),
+  1552→            granularity: p.granularity,
+  1553→            requiredPmHours: String(p.required.pm),
+  1554→            requiredCorrectiveHours: String(p.required.corrective),
+  1555→            requiredOverhaulHours: String(p.required.overhaul),
+  1556→            requiredTotalHours: String(p.required.total),
+  1557→            availableRegularHours: String(p.available.regular),
+  1558→            availableOvertimeHours: String(p.available.overtime),
+  1559→            availableTotalHours: String(p.available.total),
+  1560→          })
+  1561→          .returning();
+  1562→
+  1563→        // Insert adjustments for this projection
+  1564→        const projectionAdjustments = adjustments.filter(
+  1565→          (a) =>
+  1566→            a.sourcePeriod.start.toISOString() === p.week.toISOString() &&
+  1567→            (!p.depotCode || a.sourcePeriod.start.toISOString() === p.week.toISOString())
+  1568→        );
+  1569→
+  1570→        for (const adj of projectionAdjustments) {
+  1571→          await tx.insert(manhourAdjustments).values({
+  1572→            projectionId: inserted.id,
+  1573→            adjustmentType: adj.type,
+  1574→            sourcePeriodStart: format(adj.sourcePeriod.start, 'yyyy-MM-dd'),
+  1575→            sourcePeriodEnd: format(adj.sourcePeriod.end, 'yyyy-MM-dd'),
+  1576→            targetPeriodStart: adj.targetPeriod
+  1577→              ? format(adj.targetPeriod.start, 'yyyy-MM-dd')
+  1578→              : null,
+  1579→            targetPeriodEnd: adj.targetPeriod ? format(adj.targetPeriod.end, 'yyyy-MM-dd') : null,
+  1580→            hoursAdjusted: String(adj.hoursAdjusted),
+  1581→            affectedPmIds: adj.affectedPMs,
+  1582→            affectedTrainIds: adj.affectedTrains,
+  1583→            costImpact: String(adj.costImpact),
+  1584→            riskImpact: adj.riskLevel,
+  1585→            reason: adj.reason,
+  1586→            status: 'PROPOSED',
+  1587→          });
+  1588→        }
+  1589→      }
+  1590→    });
+  1591→  }
+  1592→}
+  1593→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

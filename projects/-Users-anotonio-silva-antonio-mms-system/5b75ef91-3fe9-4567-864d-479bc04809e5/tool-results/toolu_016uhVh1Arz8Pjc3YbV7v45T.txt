@@ -1,0 +1,268 @@
+     1→/**
+     2→ * MMS Baseline & Drift Tables
+     3→ *
+     4→ * Plan stability through immutable baseline snapshots and drift monitoring.
+     5→ *
+     6→ * Baseline/Drift Architecture:
+     7→ * - Baselines are published snapshots of the PM schedule and mileage projections
+     8→ * - Drift analysis compares current state to baseline
+     9→ * - When drift exceeds thresholds, requires_replan flag is set
+    10→ *
+    11→ * Drift thresholds:
+    12→ * - Mileage: ±5.0%
+    13→ * - Schedule: ±14 days
+    14→ * - Fleet: ≥5 trains requiring replan
+    15→ *
+    16→ * @see specs/003-database-schema.md Section 3.8
+    17→ */
+    18→
+    19→import { relations, sql } from 'drizzle-orm';
+    20→import {
+    21→  boolean,
+    22→  date,
+    23→  decimal,
+    24→  index,
+    25→  integer,
+    26→  pgTable,
+    27→  text,
+    28→  timestamp,
+    29→  uniqueIndex,
+    30→  uuid,
+    31→  varchar,
+    32→} from 'drizzle-orm/pg-core';
+    33→import { depots, trains } from './core-fleet';
+    34→import { baselineStatusEnum } from './enums';
+    35→import { pmTypes } from './pm-management';
+    36→import { users } from './users';
+    37→
+    38→/**
+    39→ * Plan Baselines - Immutable schedule snapshots
+    40→ *
+    41→ * A baseline captures the state of PM scheduling and mileage projections
+    42→ * at a point in time. Published baselines become the reference for drift analysis.
+    43→ *
+    44→ * Status lifecycle:
+    45→ * DRAFT -> PUBLISHED -> SUPERSEDED (when new baseline published)
+    46→ */
+    47→export const planBaselines = pgTable(
+    48→  'plan_baselines',
+    49→  {
+    50→    id: uuid('id').primaryKey().defaultRandom(),
+    51→    name: varchar('name', { length: 100 }).notNull(),
+    52→    description: text('description'),
+    53→    version: varchar('version', { length: 20 }).notNull(), // 'v3.2'
+    54→
+    55→    baselineDate: date('baseline_date').notNull(), // "As of" date
+    56→    horizonEnd: date('horizon_end').notNull(), // How far into future
+    57→
+    58→    // Workflow
+    59→    status: baselineStatusEnum('status').default('DRAFT'),
+    60→    createdBy: uuid('created_by')
+    61→      .notNull()
+    62→      .references(() => users.id),
+    63→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    64→
+    65→    publishedBy: uuid('published_by').references(() => users.id),
+    66→    publishedAt: timestamp('published_at', { withTimezone: true }),
+    67→
+    68→    supersededBy: uuid('superseded_by'),
+    69→    supersededAt: timestamp('superseded_at', { withTimezone: true }),
+    70→
+    71→    // Metrics at baseline time
+    72→    fleetCount: integer('fleet_count'),
+    73→    totalPmScheduled: integer('total_pm_scheduled'),
+    74→    totalManhourProjected: decimal('total_manhour_projected', { precision: 12, scale: 2 }),
+    75→  },
+    76→  (table) => [
+    77→    index('idx_baselines_status').on(table.status),
+    78→    index('idx_baselines_date').on(table.baselineDate),
+    79→  ]
+    80→);
+    81→
+    82→/**
+    83→ * Baseline PM Schedule - Snapshot of scheduled maintenance
+    84→ *
+    85→ * Immutable copy of PM schedule at baseline time.
+    86→ * Used for drift comparison.
+    87→ */
+    88→export const baselinePmSchedule = pgTable(
+    89→  'baseline_pm_schedule',
+    90→  {
+    91→    id: uuid('id').primaryKey().defaultRandom(),
+    92→    baselineId: uuid('baseline_id')
+    93→      .notNull()
+    94→      .references(() => planBaselines.id, { onDelete: 'cascade' }),
+    95→
+    96→    trainId: uuid('train_id')
+    97→      .notNull()
+    98→      .references(() => trains.id),
+    99→    pmTypeId: uuid('pm_type_id')
+   100→      .notNull()
+   101→      .references(() => pmTypes.id),
+   102→    projectedDate: date('projected_date').notNull(),
+   103→    projectedMileageKm: integer('projected_mileage_km'),
+   104→
+   105→    assignedDepotId: uuid('assigned_depot_id').references(() => depots.id),
+   106→    assignedHours: decimal('assigned_hours', { precision: 6, scale: 2 }),
+   107→  },
+   108→  (table) => [
+   109→    uniqueIndex('idx_baseline_pm_unique').on(
+   110→      table.baselineId,
+   111→      table.trainId,
+   112→      table.pmTypeId,
+   113→      table.projectedDate
+   114→    ),
+   115→    index('idx_baseline_pm_baseline').on(table.baselineId),
+   116→    index('idx_baseline_pm_train').on(table.trainId, table.projectedDate),
+   117→  ]
+   118→);
+   119→
+   120→/**
+   121→ * Baseline Mileage Projection - Snapshot of mileage forecasts
+   122→ *
+   123→ * Immutable copy of mileage projections at baseline time.
+   124→ * Used for drift comparison.
+   125→ */
+   126→export const baselineMileageProjection = pgTable(
+   127→  'baseline_mileage_projection',
+   128→  {
+   129→    id: uuid('id').primaryKey().defaultRandom(),
+   130→    baselineId: uuid('baseline_id')
+   131→      .notNull()
+   132→      .references(() => planBaselines.id, { onDelete: 'cascade' }),
+   133→
+   134→    trainId: uuid('train_id')
+   135→      .notNull()
+   136→      .references(() => trains.id),
+   137→    projectionDate: date('projection_date').notNull(),
+   138→    projectedCumulativeKm: integer('projected_cumulative_km').notNull(),
+   139→    dailyRateKm: integer('daily_rate_km'), // Assumed daily accrual rate
+   140→  },
+   141→  (table) => [
+   142→    uniqueIndex('idx_baseline_mileage_unique').on(
+   143→      table.baselineId,
+   144→      table.trainId,
+   145→      table.projectionDate
+   146→    ),
+   147→    index('idx_baseline_mileage').on(table.baselineId, table.trainId),
+   148→  ]
+   149→);
+   150→
+   151→/**
+   152→ * Drift Analysis - Comparison results
+   153→ *
+   154→ * Generated by drift monitor (nightly job).
+   155→ * Compares current state to baseline and flags trains requiring replan.
+   156→ */
+   157→export const driftAnalysis = pgTable(
+   158→  'drift_analysis',
+   159→  {
+   160→    id: uuid('id').primaryKey().defaultRandom(),
+   161→    baselineId: uuid('baseline_id')
+   162→      .notNull()
+   163→      .references(() => planBaselines.id),
+   164→    analysisDate: date('analysis_date').notNull(),
+   165→
+   166→    trainId: uuid('train_id')
+   167→      .notNull()
+   168→      .references(() => trains.id),
+   169→
+   170→    // Mileage drift
+   171→    baselineProjectedKm: integer('baseline_projected_km').notNull(),
+   172→    actualKm: integer('actual_km').notNull(),
+   173→    // Generated column: mileage drift (positive = traveled more than projected)
+   174→    mileageDriftKm: integer('mileage_drift_km').generatedAlwaysAs(
+   175→      sql`actual_km - baseline_projected_km`
+   176→    ),
+   177→    mileageDriftPct: decimal('mileage_drift_pct', { precision: 5, scale: 2 }),
+   178→
+   179→    // Schedule drift (days)
+   180→    avgPmDriftDays: decimal('avg_pm_drift_days', { precision: 5, scale: 1 }),
+   181→    maxPmDriftDays: integer('max_pm_drift_days'),
+   182→
+   183→    // Threshold breach
+   184→    requiresReplan: boolean('requires_replan').default(false),
+   185→    replanReason: text('replan_reason'),
+   186→
+   187→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   188→  },
+   189→  (table) => [
+   190→    uniqueIndex('idx_drift_unique').on(table.baselineId, table.trainId, table.analysisDate),
+   191→    index('idx_drift_baseline').on(table.baselineId, table.analysisDate),
+   192→    index('idx_drift_replan').on(table.requiresReplan, table.analysisDate),
+   193→  ]
+   194→);
+   195→
+   196→// ============================================================================
+   197→// Relations
+   198→// ============================================================================
+   199→
+   200→export const planBaselinesRelations = relations(planBaselines, ({ one, many }) => ({
+   201→  createdByUser: one(users, {
+   202→    fields: [planBaselines.createdBy],
+   203→    references: [users.id],
+   204→    relationName: 'createdBy',
+   205→  }),
+   206→  publishedByUser: one(users, {
+   207→    fields: [planBaselines.publishedBy],
+   208→    references: [users.id],
+   209→    relationName: 'publishedBy',
+   210→  }),
+   211→  supersededByBaseline: one(planBaselines, {
+   212→    fields: [planBaselines.supersededBy],
+   213→    references: [planBaselines.id],
+   214→    relationName: 'supersedes',
+   215→  }),
+   216→  pmScheduleSnapshots: many(baselinePmSchedule),
+   217→  mileageProjections: many(baselineMileageProjection),
+   218→  driftAnalyses: many(driftAnalysis),
+   219→}));
+   220→
+   221→export const baselinePmScheduleRelations = relations(baselinePmSchedule, ({ one }) => ({
+   222→  baseline: one(planBaselines, {
+   223→    fields: [baselinePmSchedule.baselineId],
+   224→    references: [planBaselines.id],
+   225→  }),
+   226→  train: one(trains, {
+   227→    fields: [baselinePmSchedule.trainId],
+   228→    references: [trains.id],
+   229→  }),
+   230→  pmType: one(pmTypes, {
+   231→    fields: [baselinePmSchedule.pmTypeId],
+   232→    references: [pmTypes.id],
+   233→  }),
+   234→  assignedDepot: one(depots, {
+   235→    fields: [baselinePmSchedule.assignedDepotId],
+   236→    references: [depots.id],
+   237→  }),
+   238→}));
+   239→
+   240→export const baselineMileageProjectionRelations = relations(
+   241→  baselineMileageProjection,
+   242→  ({ one }) => ({
+   243→    baseline: one(planBaselines, {
+   244→      fields: [baselineMileageProjection.baselineId],
+   245→      references: [planBaselines.id],
+   246→    }),
+   247→    train: one(trains, {
+   248→      fields: [baselineMileageProjection.trainId],
+   249→      references: [trains.id],
+   250→    }),
+   251→  })
+   252→);
+   253→
+   254→export const driftAnalysisRelations = relations(driftAnalysis, ({ one }) => ({
+   255→  baseline: one(planBaselines, {
+   256→    fields: [driftAnalysis.baselineId],
+   257→    references: [planBaselines.id],
+   258→  }),
+   259→  train: one(trains, {
+   260→    fields: [driftAnalysis.trainId],
+   261→    references: [trains.id],
+   262→  }),
+   263→}));
+   264→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

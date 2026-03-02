@@ -1,0 +1,2323 @@
+     1→/**
+     2→ * MMS Fleet Service
+     3→ *
+     4→ * Core domain service for fleet asset management.
+     5→ * Provides CRUD operations for depots, fleets, trains, routes, and tracks.
+     6→ * Manages train lifecycle states and mileage tracking.
+     7→ *
+     8→ * Business rules:
+     9→ * - Train fitness transitions: FIT <-> RESTRICTED <-> GROUNDED
+    10→ * - Mileage accumulation is additive (never decreases except for corrections)
+    11→ * - Fleet mileage balancing: target = fleet average, variance = current - target
+    12→ * - Active entities can be deactivated but not deleted (audit compliance)
+    13→ *
+    14→ * @see specs/003-database-schema.md Section 3.2 (Core Fleet Domain)
+    15→ */
+    16→
+    17→import { eq, and, inArray, sql, desc, asc, count, avg, sum, type SQL } from 'drizzle-orm';
+    18→import { BaseService, MmsAttributes } from '../lib/services/base';
+    19→import {
+    20→  depots,
+    21→  fleets,
+    22→  trains,
+    23→  routes,
+    24→  tracks,
+    25→  trainComponents,
+    26→  componentInstallations,
+    27→  componentPmTracking,
+    28→  type Depot,
+    29→  type NewDepot,
+    30→  type Fleet,
+    31→  type NewFleet,
+    32→  type Train,
+    33→  type NewTrain,
+    34→  type Route,
+    35→  type NewRoute,
+    36→  type Track,
+    37→  type NewTrack,
+    38→  type TrainComponent,
+    39→  type NewTrainComponent,
+    40→  type ComponentInstallation,
+    41→  type NewComponentInstallation,
+    42→  type ComponentPmTracking,
+    43→} from '../lib/db/schema';
+    44→import {
+    45→  NotFoundError,
+    46→  TrainNotFoundError,
+    47→  ValidationError,
+    48→  DuplicateError,
+    49→  BusinessRuleError,
+    50→} from '../lib/errors';
+    51→
+    52→// =============================================================================
+    53→// Types
+    54→// =============================================================================
+    55→
+    56→/** Valid fitness status transitions */
+    57→type FitnessStatus = 'FIT' | 'RESTRICTED' | 'GROUNDED';
+    58→
+    59→/** Query filters for listing trains */
+    60→export interface TrainListFilters {
+    61→  fleetId?: string;
+    62→  depotId?: string;
+    63→  fitnessStatus?: FitnessStatus | FitnessStatus[];
+    64→  active?: boolean;
+    65→  trainNumbers?: string[];
+    66→}
+    67→
+    68→/** Query filters for listing fleets */
+    69→export interface FleetListFilters {
+    70→  baseDepotId?: string;
+    71→  manufacturer?: string;
+    72→  active?: boolean;
+    73→}
+    74→
+    75→/** Pagination options */
+    76→export interface PaginationOptions {
+    77→  page?: number;
+    78→  pageSize?: number;
+    79→  sortBy?: string;
+    80→  sortOrder?: 'asc' | 'desc';
+    81→}
+    82→
+    83→/** Paginated result */
+    84→export interface PaginatedResult<T> {
+    85→  data: T[];
+    86→  total: number;
+    87→  page: number;
+    88→  pageSize: number;
+    89→  totalPages: number;
+    90→}
+    91→
+    92→/** Fleet statistics */
+    93→export interface FleetStatistics {
+    94→  fleetId: string;
+    95→  fleetCode: string;
+    96→  totalTrains: number;
+    97→  activeTrains: number;
+    98→  fitTrains: number;
+    99→  restrictedTrains: number;
+   100→  groundedTrains: number;
+   101→  totalMileageKm: number;
+   102→  averageMileageKm: number;
+   103→  minMileageKm: number;
+   104→  maxMileageKm: number;
+   105→  mileageStdDevKm: number;
+   106→}
+   107→
+   108→/** Train with fleet details */
+   109→export interface TrainWithFleet extends Train {
+   110→  fleet: Fleet | null;
+   111→  currentDepot: Depot | null;
+   112→  homeDepot: Depot | null;
+   113→}
+   114→
+   115→/** Fitness status change request */
+   116→export interface FitnessStatusChangeRequest {
+   117→  trainId: string;
+   118→  newStatus: FitnessStatus;
+   119→  notes?: string;
+   120→  changedBy?: string;
+   121→}
+   122→
+   123→/** Mileage update request */
+   124→export interface MileageUpdateRequest {
+   125→  trainId: string;
+   126→  newMileageKm: number;
+   127→  source?: string;
+   128→}
+   129→
+   130→// =============================================================================
+   131→// Component Tracking Types
+   132→// =============================================================================
+   133→
+   134→/** Valid component status (matches componentStatusEnum in schema) */
+   135→export type ComponentStatus = 'IN_SERVICE' | 'SPARE' | 'IN_OVERHAUL' | 'CONDEMNED';
+   136→
+   137→/** Valid removal reasons (matches removalReasonEnum in schema) */
+   138→export type RemovalReason = 'SCHEDULED_OVERHAUL' | 'FAILURE' | 'SWAP' | 'UPGRADE';
+   139→
+   140→/** Query filters for listing components */
+   141→export interface ComponentListFilters {
+   142→  componentType?: string;
+   143→  status?: ComponentStatus | ComponentStatus[];
+   144→  trainId?: string;
+   145→  serialNumbers?: string[];
+   146→  hasCurrentTrain?: boolean;
+   147→}
+   148→
+   149→/** Component with current train details */
+   150→export interface ComponentWithTrain extends TrainComponent {
+   151→  currentTrain?: Train | null;
+   152→}
+   153→
+   154→/** Component with full installation history */
+   155→export interface ComponentWithHistory extends TrainComponent {
+   156→  installations: ComponentInstallation[];
+   157→  pmTracking: ComponentPmTracking[];
+   158→}
+   159→
+   160→/** Install component request */
+   161→export interface InstallComponentRequest {
+   162→  componentId: string;
+   163→  trainId: string;
+   164→  position?: string;
+   165→  workOrderId?: string;
+   166→}
+   167→
+   168→/** Remove component request */
+   169→export interface RemoveComponentRequest {
+   170→  componentId: string;
+   171→  reason: RemovalReason;
+   172→  workOrderId?: string;
+   173→}
+   174→
+   175→/** Transfer component request */
+   176→export interface TransferComponentRequest {
+   177→  componentId: string;
+   178→  newTrainId: string;
+   179→  newPosition?: string;
+   180→  reason?: RemovalReason;
+   181→  workOrderId?: string;
+   182→}
+   183→
+   184→/** Component mileage calculation result */
+   185→export interface ComponentMileageResult {
+   186→  componentId: string;
+   187→  serialNumber: string;
+   188→  totalComponentMileageKm: number;
+   189→  installationsCalculated: number;
+   190→}
+   191→
+   192→// =============================================================================
+   193→// Fleet Service
+   194→// =============================================================================
+   195→
+   196→export class FleetService extends BaseService {
+   197→  constructor() {
+   198→    super({ name: 'fleet-service', version: '1.0.0' });
+   199→  }
+   200→
+   201→  // ===========================================================================
+   202→  // Depot Operations
+   203→  // ===========================================================================
+   204→
+   205→  async getDepotById(id: string): Promise<Depot> {
+   206→    return this.traced('getDepotById', async (span) => {
+   207→      span.setAttribute(MmsAttributes.DEPOT_ID, id);
+   208→
+   209→      const result = await this.db.query.depots.findFirst({
+   210→        where: eq(depots.id, id),
+   211→      });
+   212→
+   213→      if (!result) {
+   214→        throw new NotFoundError(`Depot not found: ${id}`, {
+   215→          entityType: 'depot',
+   216→          entityId: id,
+   217→        });
+   218→      }
+   219→
+   220→      return result;
+   221→    });
+   222→  }
+   223→
+   224→  async getDepotByCode(code: string): Promise<Depot> {
+   225→    return this.traced('getDepotByCode', async (span) => {
+   226→      span.setAttribute('depot.code', code);
+   227→
+   228→      const result = await this.db.query.depots.findFirst({
+   229→        where: eq(depots.code, code),
+   230→      });
+   231→
+   232→      if (!result) {
+   233→        throw new NotFoundError(`Depot not found with code: ${code}`, {
+   234→          entityType: 'depot',
+   235→          entityId: code,
+   236→        });
+   237→      }
+   238→
+   239→      return result;
+   240→    });
+   241→  }
+   242→
+   243→  async listDepots(options?: { active?: boolean }): Promise<Depot[]> {
+   244→    return this.traced('listDepots', async (span) => {
+   245→      const conditions: SQL<unknown>[] = [];
+   246→      if (options?.active !== undefined) {
+   247→        conditions.push(eq(depots.active, options.active));
+   248→      }
+   249→
+   250→      const result = await this.db.query.depots.findMany({
+   251→        where: conditions.length > 0 ? and(...conditions) : undefined,
+   252→        orderBy: asc(depots.code),
+   253→      });
+   254→
+   255→      span.setAttribute('result.count', result.length);
+   256→      return result;
+   257→    });
+   258→  }
+   259→
+   260→  async createDepot(data: NewDepot): Promise<Depot> {
+   261→    return this.inTransaction('createDepot', async (tx, span) => {
+   262→      span.setAttribute('depot.code', data.code);
+   263→
+   264→      // Check for duplicate code
+   265→      const existing = await tx.query.depots.findFirst({
+   266→        where: eq(depots.code, data.code),
+   267→      });
+   268→
+   269→      if (existing) {
+   270→        throw new DuplicateError(`Depot with code ${data.code} already exists`, {
+   271→          field: 'code',
+   272→          value: data.code,
+   273→        });
+   274→      }
+   275→
+   276→      const [result] = await tx.insert(depots).values(data).returning();
+   277→      span.setAttribute(MmsAttributes.DEPOT_ID, result.id);
+   278→
+   279→      this.log.info({ depotId: result.id, code: data.code }, 'Depot created');
+   280→      return result;
+   281→    });
+   282→  }
+   283→
+   284→  async updateDepot(id: string, data: Partial<NewDepot>): Promise<Depot> {
+   285→    return this.inTransaction('updateDepot', async (tx, span) => {
+   286→      span.setAttribute(MmsAttributes.DEPOT_ID, id);
+   287→
+   288→      const existing = await tx.query.depots.findFirst({
+   289→        where: eq(depots.id, id),
+   290→      });
+   291→
+   292→      if (!existing) {
+   293→        throw new NotFoundError(`Depot not found: ${id}`, {
+   294→          entityType: 'depot',
+   295→          entityId: id,
+   296→        });
+   297→      }
+   298→
+   299→      // Check for duplicate code if changing
+   300→      if (data.code && data.code !== existing.code) {
+   301→        const duplicate = await tx.query.depots.findFirst({
+   302→          where: eq(depots.code, data.code),
+   303→        });
+   304→        if (duplicate) {
+   305→          throw new DuplicateError(`Depot with code ${data.code} already exists`, {
+   306→            field: 'code',
+   307→            value: data.code,
+   308→          });
+   309→        }
+   310→      }
+   311→
+   312→      const [result] = await tx
+   313→        .update(depots)
+   314→        .set({ ...data, updatedAt: new Date() })
+   315→        .where(eq(depots.id, id))
+   316→        .returning();
+   317→
+   318→      return result;
+   319→    });
+   320→  }
+   321→
+   322→  async deactivateDepot(id: string): Promise<Depot> {
+   323→    return this.updateDepot(id, { active: false });
+   324→  }
+   325→
+   326→  // ===========================================================================
+   327→  // Fleet Operations
+   328→  // ===========================================================================
+   329→
+   330→  async getFleetById(id: string): Promise<Fleet> {
+   331→    return this.traced('getFleetById', async (span) => {
+   332→      span.setAttribute(MmsAttributes.FLEET_ID, id);
+   333→
+   334→      const result = await this.db.query.fleets.findFirst({
+   335→        where: eq(fleets.id, id),
+   336→      });
+   337→
+   338→      if (!result) {
+   339→        throw new NotFoundError(`Fleet not found: ${id}`, {
+   340→          entityType: 'fleet',
+   341→          entityId: id,
+   342→        });
+   343→      }
+   344→
+   345→      return result;
+   346→    });
+   347→  }
+   348→
+   349→  async getFleetByCode(code: string): Promise<Fleet> {
+   350→    return this.traced('getFleetByCode', async (span) => {
+   351→      span.setAttribute('fleet.code', code);
+   352→
+   353→      const result = await this.db.query.fleets.findFirst({
+   354→        where: eq(fleets.code, code),
+   355→      });
+   356→
+   357→      if (!result) {
+   358→        throw new NotFoundError(`Fleet not found with code: ${code}`, {
+   359→          entityType: 'fleet',
+   360→          entityId: code,
+   361→        });
+   362→      }
+   363→
+   364→      return result;
+   365→    });
+   366→  }
+   367→
+   368→  async listFleets(filters?: FleetListFilters): Promise<Fleet[]> {
+   369→    return this.traced('listFleets', async (span) => {
+   370→      const conditions: SQL<unknown>[] = [];
+   371→
+   372→      if (filters?.baseDepotId) {
+   373→        conditions.push(eq(fleets.baseDepotId, filters.baseDepotId));
+   374→      }
+   375→      if (filters?.manufacturer) {
+   376→        conditions.push(eq(fleets.manufacturer, filters.manufacturer));
+   377→      }
+   378→      if (filters?.active !== undefined) {
+   379→        conditions.push(eq(fleets.active, filters.active));
+   380→      }
+   381→
+   382→      const result = await this.db.query.fleets.findMany({
+   383→        where: conditions.length > 0 ? and(...conditions) : undefined,
+   384→        orderBy: asc(fleets.code),
+   385→      });
+   386→
+   387→      span.setAttribute('result.count', result.length);
+   388→      return result;
+   389→    });
+   390→  }
+   391→
+   392→  async createFleet(data: NewFleet): Promise<Fleet> {
+   393→    return this.inTransaction('createFleet', async (tx, span) => {
+   394→      span.setAttribute('fleet.code', data.code);
+   395→
+   396→      // Validate base depot exists if provided
+   397→      if (data.baseDepotId) {
+   398→        const depot = await tx.query.depots.findFirst({
+   399→          where: eq(depots.id, data.baseDepotId),
+   400→        });
+   401→        if (!depot) {
+   402→          throw new ValidationError('Base depot not found', {
+   403→            field: 'baseDepotId',
+   404→            context: { depotId: data.baseDepotId },
+   405→          });
+   406→        }
+   407→      }
+   408→
+   409→      // Check for duplicate code
+   410→      const existing = await tx.query.fleets.findFirst({
+   411→        where: eq(fleets.code, data.code),
+   412→      });
+   413→
+   414→      if (existing) {
+   415→        throw new DuplicateError(`Fleet with code ${data.code} already exists`, {
+   416→          field: 'code',
+   417→          value: data.code,
+   418→        });
+   419→      }
+   420→
+   421→      const [result] = await tx.insert(fleets).values(data).returning();
+   422→      span.setAttribute(MmsAttributes.FLEET_ID, result.id);
+   423→
+   424→      this.log.info({ fleetId: result.id, code: data.code }, 'Fleet created');
+   425→      return result;
+   426→    });
+   427→  }
+   428→
+   429→  async updateFleet(id: string, data: Partial<NewFleet>): Promise<Fleet> {
+   430→    return this.inTransaction('updateFleet', async (tx, span) => {
+   431→      span.setAttribute(MmsAttributes.FLEET_ID, id);
+   432→
+   433→      const existing = await tx.query.fleets.findFirst({
+   434→        where: eq(fleets.id, id),
+   435→      });
+   436→
+   437→      if (!existing) {
+   438→        throw new NotFoundError(`Fleet not found: ${id}`, {
+   439→          entityType: 'fleet',
+   440→          entityId: id,
+   441→        });
+   442→      }
+   443→
+   444→      // Check for duplicate code if changing
+   445→      if (data.code && data.code !== existing.code) {
+   446→        const duplicate = await tx.query.fleets.findFirst({
+   447→          where: eq(fleets.code, data.code),
+   448→        });
+   449→        if (duplicate) {
+   450→          throw new DuplicateError(`Fleet with code ${data.code} already exists`, {
+   451→            field: 'code',
+   452→            value: data.code,
+   453→          });
+   454→        }
+   455→      }
+   456→
+   457→      const [result] = await tx
+   458→        .update(fleets)
+   459→        .set({ ...data, updatedAt: new Date() })
+   460→        .where(eq(fleets.id, id))
+   461→        .returning();
+   462→
+   463→      return result;
+   464→    });
+   465→  }
+   466→
+   467→  async deactivateFleet(id: string): Promise<Fleet> {
+   468→    return this.updateFleet(id, { active: false });
+   469→  }
+   470→
+   471→  // ===========================================================================
+   472→  // Train Operations
+   473→  // ===========================================================================
+   474→
+   475→  async getTrainById(id: string): Promise<Train> {
+   476→    return this.traced('getTrainById', async (span) => {
+   477→      span.setAttribute(MmsAttributes.TRAIN_ID, id);
+   478→
+   479→      const result = await this.db.query.trains.findFirst({
+   480→        where: eq(trains.id, id),
+   481→      });
+   482→
+   483→      if (!result) {
+   484→        throw new TrainNotFoundError(id);
+   485→      }
+   486→
+   487→      return result;
+   488→    });
+   489→  }
+   490→
+   491→  async getTrainByNumber(trainNumber: string): Promise<Train> {
+   492→    return this.traced('getTrainByNumber', async (span) => {
+   493→      span.setAttribute(MmsAttributes.TRAIN_NUMBER, trainNumber);
+   494→
+   495→      const result = await this.db.query.trains.findFirst({
+   496→        where: eq(trains.trainNumber, trainNumber),
+   497→      });
+   498→
+   499→      if (!result) {
+   500→        throw new NotFoundError(`Train not found with number: ${trainNumber}`, {
+   501→          entityType: 'train',
+   502→          entityId: trainNumber,
+   503→        });
+   504→      }
+   505→
+   506→      return result;
+   507→    });
+   508→  }
+   509→
+   510→  async getTrainWithDetails(id: string): Promise<TrainWithFleet> {
+   511→    return this.traced('getTrainWithDetails', async (span) => {
+   512→      span.setAttribute(MmsAttributes.TRAIN_ID, id);
+   513→
+   514→      const result = await this.db.query.trains.findFirst({
+   515→        where: eq(trains.id, id),
+   516→        with: {
+   517→          fleet: true,
+   518→          currentDepot: true,
+   519→          homeDepot: true,
+   520→        },
+   521→      });
+   522→
+   523→      if (!result) {
+   524→        throw new TrainNotFoundError(id);
+   525→      }
+   526→
+   527→      return result as TrainWithFleet;
+   528→    });
+   529→  }
+   530→
+   531→  async listTrains(
+   532→    filters?: TrainListFilters,
+   533→    pagination?: PaginationOptions
+   534→  ): Promise<PaginatedResult<Train>> {
+   535→    return this.traced('listTrains', async (span) => {
+   536→      const conditions: SQL<unknown>[] = [];
+   537→
+   538→      if (filters?.fleetId) {
+   539→        conditions.push(eq(trains.fleetId, filters.fleetId));
+   540→      }
+   541→      if (filters?.depotId) {
+   542→        conditions.push(eq(trains.currentDepotId, filters.depotId));
+   543→      }
+   544→      if (filters?.fitnessStatus) {
+   545→        if (Array.isArray(filters.fitnessStatus)) {
+   546→          conditions.push(inArray(trains.fitnessStatus, filters.fitnessStatus));
+   547→        } else {
+   548→          conditions.push(eq(trains.fitnessStatus, filters.fitnessStatus));
+   549→        }
+   550→      }
+   551→      if (filters?.active !== undefined) {
+   552→        conditions.push(eq(trains.active, filters.active));
+   553→      }
+   554→      if (filters?.trainNumbers && filters.trainNumbers.length > 0) {
+   555→        conditions.push(inArray(trains.trainNumber, filters.trainNumbers));
+   556→      }
+   557→
+   558→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   559→
+   560→      // Get total count
+   561→      const [{ totalCount }] = await this.db
+   562→        .select({ totalCount: count() })
+   563→        .from(trains)
+   564→        .where(whereClause);
+   565→
+   566→      // Apply pagination
+   567→      const page = pagination?.page ?? 1;
+   568→      const pageSize = Math.min(pagination?.pageSize ?? 50, 500);
+   569→      const offset = (page - 1) * pageSize;
+   570→
+   571→      // Determine sort order
+   572→      const sortDirection = pagination?.sortOrder === 'desc' ? desc : asc;
+   573→      const getOrderBy = () => {
+   574→        switch (pagination?.sortBy) {
+   575→          case 'mileage':
+   576→            return sortDirection(trains.currentMileageKm);
+   577→          case 'fitnessStatus':
+   578→            return sortDirection(trains.fitnessStatus);
+   579→          default:
+   580→            return sortDirection(trains.trainNumber);
+   581→        }
+   582→      };
+   583→
+   584→      const data = await this.db.query.trains.findMany({
+   585→        where: whereClause,
+   586→        orderBy: getOrderBy(),
+   587→        limit: pageSize,
+   588→        offset,
+   589→      });
+   590→
+   591→      span.setAttribute('result.count', data.length);
+   592→      span.setAttribute('result.total', totalCount);
+   593→
+   594→      return {
+   595→        data,
+   596→        total: totalCount,
+   597→        page,
+   598→        pageSize,
+   599→        totalPages: Math.ceil(totalCount / pageSize),
+   600→      };
+   601→    });
+   602→  }
+   603→
+   604→  async createTrain(data: NewTrain): Promise<Train> {
+   605→    return this.inTransaction('createTrain', async (tx, span) => {
+   606→      span.setAttribute(MmsAttributes.TRAIN_NUMBER, data.trainNumber);
+   607→
+   608→      // Validate fleet exists
+   609→      const fleet = await tx.query.fleets.findFirst({
+   610→        where: eq(fleets.id, data.fleetId),
+   611→      });
+   612→      if (!fleet) {
+   613→        throw new ValidationError('Fleet not found', {
+   614→          field: 'fleetId',
+   615→          context: { fleetId: data.fleetId },
+   616→        });
+   617→      }
+   618→
+   619→      // Validate depots if provided
+   620→      if (data.currentDepotId) {
+   621→        const depot = await tx.query.depots.findFirst({
+   622→          where: eq(depots.id, data.currentDepotId),
+   623→        });
+   624→        if (!depot) {
+   625→          throw new ValidationError('Current depot not found', {
+   626→            field: 'currentDepotId',
+   627→            context: { depotId: data.currentDepotId },
+   628→          });
+   629→        }
+   630→      }
+   631→
+   632→      if (data.homeDepotId) {
+   633→        const depot = await tx.query.depots.findFirst({
+   634→          where: eq(depots.id, data.homeDepotId),
+   635→        });
+   636→        if (!depot) {
+   637→          throw new ValidationError('Home depot not found', {
+   638→            field: 'homeDepotId',
+   639→            context: { depotId: data.homeDepotId },
+   640→          });
+   641→        }
+   642→      }
+   643→
+   644→      // Check for duplicate train number
+   645→      const existing = await tx.query.trains.findFirst({
+   646→        where: eq(trains.trainNumber, data.trainNumber),
+   647→      });
+   648→
+   649→      if (existing) {
+   650→        throw new DuplicateError(`Train with number ${data.trainNumber} already exists`, {
+   651→          field: 'trainNumber',
+   652→          value: data.trainNumber,
+   653→        });
+   654→      }
+   655→
+   656→      const [result] = await tx.insert(trains).values(data).returning();
+   657→      span.setAttribute(MmsAttributes.TRAIN_ID, result.id);
+   658→
+   659→      this.log.info(
+   660→        { trainId: result.id, trainNumber: data.trainNumber, fleetId: data.fleetId },
+   661→        'Train created'
+   662→      );
+   663→      return result;
+   664→    });
+   665→  }
+   666→
+   667→  async updateTrain(id: string, data: Partial<NewTrain>): Promise<Train> {
+   668→    return this.inTransaction('updateTrain', async (tx, span) => {
+   669→      span.setAttribute(MmsAttributes.TRAIN_ID, id);
+   670→
+   671→      const existing = await tx.query.trains.findFirst({
+   672→        where: eq(trains.id, id),
+   673→      });
+   674→
+   675→      if (!existing) {
+   676→        throw new TrainNotFoundError(id);
+   677→      }
+   678→
+   679→      // Check for duplicate train number if changing
+   680→      if (data.trainNumber && data.trainNumber !== existing.trainNumber) {
+   681→        const duplicate = await tx.query.trains.findFirst({
+   682→          where: eq(trains.trainNumber, data.trainNumber),
+   683→        });
+   684→        if (duplicate) {
+   685→          throw new DuplicateError(`Train with number ${data.trainNumber} already exists`, {
+   686→            field: 'trainNumber',
+   687→            value: data.trainNumber,
+   688→          });
+   689→        }
+   690→      }
+   691→
+   692→      const [result] = await tx
+   693→        .update(trains)
+   694→        .set({ ...data, updatedAt: new Date() })
+   695→        .where(eq(trains.id, id))
+   696→        .returning();
+   697→
+   698→      return result;
+   699→    });
+   700→  }
+   701→
+   702→  async deactivateTrain(id: string): Promise<Train> {
+   703→    return this.updateTrain(id, { active: false });
+   704→  }
+   705→
+   706→  // ===========================================================================
+   707→  // Train Fitness Status Management
+   708→  // ===========================================================================
+   709→
+   710→  /**
+   711→   * Update train fitness status with validation.
+   712→   *
+   713→   * Valid transitions:
+   714→   * - FIT -> RESTRICTED, GROUNDED
+   715→   * - RESTRICTED -> FIT, GROUNDED
+   716→   * - GROUNDED -> RESTRICTED, FIT
+   717→   *
+   718→   * Note: Transitions from GROUNDED to FIT should typically go through RESTRICTED
+   719→   * for inspection, but this is not enforced (operational flexibility).
+   720→   */
+   721→  async updateFitnessStatus(request: FitnessStatusChangeRequest): Promise<Train> {
+   722→    return this.inTransaction('updateFitnessStatus', async (tx, span) => {
+   723→      const { trainId, newStatus, notes, changedBy } = request;
+   724→
+   725→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   726→      span.setAttribute('fitness.newStatus', newStatus);
+   727→
+   728→      const train = await tx.query.trains.findFirst({
+   729→        where: eq(trains.id, trainId),
+   730→      });
+   731→
+   732→      if (!train) {
+   733→        throw new TrainNotFoundError(trainId);
+   734→      }
+   735→
+   736→      const oldStatus = train.fitnessStatus;
+   737→      span.setAttribute('fitness.oldStatus', oldStatus ?? 'null');
+   738→
+   739→      // Log transition
+   740→      this.log.info(
+   741→        {
+   742→          trainId,
+   743→          trainNumber: train.trainNumber,
+   744→          oldStatus,
+   745→          newStatus,
+   746→          changedBy,
+   747→        },
+   748→        `Train fitness status change: ${oldStatus} -> ${newStatus}`
+   749→      );
+   750→
+   751→      // Update with notes
+   752→      const [result] = await tx
+   753→        .update(trains)
+   754→        .set({
+   755→          fitnessStatus: newStatus,
+   756→          fitnessNotes: notes ?? train.fitnessNotes,
+   757→          updatedAt: new Date(),
+   758→        })
+   759→        .where(eq(trains.id, trainId))
+   760→        .returning();
+   761→
+   762→      this.recordEvent('train.fitness_changed', {
+   763→        [MmsAttributes.TRAIN_ID]: trainId,
+   764→        [MmsAttributes.TRAIN_NUMBER]: train.trainNumber,
+   765→        'fitness.old': oldStatus ?? 'unknown',
+   766→        'fitness.new': newStatus,
+   767→      }, span);
+   768→
+   769→      return result;
+   770→    });
+   771→  }
+   772→
+   773→  /**
+   774→   * Get trains by fitness status with optional fleet filter
+   775→   */
+   776→  async getTrainsByFitnessStatus(
+   777→    status: FitnessStatus,
+   778→    fleetId?: string
+   779→  ): Promise<Train[]> {
+   780→    return this.traced('getTrainsByFitnessStatus', async (span) => {
+   781→      span.setAttribute('fitness.status', status);
+   782→      if (fleetId) {
+   783→        span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   784→      }
+   785→
+   786→      const conditions = [
+   787→        eq(trains.fitnessStatus, status),
+   788→        eq(trains.active, true),
+   789→      ];
+   790→
+   791→      if (fleetId) {
+   792→        conditions.push(eq(trains.fleetId, fleetId));
+   793→      }
+   794→
+   795→      const result = await this.db.query.trains.findMany({
+   796→        where: and(...conditions),
+   797→        orderBy: asc(trains.trainNumber),
+   798→      });
+   799→
+   800→      span.setAttribute('result.count', result.length);
+   801→      return result;
+   802→    });
+   803→  }
+   804→
+   805→  /**
+   806→   * Get count of available (FIT) trains for a fleet
+   807→   */
+   808→  async getAvailableTrainCount(fleetId: string): Promise<number> {
+   809→    return this.traced('getAvailableTrainCount', async (span) => {
+   810→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   811→
+   812→      const [{ fitCount }] = await this.db
+   813→        .select({ fitCount: count() })
+   814→        .from(trains)
+   815→        .where(
+   816→          and(
+   817→            eq(trains.fleetId, fleetId),
+   818→            eq(trains.fitnessStatus, 'FIT'),
+   819→            eq(trains.active, true)
+   820→          )
+   821→        );
+   822→
+   823→      span.setAttribute('result.fitCount', fitCount);
+   824→      return fitCount;
+   825→    });
+   826→  }
+   827→
+   828→  // ===========================================================================
+   829→  // Mileage Operations
+   830→  // ===========================================================================
+   831→
+   832→  /**
+   833→   * Update train mileage (typically called by ingestion service)
+   834→   *
+   835→   * Validates:
+   836→   * - New mileage must be >= current (no rollback unless meter event)
+   837→   * - Maximum daily increase: 2000 km (configurable)
+   838→   */
+   839→  async updateMileage(request: MileageUpdateRequest): Promise<Train> {
+   840→    return this.inTransaction('updateMileage', async (tx, span) => {
+   841→      const { trainId, newMileageKm, source } = request;
+   842→
+   843→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   844→      span.setAttribute(MmsAttributes.MILEAGE_KM, newMileageKm);
+   845→
+   846→      const train = await tx.query.trains.findFirst({
+   847→        where: eq(trains.id, trainId),
+   848→      });
+   849→
+   850→      if (!train) {
+   851→        throw new TrainNotFoundError(trainId);
+   852→      }
+   853→
+   854→      const oldMileage = train.currentMileageKm;
+   855→      const delta = newMileageKm - oldMileage;
+   856→
+   857→      span.setAttribute('mileage.old', oldMileage);
+   858→      span.setAttribute('mileage.delta', delta);
+   859→
+   860→      // Validate mileage increase
+   861→      if (delta < 0) {
+   862→        throw new BusinessRuleError(
+   863→          `Mileage cannot decrease (${oldMileage} -> ${newMileageKm}). Use meter event for corrections.`,
+   864→          {
+   865→            rule: 'mileage_no_decrease',
+   866→            context: { trainId, oldMileage, newMileageKm },
+   867→          }
+   868→        );
+   869→      }
+   870→
+   871→      // Warn on large delta (>2000km in single update)
+   872→      if (delta > 2000) {
+   873→        this.log.warn(
+   874→          {
+   875→            trainId,
+   876→            trainNumber: train.trainNumber,
+   877→            oldMileage,
+   878→            newMileageKm,
+   879→            delta,
+   880→            source,
+   881→          },
+   882→          'Large mileage delta detected - possible anomaly'
+   883→        );
+   884→      }
+   885→
+   886→      const [result] = await tx
+   887→        .update(trains)
+   888→        .set({
+   889→          currentMileageKm: newMileageKm,
+   890→          updatedAt: new Date(),
+   891→        })
+   892→        .where(eq(trains.id, trainId))
+   893→        .returning();
+   894→
+   895→      this.log.info(
+   896→        {
+   897→          trainId,
+   898→          trainNumber: train.trainNumber,
+   899→          oldMileage,
+   900→          newMileageKm,
+   901→          delta,
+   902→          source,
+   903→        },
+   904→        `Train mileage updated: ${oldMileage} -> ${newMileageKm} (+${delta} km)`
+   905→      );
+   906→
+   907→      return result;
+   908→    });
+   909→  }
+   910→
+   911→  /**
+   912→   * Calculate and update fleet mileage targets for balancing.
+   913→   * Target = fleet average mileage, variance = current - target
+   914→   */
+   915→  async recalculateFleetTargets(fleetId: string): Promise<void> {
+   916→    return this.inTransaction('recalculateFleetTargets', async (tx, span) => {
+   917→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   918→
+   919→      // Get average mileage for the fleet
+   920→      const [{ avgMileage }] = await tx
+   921→        .select({ avgMileage: avg(trains.currentMileageKm) })
+   922→        .from(trains)
+   923→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+   924→
+   925→      const targetMileage = Math.round(Number(avgMileage) || 0);
+   926→      span.setAttribute('mileage.target', targetMileage);
+   927→
+   928→      // Update all trains in fleet with new target
+   929→      await tx
+   930→        .update(trains)
+   931→        .set({
+   932→          targetMileageKm: targetMileage,
+   933→          updatedAt: new Date(),
+   934→        })
+   935→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+   936→
+   937→      this.log.info(
+   938→        { fleetId, targetMileage },
+   939→        'Fleet mileage targets recalculated'
+   940→      );
+   941→    });
+   942→  }
+   943→
+   944→  // ===========================================================================
+   945→  // Route Operations
+   946→  // ===========================================================================
+   947→
+   948→  async getRouteById(id: string): Promise<Route> {
+   949→    return this.traced('getRouteById', async (span) => {
+   950→      span.setAttribute('route.id', id);
+   951→
+   952→      const result = await this.db.query.routes.findFirst({
+   953→        where: eq(routes.id, id),
+   954→      });
+   955→
+   956→      if (!result) {
+   957→        throw new NotFoundError(`Route not found: ${id}`, {
+   958→          entityType: 'route',
+   959→          entityId: id,
+   960→        });
+   961→      }
+   962→
+   963→      return result;
+   964→    });
+   965→  }
+   966→
+   967→  async getRouteByCode(routeCode: string): Promise<Route> {
+   968→    return this.traced('getRouteByCode', async (span) => {
+   969→      span.setAttribute('route.code', routeCode);
+   970→
+   971→      const result = await this.db.query.routes.findFirst({
+   972→        where: eq(routes.routeCode, routeCode),
+   973→      });
+   974→
+   975→      if (!result) {
+   976→        throw new NotFoundError(`Route not found with code: ${routeCode}`, {
+   977→          entityType: 'route',
+   978→          entityId: routeCode,
+   979→        });
+   980→      }
+   981→
+   982→      return result;
+   983→    });
+   984→  }
+   985→
+   986→  async listRoutes(options?: { active?: boolean }): Promise<Route[]> {
+   987→    return this.traced('listRoutes', async (span) => {
+   988→      const conditions: SQL<unknown>[] = [];
+   989→      if (options?.active !== undefined) {
+   990→        conditions.push(eq(routes.active, options.active));
+   991→      }
+   992→
+   993→      const result = await this.db.query.routes.findMany({
+   994→        where: conditions.length > 0 ? and(...conditions) : undefined,
+   995→        orderBy: asc(routes.routeCode),
+   996→      });
+   997→
+   998→      span.setAttribute('result.count', result.length);
+   999→      return result;
+  1000→    });
+  1001→  }
+  1002→
+  1003→  async createRoute(data: NewRoute): Promise<Route> {
+  1004→    return this.inTransaction('createRoute', async (tx, span) => {
+  1005→      span.setAttribute('route.code', data.routeCode);
+  1006→
+  1007→      // Check for duplicate code
+  1008→      const existing = await tx.query.routes.findFirst({
+  1009→        where: eq(routes.routeCode, data.routeCode),
+  1010→      });
+  1011→
+  1012→      if (existing) {
+  1013→        throw new DuplicateError(`Route with code ${data.routeCode} already exists`, {
+  1014→          field: 'routeCode',
+  1015→          value: data.routeCode,
+  1016→        });
+  1017→      }
+  1018→
+  1019→      const [result] = await tx.insert(routes).values(data).returning();
+  1020→      span.setAttribute('route.id', result.id);
+  1021→
+  1022→      this.log.info({ routeId: result.id, routeCode: data.routeCode }, 'Route created');
+  1023→      return result;
+  1024→    });
+  1025→  }
+  1026→
+  1027→  async updateRoute(id: string, data: Partial<NewRoute>): Promise<Route> {
+  1028→    return this.inTransaction('updateRoute', async (tx, span) => {
+  1029→      span.setAttribute('route.id', id);
+  1030→
+  1031→      const existing = await tx.query.routes.findFirst({
+  1032→        where: eq(routes.id, id),
+  1033→      });
+  1034→
+  1035→      if (!existing) {
+  1036→        throw new NotFoundError(`Route not found: ${id}`, {
+  1037→          entityType: 'route',
+  1038→          entityId: id,
+  1039→        });
+  1040→      }
+  1041→
+  1042→      // Check for duplicate code if changing
+  1043→      if (data.routeCode && data.routeCode !== existing.routeCode) {
+  1044→        const duplicate = await tx.query.routes.findFirst({
+  1045→          where: eq(routes.routeCode, data.routeCode),
+  1046→        });
+  1047→        if (duplicate) {
+  1048→          throw new DuplicateError(`Route with code ${data.routeCode} already exists`, {
+  1049→            field: 'routeCode',
+  1050→            value: data.routeCode,
+  1051→          });
+  1052→        }
+  1053→      }
+  1054→
+  1055→      const [result] = await tx
+  1056→        .update(routes)
+  1057→        .set({ ...data, updatedAt: new Date() })
+  1058→        .where(eq(routes.id, id))
+  1059→        .returning();
+  1060→
+  1061→      return result;
+  1062→    });
+  1063→  }
+  1064→
+  1065→  async deactivateRoute(id: string): Promise<Route> {
+  1066→    return this.updateRoute(id, { active: false });
+  1067→  }
+  1068→
+  1069→  // ===========================================================================
+  1070→  // Track Operations
+  1071→  // ===========================================================================
+  1072→
+  1073→  async getTrackById(id: string): Promise<Track> {
+  1074→    return this.traced('getTrackById', async (span) => {
+  1075→      span.setAttribute('track.id', id);
+  1076→
+  1077→      const result = await this.db.query.tracks.findFirst({
+  1078→        where: eq(tracks.id, id),
+  1079→      });
+  1080→
+  1081→      if (!result) {
+  1082→        throw new NotFoundError(`Track not found: ${id}`, {
+  1083→          entityType: 'track',
+  1084→          entityId: id,
+  1085→        });
+  1086→      }
+  1087→
+  1088→      return result;
+  1089→    });
+  1090→  }
+  1091→
+  1092→  async listTracks(options?: { depotId?: string; active?: boolean }): Promise<Track[]> {
+  1093→    return this.traced('listTracks', async (span) => {
+  1094→      const conditions: SQL<unknown>[] = [];
+  1095→
+  1096→      if (options?.depotId) {
+  1097→        conditions.push(eq(tracks.depotId, options.depotId));
+  1098→        span.setAttribute(MmsAttributes.DEPOT_ID, options.depotId);
+  1099→      }
+  1100→      if (options?.active !== undefined) {
+  1101→        conditions.push(eq(tracks.active, options.active));
+  1102→      }
+  1103→
+  1104→      const result = await this.db.query.tracks.findMany({
+  1105→        where: conditions.length > 0 ? and(...conditions) : undefined,
+  1106→        orderBy: asc(tracks.trackNumber),
+  1107→      });
+  1108→
+  1109→      span.setAttribute('result.count', result.length);
+  1110→      return result;
+  1111→    });
+  1112→  }
+  1113→
+  1114→  async createTrack(data: NewTrack): Promise<Track> {
+  1115→    return this.inTransaction('createTrack', async (tx, span) => {
+  1116→      span.setAttribute('track.number', data.trackNumber);
+  1117→      span.setAttribute(MmsAttributes.DEPOT_ID, data.depotId);
+  1118→
+  1119→      // Validate depot exists
+  1120→      const depot = await tx.query.depots.findFirst({
+  1121→        where: eq(depots.id, data.depotId),
+  1122→      });
+  1123→      if (!depot) {
+  1124→        throw new ValidationError('Depot not found', {
+  1125→          field: 'depotId',
+  1126→          context: { depotId: data.depotId },
+  1127→        });
+  1128→      }
+  1129→
+  1130→      // Check for duplicate track number within depot
+  1131→      const existing = await tx.query.tracks.findFirst({
+  1132→        where: and(eq(tracks.depotId, data.depotId), eq(tracks.trackNumber, data.trackNumber)),
+  1133→      });
+  1134→
+  1135→      if (existing) {
+  1136→        throw new DuplicateError(
+  1137→          `Track ${data.trackNumber} already exists in depot`,
+  1138→          {
+  1139→            field: 'trackNumber',
+  1140→            value: data.trackNumber,
+  1141→            context: { depotId: data.depotId },
+  1142→          }
+  1143→        );
+  1144→      }
+  1145→
+  1146→      const [result] = await tx.insert(tracks).values(data).returning();
+  1147→      span.setAttribute('track.id', result.id);
+  1148→
+  1149→      this.log.info(
+  1150→        { trackId: result.id, trackNumber: data.trackNumber, depotId: data.depotId },
+  1151→        'Track created'
+  1152→      );
+  1153→      return result;
+  1154→    });
+  1155→  }
+  1156→
+  1157→  async updateTrack(id: string, data: Partial<NewTrack>): Promise<Track> {
+  1158→    return this.inTransaction('updateTrack', async (tx, span) => {
+  1159→      span.setAttribute('track.id', id);
+  1160→
+  1161→      const existing = await tx.query.tracks.findFirst({
+  1162→        where: eq(tracks.id, id),
+  1163→      });
+  1164→
+  1165→      if (!existing) {
+  1166→        throw new NotFoundError(`Track not found: ${id}`, {
+  1167→          entityType: 'track',
+  1168→          entityId: id,
+  1169→        });
+  1170→      }
+  1171→
+  1172→      // Check for duplicate track number if changing
+  1173→      if (data.trackNumber && data.trackNumber !== existing.trackNumber) {
+  1174→        const depotId = data.depotId ?? existing.depotId;
+  1175→        const duplicate = await tx.query.tracks.findFirst({
+  1176→          where: and(eq(tracks.depotId, depotId), eq(tracks.trackNumber, data.trackNumber)),
+  1177→        });
+  1178→        if (duplicate) {
+  1179→          throw new DuplicateError(
+  1180→            `Track ${data.trackNumber} already exists in depot`,
+  1181→            {
+  1182→              field: 'trackNumber',
+  1183→              value: data.trackNumber,
+  1184→              context: { depotId },
+  1185→            }
+  1186→          );
+  1187→        }
+  1188→      }
+  1189→
+  1190→      // Drizzle doesn't have updatedAt on tracks schema, so just update fields
+  1191→      const [result] = await tx
+  1192→        .update(tracks)
+  1193→        .set(data)
+  1194→        .where(eq(tracks.id, id))
+  1195→        .returning();
+  1196→
+  1197→      return result;
+  1198→    });
+  1199→  }
+  1200→
+  1201→  async deactivateTrack(id: string): Promise<Track> {
+  1202→    return this.updateTrack(id, { active: false });
+  1203→  }
+  1204→
+  1205→  // ===========================================================================
+  1206→  // Fleet Statistics
+  1207→  // ===========================================================================
+  1208→
+  1209→  /**
+  1210→   * Get comprehensive statistics for a fleet
+  1211→   */
+  1212→  async getFleetStatistics(fleetId: string): Promise<FleetStatistics> {
+  1213→    return this.traced('getFleetStatistics', async (span) => {
+  1214→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+  1215→
+  1216→      // Verify fleet exists
+  1217→      const fleet = await this.db.query.fleets.findFirst({
+  1218→        where: eq(fleets.id, fleetId),
+  1219→      });
+  1220→
+  1221→      if (!fleet) {
+  1222→        throw new NotFoundError(`Fleet not found: ${fleetId}`, {
+  1223→          entityType: 'fleet',
+  1224→          entityId: fleetId,
+  1225→        });
+  1226→      }
+  1227→
+  1228→      // Get all stats in one query
+  1229→      const statsQuery = await this.db
+  1230→        .select({
+  1231→          totalTrains: count(),
+  1232→          totalMileageKm: sum(trains.currentMileageKm),
+  1233→          averageMileageKm: avg(trains.currentMileageKm),
+  1234→          minMileageKm: sql<number>`MIN(${trains.currentMileageKm})`,
+  1235→          maxMileageKm: sql<number>`MAX(${trains.currentMileageKm})`,
+  1236→          stdDevMileageKm: sql<number>`STDDEV(${trains.currentMileageKm})`,
+  1237→        })
+  1238→        .from(trains)
+  1239→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+  1240→
+  1241→      const stats = statsQuery[0];
+  1242→
+  1243→      // Get counts by fitness status
+  1244→      const fitnessCounts = await this.db
+  1245→        .select({
+  1246→          status: trains.fitnessStatus,
+  1247→          count: count(),
+  1248→        })
+  1249→        .from(trains)
+  1250→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)))
+  1251→        .groupBy(trains.fitnessStatus);
+  1252→
+  1253→      const statusMap = new Map(fitnessCounts.map((fc) => [fc.status, fc.count]));
+  1254→
+  1255→      const result: FleetStatistics = {
+  1256→        fleetId,
+  1257→        fleetCode: fleet.code,
+  1258→        totalTrains: Number(stats.totalTrains) || 0,
+  1259→        activeTrains: Number(stats.totalTrains) || 0,
+  1260→        fitTrains: statusMap.get('FIT') || 0,
+  1261→        restrictedTrains: statusMap.get('RESTRICTED') || 0,
+  1262→        groundedTrains: statusMap.get('GROUNDED') || 0,
+  1263→        totalMileageKm: Number(stats.totalMileageKm) || 0,
+  1264→        averageMileageKm: Math.round(Number(stats.averageMileageKm) || 0),
+  1265→        minMileageKm: Number(stats.minMileageKm) || 0,
+  1266→        maxMileageKm: Number(stats.maxMileageKm) || 0,
+  1267→        mileageStdDevKm: Math.round(Number(stats.stdDevMileageKm) || 0),
+  1268→      };
+  1269→
+  1270→      span.setAttribute('stats.totalTrains', result.totalTrains);
+  1271→      span.setAttribute('stats.fitTrains', result.fitTrains);
+  1272→      span.setAttribute('stats.avgMileage', result.averageMileageKm);
+  1273→
+  1274→      return result;
+  1275→    });
+  1276→  }
+  1277→
+  1278→  /**
+  1279→   * Get statistics for all fleets
+  1280→   */
+  1281→  async getAllFleetStatistics(): Promise<FleetStatistics[]> {
+  1282→    return this.traced('getAllFleetStatistics', async (span) => {
+  1283→      const allFleets = await this.db.query.fleets.findMany({
+  1284→        where: eq(fleets.active, true),
+  1285→        orderBy: asc(fleets.code),
+  1286→      });
+  1287→
+  1288→      const stats = await Promise.all(
+  1289→        allFleets.map((f) => this.getFleetStatistics(f.id))
+  1290→      );
+  1291→
+  1292→      span.setAttribute('result.count', stats.length);
+  1293→      return stats;
+  1294→    });
+  1295→  }
+  1296→
+  1297→  // ===========================================================================
+  1298→  // Bulk Operations
+  1299→  // ===========================================================================
+  1300→
+  1301→  /**
+  1302→   * Get multiple trains by IDs
+  1303→   */
+  1304→  async getTrainsByIds(ids: string[]): Promise<Train[]> {
+  1305→    return this.traced('getTrainsByIds', async (span) => {
+  1306→      span.setAttribute('input.count', ids.length);
+  1307→
+  1308→      if (ids.length === 0) {
+  1309→        return [];
+  1310→      }
+  1311→
+  1312→      const result = await this.db.query.trains.findMany({
+  1313→        where: inArray(trains.id, ids),
+  1314→      });
+  1315→
+  1316→      span.setAttribute('result.count', result.length);
+  1317→      return result;
+  1318→    });
+  1319→  }
+  1320→
+  1321→  /**
+  1322→   * Get multiple trains by train numbers
+  1323→   */
+  1324→  async getTrainsByNumbers(trainNumbers: string[]): Promise<Train[]> {
+  1325→    return this.traced('getTrainsByNumbers', async (span) => {
+  1326→      span.setAttribute('input.count', trainNumbers.length);
+  1327→
+  1328→      if (trainNumbers.length === 0) {
+  1329→        return [];
+  1330→      }
+  1331→
+  1332→      const result = await this.db.query.trains.findMany({
+  1333→        where: inArray(trains.trainNumber, trainNumbers),
+  1334→      });
+  1335→
+  1336→      span.setAttribute('result.count', result.length);
+  1337→      return result;
+  1338→    });
+  1339→  }
+  1340→
+  1341→  /**
+  1342→   * Check if train numbers exist (for ingestion validation)
+  1343→   */
+  1344→  async validateTrainNumbers(trainNumbers: string[]): Promise<{
+  1345→    valid: string[];
+  1346→    invalid: string[];
+  1347→  }> {
+  1348→    return this.traced('validateTrainNumbers', async (span) => {
+  1349→      span.setAttribute('input.count', trainNumbers.length);
+  1350→
+  1351→      if (trainNumbers.length === 0) {
+  1352→        return { valid: [], invalid: [] };
+  1353→      }
+  1354→
+  1355→      const existing = await this.db.query.trains.findMany({
+  1356→        where: inArray(trains.trainNumber, trainNumbers),
+  1357→        columns: { trainNumber: true },
+  1358→      });
+  1359→
+  1360→      const existingSet = new Set(existing.map((t) => t.trainNumber));
+  1361→      const valid: string[] = [];
+  1362→      const invalid: string[] = [];
+  1363→
+  1364→      for (const num of trainNumbers) {
+  1365→        if (existingSet.has(num)) {
+  1366→          valid.push(num);
+  1367→        } else {
+  1368→          invalid.push(num);
+  1369→        }
+  1370→      }
+  1371→
+  1372→      span.setAttribute('result.valid', valid.length);
+  1373→      span.setAttribute('result.invalid', invalid.length);
+  1374→
+  1375→      return { valid, invalid };
+  1376→    });
+  1377→  }
+  1378→
+  1379→  // ===========================================================================
+  1380→  // Component Operations
+  1381→  // ===========================================================================
+  1382→
+  1383→  /**
+  1384→   * Get a component by ID
+  1385→   */
+  1386→  async getComponentById(id: string): Promise<TrainComponent> {
+  1387→    return this.traced('getComponentById', async (span) => {
+  1388→      span.setAttribute('component.id', id);
+  1389→
+  1390→      const result = await this.db.query.trainComponents.findFirst({
+  1391→        where: eq(trainComponents.id, id),
+  1392→      });
+  1393→
+  1394→      if (!result) {
+  1395→        throw new NotFoundError(`Component not found: ${id}`, {
+  1396→          entityType: 'component',
+  1397→          entityId: id,
+  1398→        });
+  1399→      }
+  1400→
+  1401→      return result;
+  1402→    });
+  1403→  }
+  1404→
+  1405→  /**
+  1406→   * Get a component by serial number
+  1407→   */
+  1408→  async getComponentBySerialNumber(serialNumber: string): Promise<TrainComponent> {
+  1409→    return this.traced('getComponentBySerialNumber', async (span) => {
+  1410→      span.setAttribute('component.serialNumber', serialNumber);
+  1411→
+  1412→      const result = await this.db.query.trainComponents.findFirst({
+  1413→        where: eq(trainComponents.serialNumber, serialNumber),
+  1414→      });
+  1415→
+  1416→      if (!result) {
+  1417→        throw new NotFoundError(`Component not found with serial number: ${serialNumber}`, {
+  1418→          entityType: 'component',
+  1419→          entityId: serialNumber,
+  1420→        });
+  1421→      }
+  1422→
+  1423→      return result;
+  1424→    });
+  1425→  }
+  1426→
+  1427→  /**
+  1428→   * Get a component with its current train details
+  1429→   */
+  1430→  async getComponentWithTrain(id: string): Promise<ComponentWithTrain> {
+  1431→    return this.traced('getComponentWithTrain', async (span) => {
+  1432→      span.setAttribute('component.id', id);
+  1433→
+  1434→      const result = await this.db.query.trainComponents.findFirst({
+  1435→        where: eq(trainComponents.id, id),
+  1436→        with: {
+  1437→          currentTrain: true,
+  1438→        },
+  1439→      });
+  1440→
+  1441→      if (!result) {
+  1442→        throw new NotFoundError(`Component not found: ${id}`, {
+  1443→          entityType: 'component',
+  1444→          entityId: id,
+  1445→        });
+  1446→      }
+  1447→
+  1448→      return result as ComponentWithTrain;
+  1449→    });
+  1450→  }
+  1451→
+  1452→  /**
+  1453→   * Get a component with full installation and PM history
+  1454→   */
+  1455→  async getComponentWithHistory(id: string): Promise<ComponentWithHistory> {
+  1456→    return this.traced('getComponentWithHistory', async (span) => {
+  1457→      span.setAttribute('component.id', id);
+  1458→
+  1459→      const result = await this.db.query.trainComponents.findFirst({
+  1460→        where: eq(trainComponents.id, id),
+  1461→        with: {
+  1462→          installations: {
+  1463→            orderBy: desc(componentInstallations.installedDate),
+  1464→          },
+  1465→          pmTracking: true,
+  1466→        },
+  1467→      });
+  1468→
+  1469→      if (!result) {
+  1470→        throw new NotFoundError(`Component not found: ${id}`, {
+  1471→          entityType: 'component',
+  1472→          entityId: id,
+  1473→        });
+  1474→      }
+  1475→
+  1476→      return result as ComponentWithHistory;
+  1477→    });
+  1478→  }
+  1479→
+  1480→  /**
+  1481→   * List components with optional filters
+  1482→   */
+  1483→  async listComponents(
+  1484→    filters?: ComponentListFilters,
+  1485→    pagination?: PaginationOptions
+  1486→  ): Promise<PaginatedResult<TrainComponent>> {
+  1487→    return this.traced('listComponents', async (span) => {
+  1488→      const conditions: SQL<unknown>[] = [];
+  1489→
+  1490→      if (filters?.componentType) {
+  1491→        conditions.push(eq(trainComponents.componentType, filters.componentType));
+  1492→      }
+  1493→      if (filters?.status) {
+  1494→        if (Array.isArray(filters.status)) {
+  1495→          conditions.push(inArray(trainComponents.status, filters.status));
+  1496→        } else {
+  1497→          conditions.push(eq(trainComponents.status, filters.status));
+  1498→        }
+  1499→      }
+  1500→      if (filters?.trainId) {
+  1501→        conditions.push(eq(trainComponents.currentTrainId, filters.trainId));
+  1502→      }
+  1503→      if (filters?.serialNumbers && filters.serialNumbers.length > 0) {
+  1504→        conditions.push(inArray(trainComponents.serialNumber, filters.serialNumbers));
+  1505→      }
+  1506→      if (filters?.hasCurrentTrain !== undefined) {
+  1507→        if (filters.hasCurrentTrain) {
+  1508→          conditions.push(sql`${trainComponents.currentTrainId} IS NOT NULL`);
+  1509→        } else {
+  1510→          conditions.push(sql`${trainComponents.currentTrainId} IS NULL`);
+  1511→        }
+  1512→      }
+  1513→
+  1514→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+  1515→
+  1516→      // Get total count
+  1517→      const [{ totalCount }] = await this.db
+  1518→        .select({ totalCount: count() })
+  1519→        .from(trainComponents)
+  1520→        .where(whereClause);
+  1521→
+  1522→      // Apply pagination
+  1523→      const page = pagination?.page ?? 1;
+  1524→      const pageSize = Math.min(pagination?.pageSize ?? 50, 500);
+  1525→      const offset = (page - 1) * pageSize;
+  1526→
+  1527→      // Determine sort order
+  1528→      const sortDirection = pagination?.sortOrder === 'desc' ? desc : asc;
+  1529→      const getOrderBy = () => {
+  1530→        switch (pagination?.sortBy) {
+  1531→          case 'mileage':
+  1532→            return sortDirection(trainComponents.componentMileageKm);
+  1533→          case 'status':
+  1534→            return sortDirection(trainComponents.status);
+  1535→          case 'type':
+  1536→            return sortDirection(trainComponents.componentType);
+  1537→          default:
+  1538→            return sortDirection(trainComponents.serialNumber);
+  1539→        }
+  1540→      };
+  1541→
+  1542→      const data = await this.db.query.trainComponents.findMany({
+  1543→        where: whereClause,
+  1544→        orderBy: getOrderBy(),
+  1545→        limit: pageSize,
+  1546→        offset,
+  1547→      });
+  1548→
+  1549→      span.setAttribute('result.count', data.length);
+  1550→      span.setAttribute('result.total', totalCount);
+  1551→
+  1552→      return {
+  1553→        data,
+  1554→        total: totalCount,
+  1555→        page,
+  1556→        pageSize,
+  1557→        totalPages: Math.ceil(totalCount / pageSize),
+  1558→      };
+  1559→    });
+  1560→  }
+  1561→
+  1562→  /**
+  1563→   * Create a new component
+  1564→   */
+  1565→  async createComponent(data: NewTrainComponent): Promise<TrainComponent> {
+  1566→    return this.inTransaction('createComponent', async (tx, span) => {
+  1567→      span.setAttribute('component.serialNumber', data.serialNumber);
+  1568→      span.setAttribute('component.type', data.componentType);
+  1569→
+  1570→      // Check for duplicate serial number
+  1571→      const existing = await tx.query.trainComponents.findFirst({
+  1572→        where: eq(trainComponents.serialNumber, data.serialNumber),
+  1573→      });
+  1574→
+  1575→      if (existing) {
+  1576→        throw new DuplicateError(`Component with serial number ${data.serialNumber} already exists`, {
+  1577→          field: 'serialNumber',
+  1578→          value: data.serialNumber,
+  1579→        });
+  1580→      }
+  1581→
+  1582→      // Validate current train if provided
+  1583→      if (data.currentTrainId) {
+  1584→        const train = await tx.query.trains.findFirst({
+  1585→          where: eq(trains.id, data.currentTrainId),
+  1586→        });
+  1587→        if (!train) {
+  1588→          throw new ValidationError('Train not found', {
+  1589→            field: 'currentTrainId',
+  1590→            context: { trainId: data.currentTrainId },
+  1591→          });
+  1592→        }
+  1593→      }
+  1594→
+  1595→      const [result] = await tx.insert(trainComponents).values(data).returning();
+  1596→      span.setAttribute('component.id', result.id);
+  1597→
+  1598→      this.log.info(
+  1599→        { componentId: result.id, serialNumber: data.serialNumber, type: data.componentType },
+  1600→        'Component created'
+  1601→      );
+  1602→      return result;
+  1603→    });
+  1604→  }
+  1605→
+  1606→  /**
+  1607→   * Update an existing component
+  1608→   */
+  1609→  async updateComponent(id: string, data: Partial<NewTrainComponent>): Promise<TrainComponent> {
+  1610→    return this.inTransaction('updateComponent', async (tx, span) => {
+  1611→      span.setAttribute('component.id', id);
+  1612→
+  1613→      const existing = await tx.query.trainComponents.findFirst({
+  1614→        where: eq(trainComponents.id, id),
+  1615→      });
+  1616→
+  1617→      if (!existing) {
+  1618→        throw new NotFoundError(`Component not found: ${id}`, {
+  1619→          entityType: 'component',
+  1620→          entityId: id,
+  1621→        });
+  1622→      }
+  1623→
+  1624→      // Check for duplicate serial number if changing
+  1625→      if (data.serialNumber && data.serialNumber !== existing.serialNumber) {
+  1626→        const duplicate = await tx.query.trainComponents.findFirst({
+  1627→          where: eq(trainComponents.serialNumber, data.serialNumber),
+  1628→        });
+  1629→        if (duplicate) {
+  1630→          throw new DuplicateError(`Component with serial number ${data.serialNumber} already exists`, {
+  1631→            field: 'serialNumber',
+  1632→            value: data.serialNumber,
+  1633→          });
+  1634→        }
+  1635→      }
+  1636→
+  1637→      const [result] = await tx
+  1638→        .update(trainComponents)
+  1639→        .set({ ...data, updatedAt: new Date() })
+  1640→        .where(eq(trainComponents.id, id))
+  1641→        .returning();
+  1642→
+  1643→      return result;
+  1644→    });
+  1645→  }
+  1646→
+  1647→  // ===========================================================================
+  1648→  // Component Installation & Transfer Operations
+  1649→  // ===========================================================================
+  1650→
+  1651→  /**
+  1652→   * Install a component on a train.
+  1653→   * Creates an installation record and updates the component's current train.
+  1654→   *
+  1655→   * Business rules:
+  1656→   * - Component must not already be installed on another train
+  1657→   * - Train must exist and be active
+  1658→   * - Component mileage tracking starts from current train mileage
+  1659→   */
+  1660→  async installComponent(request: InstallComponentRequest): Promise<ComponentInstallation> {
+  1661→    return this.inTransaction('installComponent', async (tx, span) => {
+  1662→      const { componentId, trainId, position, workOrderId } = request;
+  1663→
+  1664→      span.setAttribute('component.id', componentId);
+  1665→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+  1666→
+  1667→      // Get component
+  1668→      const component = await tx.query.trainComponents.findFirst({
+  1669→        where: eq(trainComponents.id, componentId),
+  1670→      });
+  1671→
+  1672→      if (!component) {
+  1673→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  1674→          entityType: 'component',
+  1675→          entityId: componentId,
+  1676→        });
+  1677→      }
+  1678→
+  1679→      // Check if component is already installed
+  1680→      if (component.currentTrainId) {
+  1681→        throw new BusinessRuleError(
+  1682→          `Component ${component.serialNumber} is already installed on a train. Remove it first.`,
+  1683→          {
+  1684→            rule: 'component_already_installed',
+  1685→            context: { componentId, currentTrainId: component.currentTrainId },
+  1686→          }
+  1687→        );
+  1688→      }
+  1689→
+  1690→      // Get target train
+  1691→      const train = await tx.query.trains.findFirst({
+  1692→        where: eq(trains.id, trainId),
+  1693→      });
+  1694→
+  1695→      if (!train) {
+  1696→        throw new TrainNotFoundError(trainId);
+  1697→      }
+  1698→
+  1699→      if (!train.active) {
+  1700→        throw new BusinessRuleError('Cannot install component on inactive train', {
+  1701→          rule: 'train_inactive',
+  1702→          context: { trainId },
+  1703→        });
+  1704→      }
+  1705→
+  1706→      const today = new Date().toISOString().split('T')[0];
+  1707→      const trainMileage = train.currentMileageKm;
+  1708→      const componentMileage = component.componentMileageKm;
+  1709→
+  1710→      // Create installation record
+  1711→      const installationData: NewComponentInstallation = {
+  1712→        componentId,
+  1713→        trainId,
+  1714→        position,
+  1715→        installedDate: today,
+  1716→        installedTrainMileageKm: trainMileage,
+  1717→        installedComponentMileageKm: componentMileage,
+  1718→        workOrderId,
+  1719→      };
+  1720→
+  1721→      const [installation] = await tx
+  1722→        .insert(componentInstallations)
+  1723→        .values(installationData)
+  1724→        .returning();
+  1725→
+  1726→      // Update component with current train
+  1727→      await tx
+  1728→        .update(trainComponents)
+  1729→        .set({
+  1730→          currentTrainId: trainId,
+  1731→          currentPosition: position,
+  1732→          installedDate: today,
+  1733→          installedMileageKm: trainMileage,
+  1734→          status: 'IN_SERVICE',
+  1735→          updatedAt: new Date(),
+  1736→        })
+  1737→        .where(eq(trainComponents.id, componentId));
+  1738→
+  1739→      span.setAttribute('installation.id', installation.id);
+  1740→
+  1741→      this.log.info(
+  1742→        {
+  1743→          componentId,
+  1744→          serialNumber: component.serialNumber,
+  1745→          trainId,
+  1746→          trainNumber: train.trainNumber,
+  1747→          position,
+  1748→          trainMileageAtInstall: trainMileage,
+  1749→          componentMileageAtInstall: componentMileage,
+  1750→        },
+  1751→        'Component installed on train'
+  1752→      );
+  1753→
+  1754→      this.recordEvent('component.installed', {
+  1755→        'component.id': componentId,
+  1756→        'component.serialNumber': component.serialNumber,
+  1757→        [MmsAttributes.TRAIN_ID]: trainId,
+  1758→        [MmsAttributes.TRAIN_NUMBER]: train.trainNumber,
+  1759→        'component.position': position ?? 'unspecified',
+  1760→      }, span);
+  1761→
+  1762→      return installation;
+  1763→    });
+  1764→  }
+  1765→
+  1766→  /**
+  1767→   * Remove a component from a train.
+  1768→   * Closes the installation record and updates component mileage.
+  1769→   *
+  1770→   * Business rules:
+  1771→   * - Component must be installed on a train
+  1772→   * - Component mileage is updated based on train mileage during installation
+  1773→   */
+  1774→  async removeComponent(request: RemoveComponentRequest): Promise<ComponentInstallation> {
+  1775→    return this.inTransaction('removeComponent', async (tx, span) => {
+  1776→      const { componentId, reason, workOrderId } = request;
+  1777→
+  1778→      span.setAttribute('component.id', componentId);
+  1779→      span.setAttribute('removal.reason', reason);
+  1780→
+  1781→      // Get component with current train
+  1782→      const component = await tx.query.trainComponents.findFirst({
+  1783→        where: eq(trainComponents.id, componentId),
+  1784→        with: {
+  1785→          currentTrain: true,
+  1786→        },
+  1787→      });
+  1788→
+  1789→      if (!component) {
+  1790→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  1791→          entityType: 'component',
+  1792→          entityId: componentId,
+  1793→        });
+  1794→      }
+  1795→
+  1796→      if (!component.currentTrainId) {
+  1797→        throw new BusinessRuleError(
+  1798→          `Component ${component.serialNumber} is not installed on any train`,
+  1799→          {
+  1800→            rule: 'component_not_installed',
+  1801→            context: { componentId },
+  1802→          }
+  1803→        );
+  1804→      }
+  1805→
+  1806→      const train = component.currentTrain;
+  1807→      if (!train) {
+  1808→        throw new NotFoundError(`Train not found for component`, {
+  1809→          entityType: 'train',
+  1810→          entityId: component.currentTrainId,
+  1811→        });
+  1812→      }
+  1813→
+  1814→      // Find the active installation record
+  1815→      const activeInstallation = await tx.query.componentInstallations.findFirst({
+  1816→        where: and(
+  1817→          eq(componentInstallations.componentId, componentId),
+  1818→          eq(componentInstallations.trainId, component.currentTrainId),
+  1819→          sql`${componentInstallations.removedDate} IS NULL`
+  1820→        ),
+  1821→        orderBy: desc(componentInstallations.installedDate),
+  1822→      });
+  1823→
+  1824→      if (!activeInstallation) {
+  1825→        throw new BusinessRuleError(
+  1826→          'No active installation record found for component',
+  1827→          {
+  1828→            rule: 'no_active_installation',
+  1829→            context: { componentId, trainId: component.currentTrainId },
+  1830→          }
+  1831→        );
+  1832→      }
+  1833→
+  1834→      const today = new Date().toISOString().split('T')[0];
+  1835→      const currentTrainMileage = train.currentMileageKm;
+  1836→
+  1837→      // Calculate mileage accumulated during this installation
+  1838→      const mileageDuringInstallation = currentTrainMileage - activeInstallation.installedTrainMileageKm;
+  1839→      const newComponentMileage = activeInstallation.installedComponentMileageKm + mileageDuringInstallation;
+  1840→
+  1841→      // Update installation record with removal data
+  1842→      const [updatedInstallation] = await tx
+  1843→        .update(componentInstallations)
+  1844→        .set({
+  1845→          removedDate: today,
+  1846→          removedTrainMileageKm: currentTrainMileage,
+  1847→          removedComponentMileageKm: newComponentMileage,
+  1848→          removalReason: reason,
+  1849→          workOrderId: workOrderId ?? activeInstallation.workOrderId,
+  1850→        })
+  1851→        .where(eq(componentInstallations.id, activeInstallation.id))
+  1852→        .returning();
+  1853→
+  1854→      // Update component - clear current train, update mileage
+  1855→      await tx
+  1856→        .update(trainComponents)
+  1857→        .set({
+  1858→          currentTrainId: null,
+  1859→          currentPosition: null,
+  1860→          installedDate: null,
+  1861→          installedMileageKm: null,
+  1862→          componentMileageKm: newComponentMileage,
+  1863→          status: 'SPARE',
+  1864→          updatedAt: new Date(),
+  1865→        })
+  1866→        .where(eq(trainComponents.id, componentId));
+  1867→
+  1868→      span.setAttribute('mileage.during_installation', mileageDuringInstallation);
+  1869→      span.setAttribute('mileage.new_total', newComponentMileage);
+  1870→
+  1871→      this.log.info(
+  1872→        {
+  1873→          componentId,
+  1874→          serialNumber: component.serialNumber,
+  1875→          trainId: component.currentTrainId,
+  1876→          trainNumber: train.trainNumber,
+  1877→          reason,
+  1878→          mileageDuringInstallation,
+  1879→          newComponentMileage,
+  1880→        },
+  1881→        'Component removed from train'
+  1882→      );
+  1883→
+  1884→      this.recordEvent('component.removed', {
+  1885→        'component.id': componentId,
+  1886→        'component.serialNumber': component.serialNumber,
+  1887→        [MmsAttributes.TRAIN_ID]: component.currentTrainId,
+  1888→        [MmsAttributes.TRAIN_NUMBER]: train.trainNumber,
+  1889→        'removal.reason': reason,
+  1890→        'mileage.accumulated': mileageDuringInstallation,
+  1891→      }, span);
+  1892→
+  1893→      return updatedInstallation;
+  1894→    });
+  1895→  }
+  1896→
+  1897→  /**
+  1898→   * Transfer a component from one train to another.
+  1899→   * Combines remove and install in a single transaction.
+  1900→   *
+  1901→   * Business rules:
+  1902→   * - Component must be installed on a train
+  1903→   * - Component mileage is updated during transfer
+  1904→   * - New train must exist and be active
+  1905→   */
+  1906→  async transferComponent(request: TransferComponentRequest): Promise<{
+  1907→    removal: ComponentInstallation;
+  1908→    installation: ComponentInstallation;
+  1909→    mileageAccumulated: number;
+  1910→  }> {
+  1911→    return this.inTransaction('transferComponent', async (tx, span) => {
+  1912→      const { componentId, newTrainId, newPosition, reason = 'SWAP', workOrderId } = request;
+  1913→
+  1914→      span.setAttribute('component.id', componentId);
+  1915→      span.setAttribute('train.new', newTrainId);
+  1916→
+  1917→      // Get component with current train
+  1918→      const component = await tx.query.trainComponents.findFirst({
+  1919→        where: eq(trainComponents.id, componentId),
+  1920→        with: {
+  1921→          currentTrain: true,
+  1922→        },
+  1923→      });
+  1924→
+  1925→      if (!component) {
+  1926→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  1927→          entityType: 'component',
+  1928→          entityId: componentId,
+  1929→        });
+  1930→      }
+  1931→
+  1932→      if (!component.currentTrainId) {
+  1933→        throw new BusinessRuleError(
+  1934→          `Component ${component.serialNumber} is not installed. Use installComponent instead.`,
+  1935→          {
+  1936→            rule: 'component_not_installed',
+  1937→            context: { componentId },
+  1938→          }
+  1939→        );
+  1940→      }
+  1941→
+  1942→      const oldTrain = component.currentTrain;
+  1943→      if (!oldTrain) {
+  1944→        throw new NotFoundError(`Train not found for component`, {
+  1945→          entityType: 'train',
+  1946→          entityId: component.currentTrainId,
+  1947→        });
+  1948→      }
+  1949→
+  1950→      // Get new train
+  1951→      const newTrain = await tx.query.trains.findFirst({
+  1952→        where: eq(trains.id, newTrainId),
+  1953→      });
+  1954→
+  1955→      if (!newTrain) {
+  1956→        throw new TrainNotFoundError(newTrainId);
+  1957→      }
+  1958→
+  1959→      if (!newTrain.active) {
+  1960→        throw new BusinessRuleError('Cannot transfer component to inactive train', {
+  1961→          rule: 'train_inactive',
+  1962→          context: { trainId: newTrainId },
+  1963→        });
+  1964→      }
+  1965→
+  1966→      span.setAttribute('train.old', component.currentTrainId);
+  1967→      span.setAttribute(MmsAttributes.TRAIN_NUMBER, `${oldTrain.trainNumber} -> ${newTrain.trainNumber}`);
+  1968→
+  1969→      // Find active installation
+  1970→      const activeInstallation = await tx.query.componentInstallations.findFirst({
+  1971→        where: and(
+  1972→          eq(componentInstallations.componentId, componentId),
+  1973→          eq(componentInstallations.trainId, component.currentTrainId),
+  1974→          sql`${componentInstallations.removedDate} IS NULL`
+  1975→        ),
+  1976→        orderBy: desc(componentInstallations.installedDate),
+  1977→      });
+  1978→
+  1979→      if (!activeInstallation) {
+  1980→        throw new BusinessRuleError('No active installation record found', {
+  1981→          rule: 'no_active_installation',
+  1982→          context: { componentId },
+  1983→        });
+  1984→      }
+  1985→
+  1986→      const today = new Date().toISOString().split('T')[0];
+  1987→      const oldTrainMileage = oldTrain.currentMileageKm;
+  1988→      const newTrainMileage = newTrain.currentMileageKm;
+  1989→
+  1990→      // Calculate mileage accumulated during previous installation
+  1991→      const mileageAccumulated = oldTrainMileage - activeInstallation.installedTrainMileageKm;
+  1992→      const updatedComponentMileage = activeInstallation.installedComponentMileageKm + mileageAccumulated;
+  1993→
+  1994→      // Close the old installation record
+  1995→      const [removalRecord] = await tx
+  1996→        .update(componentInstallations)
+  1997→        .set({
+  1998→          removedDate: today,
+  1999→          removedTrainMileageKm: oldTrainMileage,
+  2000→          removedComponentMileageKm: updatedComponentMileage,
+  2001→          removalReason: reason,
+  2002→          workOrderId,
+  2003→        })
+  2004→        .where(eq(componentInstallations.id, activeInstallation.id))
+  2005→        .returning();
+  2006→
+  2007→      // Create new installation record
+  2008→      const newInstallationData: NewComponentInstallation = {
+  2009→        componentId,
+  2010→        trainId: newTrainId,
+  2011→        position: newPosition,
+  2012→        installedDate: today,
+  2013→        installedTrainMileageKm: newTrainMileage,
+  2014→        installedComponentMileageKm: updatedComponentMileage,
+  2015→        workOrderId,
+  2016→      };
+  2017→
+  2018→      const [installationRecord] = await tx
+  2019→        .insert(componentInstallations)
+  2020→        .values(newInstallationData)
+  2021→        .returning();
+  2022→
+  2023→      // Update component
+  2024→      await tx
+  2025→        .update(trainComponents)
+  2026→        .set({
+  2027→          currentTrainId: newTrainId,
+  2028→          currentPosition: newPosition,
+  2029→          installedDate: today,
+  2030→          installedMileageKm: newTrainMileage,
+  2031→          componentMileageKm: updatedComponentMileage,
+  2032→          status: 'IN_SERVICE',
+  2033→          updatedAt: new Date(),
+  2034→        })
+  2035→        .where(eq(trainComponents.id, componentId));
+  2036→
+  2037→      span.setAttribute('mileage.accumulated', mileageAccumulated);
+  2038→      span.setAttribute('mileage.component_total', updatedComponentMileage);
+  2039→
+  2040→      this.log.info(
+  2041→        {
+  2042→          componentId,
+  2043→          serialNumber: component.serialNumber,
+  2044→          oldTrainId: component.currentTrainId,
+  2045→          oldTrainNumber: oldTrain.trainNumber,
+  2046→          newTrainId,
+  2047→          newTrainNumber: newTrain.trainNumber,
+  2048→          position: newPosition,
+  2049→          mileageAccumulated,
+  2050→          newComponentMileage: updatedComponentMileage,
+  2051→        },
+  2052→        'Component transferred between trains'
+  2053→      );
+  2054→
+  2055→      this.recordEvent('component.transferred', {
+  2056→        'component.id': componentId,
+  2057→        'component.serialNumber': component.serialNumber,
+  2058→        'train.old.id': component.currentTrainId,
+  2059→        'train.old.number': oldTrain.trainNumber,
+  2060→        'train.new.id': newTrainId,
+  2061→        'train.new.number': newTrain.trainNumber,
+  2062→        'mileage.accumulated': mileageAccumulated,
+  2063→      }, span);
+  2064→
+  2065→      return {
+  2066→        removal: removalRecord,
+  2067→        installation: installationRecord,
+  2068→        mileageAccumulated,
+  2069→      };
+  2070→    });
+  2071→  }
+  2072→
+  2073→  /**
+  2074→   * Recalculate and update component mileage based on installation history.
+  2075→   * Useful for reconciliation or after data corrections.
+  2076→   */
+  2077→  async recalculateComponentMileage(componentId: string): Promise<ComponentMileageResult> {
+  2078→    return this.inTransaction('recalculateComponentMileage', async (tx, span) => {
+  2079→      span.setAttribute('component.id', componentId);
+  2080→
+  2081→      const component = await tx.query.trainComponents.findFirst({
+  2082→        where: eq(trainComponents.id, componentId),
+  2083→        with: {
+  2084→          installations: {
+  2085→            orderBy: asc(componentInstallations.installedDate),
+  2086→          },
+  2087→          currentTrain: true,
+  2088→        },
+  2089→      });
+  2090→
+  2091→      if (!component) {
+  2092→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  2093→          entityType: 'component',
+  2094→          entityId: componentId,
+  2095→        });
+  2096→      }
+  2097→
+  2098→      let totalMileage = 0;
+  2099→      let installationsCalculated = 0;
+  2100→
+  2101→      for (const installation of component.installations) {
+  2102→        if (installation.removedDate && installation.removedTrainMileageKm !== null) {
+  2103→          // Completed installation - use recorded values
+  2104→          const mileageDelta = installation.removedTrainMileageKm - installation.installedTrainMileageKm;
+  2105→          totalMileage += Math.max(0, mileageDelta);
+  2106→          installationsCalculated++;
+  2107→        } else if (component.currentTrain && component.currentTrainId === installation.trainId) {
+  2108→          // Active installation - calculate from current train mileage
+  2109→          const mileageDelta = component.currentTrain.currentMileageKm - installation.installedTrainMileageKm;
+  2110→          totalMileage += Math.max(0, mileageDelta);
+  2111→          installationsCalculated++;
+  2112→        }
+  2113→      }
+  2114→
+  2115→      // Update component mileage
+  2116→      await tx
+  2117→        .update(trainComponents)
+  2118→        .set({
+  2119→          componentMileageKm: totalMileage,
+  2120→          updatedAt: new Date(),
+  2121→        })
+  2122→        .where(eq(trainComponents.id, componentId));
+  2123→
+  2124→      span.setAttribute('mileage.calculated', totalMileage);
+  2125→      span.setAttribute('installations.count', installationsCalculated);
+  2126→
+  2127→      this.log.info(
+  2128→        {
+  2129→          componentId,
+  2130→          serialNumber: component.serialNumber,
+  2131→          totalMileage,
+  2132→          installationsCalculated,
+  2133→        },
+  2134→        'Component mileage recalculated'
+  2135→      );
+  2136→
+  2137→      return {
+  2138→        componentId,
+  2139→        serialNumber: component.serialNumber,
+  2140→        totalComponentMileageKm: totalMileage,
+  2141→        installationsCalculated,
+  2142→      };
+  2143→    });
+  2144→  }
+  2145→
+  2146→  /**
+  2147→   * Get installation history for a component
+  2148→   */
+  2149→  async getComponentInstallationHistory(componentId: string): Promise<ComponentInstallation[]> {
+  2150→    return this.traced('getComponentInstallationHistory', async (span) => {
+  2151→      span.setAttribute('component.id', componentId);
+  2152→
+  2153→      // Verify component exists
+  2154→      const component = await this.db.query.trainComponents.findFirst({
+  2155→        where: eq(trainComponents.id, componentId),
+  2156→      });
+  2157→
+  2158→      if (!component) {
+  2159→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  2160→          entityType: 'component',
+  2161→          entityId: componentId,
+  2162→        });
+  2163→      }
+  2164→
+  2165→      const history = await this.db.query.componentInstallations.findMany({
+  2166→        where: eq(componentInstallations.componentId, componentId),
+  2167→        orderBy: desc(componentInstallations.installedDate),
+  2168→      });
+  2169→
+  2170→      span.setAttribute('result.count', history.length);
+  2171→      return history;
+  2172→    });
+  2173→  }
+  2174→
+  2175→  /**
+  2176→   * Get all components currently installed on a train
+  2177→   */
+  2178→  async getTrainComponents(trainId: string): Promise<TrainComponent[]> {
+  2179→    return this.traced('getTrainComponents', async (span) => {
+  2180→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+  2181→
+  2182→      // Verify train exists
+  2183→      const train = await this.db.query.trains.findFirst({
+  2184→        where: eq(trains.id, trainId),
+  2185→      });
+  2186→
+  2187→      if (!train) {
+  2188→        throw new TrainNotFoundError(trainId);
+  2189→      }
+  2190→
+  2191→      const components = await this.db.query.trainComponents.findMany({
+  2192→        where: eq(trainComponents.currentTrainId, trainId),
+  2193→        orderBy: [asc(trainComponents.componentType), asc(trainComponents.currentPosition)],
+  2194→      });
+  2195→
+  2196→      span.setAttribute('result.count', components.length);
+  2197→      return components;
+  2198→    });
+  2199→  }
+  2200→
+  2201→  // ===========================================================================
+  2202→  // Component PM Tracking
+  2203→  // ===========================================================================
+  2204→
+  2205→  /**
+  2206→   * Get PM tracking status for a component
+  2207→   */
+  2208→  async getComponentPmStatus(componentId: string): Promise<ComponentPmTracking[]> {
+  2209→    return this.traced('getComponentPmStatus', async (span) => {
+  2210→      span.setAttribute('component.id', componentId);
+  2211→
+  2212→      // Verify component exists
+  2213→      const component = await this.db.query.trainComponents.findFirst({
+  2214→        where: eq(trainComponents.id, componentId),
+  2215→      });
+  2216→
+  2217→      if (!component) {
+  2218→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  2219→          entityType: 'component',
+  2220→          entityId: componentId,
+  2221→        });
+  2222→      }
+  2223→
+  2224→      const pmStatus = await this.db.query.componentPmTracking.findMany({
+  2225→        where: eq(componentPmTracking.componentId, componentId),
+  2226→      });
+  2227→
+  2228→      span.setAttribute('result.count', pmStatus.length);
+  2229→      return pmStatus;
+  2230→    });
+  2231→  }
+  2232→
+  2233→  /**
+  2234→   * Update or create PM tracking status for a component
+  2235→   */
+  2236→  async updateComponentPmStatus(
+  2237→    componentId: string,
+  2238→    pmTypeId: string,
+  2239→    lastPmDate: string,
+  2240→    lastPmMileageKm: number
+  2241→  ): Promise<ComponentPmTracking> {
+  2242→    return this.inTransaction('updateComponentPmStatus', async (tx, span) => {
+  2243→      span.setAttribute('component.id', componentId);
+  2244→      span.setAttribute('pmType.id', pmTypeId);
+  2245→
+  2246→      // Verify component exists
+  2247→      const component = await tx.query.trainComponents.findFirst({
+  2248→        where: eq(trainComponents.id, componentId),
+  2249→      });
+  2250→
+  2251→      if (!component) {
+  2252→        throw new NotFoundError(`Component not found: ${componentId}`, {
+  2253→          entityType: 'component',
+  2254→          entityId: componentId,
+  2255→        });
+  2256→      }
+  2257→
+  2258→      // Check if tracking record exists
+  2259→      const existing = await tx.query.componentPmTracking.findFirst({
+  2260→        where: and(
+  2261→          eq(componentPmTracking.componentId, componentId),
+  2262→          eq(componentPmTracking.pmTypeId, pmTypeId)
+  2263→        ),
+  2264→      });
+  2265→
+  2266→      if (existing) {
+  2267→        // Update existing record
+  2268→        const [result] = await tx
+  2269→          .update(componentPmTracking)
+  2270→          .set({
+  2271→            lastPmDate,
+  2272→            lastPmMileageKm,
+  2273→            updatedAt: new Date(),
+  2274→          })
+  2275→          .where(eq(componentPmTracking.id, existing.id))
+  2276→          .returning();
+  2277→
+  2278→        this.log.info(
+  2279→          { componentId, pmTypeId, lastPmDate, lastPmMileageKm },
+  2280→          'Component PM status updated'
+  2281→        );
+  2282→        return result;
+  2283→      } else {
+  2284→        // Create new record
+  2285→        const [result] = await tx
+  2286→          .insert(componentPmTracking)
+  2287→          .values({
+  2288→            componentId,
+  2289→            pmTypeId,
+  2290→            lastPmDate,
+  2291→            lastPmMileageKm,
+  2292→          })
+  2293→          .returning();
+  2294→
+  2295→        this.log.info(
+  2296→          { componentId, pmTypeId, lastPmDate, lastPmMileageKm },
+  2297→          'Component PM tracking created'
+  2298→        );
+  2299→        return result;
+  2300→      }
+  2301→    });
+  2302→  }
+  2303→}
+  2304→
+  2305→// =============================================================================
+  2306→// Singleton Export
+  2307→// =============================================================================
+  2308→
+  2309→let fleetServiceInstance: FleetService | null = null;
+  2310→
+  2311→export function getFleetService(): FleetService {
+  2312→  if (!fleetServiceInstance) {
+  2313→    fleetServiceInstance = new FleetService();
+  2314→  }
+  2315→  return fleetServiceInstance;
+  2316→}
+  2317→
+  2318→export default FleetService;
+  2319→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

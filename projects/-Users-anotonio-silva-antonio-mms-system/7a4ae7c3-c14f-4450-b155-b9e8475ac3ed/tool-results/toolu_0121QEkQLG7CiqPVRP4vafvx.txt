@@ -1,0 +1,957 @@
+     1→/**
+     2→ * MMS Costing Service
+     3→ *
+     4→ * Calculates TCO (Total Cost of Ownership) projections, tracks variance against budget,
+     5→ * and provides cost impact analysis for schedule adjustments.
+     6→ *
+     7→ * Key responsibilities:
+     8→ * - Calculate individual PM costs (labor + materials + overhead)
+     9→ * - Project 12-year TCO with inflation and NPV calculations
+    10→ * - Track budget vs. actual cost variance
+    11→ * - Support depot-level and global cost analysis
+    12→ *
+    13→ * Cost calculation components:
+    14→ * - Labor: Hours × shop rate with shift multipliers
+    15→ * - Materials: Part costs from PM material requirements
+    16→ * - Overhead: 18% of direct costs (industry standard)
+    17→ *
+    18→ * Financial parameters (12-year contract):
+    19→ * - Inflation: 3% annually
+    20→ * - Discount rate: 5% for NPV calculations
+    21→ * - Variance tolerance: 10% before flagging as over-budget
+    22→ *
+    23→ * @see specs/004-domain-services.md Section 4.10
+    24→ */
+    25→
+    26→import { eq, and, gte, lte, isNull, sql, desc } from 'drizzle-orm';
+    27→import { BaseService, MmsAttributes } from '../lib/services/base';
+    28→import {
+    29→  pmSchedule,
+    30→  pmTypes,
+    31→  pmMaterialRequirements,
+    32→  laborRates,
+    33→  materialCosts,
+    34→  costBaselines,
+    35→  manhourAdjustments,
+    36→} from '../lib/db/schema';
+    37→import { NotFoundError } from '../lib/errors';
+    38→import { costingMetrics } from '../lib/metrics';
+    39→
+    40→/** PM schedule record type (inferred from schema) */
+    41→type PmScheduleRecord = typeof pmSchedule.$inferSelect;
+    42→
+    43→/** PM type record (inferred from schema) */
+    44→type PmTypeRecord = typeof pmTypes.$inferSelect;
+    45→
+    46→// =============================================================================
+    47→// Constants
+    48→// =============================================================================
+    49→
+    50→/** Overhead rate applied to direct costs (labor + materials) */
+    51→export const OVERHEAD_RATE = 0.18;
+    52→
+    53→/** Annual inflation rate for TCO projections */
+    54→export const INFLATION_RATE = 0.03;
+    55→
+    56→/** Discount rate for NPV calculations */
+    57→export const DISCOUNT_RATE = 0.05;
+    58→
+    59→/** Default TCO projection horizon in years (contract period) */
+    60→export const DEFAULT_HORIZON_YEARS = 12;
+    61→
+    62→/** Budget variance tolerance before flagging as over-budget */
+    63→export const VARIANCE_TOLERANCE = 0.10;
+    64→
+    65→/** Overtime multiplier for night shift (default if not in labor rates) */
+    66→export const DEFAULT_OVERTIME_MULTIPLIER = 1.35;
+    67→
+    68→/** Weekend multiplier (default if not in labor rates) */
+    69→export const DEFAULT_WEEKEND_MULTIPLIER = 1.5;
+    70→
+    71→/** Default shop rate if not configured (SGD/hour) */
+    72→export const DEFAULT_SHOP_RATE = 85.0;
+    73→
+    74→/** Contractor cost multiplier (contractors cost 2x regular labor) */
+    75→export const CONTRACTOR_COST_MULTIPLIER = 2.0;
+    76→
+    77→// =============================================================================
+    78→// Types
+    79→// =============================================================================
+    80→
+    81→/** Detailed cost breakdown for a PM */
+    82→export interface CostBreakdown {
+    83→  laborCost: number;
+    84→  overtimeCost: number;
+    85→  materialCost: number;
+    86→  contractorCost: number;
+    87→  overheadCost: number;
+    88→  totalCost: number;
+    89→}
+    90→
+    91→/** Yearly cost projection for TCO */
+    92→export interface YearlyCost {
+    93→  fiscalYear: number;
+    94→  laborCost: number;
+    95→  materialCost: number;
+    96→  totalCost: number;
+    97→  pmCount: number;
+    98→  inflationFactor: number;
+    99→}
+   100→
+   101→/** TCO projection summary */
+   102→export interface TCOSummary {
+   103→  totalLaborCost: number;
+   104→  totalMaterialCost: number;
+   105→  totalCost: number;
+   106→  totalPMCount: number;
+   107→  npv: number;
+   108→  avgAnnualCost: number;
+   109→}
+   110→
+   111→/** Full TCO projection result */
+   112→export interface TCOProjection {
+   113→  projections: YearlyCost[];
+   114→  summary: TCOSummary;
+   115→  horizonYears: number;
+   116→  calculatedAt: Date;
+   117→}
+   118→
+   119→/** Budget figures for variance calculation */
+   120→export interface BudgetFigures {
+   121→  labor: number;
+   122→  material: number;
+   123→  total: number;
+   124→}
+   125→
+   126→/** Actual cost figures for variance calculation */
+   127→export interface ActualFigures {
+   128→  labor: number;
+   129→  material: number;
+   130→  total: number;
+   131→}
+   132→
+   133→/** Variance figures */
+   134→export interface VarianceFigures {
+   135→  labor: number;
+   136→  material: number;
+   137→  total: number;
+   138→  percentage: number;
+   139→}
+   140→
+   141→/** Variance status */
+   142→export type VarianceStatus = 'UNDER_BUDGET' | 'WITHIN_TOLERANCE' | 'OVER_BUDGET';
+   143→
+   144→/** Cost variance analysis result */
+   145→export interface CostVariance {
+   146→  fiscalYear: number;
+   147→  depotId: string | null;
+   148→  depotCode?: string;
+   149→  budget: BudgetFigures;
+   150→  actual: ActualFigures;
+   151→  variance: VarianceFigures;
+   152→  status: VarianceStatus;
+   153→  pmCompleted: number;
+   154→  calculatedAt: Date;
+   155→}
+   156→
+   157→/** Labor rate lookup result */
+   158→export interface LaborRate {
+   159→  id: string;
+   160→  depotId: string | null;
+   161→  regularHourlyRate: number;
+   162→  overtimeMultiplier: number;
+   163→  weekendMultiplier: number;
+   164→  holidayMultiplier: number;
+   165→  shopRateHourly: number;
+   166→  currency: string;
+   167→  effectiveFrom: Date;
+   168→  effectiveTo: Date | null;
+   169→}
+   170→
+   171→/** PM cost calculation request */
+   172→export interface CalculatePMCostRequest {
+   173→  pmScheduleId: string;
+   174→  includeProjected?: boolean;
+   175→}
+   176→
+   177→/** TCO projection request */
+   178→export interface ProjectTCORequest {
+   179→  horizonYears?: number;
+   180→  scenarioId?: string;
+   181→  depotId?: string;
+   182→}
+   183→
+   184→/** Cost variance request */
+   185→export interface CalculateVarianceRequest {
+   186→  fiscalYear: number;
+   187→  depotId?: string;
+   188→}
+   189→
+   190→// =============================================================================
+   191→// Singleton Instance
+   192→// =============================================================================
+   193→
+   194→let instance: CostingService | null = null;
+   195→
+   196→/**
+   197→ * Get the singleton CostingService instance
+   198→ */
+   199→export function getCostingService(): CostingService {
+   200→  if (!instance) {
+   201→    instance = new CostingService();
+   202→  }
+   203→  return instance;
+   204→}
+   205→
+   206→// =============================================================================
+   207→// CostingService Implementation
+   208→// =============================================================================
+   209→
+   210→/**
+   211→ * Costing Service for TCO projections and cost analysis
+   212→ *
+   213→ * @example
+   214→ * ```typescript
+   215→ * const costingService = getCostingService();
+   216→ *
+   217→ * // Calculate cost for a single PM
+   218→ * const cost = await costingService.calculatePMCost({
+   219→ *   pmScheduleId: 'pm-123'
+   220→ * });
+   221→ *
+   222→ * // Project 12-year TCO
+   223→ * const tco = await costingService.projectTCO();
+   224→ *
+   225→ * // Calculate variance for current fiscal year
+   226→ * const variance = await costingService.calculateVariance({
+   227→ *   fiscalYear: 2026,
+   228→ *   depotId: 'depot-001'
+   229→ * });
+   230→ * ```
+   231→ */
+   232→export class CostingService extends BaseService {
+   233→  constructor() {
+   234→    super({ name: 'costing-service' });
+   235→  }
+   236→
+   237→  // ===========================================================================
+   238→  // Public Methods
+   239→  // ===========================================================================
+   240→
+   241→  /**
+   242→   * Calculate the cost breakdown for a specific PM
+   243→   *
+   244→   * Includes labor (with overtime multipliers), materials, and overhead.
+   245→   *
+   246→   * @param request - PM cost calculation request
+   247→   * @returns Detailed cost breakdown
+   248→   * @throws NotFoundError if PM not found
+   249→   */
+   250→  async calculatePMCost(request: CalculatePMCostRequest): Promise<CostBreakdown> {
+   251→    return this.traced('calculatePMCost', async (span) => {
+   252→      span.setAttribute(MmsAttributes.PM_SCHEDULE_ID, request.pmScheduleId);
+   253→
+   254→      // Fetch PM with relations
+   255→      const pm = await this.db.query.pmSchedule.findFirst({
+   256→        where: eq(pmSchedule.id, request.pmScheduleId),
+   257→        with: {
+   258→          pmType: true,
+   259→          assignedDepot: true,
+   260→        },
+   261→      });
+   262→
+   263→      if (!pm) {
+   264→        throw new NotFoundError('PM schedule not found', {
+   265→          entityType: 'PM_SCHEDULE',
+   266→          entityId: request.pmScheduleId,
+   267→        });
+   268→      }
+   269→
+   270→      span.setAttribute(MmsAttributes.TRAIN_ID, pm.trainId);
+   271→      span.setAttribute(MmsAttributes.PM_TYPE_CODE, pm.pmType?.pmCode || 'UNKNOWN');
+   272→
+   273→      // Get labor rate for depot and date
+   274→      const laborRate = await this.getLaborRate(
+   275→        pm.assignedDepotId || null,
+   276→        pm.targetDate ? new Date(pm.targetDate) : new Date()
+   277→      );
+   278→
+   279→      // Calculate material cost
+   280→      const materialCost = await this.calculateMaterialCost(pm.pmTypeId);
+   281→
+   282→      // Determine hours: actual > assigned > estimated
+   283→      const hours = this.resolveHours(pm, pm.pmType);
+   284→
+   285→      // Calculate labor cost using shop rate
+   286→      const shopRate = laborRate?.shopRateHourly || DEFAULT_SHOP_RATE;
+   287→      const laborCost = hours * shopRate;
+   288→
+   289→      // Calculate overtime cost if night/weekend shift
+   290→      let overtimeCost = 0;
+   291→      if (pm.assignedShift && laborRate) {
+   292→        overtimeCost = this.calculateOvertimeCost(
+   293→          hours,
+   294→          laborRate.regularHourlyRate,
+   295→          pm.assignedShift,
+   296→          laborRate
+   297→        );
+   298→      }
+   299→
+   300→      // Calculate contractor cost from approved manhour adjustments
+   301→      const contractorCost = await this.calculateContractorCost(
+   302→        request.pmScheduleId,
+   303→        laborRate?.shopRateHourly || DEFAULT_SHOP_RATE
+   304→      );
+   305→
+   306→      // Overhead: 18% of direct costs (including contractor work)
+   307→      const directCost = laborCost + materialCost + contractorCost;
+   308→      const overheadCost = directCost * OVERHEAD_RATE;
+   309→
+   310→      const totalCost = laborCost + overtimeCost + materialCost + contractorCost + overheadCost;
+   311→
+   312→      // Record metrics
+   313→      costingMetrics.pmCostCalculated.inc({
+   314→        pm_type: pm.pmType?.pmCode || 'UNKNOWN',
+   315→        depot_id: pm.assignedDepotId || 'UNASSIGNED',
+   316→      });
+   317→
+   318→      this.log.info({
+   319→        pmScheduleId: request.pmScheduleId,
+   320→        hours,
+   321→        laborCost,
+   322→        overtimeCost,
+   323→        materialCost,
+   324→        contractorCost,
+   325→        overheadCost,
+   326→        totalCost,
+   327→      }, 'PM cost calculated');
+   328→
+   329→      return {
+   330→        laborCost,
+   331→        overtimeCost,
+   332→        materialCost,
+   333→        contractorCost,
+   334→        overheadCost,
+   335→        totalCost,
+   336→      };
+   337→    });
+   338→  }
+   339→
+   340→  /**
+   341→   * Project Total Cost of Ownership over the contract horizon
+   342→   *
+   343→   * Calculates yearly costs with inflation adjustment and NPV.
+   344→   *
+   345→   * @param request - TCO projection request
+   346→   * @returns TCO projection with yearly breakdown and summary
+   347→   */
+   348→  async projectTCO(request: ProjectTCORequest = {}): Promise<TCOProjection> {
+   349→    return this.traced('projectTCO', async (span) => {
+   350→      const horizonYears = request.horizonYears || DEFAULT_HORIZON_YEARS;
+   351→      span.setAttribute('tco.horizon_years', horizonYears);
+   352→
+   353→      if (request.scenarioId) {
+   354→        span.setAttribute('scenario.id', request.scenarioId);
+   355→      }
+   356→      if (request.depotId) {
+   357→        span.setAttribute(MmsAttributes.DEPOT_ID, request.depotId);
+   358→      }
+   359→
+   360→      const projections: YearlyCost[] = [];
+   361→      const startYear = new Date().getFullYear();
+   362→
+   363→      for (let yearOffset = 0; yearOffset < horizonYears; yearOffset++) {
+   364→        const fiscalYear = startYear + yearOffset;
+   365→        const yearStart = new Date(fiscalYear, 0, 1);
+   366→        const yearEnd = new Date(fiscalYear, 11, 31);
+   367→
+   368→        // Build where conditions for PM query
+   369→        const whereConditions = [
+   370→          request.scenarioId
+   371→            ? eq(pmSchedule.scenarioId, request.scenarioId)
+   372→            : isNull(pmSchedule.scenarioId),
+   373→          gte(pmSchedule.targetDate, yearStart.toISOString().split('T')[0]),
+   374→          lte(pmSchedule.targetDate, yearEnd.toISOString().split('T')[0]),
+   375→        ];
+   376→
+   377→        if (request.depotId) {
+   378→          whereConditions.push(eq(pmSchedule.assignedDepotId, request.depotId));
+   379→        }
+   380→
+   381→        // Fetch scheduled PMs for this year
+   382→        const scheduledPMs = await this.db.query.pmSchedule.findMany({
+   383→          where: and(...whereConditions),
+   384→          with: { pmType: true },
+   385→        });
+   386→
+   387→        // Calculate costs for each PM
+   388→        let totalLabor = 0;
+   389→        let totalMaterial = 0;
+   390→
+   391→        for (const pm of scheduledPMs) {
+   392→          try {
+   393→            const cost = await this.calculatePMCost({
+   394→              pmScheduleId: pm.id,
+   395→              includeProjected: request.scenarioId ? true : false,
+   396→            });
+   397→            totalLabor += cost.laborCost + cost.overtimeCost;
+   398→            totalMaterial += cost.materialCost;
+   399→          } catch (error) {
+   400→            // Log but continue - don't fail entire projection for one PM
+   401→            this.log.warn({ pmId: pm.id, error }, 'Failed to calculate PM cost, using estimate');
+   402→            // Use estimated values based on PM type
+   403→            if (pm.pmType) {
+   404→              const hours = parseFloat(pm.pmType.estimatedHours || '0');
+   405→              totalLabor += hours * DEFAULT_SHOP_RATE;
+   406→            }
+   407→          }
+   408→        }
+   409→
+   410→        // Apply inflation adjustment for future years
+   411→        const inflationFactor = Math.pow(1 + INFLATION_RATE, yearOffset);
+   412→        const adjustedLabor = totalLabor * inflationFactor;
+   413→        const adjustedMaterial = totalMaterial * inflationFactor;
+   414→
+   415→        projections.push({
+   416→          fiscalYear,
+   417→          laborCost: adjustedLabor,
+   418→          materialCost: adjustedMaterial,
+   419→          totalCost: adjustedLabor + adjustedMaterial,
+   420→          pmCount: scheduledPMs.length,
+   421→          inflationFactor,
+   422→        });
+   423→
+   424→        this.log.debug({
+   425→          fiscalYear,
+   426→          pmCount: scheduledPMs.length,
+   427→          laborCost: adjustedLabor,
+   428→          materialCost: adjustedMaterial,
+   429→        }, 'Year projection calculated');
+   430→      }
+   431→
+   432→      // Calculate NPV - discount future costs to present value
+   433→      let npv = 0;
+   434→      for (let i = 0; i < projections.length; i++) {
+   435→        const yearCost = projections[i].totalCost;
+   436→        npv += yearCost / Math.pow(1 + DISCOUNT_RATE, i);
+   437→      }
+   438→
+   439→      // Calculate summary
+   440→      const summary: TCOSummary = {
+   441→        totalLaborCost: projections.reduce((sum, p) => sum + p.laborCost, 0),
+   442→        totalMaterialCost: projections.reduce((sum, p) => sum + p.materialCost, 0),
+   443→        totalCost: projections.reduce((sum, p) => sum + p.totalCost, 0),
+   444→        totalPMCount: projections.reduce((sum, p) => sum + p.pmCount, 0),
+   445→        npv,
+   446→        avgAnnualCost: npv / horizonYears,
+   447→      };
+   448→
+   449→      // Record metrics
+   450→      costingMetrics.tcoProjected.observe(summary.npv);
+   451→
+   452→      this.log.info({
+   453→        horizonYears,
+   454→        totalCost: summary.totalCost,
+   455→        npv: summary.npv,
+   456→        totalPMCount: summary.totalPMCount,
+   457→      }, 'TCO projection complete');
+   458→
+   459→      return {
+   460→        projections,
+   461→        summary,
+   462→        horizonYears,
+   463→        calculatedAt: new Date(),
+   464→      };
+   465→    });
+   466→  }
+   467→
+   468→  /**
+   469→   * Calculate cost variance against budget for a fiscal year
+   470→   *
+   471→   * Compares actual costs from completed PMs against budget baseline.
+   472→   *
+   473→   * @param request - Variance calculation request
+   474→   * @returns Cost variance analysis
+   475→   * @throws NotFoundError if budget baseline not found
+   476→   */
+   477→  async calculateVariance(request: CalculateVarianceRequest): Promise<CostVariance> {
+   478→    return this.traced('calculateVariance', async (span) => {
+   479→      span.setAttribute('variance.fiscal_year', request.fiscalYear);
+   480→      if (request.depotId) {
+   481→        span.setAttribute(MmsAttributes.DEPOT_ID, request.depotId);
+   482→      }
+   483→
+   484→      // Fetch cost baseline for the fiscal year
+   485→      const baseline = await this.db.query.costBaselines.findFirst({
+   486→        where: and(
+   487→          eq(costBaselines.fiscalYear, request.fiscalYear),
+   488→          request.depotId
+   489→            ? eq(costBaselines.depotId, request.depotId)
+   490→            : isNull(costBaselines.depotId)
+   491→        ),
+   492→        with: {
+   493→          depot: true,
+   494→        },
+   495→      });
+   496→
+   497→      if (!baseline) {
+   498→        throw new NotFoundError(
+   499→          `Cost baseline not found for fiscal year ${request.fiscalYear}`,
+   500→          {
+   501→            entityType: 'COST_BASELINE',
+   502→            entityId: `${request.fiscalYear}-${request.depotId || 'GLOBAL'}`,
+   503→          }
+   504→        );
+   505→      }
+   506→
+   507→      // Get actual costs from completed PMs in this fiscal year
+   508→      const yearStart = new Date(request.fiscalYear, 0, 1);
+   509→      const yearEnd = new Date(request.fiscalYear, 11, 31);
+   510→
+   511→      const whereConditions = [
+   512→        eq(pmSchedule.status, 'COMPLETED'),
+   513→        gte(pmSchedule.completedAt, yearStart),
+   514→        lte(pmSchedule.completedAt, yearEnd),
+   515→        isNull(pmSchedule.scenarioId), // Only production PMs
+   516→      ];
+   517→
+   518→      if (request.depotId) {
+   519→        whereConditions.push(eq(pmSchedule.assignedDepotId, request.depotId));
+   520→      }
+   521→
+   522→      const completedPMs = await this.db.query.pmSchedule.findMany({
+   523→        where: and(...whereConditions),
+   524→        with: { pmType: true },
+   525→      });
+   526→
+   527→      // Calculate actual costs
+   528→      let actualLaborCost = 0;
+   529→      let actualMaterialCost = 0;
+   530→
+   531→      for (const pm of completedPMs) {
+   532→        try {
+   533→          const cost = await this.calculatePMCost({ pmScheduleId: pm.id });
+   534→          actualLaborCost += cost.laborCost + cost.overtimeCost;
+   535→          actualMaterialCost += cost.materialCost;
+   536→        } catch (error) {
+   537→          this.log.warn({ pmId: pm.id, error }, 'Failed to calculate completed PM cost');
+   538→        }
+   539→      }
+   540→
+   541→      const actualTotal = actualLaborCost + actualMaterialCost;
+   542→      const budgetTotal = parseFloat(baseline.budgetTotal || '0');
+   543→      const budgetLabor = parseFloat(baseline.budgetLaborCost || '0');
+   544→      const budgetMaterial = parseFloat(baseline.budgetMaterialCost || '0');
+   545→
+   546→      // Calculate variance
+   547→      const varianceLabor = actualLaborCost - budgetLabor;
+   548→      const varianceMaterial = actualMaterialCost - budgetMaterial;
+   549→      const varianceTotal = actualTotal - budgetTotal;
+   550→      const variancePercentage = budgetTotal > 0
+   551→        ? ((actualTotal - budgetTotal) / budgetTotal) * 100
+   552→        : 0;
+   553→
+   554→      // Determine status
+   555→      let status: VarianceStatus;
+   556→      if (actualTotal <= budgetTotal) {
+   557→        status = 'UNDER_BUDGET';
+   558→      } else if (actualTotal <= budgetTotal * (1 + VARIANCE_TOLERANCE)) {
+   559→        status = 'WITHIN_TOLERANCE';
+   560→      } else {
+   561→        status = 'OVER_BUDGET';
+   562→      }
+   563→
+   564→      // Record metrics
+   565→      costingMetrics.varianceCalculated.observe({
+   566→        fiscal_year: request.fiscalYear.toString(),
+   567→        depot_id: request.depotId || 'GLOBAL',
+   568→        status,
+   569→      }, variancePercentage);
+   570→
+   571→      this.log.info({
+   572→        fiscalYear: request.fiscalYear,
+   573→        depotId: request.depotId,
+   574→        budgetTotal,
+   575→        actualTotal,
+   576→        variancePercentage,
+   577→        status,
+   578→        pmCompleted: completedPMs.length,
+   579→      }, 'Variance calculated');
+   580→
+   581→      return {
+   582→        fiscalYear: request.fiscalYear,
+   583→        depotId: request.depotId || null,
+   584→        depotCode: (baseline as { depot?: { code?: string } }).depot?.code,
+   585→        budget: {
+   586→          labor: budgetLabor,
+   587→          material: budgetMaterial,
+   588→          total: budgetTotal,
+   589→        },
+   590→        actual: {
+   591→          labor: actualLaborCost,
+   592→          material: actualMaterialCost,
+   593→          total: actualTotal,
+   594→        },
+   595→        variance: {
+   596→          labor: varianceLabor,
+   597→          material: varianceMaterial,
+   598→          total: varianceTotal,
+   599→          percentage: variancePercentage,
+   600→        },
+   601→        status,
+   602→        pmCompleted: completedPMs.length,
+   603→        calculatedAt: new Date(),
+   604→      };
+   605→    });
+   606→  }
+   607→
+   608→  // ===========================================================================
+   609→  // Labor Rate Methods
+   610→  // ===========================================================================
+   611→
+   612→  /**
+   613→   * Get labor rate for a depot at a specific date
+   614→   *
+   615→   * Falls back to global rate if depot-specific rate not found.
+   616→   *
+   617→   * @param depotId - Depot ID (null for global)
+   618→   * @param date - Date for rate lookup
+   619→   * @returns Labor rate or null if not found
+   620→   */
+   621→  async getLaborRate(depotId: string | null, date: Date): Promise<LaborRate | null> {
+   622→    return this.traced('getLaborRate', async (span) => {
+   623→      if (depotId) {
+   624→        span.setAttribute(MmsAttributes.DEPOT_ID, depotId);
+   625→      }
+   626→
+   627→      const dateStr = date.toISOString().split('T')[0];
+   628→
+   629→      // Try depot-specific rate first
+   630→      if (depotId) {
+   631→        const depotRate = await this.db.query.laborRates.findFirst({
+   632→          where: and(
+   633→            eq(laborRates.depotId, depotId),
+   634→            lte(laborRates.effectiveFrom, dateStr),
+   635→            sql`(${laborRates.effectiveTo} IS NULL OR ${laborRates.effectiveTo} >= ${dateStr})`
+   636→          ),
+   637→          orderBy: [desc(laborRates.effectiveFrom)],
+   638→        });
+   639→
+   640→        if (depotRate) {
+   641→          return this.mapLaborRate(depotRate);
+   642→        }
+   643→      }
+   644→
+   645→      // Fall back to global rate
+   646→      const globalRate = await this.db.query.laborRates.findFirst({
+   647→        where: and(
+   648→          isNull(laborRates.depotId),
+   649→          lte(laborRates.effectiveFrom, dateStr),
+   650→          sql`(${laborRates.effectiveTo} IS NULL OR ${laborRates.effectiveTo} >= ${dateStr})`
+   651→        ),
+   652→        orderBy: [desc(laborRates.effectiveFrom)],
+   653→      });
+   654→
+   655→      if (globalRate) {
+   656→        return this.mapLaborRate(globalRate);
+   657→      }
+   658→
+   659→      this.log.warn({ depotId, date: dateStr }, 'No labor rate found, using defaults');
+   660→      return null;
+   661→    });
+   662→  }
+   663→
+   664→  /**
+   665→   * Create or update a labor rate
+   666→   */
+   667→  async upsertLaborRate(rate: Omit<LaborRate, 'id'>): Promise<LaborRate> {
+   668→    return this.traced('upsertLaborRate', async (span) => {
+   669→      if (rate.depotId) {
+   670→        span.setAttribute(MmsAttributes.DEPOT_ID, rate.depotId);
+   671→      }
+   672→
+   673→      const existing = await this.db.query.laborRates.findFirst({
+   674→        where: and(
+   675→          rate.depotId
+   676→            ? eq(laborRates.depotId, rate.depotId)
+   677→            : isNull(laborRates.depotId),
+   678→          eq(laborRates.effectiveFrom, rate.effectiveFrom.toISOString().split('T')[0])
+   679→        ),
+   680→      });
+   681→
+   682→      if (existing) {
+   683→        const [updated] = await this.db
+   684→          .update(laborRates)
+   685→          .set({
+   686→            regularHourlyRate: rate.regularHourlyRate.toString(),
+   687→            overtimeMultiplier: rate.overtimeMultiplier.toString(),
+   688→            weekendMultiplier: rate.weekendMultiplier.toString(),
+   689→            holidayMultiplier: rate.holidayMultiplier.toString(),
+   690→            shopRateHourly: rate.shopRateHourly.toString(),
+   691→            effectiveTo: rate.effectiveTo?.toISOString().split('T')[0] || null,
+   692→          })
+   693→          .where(eq(laborRates.id, existing.id))
+   694→          .returning();
+   695→
+   696→        return this.mapLaborRate(updated);
+   697→      }
+   698→
+   699→      const [created] = await this.db
+   700→        .insert(laborRates)
+   701→        .values({
+   702→          depotId: rate.depotId,
+   703→          regularHourlyRate: rate.regularHourlyRate.toString(),
+   704→          overtimeMultiplier: rate.overtimeMultiplier.toString(),
+   705→          weekendMultiplier: rate.weekendMultiplier.toString(),
+   706→          holidayMultiplier: rate.holidayMultiplier.toString(),
+   707→          shopRateHourly: rate.shopRateHourly.toString(),
+   708→          effectiveFrom: rate.effectiveFrom.toISOString().split('T')[0],
+   709→          effectiveTo: rate.effectiveTo?.toISOString().split('T')[0] || null,
+   710→          currency: rate.currency,
+   711→        })
+   712→        .returning();
+   713→
+   714→      return this.mapLaborRate(created);
+   715→    });
+   716→  }
+   717→
+   718→  // ===========================================================================
+   719→  // Cost Baseline Methods
+   720→  // ===========================================================================
+   721→
+   722→  /**
+   723→   * Create or update a cost baseline for a fiscal year
+   724→   */
+   725→  async upsertCostBaseline(baseline: {
+   726→    fiscalYear: number;
+   727→    depotId?: string | null;
+   728→    budgetLaborCost: number;
+   729→    budgetMaterialCost: number;
+   730→    budgetLaborHours?: number;
+   731→  }): Promise<typeof costBaselines.$inferSelect> {
+   732→    return this.traced('upsertCostBaseline', async (span) => {
+   733→      span.setAttribute('baseline.fiscal_year', baseline.fiscalYear);
+   734→      if (baseline.depotId) {
+   735→        span.setAttribute(MmsAttributes.DEPOT_ID, baseline.depotId);
+   736→      }
+   737→
+   738→      const budgetTotal = baseline.budgetLaborCost + baseline.budgetMaterialCost;
+   739→
+   740→      const existing = await this.db.query.costBaselines.findFirst({
+   741→        where: and(
+   742→          eq(costBaselines.fiscalYear, baseline.fiscalYear),
+   743→          baseline.depotId
+   744→            ? eq(costBaselines.depotId, baseline.depotId)
+   745→            : isNull(costBaselines.depotId)
+   746→        ),
+   747→      });
+   748→
+   749→      if (existing) {
+   750→        const [updated] = await this.db
+   751→          .update(costBaselines)
+   752→          .set({
+   753→            budgetLaborCost: baseline.budgetLaborCost.toString(),
+   754→            budgetMaterialCost: baseline.budgetMaterialCost.toString(),
+   755→            budgetTotal: budgetTotal.toString(),
+   756→            budgetLaborHours: baseline.budgetLaborHours?.toString() || null,
+   757→            updatedAt: new Date(),
+   758→          })
+   759→          .where(eq(costBaselines.id, existing.id))
+   760→          .returning();
+   761→
+   762→        return updated;
+   763→      }
+   764→
+   765→      const [created] = await this.db
+   766→        .insert(costBaselines)
+   767→        .values({
+   768→          fiscalYear: baseline.fiscalYear,
+   769→          depotId: baseline.depotId || null,
+   770→          budgetLaborCost: baseline.budgetLaborCost.toString(),
+   771→          budgetMaterialCost: baseline.budgetMaterialCost.toString(),
+   772→          budgetTotal: budgetTotal.toString(),
+   773→          budgetLaborHours: baseline.budgetLaborHours?.toString() || null,
+   774→        })
+   775→        .returning();
+   776→
+   777→      return created;
+   778→    });
+   779→  }
+   780→
+   781→  /**
+   782→   * Get all cost baselines for a fiscal year
+   783→   */
+   784→  async getCostBaselines(fiscalYear: number): Promise<(typeof costBaselines.$inferSelect)[]> {
+   785→    return this.traced('getCostBaselines', async (span) => {
+   786→      span.setAttribute('baseline.fiscal_year', fiscalYear);
+   787→
+   788→      return this.db.query.costBaselines.findMany({
+   789→        where: eq(costBaselines.fiscalYear, fiscalYear),
+   790→        with: { depot: true },
+   791→      });
+   792→    });
+   793→  }
+   794→
+   795→  // ===========================================================================
+   796→  // Private Helpers
+   797→  // ===========================================================================
+   798→
+   799→  /**
+   800→   * Calculate material cost for a PM type
+   801→   */
+   802→  private async calculateMaterialCost(pmTypeId: string): Promise<number> {
+   803→    // Get material requirements for this PM type
+   804→    const requirements = await this.db.query.pmMaterialRequirements.findMany({
+   805→      where: eq(pmMaterialRequirements.pmTypeId, pmTypeId),
+   806→    });
+   807→
+   808→    let totalCost = 0;
+   809→    const today = new Date().toISOString().split('T')[0];
+   810→
+   811→    for (const req of requirements) {
+   812→      // Get current material cost
+   813→      const cost = await this.db.query.materialCosts.findFirst({
+   814→        where: and(
+   815→          eq(materialCosts.partNumber, req.partNumber),
+   816→          lte(materialCosts.effectiveFrom, today),
+   817→          sql`(${materialCosts.effectiveTo} IS NULL OR ${materialCosts.effectiveTo} >= ${today})`
+   818→        ),
+   819→        orderBy: [desc(materialCosts.effectiveFrom)],
+   820→      });
+   821→
+   822→      if (cost) {
+   823→        const unitCost = parseFloat(cost.unitCost || '0');
+   824→        const quantity = req.quantityPerPm || 1;
+   825→        totalCost += unitCost * quantity;
+   826→      } else {
+   827→        this.log.debug({ partNumber: req.partNumber }, 'No material cost found for part');
+   828→      }
+   829→    }
+   830→
+   831→    return totalCost;
+   832→  }
+   833→
+   834→  /**
+   835→   * Resolve hours for PM cost calculation
+   836→   * Priority: actual > assigned > estimated
+   837→   */
+   838→  private resolveHours(pm: PmScheduleRecord, pmType: PmTypeRecord | null): number {
+   839→    if (pm.actualHours) {
+   840→      return parseFloat(pm.actualHours);
+   841→    }
+   842→    if (pm.assignedHours) {
+   843→      return parseFloat(pm.assignedHours);
+   844→    }
+   845→    if (pmType?.estimatedHours) {
+   846→      return parseFloat(pmType.estimatedHours);
+   847→    }
+   848→    return 0;
+   849→  }
+   850→
+   851→  /**
+   852→   * Calculate overtime cost based on shift type
+   853→   */
+   854→  private calculateOvertimeCost(
+   855→    hours: number,
+   856→    regularRate: number,
+   857→    shift: string,
+   858→    rate: LaborRate
+   859→  ): number {
+   860→    let multiplier = 1;
+   861→
+   862→    switch (shift) {
+   863→      case 'NIGHT':
+   864→        multiplier = rate.overtimeMultiplier || DEFAULT_OVERTIME_MULTIPLIER;
+   865→        break;
+   866→      case 'WEEKEND':
+   867→        multiplier = rate.weekendMultiplier || DEFAULT_WEEKEND_MULTIPLIER;
+   868→        break;
+   869→      case 'HOLIDAY':
+   870→        multiplier = rate.holidayMultiplier || 2.5;
+   871→        break;
+   872→      default:
+   873→        return 0; // No overtime for regular shifts
+   874→    }
+   875→
+   876→    // Overtime cost is the premium above regular rate
+   877→    return hours * regularRate * (multiplier - 1);
+   878→  }
+   879→
+   880→  /**
+   881→   * Calculate contractor cost for a PM
+   882→   *
+   883→   * Looks up APPROVED manhour adjustments of type ADD_CONTRACTOR that
+   884→   * include this PM in their affected PMs list. Contractors cost 2x
+   885→   * the regular labor rate for the hours they work.
+   886→   *
+   887→   * @param pmScheduleId - PM schedule ID to check
+   888→   * @param baseRate - Base shop rate for cost calculation
+   889→   * @returns Contractor cost (0 if no contractor work)
+   890→   */
+   891→  private async calculateContractorCost(
+   892→    pmScheduleId: string,
+   893→    baseRate: number
+   894→  ): Promise<number> {
+   895→    // Find approved contractor adjustments that affect this PM
+   896→    // Using raw SQL for array contains since affectedPmIds is text[]
+   897→    const contractorAdjustments = await this.db
+   898→      .select()
+   899→      .from(manhourAdjustments)
+   900→      .where(
+   901→        and(
+   902→          eq(manhourAdjustments.adjustmentType, 'ADD_CONTRACTOR'),
+   903→          eq(manhourAdjustments.status, 'APPROVED'),
+   904→          sql`${pmScheduleId} = ANY(${manhourAdjustments.affectedPmIds})`
+   905→        )
+   906→      );
+   907→
+   908→    if (contractorAdjustments.length === 0) {
+   909→      return 0;
+   910→    }
+   911→
+   912→    // Sum up contractor costs
+   913→    // Contractor premium is the additional cost above regular labor
+   914→    // Contractors charge 2x the base rate, so premium is 1x extra
+   915→    let totalContractorCost = 0;
+   916→
+   917→    for (const adj of contractorAdjustments) {
+   918→      const hoursAdjusted = parseFloat(adj.hoursAdjusted || '0');
+   919→      // Contractor cost = hours * base_rate * (multiplier - 1)
+   920→      // This represents the premium charged by contractors
+   921→      const contractorPremium = hoursAdjusted * baseRate * (CONTRACTOR_COST_MULTIPLIER - 1);
+   922→      totalContractorCost += contractorPremium;
+   923→
+   924→      this.log.debug({
+   925→        pmScheduleId,
+   926→        adjustmentId: adj.id,
+   927→        hoursAdjusted,
+   928→        contractorPremium,
+   929→      }, 'Contractor cost calculated for adjustment');
+   930→    }
+   931→
+   932→    return totalContractorCost;
+   933→  }
+   934→
+   935→  /**
+   936→   * Map database labor rate to LaborRate type
+   937→   */
+   938→  private mapLaborRate(rate: typeof laborRates.$inferSelect): LaborRate {
+   939→    return {
+   940→      id: rate.id,
+   941→      depotId: rate.depotId,
+   942→      regularHourlyRate: parseFloat(rate.regularHourlyRate || '0'),
+   943→      overtimeMultiplier: parseFloat(rate.overtimeMultiplier || '1.5'),
+   944→      weekendMultiplier: parseFloat(rate.weekendMultiplier || '2.0'),
+   945→      holidayMultiplier: parseFloat(rate.holidayMultiplier || '2.5'),
+   946→      shopRateHourly: parseFloat(rate.shopRateHourly || '0'),
+   947→      currency: rate.currency || 'SGD',
+   948→      effectiveFrom: new Date(rate.effectiveFrom),
+   949→      effectiveTo: rate.effectiveTo ? new Date(rate.effectiveTo) : null,
+   950→    };
+   951→  }
+   952→}
+   953→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

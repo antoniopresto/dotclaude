@@ -1,0 +1,89 @@
+A análise do Claude Code está **substancialmente correta**, mas com nuances importantes que ele simplificou demais. Vou validar ponto a ponto contra o código real.
+
+---
+
+## O que está CORRETO na análise
+
+**1. O envio manual para DLQ é factual:**
+```typescript
+// linha 52 — envia manualmente para DLQ
+await this.sqsDLQService.sendToSQS(SQSEvent);
+// linha 56 — deleta manualmente da fila principal
+await this.sqsService.deleteFromSQS(event.receiptHandle);
+```
+Confirmado no código. Nenhuma dúvida.
+
+**2. Isso impede o "Redrive to source queue" do Console AWS:**
+The `CouldNotDetermineMessageSource` error occurs when you attempt to start a DLQ redrive with an Amazon SQS message sent directly to the DLQ with `SendMessage` API. A resolução indicada é usar "Redrive to a custom destination", o que não é tão simples quanto o one-click nativo.
+
+**3. A tabela comparativa está correta:** Retries antes da DLQ = 0 com o código atual (primeiro erro já vai direto), vs. configurável com `maxReceiveCount`.
+
+**4. A recomendação de remover as 3 linhas e manter só o `throw error` é correta** como direção geral.
+
+---
+
+## O que o Claude Code ERROU ou SIMPLIFICOU DEMAIS
+
+### Erro 1: "Não funciona" é impreciso
+
+Ele disse "Redrive via Console = Não funciona". Parcialmente errado. Para resolver o erro de mensagens enviadas manualmente, a AWS indica escolher "Redrive to a custom destination" informando o ARN da fila de destino. Ou seja: **"Redrive to source" não funciona, mas "Redrive to custom destination" pode funcionar** — desde que a DLQ esteja configurada como DLQ de alguma fila. É mais manual, mas não é impossível.
+
+### Erro 2: Ignorou o `throw error` DEPOIS do delete — isso é um bug real
+
+Olha a sequência:
+```typescript
+await this.sqsDLQService.sendToSQS(SQSEvent);           // 1. Envia para DLQ
+await this.sqsEmailService.sendToSQS(message);          // 2. Envia notificação
+await this.sqsService.deleteFromSQS(event.receiptHandle); // 3. Deleta da fila
+throw error;                                              // 4. Lança exceção ???
+```
+
+Linha 4 é **arquiteturalmente contraditório**. Ele já tratou o erro manualmente (DLQ + email + delete), mas depois lança exceção mesmo assim. Consequências:
+
+- **Lambda reporta erro** nas métricas do CloudWatch, mesmo tendo tratado a falha com sucesso
+- **Se `batchSize > 1`** (JIRA confirma que já esteve em 10): o `throw` aborta o processamento dos itens restantes do batch. Os itens não processados voltam para a fila e são reprocessados — mas o item que falhou já foi deletado e movido para DLQ. Isso gera métricas enganosas.
+- **Se algum await anterior falhar** (ex: `deleteFromSQS` dá timeout), o throw faz SQS retentar a mensagem que JÁ está na DLQ = **duplicata na DLQ**
+
+O Claude Code mencionou o race condition superficialmente mas não identificou o `throw` pós-delete como a causa direta.
+
+### Erro 3: Não identificou provável DUPLICIDADE DE NOTIFICAÇÃO
+
+O código envia para `sqsEmailService` (linha 54). Separadamente, a JIRA confirma que `NTS-App-Fintech-StateMachine-SendEmailNotification` **consome a DLQ e envia email**. São `SqsService` instances diferentes:
+
+```typescript
+constructor(
+  // ...
+  private sqsDLQService: SqsService,    // → DLQ
+  private sqsEmailService: SqsService,  // → Fila de email separada
+  private sqsService: SqsService        // → Fila principal (para delete)
+)
+```
+
+Se a StateMachine TAMBÉM dispara email ao ler da DLQ, o squad pode estar recebendo **dois emails por falha** hoje. Precisa confirmar.
+
+### Erro 4: Subestimou o valor do enrichment
+
+O código atual enriquece a mensagem antes de enviar para DLQ:
+```typescript
+body.error = classifiedError.message;
+body.errorType = classifiedError.type;
+```
+
+Com DLQ nativa, a mensagem chega exatamente como saiu da fila principal — sem contexto de erro no body. O Claude Code mencionou "precisa log separado" mas não dimensionou o impacto: **a squad hoje lê o erro diretamente da mensagem na DLQ**. Se mudar para logs, precisa ensinar CloudWatch Logs Insights à equipe.
+
+---
+
+## Minha avaliação: A correção está certa, mas a execução precisa de mais cuidado
+
+A direção do Claude Code está correta: usar `RedrivePolicy` nativo é a solução certa para o objetivo do spike. Mas a implementação precisa endereçar:
+
+| Item | Ação necessária |
+|------|----------------|
+| `throw` após delete | Remover as 3 linhas manuais, manter só o throw |
+| Email duplicado? | Verificar se StateMachine + sqsEmailService causam 2 notificações |
+| batchSize | Confirmar que está em 1 (JIRA diz que já foi 10 e causou incidente) |
+| Enrichment perdido | Aceitar trade-off: log estruturado substitui body enriquecido |
+| `maxReceiveCount` | Verificar se "10 tentativas" do JIRA é interno ao código ou SQS |
+| StateMachine na DLQ | Se ela deleta mensagens após email, não sobra nada para redrive |
+
+**O último ponto é o mais crítico.** Se a StateMachine consome e deleta da DLQ (comportamento padrão de SQS Lambda trigger), mesmo com RedrivePolicy nativa, não vai ter mensagem para fazer redrive. Esse ponto o Claude Code não pegou de forma alguma.

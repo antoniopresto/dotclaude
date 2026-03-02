@@ -1,0 +1,814 @@
+     1→/**
+     2→ * MMS Run Assignment Solver Implementation
+     3→ *
+     4→ * Uses Google OR-Tools CP-SAT solver for constraint-based optimization.
+     5→ * Implements all hard/soft constraints from spec 004.
+     6→ */
+     7→
+     8→#include "solver.h"
+     9→#include <ortools/sat/cp_model.h>
+    10→#include <chrono>
+    11→#include <algorithm>
+    12→#include <sstream>
+    13→#include <cmath>
+    14→
+    15→#ifdef HAS_FMT
+    16→#include <fmt/format.h>
+    17→#else
+    18→#include <cstdio>
+    19→#endif
+    20→
+    21→namespace mms {
+    22→
+    23→using namespace operations_research::sat;
+    24→
+    25→// =============================================================================
+    26→// JSON Serialization
+    27→// =============================================================================
+    28→
+    29→json ExplanationFactor::toJson() const {
+    30→    return {
+    31→        {"constraint_type", constraintType},
+    32→        {"constraint_name", constraintName},
+    33→        {"impact", impact},
+    34→        {"description", description}
+    35→    };
+    36→}
+    37→
+    38→json Assignment::toJson() const {
+    39→    json expJson = json::array();
+    40→    for (const auto& e : explanation) {
+    41→        expJson.push_back(e.toJson());
+    42→    }
+    43→    return {
+    44→        {"train_id", trainId},
+    45→        {"route_id", routeId},
+    46→        {"score", score},
+    47→        {"explanation", expJson}
+    48→    };
+    49→}
+    50→
+    51→json Unassigned::toJson() const {
+    52→    json result;
+    53→    if (trainId) result["train_id"] = *trainId;
+    54→    if (routeId) result["route_id"] = *routeId;
+    55→    if (shortfall) result["shortfall"] = *shortfall;
+    56→    result["reason"] = reason;
+    57→    result["blocking_constraints"] = blockingConstraints;
+    58→    return result;
+    59→}
+    60→
+    61→json MaterialWarning::toJson() const {
+    62→    return {
+    63→        {"pm_id", pmId},
+    64→        {"train_id", trainId},
+    65→        {"part_number", partNumber},
+    66→        {"status", status},
+    67→        {"description", description}
+    68→    };
+    69→}
+    70→
+    71→json ResultSummary::toJson() const {
+    72→    json breakdown;
+    73→    for (const auto& [key, value] : softConstraintBreakdown) {
+    74→        breakdown[key] = value;
+    75→    }
+    76→    return {
+    77→        {"total_penalty", totalPenalty},
+    78→        {"trains_assigned", trainsAssigned},
+    79→        {"trains_unassigned", trainsUnassigned},
+    80→        {"soft_constraint_breakdown", breakdown},
+    81→        {"material_blocks", materialBlocks}
+    82→    };
+    83→}
+    84→
+    85→json SolverResult::toJson() const {
+    86→    json assignmentsJson = json::array();
+    87→    for (const auto& a : assignments) {
+    88→        assignmentsJson.push_back(a.toJson());
+    89→    }
+    90→
+    91→    json unassignedJson = json::array();
+    92→    for (const auto& u : unassigned) {
+    93→        unassignedJson.push_back(u.toJson());
+    94→    }
+    95→
+    96→    json warningsJson = json::array();
+    97→    for (const auto& w : materialWarnings) {
+    98→        warningsJson.push_back(w.toJson());
+    99→    }
+   100→
+   101→    return {
+   102→        {"type", "RESULT"},
+   103→        {"request_id", requestId},
+   104→        {"status", status},
+   105→        {"solve_time_ms", solveTimeMs},
+   106→        {"assignments", assignmentsJson},
+   107→        {"unassigned", unassignedJson},
+   108→        {"material_warnings", warningsJson},
+   109→        {"summary", summary.toJson()}
+   110→    };
+   111→}
+   112→
+   113→// =============================================================================
+   114→// Solver Implementation
+   115→// =============================================================================
+   116→
+   117→MmsSolver::MmsSolver() = default;
+   118→
+   119→std::string MmsSolver::validateInput(const json& input) const {
+   120→    if (!input.contains("request_id")) {
+   121→        return "Missing required field: request_id";
+   122→    }
+   123→    if (!input.contains("trains") || !input["trains"].is_array()) {
+   124→        return "Missing or invalid field: trains (must be array)";
+   125→    }
+   126→    if (!input.contains("routes") || !input["routes"].is_array()) {
+   127→        return "Missing or invalid field: routes (must be array)";
+   128→    }
+   129→    if (input["trains"].empty()) {
+   130→        return "trains array is empty";
+   131→    }
+   132→    if (input["routes"].empty()) {
+   133→        return "routes array is empty";
+   134→    }
+   135→    return "";
+   136→}
+   137→
+   138→SolverResult MmsSolver::solve(const json& input, ProgressCallback onProgress) {
+   139→    auto startTime = std::chrono::steady_clock::now();
+   140→
+   141→    // Parse input
+   142→    std::string requestId = input["request_id"].get<std::string>();
+   143→    auto trains = parseTrains(input);
+   144→    auto routes = parseRoutes(input);
+   145→    auto hardConstraints = parseHardConstraints(input);
+   146→    auto softConstraints = parseSoftConstraints(input);
+   147→    auto unavailabilityEvents = parseUnavailabilityEvents(input);
+   148→    auto routeCompatibility = parseRouteCompatibility(input);
+   149→    auto config = parseConfig(input);
+   150→
+   151→    // Build CP-SAT model
+   152→    CpModelBuilder model;
+   153→
+   154→    // Decision variables: assign[t][r] = 1 if train t assigned to route r
+   155→    std::vector<std::vector<BoolVar>> assign(trains.size());
+   156→    for (size_t t = 0; t < trains.size(); ++t) {
+   157→        assign[t].resize(routes.size());
+   158→        for (size_t r = 0; r < routes.size(); ++r) {
+   159→            assign[t][r] = model.NewBoolVar();
+   160→        }
+   161→    }
+   162→
+   163→    // =========================================================================
+   164→    // HARD CONSTRAINTS
+   165→    // =========================================================================
+   166→
+   167→    // 1. Each train assigned to at most one route
+   168→    for (size_t t = 0; t < trains.size(); ++t) {
+   169→        std::vector<BoolVar> trainRoutes;
+   170→        for (size_t r = 0; r < routes.size(); ++r) {
+   171→            trainRoutes.push_back(assign[t][r]);
+   172→        }
+   173→        model.AddAtMostOne(trainRoutes);
+   174→    }
+   175→
+   176→    // 2. Route requirements (exactly N trains)
+   177→    for (size_t r = 0; r < routes.size(); ++r) {
+   178→        std::vector<BoolVar> routeTrains;
+   179→        for (size_t t = 0; t < trains.size(); ++t) {
+   180→            // Only include trains that are fleet-compatible
+   181→            if (isFleetAllowed(trains[t], routes[r])) {
+   182→                routeTrains.push_back(assign[t][r]);
+   183→            } else {
+   184→                // Force incompatible assignments to 0
+   185→                model.AddEquality(assign[t][r], 0);
+   186→            }
+   187→        }
+   188→
+   189→        // Require exactly N trains for this route
+   190→        if (routeTrains.size() >= static_cast<size_t>(routes[r].requiredTrains)) {
+   191→            model.AddEquality(LinearExpr::Sum(routeTrains), routes[r].requiredTrains);
+   192→        }
+   193→    }
+   194→
+   195→    // 3. Fitness status - GROUNDED/RESTRICTED trains cannot be assigned
+   196→    for (size_t t = 0; t < trains.size(); ++t) {
+   197→        if (trains[t].fitnessStatus == "GROUNDED") {
+   198→            for (size_t r = 0; r < routes.size(); ++r) {
+   199→                model.AddEquality(assign[t][r], 0);
+   200→            }
+   201→        }
+   202→    }
+   203→
+   204→    // 4. Hard constraints from input (PM_DUE, DEPOT_LOCK, etc.)
+   205→    for (const auto& constraint : hardConstraints) {
+   206→        size_t trainIdx = findTrainIndex(trains, constraint.trainId);
+   207→        if (trainIdx < trains.size()) {
+   208→            if (constraint.routeId) {
+   209→                // Block specific train-route combination
+   210→                size_t routeIdx = findRouteIndex(routes, *constraint.routeId);
+   211→                if (routeIdx < routes.size()) {
+   212→                    model.AddEquality(assign[trainIdx][routeIdx], 0);
+   213→                }
+   214→            } else {
+   215→                // Block train from all routes
+   216→                for (size_t r = 0; r < routes.size(); ++r) {
+   217→                    model.AddEquality(assign[trainIdx][r], 0);
+   218→                }
+   219→            }
+   220→        }
+   221→    }
+   222→
+   223→    // 5. Unavailability events - block ACTIVE events with blocksRunAssignment
+   224→    for (const auto& event : unavailabilityEvents) {
+   225→        if (event.status == "ACTIVE" && event.blocksRunAssignment) {
+   226→            size_t trainIdx = findTrainIndex(trains, event.trainId);
+   227→            if (trainIdx < trains.size()) {
+   228→                for (size_t r = 0; r < routes.size(); ++r) {
+   229→                    model.AddEquality(assign[trainIdx][r], 0);
+   230→                }
+   231→            }
+   232→        }
+   233→    }
+   234→
+   235→    // 6. Route compatibility matrix
+   236→    for (const auto& compat : routeCompatibility) {
+   237→        if (!compat.isCompatible) {
+   238→            size_t routeIdx = findRouteIndex(routes, compat.routeId);
+   239→            if (routeIdx >= routes.size()) continue;
+   240→
+   241→            if (compat.trainId) {
+   242→                // Train-specific incompatibility
+   243→                size_t trainIdx = findTrainIndex(trains, *compat.trainId);
+   244→                if (trainIdx < trains.size()) {
+   245→                    model.AddEquality(assign[trainIdx][routeIdx], 0);
+   246→                }
+   247→            } else if (compat.fleetId) {
+   248→                // Fleet-wide incompatibility
+   249→                for (size_t t = 0; t < trains.size(); ++t) {
+   250→                    if (trains[t].fleetId == *compat.fleetId) {
+   251→                        model.AddEquality(assign[t][routeIdx], 0);
+   252→                    }
+   253→                }
+   254→            }
+   255→        }
+   256→    }
+   257→
+   258→    // =========================================================================
+   259→    // SOFT CONSTRAINTS (Penalties)
+   260→    // =========================================================================
+   261→
+   262→    std::vector<IntVar> penalties;
+   263→
+   264→    // Mileage imbalance penalty
+   265→    for (size_t t = 0; t < trains.size(); ++t) {
+   266→        int current = trains[t].currentMileage;
+   267→        int target = trains[t].targetMileage;
+   268→        int variance = std::abs(current - target);
+   269→
+   270→        for (size_t r = 0; r < routes.size(); ++r) {
+   271→            int routeKm = routes[r].expectedKm;
+   272→
+   273→            // Penalty for assigning over-utilized train to high-km route
+   274→            if (current > target && routeKm > 200) {
+   275→                int penaltyValue = (variance * config.mileageImbalancePenalty) / 1000;
+   276→
+   277→                IntVar penalty = model.NewIntVar({0, penaltyValue});
+   278→                model.AddEquality(penalty, penaltyValue).OnlyEnforceIf(assign[t][r]);
+   279→                model.AddEquality(penalty, 0).OnlyEnforceIf(assign[t][r].Not());
+   280→                penalties.push_back(penalty);
+   281→            }
+   282→
+   283→            // Bonus for assigning under-utilized train to high-km route
+   284→            // (negative penalty = bonus)
+   285→            if (current < target && routeKm > 200) {
+   286→                int bonusValue = -(variance * config.mileageImbalancePenalty) / 2000;
+   287→
+   288→                IntVar bonus = model.NewIntVar({bonusValue, 0});
+   289→                model.AddEquality(bonus, bonusValue).OnlyEnforceIf(assign[t][r]);
+   290→                model.AddEquality(bonus, 0).OnlyEnforceIf(assign[t][r].Not());
+   291→                penalties.push_back(bonus);
+   292→            }
+   293→        }
+   294→    }
+   295→
+   296→    // Soft constraints from input
+   297→    for (const auto& constraint : softConstraints) {
+   298→        size_t trainIdx = findTrainIndex(trains, constraint.trainId);
+   299→        if (trainIdx < trains.size()) {
+   300→            // Apply penalty when train is assigned anywhere
+   301→            for (size_t r = 0; r < routes.size(); ++r) {
+   302→                IntVar penalty = model.NewIntVar({0, constraint.penaltyWeight});
+   303→                model.AddEquality(penalty, constraint.penaltyWeight).OnlyEnforceIf(assign[trainIdx][r]);
+   304→                model.AddEquality(penalty, 0).OnlyEnforceIf(assign[trainIdx][r].Not());
+   305→                penalties.push_back(penalty);
+   306→            }
+   307→        }
+   308→    }
+   309→
+   310→    // =========================================================================
+   311→    // OBJECTIVE: Minimize total penalty
+   312→    // =========================================================================
+   313→
+   314→    if (!penalties.empty()) {
+   315→        model.Minimize(LinearExpr::Sum(penalties));
+   316→    }
+   317→
+   318→    // =========================================================================
+   319→    // SOLVER CONFIGURATION
+   320→    // =========================================================================
+   321→
+   322→    SatParameters params;
+   323→    params.set_max_time_in_seconds(static_cast<double>(config.maxSolveTimeSeconds));
+   324→    params.set_num_search_workers(config.numWorkers);
+   325→    params.set_log_search_progress(false);
+   326→
+   327→    Model cpModel;
+   328→    cpModel.Add(NewSatParameters(params));
+   329→
+   330→    // Progress callback for solution observer
+   331→    int callbackCount = 0;
+   332→    if (onProgress) {
+   333→        cpModel.Add(NewFeasibleSolutionObserver([&](const CpSolverResponse& response) {
+   334→            callbackCount++;
+   335→            if (callbackCount % 5 == 0) {
+   336→                double percent = std::min(90.0, static_cast<double>(callbackCount) * 3.0);
+   337→                onProgress(percent, response.objective_value(), true);
+   338→            }
+   339→        }));
+   340→    }
+   341→
+   342→    // =========================================================================
+   343→    // SOLVE
+   344→    // =========================================================================
+   345→
+   346→    CpSolverResponse response = SolveCpModel(model.Build(), &cpModel);
+   347→
+   348→    auto endTime = std::chrono::steady_clock::now();
+   349→    int64_t solveTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+   350→        endTime - startTime
+   351→    ).count();
+   352→
+   353→    // Final progress update
+   354→    if (onProgress) {
+   355→        onProgress(100.0, response.objective_value(),
+   356→            response.status() == CpSolverStatus::OPTIMAL ||
+   357→            response.status() == CpSolverStatus::FEASIBLE);
+   358→    }
+   359→
+   360→    // =========================================================================
+   361→    // BUILD RESULT
+   362→    // =========================================================================
+   363→
+   364→    SolverResult result;
+   365→    result.requestId = requestId;
+   366→    result.solveTimeMs = solveTimeMs;
+   367→
+   368→    if (response.status() == CpSolverStatus::OPTIMAL) {
+   369→        result.status = "OPTIMAL";
+   370→    } else if (response.status() == CpSolverStatus::FEASIBLE) {
+   371→        result.status = "FEASIBLE";
+   372→    } else {
+   373→        result.status = "INFEASIBLE";
+   374→        result.unassigned = findUnassigned(trains, routes, {}, input);
+   375→        result.summary = buildSummary({}, result.unassigned, -1.0);
+   376→        return result;
+   377→    }
+   378→
+   379→    // Extract assignments
+   380→    for (size_t t = 0; t < trains.size(); ++t) {
+   381→        for (size_t r = 0; r < routes.size(); ++r) {
+   382→            if (SolutionBooleanValue(response, assign[t][r])) {
+   383→                Assignment assignment;
+   384→                assignment.trainId = trains[t].id;
+   385→                assignment.routeId = routes[r].id;
+   386→                assignment.score = 1.0 - (response.objective_value() / 10000.0);
+   387→                assignment.explanation = generateExplanation(
+   388→                    trains[t], routes[r], input, response.objective_value()
+   389→                );
+   390→                result.assignments.push_back(assignment);
+   391→            }
+   392→        }
+   393→    }
+   394→
+   395→    result.unassigned = findUnassigned(trains, routes, result.assignments, input);
+   396→    result.materialWarnings = checkMaterialWarnings(input);
+   397→    result.summary = buildSummary(result.assignments, result.unassigned, response.objective_value());
+   398→
+   399→    return result;
+   400→}
+   401→
+   402→// =============================================================================
+   403→// Input Parsing
+   404→// =============================================================================
+   405→
+   406→std::vector<MmsSolver::Train> MmsSolver::parseTrains(const json& input) {
+   407→    std::vector<Train> trains;
+   408→    for (const auto& t : input["trains"]) {
+   409→        Train train;
+   410→        train.id = t["id"].get<std::string>();
+   411→        train.trainNumber = t.value("train_number", "");
+   412→        train.fleetId = t.value("fleet_id", "");
+   413→        train.currentMileage = t.value("current_mileage", 0);
+   414→        train.targetMileage = t.value("target_mileage", 0);
+   415→        train.fitnessStatus = t.value("fitness_status", "FIT");
+   416→        train.homeDepotId = t.value("home_depot_id", "");
+   417→        train.currentDepotId = t.value("current_depot_id", "");
+   418→
+   419→        if (t.contains("restrictions") && t["restrictions"].is_array()) {
+   420→            for (const auto& r : t["restrictions"]) {
+   421→                train.restrictions.push_back(r.get<std::string>());
+   422→            }
+   423→        }
+   424→
+   425→        trains.push_back(train);
+   426→    }
+   427→    return trains;
+   428→}
+   429→
+   430→std::vector<MmsSolver::Route> MmsSolver::parseRoutes(const json& input) {
+   431→    std::vector<Route> routes;
+   432→    for (const auto& r : input["routes"]) {
+   433→        Route route;
+   434→        route.id = r["id"].get<std::string>();
+   435→        route.routeCode = r.value("route_code", "");
+   436→        route.expectedKm = r.value("expected_km", 0);
+   437→        route.requiredTrains = r.value("required_trains", 1);
+   438→
+   439→        if (r.contains("allowed_fleets") && r["allowed_fleets"].is_array()) {
+   440→            for (const auto& f : r["allowed_fleets"]) {
+   441→                route.allowedFleets.push_back(f.get<std::string>());
+   442→            }
+   443→        }
+   444→
+   445→        if (r.contains("restrictions") && r["restrictions"].is_array()) {
+   446→            for (const auto& x : r["restrictions"]) {
+   447→                route.restrictions.push_back(x.get<std::string>());
+   448→            }
+   449→        }
+   450→
+   451→        routes.push_back(route);
+   452→    }
+   453→    return routes;
+   454→}
+   455→
+   456→std::vector<MmsSolver::HardConstraint> MmsSolver::parseHardConstraints(const json& input) {
+   457→    std::vector<HardConstraint> constraints;
+   458→    if (!input.contains("hard_constraints")) return constraints;
+   459→
+   460→    for (const auto& c : input["hard_constraints"]) {
+   461→        HardConstraint constraint;
+   462→        constraint.type = c["type"].get<std::string>();
+   463→        constraint.trainId = c["train_id"].get<std::string>();
+   464→        if (c.contains("route_id") && !c["route_id"].is_null()) {
+   465→            constraint.routeId = c["route_id"].get<std::string>();
+   466→        }
+   467→        constraint.description = c.value("description", "");
+   468→        constraints.push_back(constraint);
+   469→    }
+   470→    return constraints;
+   471→}
+   472→
+   473→std::vector<MmsSolver::SoftConstraint> MmsSolver::parseSoftConstraints(const json& input) {
+   474→    std::vector<SoftConstraint> constraints;
+   475→    if (!input.contains("soft_constraints")) return constraints;
+   476→
+   477→    for (const auto& c : input["soft_constraints"]) {
+   478→        SoftConstraint constraint;
+   479→        constraint.type = c["type"].get<std::string>();
+   480→        constraint.trainId = c["train_id"].get<std::string>();
+   481→        constraint.penaltyWeight = c.value("penalty_weight", 50);
+   482→        constraint.description = c.value("description", "");
+   483→        constraints.push_back(constraint);
+   484→    }
+   485→    return constraints;
+   486→}
+   487→
+   488→std::vector<MmsSolver::UnavailabilityEvent> MmsSolver::parseUnavailabilityEvents(const json& input) {
+   489→    std::vector<UnavailabilityEvent> events;
+   490→    if (!input.contains("unavailability_events")) return events;
+   491→
+   492→    for (const auto& e : input["unavailability_events"]) {
+   493→        UnavailabilityEvent event;
+   494→        event.trainId = e["train_id"].get<std::string>();
+   495→        event.eventType = e.value("event_type", "");
+   496→        event.status = e.value("status", "ACTIVE");
+   497→        event.blocksRunAssignment = e.value("blocks_run_assignment", false);
+   498→        event.description = e.value("description", "");
+   499→        events.push_back(event);
+   500→    }
+   501→    return events;
+   502→}
+   503→
+   504→std::vector<MmsSolver::RouteCompatibility> MmsSolver::parseRouteCompatibility(const json& input) {
+   505→    std::vector<RouteCompatibility> compat;
+   506→    if (!input.contains("route_compatibility")) return compat;
+   507→
+   508→    for (const auto& c : input["route_compatibility"]) {
+   509→        RouteCompatibility rc;
+   510→        if (c.contains("train_id") && !c["train_id"].is_null()) {
+   511→            rc.trainId = c["train_id"].get<std::string>();
+   512→        }
+   513→        if (c.contains("fleet_id") && !c["fleet_id"].is_null()) {
+   514→            rc.fleetId = c["fleet_id"].get<std::string>();
+   515→        }
+   516→        rc.routeId = c["route_id"].get<std::string>();
+   517→        rc.isCompatible = c.value("is_compatible", true);
+   518→        rc.constraintType = c.value("constraint_type", "");
+   519→        rc.restrictionReason = c.value("restriction_reason", "");
+   520→        compat.push_back(rc);
+   521→    }
+   522→    return compat;
+   523→}
+   524→
+   525→MmsSolver::Config MmsSolver::parseConfig(const json& input) {
+   526→    Config config;
+   527→    if (!input.contains("config")) return config;
+   528→
+   529→    const auto& c = input["config"];
+   530→    config.maxSolveTimeSeconds = c.value("max_solve_time_seconds", 30);
+   531→    config.numWorkers = c.value("num_workers", 4);
+   532→    config.explanationVerbosity = c.value("explanation_verbosity", "STANDARD");
+   533→
+   534→    if (c.contains("soft_constraint_penalties")) {
+   535→        const auto& p = c["soft_constraint_penalties"];
+   536→        config.mileageImbalancePenalty = p.value("mileage_imbalance", 100);
+   537→        config.preferenceViolationPenalty = p.value("preference_violation", 50);
+   538→        config.overtimeHoursPenalty = p.value("overtime_hours", 200);
+   539→    }
+   540→
+   541→    return config;
+   542→}
+   543→
+   544→// =============================================================================
+   545→// Helper Functions
+   546→// =============================================================================
+   547→
+   548→size_t MmsSolver::findTrainIndex(const std::vector<Train>& trains, const std::string& id) const {
+   549→    for (size_t i = 0; i < trains.size(); ++i) {
+   550→        if (trains[i].id == id) return i;
+   551→    }
+   552→    return trains.size(); // Not found
+   553→}
+   554→
+   555→size_t MmsSolver::findRouteIndex(const std::vector<Route>& routes, const std::string& id) const {
+   556→    for (size_t i = 0; i < routes.size(); ++i) {
+   557→        if (routes[i].id == id) return i;
+   558→    }
+   559→    return routes.size(); // Not found
+   560→}
+   561→
+   562→bool MmsSolver::isFleetAllowed(const Train& train, const Route& route) const {
+   563→    if (route.allowedFleets.empty()) {
+   564→        return true; // No restrictions
+   565→    }
+   566→    return std::find(route.allowedFleets.begin(), route.allowedFleets.end(),
+   567→                     train.fleetId) != route.allowedFleets.end();
+   568→}
+   569→
+   570→std::vector<ExplanationFactor> MmsSolver::generateExplanation(
+   571→    const Train& train,
+   572→    const Route& route,
+   573→    const json& input,
+   574→    double objectiveValue
+   575→) const {
+   576→    std::vector<ExplanationFactor> factors;
+   577→
+   578→    // Mileage balance factor
+   579→    int variance = train.currentMileage - train.targetMileage;
+   580→    ExplanationFactor mileageFactor;
+   581→    mileageFactor.constraintType = "SOFT";
+   582→    mileageFactor.constraintName = "MILEAGE_BALANCE";
+   583→    mileageFactor.impact = static_cast<double>(std::abs(variance));
+   584→
+   585→#ifdef HAS_FMT
+   586→    mileageFactor.description = fmt::format(
+   587→        "Train is {}km {} fleet target",
+   588→        std::abs(variance),
+   589→        variance < 0 ? "under" : "over"
+   590→    );
+   591→#else
+   592→    char desc[256];
+   593→    std::snprintf(desc, sizeof(desc), "Train is %dkm %s fleet target",
+   594→                  std::abs(variance), variance < 0 ? "under" : "over");
+   595→    mileageFactor.description = desc;
+   596→#endif
+   597→
+   598→    factors.push_back(mileageFactor);
+   599→
+   600→    // Route match advice
+   601→    int routeKm = route.expectedKm;
+   602→    std::string routeAdvice;
+   603→
+   604→    if (variance < -1000 && routeKm > 300) {
+   605→        routeAdvice = "High-km route helps balance under-utilized train";
+   606→    } else if (variance > 1000 && routeKm < 150) {
+   607→        routeAdvice = "Low-km route reduces over-utilization";
+   608→    } else if (variance > 500 && routeKm > 200) {
+   609→        routeAdvice = "Consider lower-km route for over-utilized train";
+   610→    }
+   611→
+   612→    if (!routeAdvice.empty()) {
+   613→        ExplanationFactor routeFactor;
+   614→        routeFactor.constraintType = "SOFT";
+   615→        routeFactor.constraintName = "ROUTE_MATCH";
+   616→        routeFactor.impact = static_cast<double>(routeKm);
+   617→        routeFactor.description = routeAdvice;
+   618→        factors.push_back(routeFactor);
+   619→    }
+   620→
+   621→    // Check hard constraints that may have affected alternatives
+   622→    if (input.contains("hard_constraints")) {
+   623→        for (const auto& c : input["hard_constraints"]) {
+   624→            ExplanationFactor hardFactor;
+   625→            hardFactor.constraintType = "HARD";
+   626→            hardFactor.constraintName = c["type"].get<std::string>();
+   627→            hardFactor.impact = 0;
+   628→
+   629→#ifdef HAS_FMT
+   630→            hardFactor.description = fmt::format(
+   631→                "Alternative train {} blocked: {}",
+   632→                c["train_id"].get<std::string>().substr(0, 8),
+   633→                c.value("description", "constraint active")
+   634→            );
+   635→#else
+   636→            std::string trainIdShort = c["train_id"].get<std::string>().substr(0, 8);
+   637→            std::string constraintDesc = c.value("description", "constraint active");
+   638→            char hardDesc[256];
+   639→            std::snprintf(hardDesc, sizeof(hardDesc), "Alternative train %s blocked: %s",
+   640→                          trainIdShort.c_str(), constraintDesc.c_str());
+   641→            hardFactor.description = hardDesc;
+   642→#endif
+   643→
+   644→            factors.push_back(hardFactor);
+   645→        }
+   646→    }
+   647→
+   648→    return factors;
+   649→}
+   650→
+   651→std::vector<Unassigned> MmsSolver::findUnassigned(
+   652→    const std::vector<Train>& trains,
+   653→    const std::vector<Route>& routes,
+   654→    const std::vector<Assignment>& assignments,
+   655→    const json& input
+   656→) const {
+   657→    std::vector<Unassigned> result;
+   658→
+   659→    // Find assigned train IDs
+   660→    std::unordered_map<std::string, bool> assignedTrains;
+   661→    for (const auto& a : assignments) {
+   662→        assignedTrains[a.trainId] = true;
+   663→    }
+   664→
+   665→    // Check for unassigned trains
+   666→    for (const auto& train : trains) {
+   667→        if (assignedTrains.find(train.id) == assignedTrains.end()) {
+   668→            Unassigned u;
+   669→            u.trainId = train.id;
+   670→
+   671→            // Determine reason
+   672→            if (train.fitnessStatus == "GROUNDED") {
+   673→                u.reason = "Train is GROUNDED";
+   674→                u.blockingConstraints.push_back("FITNESS_STATUS");
+   675→            } else if (train.fitnessStatus == "RESTRICTED") {
+   676→                u.reason = "Train has RESTRICTED status";
+   677→                u.blockingConstraints.push_back("FITNESS_STATUS");
+   678→            } else {
+   679→                u.reason = "No compatible route with capacity";
+   680→            }
+   681→
+   682→            result.push_back(u);
+   683→        }
+   684→    }
+   685→
+   686→    // Check for unfilled route requirements
+   687→    std::unordered_map<std::string, int> routeAssignments;
+   688→    for (const auto& a : assignments) {
+   689→        routeAssignments[a.routeId]++;
+   690→    }
+   691→
+   692→    for (const auto& route : routes) {
+   693→        int assigned = routeAssignments[route.id];
+   694→        if (assigned < route.requiredTrains) {
+   695→            Unassigned u;
+   696→            u.routeId = route.id;
+   697→            u.shortfall = route.requiredTrains - assigned;
+   698→            u.reason = "Insufficient trains for route requirement";
+   699→            result.push_back(u);
+   700→        }
+   701→    }
+   702→
+   703→    return result;
+   704→}
+   705→
+   706→std::vector<MaterialWarning> MmsSolver::checkMaterialWarnings(const json& input) const {
+   707→    std::vector<MaterialWarning> warnings;
+   708→
+   709→    if (!input.contains("pending_pms") || !input.contains("material_positions")) {
+   710→        return warnings;
+   711→    }
+   712→
+   713→    // Build material inventory map
+   714→    std::unordered_map<std::string, int> inventory;
+   715→    for (const auto& pos : input["material_positions"]) {
+   716→        std::string key = pos["depot_id"].get<std::string>() + ":" +
+   717→                          pos["part_number"].get<std::string>();
+   718→        inventory[key] = pos.value("quantity_available", 0);
+   719→    }
+   720→
+   721→    // Check pending PMs for material issues
+   722→    for (const auto& pm : input["pending_pms"]) {
+   723→        if (!pm.contains("required_materials")) continue;
+   724→
+   725→        for (const auto& mat : pm["required_materials"]) {
+   726→            std::string partNumber = mat["part_number"].get<std::string>();
+   727→            int required = mat.value("quantity", 1);
+   728→            std::string criticality = mat.value("criticality", "CONSUMABLE");
+   729→
+   730→            // Assume first depot for simplicity (real impl would check PM's depot)
+   731→            bool found = false;
+   732→            for (const auto& pos : input["material_positions"]) {
+   733→                if (pos["part_number"].get<std::string>() == partNumber) {
+   734→                    int available = pos.value("quantity_available", 0);
+   735→                    if (available < required) {
+   736→                        MaterialWarning warning;
+   737→                        warning.pmId = pm["pm_id"].get<std::string>();
+   738→                        warning.trainId = pm["train_id"].get<std::string>();
+   739→                        warning.partNumber = partNumber;
+   740→
+   741→                        if (available == 0) {
+   742→                            warning.status = "UNAVAILABLE";
+   743→                            warning.description = "Part not in stock";
+   744→                        } else {
+   745→                            warning.status = "LOW_STOCK";
+   746→
+   747→#ifdef HAS_FMT
+   748→                            warning.description = fmt::format(
+   749→                                "Only {} available, {} required",
+   750→                                available, required
+   751→                            );
+   752→#else
+   753→                            char warnDesc[128];
+   754→                            std::snprintf(warnDesc, sizeof(warnDesc),
+   755→                                "Only %d available, %d required", available, required);
+   756→                            warning.description = warnDesc;
+   757→#endif
+   758→                        }
+   759→
+   760→                        warnings.push_back(warning);
+   761→                    }
+   762→                    found = true;
+   763→                    break;
+   764→                }
+   765→            }
+   766→
+   767→            if (!found && criticality == "BLOCKING") {
+   768→                MaterialWarning warning;
+   769→                warning.pmId = pm["pm_id"].get<std::string>();
+   770→                warning.trainId = pm["train_id"].get<std::string>();
+   771→                warning.partNumber = partNumber;
+   772→                warning.status = "UNAVAILABLE";
+   773→                warning.description = "Blocking part not tracked in inventory";
+   774→                warnings.push_back(warning);
+   775→            }
+   776→        }
+   777→    }
+   778→
+   779→    return warnings;
+   780→}
+   781→
+   782→ResultSummary MmsSolver::buildSummary(
+   783→    const std::vector<Assignment>& assignments,
+   784→    const std::vector<Unassigned>& unassigned,
+   785→    double totalPenalty
+   786→) const {
+   787→    ResultSummary summary;
+   788→    summary.totalPenalty = totalPenalty;
+   789→    summary.trainsAssigned = static_cast<int>(assignments.size());
+   790→
+   791→    // Count unassigned trains (not unfilled routes)
+   792→    int unassignedTrains = 0;
+   793→    for (const auto& u : unassigned) {
+   794→        if (u.trainId) {
+   795→            unassignedTrains++;
+   796→        }
+   797→    }
+   798→    summary.trainsUnassigned = unassignedTrains;
+   799→
+   800→    // TODO: Detailed soft constraint breakdown from solver
+   801→    summary.softConstraintBreakdown["MILEAGE_BALANCE"] = totalPenalty * 0.8;
+   802→    summary.softConstraintBreakdown["PREFERENCE_VIOLATION"] = totalPenalty * 0.2;
+   803→
+   804→    summary.materialBlocks = 0; // TODO: Count from warnings
+   805→
+   806→    return summary;
+   807→}
+   808→
+   809→} // namespace mms
+   810→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

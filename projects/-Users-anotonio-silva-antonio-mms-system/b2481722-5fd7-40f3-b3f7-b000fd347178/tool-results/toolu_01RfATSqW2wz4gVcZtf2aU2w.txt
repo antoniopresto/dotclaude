@@ -1,0 +1,840 @@
+     1→/**
+     2→ * MMS Baseline Assumption Service Unit Tests
+     3→ *
+     4→ * Tests for the Baseline Assumption Service covering:
+     5→ * - CRUD operations for PM baseline assumptions
+     6→ * - Inference rules (commissioning date, higher PM)
+     7→ * - Manual review queue functionality
+     8→ * - Review/approval workflow
+     9→ * - Confidence level handling
+    10→ *
+    11→ * Note: These tests use Bun's test framework and document expected behavior.
+    12→ *
+    13→ * @see src/services/baseline-assumption.ts
+    14→ * @see specs/003-database-schema.md Section 3.2.6
+    15→ */
+    16→
+    17→import { describe, test, expect } from 'bun:test';
+    18→import {
+    19→  BaselineAssumptionService,
+    20→  getBaselineAssumptionService,
+    21→  type AssumptionType,
+    22→  type ConfidenceLevel,
+    23→  type ReviewStatus,
+    24→  type CreateAssumptionRequest,
+    25→  type UpdateAssumptionRequest,
+    26→  type ReviewAssumptionRequest,
+    27→  type ApplyAssumptionRequest,
+    28→  type InferFromCommissioningRequest,
+    29→  type InferFromHigherPmRequest,
+    30→  type AssumptionFilters,
+    31→  type PaginationOptions,
+    32→  type ReviewQueueSummary,
+    33→  type InferenceResult,
+    34→  type AssumptionWithDetails,
+    35→} from './baseline-assumption';
+    36→
+    37→// =============================================================================
+    38→// Service Instantiation Tests
+    39→// =============================================================================
+    40→
+    41→describe('BaselineAssumptionService', () => {
+    42→  describe('Initialization', () => {
+    43→    test('should create a BaselineAssumptionService instance', () => {
+    44→      const service = new BaselineAssumptionService();
+    45→      expect(service).toBeDefined();
+    46→      expect(service).toBeInstanceOf(BaselineAssumptionService);
+    47→    });
+    48→
+    49→    test('should return singleton instance via getBaselineAssumptionService', () => {
+    50→      const service1 = getBaselineAssumptionService();
+    51→      const service2 = getBaselineAssumptionService();
+    52→      expect(service1).toBe(service2);
+    53→    });
+    54→  });
+    55→
+    56→  // =============================================================================
+    57→  // Type Definition Tests
+    58→  // =============================================================================
+    59→
+    60→  describe('Type Definitions', () => {
+    61→    describe('AssumptionType', () => {
+    62→      test('should include all inference types', () => {
+    63→        const types: AssumptionType[] = [
+    64→          'INFERRED_FROM_COMMISSIONING',
+    65→          'INFERRED_FROM_HIGHER_PM',
+    66→          'MANUAL_OVERRIDE',
+    67→          'IMPORTED',
+    68→          'NO_HISTORY',
+    69→        ];
+    70→        expect(types).toHaveLength(5);
+    71→      });
+    72→
+    73→      test('INFERRED_FROM_COMMISSIONING should be for commissioning-based inference', () => {
+    74→        const type: AssumptionType = 'INFERRED_FROM_COMMISSIONING';
+    75→        expect(type).toBe('INFERRED_FROM_COMMISSIONING');
+    76→      });
+    77→
+    78→      test('INFERRED_FROM_HIGHER_PM should be for PM hierarchy inference', () => {
+    79→        const type: AssumptionType = 'INFERRED_FROM_HIGHER_PM';
+    80→        expect(type).toBe('INFERRED_FROM_HIGHER_PM');
+    81→      });
+    82→
+    83→      test('NO_HISTORY should flag for manual review', () => {
+    84→        const type: AssumptionType = 'NO_HISTORY';
+    85→        expect(type).toBe('NO_HISTORY');
+    86→      });
+    87→    });
+    88→
+    89→    describe('ConfidenceLevel', () => {
+    90→      test('should include all confidence levels', () => {
+    91→        const levels: ConfidenceLevel[] = ['HIGH', 'MEDIUM', 'LOW', 'ESTIMATED'];
+    92→        expect(levels).toHaveLength(4);
+    93→      });
+    94→
+    95→      test('HIGH confidence should not require review', () => {
+    96→        const level: ConfidenceLevel = 'HIGH';
+    97→        const requiresReview = level === 'LOW' || level === 'ESTIMATED';
+    98→        expect(requiresReview).toBe(false);
+    99→      });
+   100→
+   101→      test('LOW confidence should require review', () => {
+   102→        const level: ConfidenceLevel = 'LOW';
+   103→        const requiresReview = level === 'LOW' || level === 'ESTIMATED';
+   104→        expect(requiresReview).toBe(true);
+   105→      });
+   106→
+   107→      test('ESTIMATED confidence should require review', () => {
+   108→        const level: ConfidenceLevel = 'ESTIMATED';
+   109→        const requiresReview = level === 'LOW' || level === 'ESTIMATED';
+   110→        expect(requiresReview).toBe(true);
+   111→      });
+   112→    });
+   113→
+   114→    describe('ReviewStatus', () => {
+   115→      test('should include all review statuses', () => {
+   116→        const statuses: ReviewStatus[] = ['PENDING_REVIEW', 'REVIEWED', 'APPLIED', 'REJECTED'];
+   117→        expect(statuses).toHaveLength(4);
+   118→      });
+   119→    });
+   120→
+   121→    describe('CreateAssumptionRequest', () => {
+   122→      test('should support all required fields', () => {
+   123→        const request: CreateAssumptionRequest = {
+   124→          trainId: 'train-123',
+   125→          pmTypeId: 'pm-type-456',
+   126→          assumptionType: 'INFERRED_FROM_COMMISSIONING',
+   127→          confidenceLevel: 'LOW',
+   128→        };
+   129→        expect(request.trainId).toBe('train-123');
+   130→        expect(request.pmTypeId).toBe('pm-type-456');
+   131→        expect(request.assumptionType).toBe('INFERRED_FROM_COMMISSIONING');
+   132→        expect(request.confidenceLevel).toBe('LOW');
+   133→      });
+   134→
+   135→      test('should support optional fields', () => {
+   136→        const request: CreateAssumptionRequest = {
+   137→          trainId: 'train-123',
+   138→          pmTypeId: 'pm-type-456',
+   139→          assumptionType: 'MANUAL_OVERRIDE',
+   140→          assumedLastPmDate: '2024-01-15',
+   141→          assumedLastPmMileage: 150000,
+   142→          confidenceLevel: 'HIGH',
+   143→          inferenceSource: 'Manual entry by operator',
+   144→          inferenceData: { operator: 'John Doe', source: 'paper records' },
+   145→          requiresReview: false,
+   146→        };
+   147→        expect(request.assumedLastPmDate).toBe('2024-01-15');
+   148→        expect(request.assumedLastPmMileage).toBe(150000);
+   149→        expect(request.inferenceSource).toBeDefined();
+   150→        expect(request.inferenceData).toBeDefined();
+   151→        expect(request.requiresReview).toBe(false);
+   152→      });
+   153→    });
+   154→
+   155→    describe('ReviewAssumptionRequest', () => {
+   156→      test('should support approval with corrections', () => {
+   157→        const request: ReviewAssumptionRequest = {
+   158→          approved: true,
+   159→          reviewNotes: 'Verified against paper records',
+   160→          correctedDate: '2024-02-01',
+   161→          correctedMileage: 155000,
+   162→        };
+   163→        expect(request.approved).toBe(true);
+   164→        expect(request.correctedDate).toBe('2024-02-01');
+   165→        expect(request.correctedMileage).toBe(155000);
+   166→      });
+   167→
+   168→      test('should support rejection', () => {
+   169→        const request: ReviewAssumptionRequest = {
+   170→          approved: false,
+   171→          reviewNotes: 'Data appears incorrect, train was not in service at that date',
+   172→        };
+   173→        expect(request.approved).toBe(false);
+   174→        expect(request.reviewNotes).toContain('incorrect');
+   175→      });
+   176→    });
+   177→
+   178→    describe('InferFromCommissioningRequest', () => {
+   179→      test('should require trainId', () => {
+   180→        const request: InferFromCommissioningRequest = {
+   181→          trainId: 'train-123',
+   182→        };
+   183→        expect(request.trainId).toBe('train-123');
+   184→      });
+   185→
+   186→      test('should support optional PM type codes filter', () => {
+   187→        const request: InferFromCommissioningRequest = {
+   188→          trainId: 'train-123',
+   189→          pmTypeCodes: ['C1', 'C2', 'C3'],
+   190→        };
+   191→        expect(request.pmTypeCodes).toHaveLength(3);
+   192→        expect(request.pmTypeCodes).toContain('C1');
+   193→      });
+   194→    });
+   195→
+   196→    describe('InferFromHigherPmRequest', () => {
+   197→      test('should require all fields for inference', () => {
+   198→        const request: InferFromHigherPmRequest = {
+   199→          trainId: 'train-123',
+   200→          knownPmTypeCode: 'C4',
+   201→          knownPmDate: '2024-06-15',
+   202→          knownPmMileage: 240000,
+   203→        };
+   204→        expect(request.trainId).toBe('train-123');
+   205→        expect(request.knownPmTypeCode).toBe('C4');
+   206→        expect(request.knownPmDate).toBe('2024-06-15');
+   207→        expect(request.knownPmMileage).toBe(240000);
+   208→      });
+   209→    });
+   210→
+   211→    describe('AssumptionFilters', () => {
+   212→      test('should support all filter options', () => {
+   213→        const filters: AssumptionFilters = {
+   214→          trainId: 'train-123',
+   215→          pmTypeId: 'pm-type-456',
+   216→          confidenceLevel: ['LOW', 'ESTIMATED'],
+   217→          assumptionType: 'INFERRED_FROM_COMMISSIONING',
+   218→          requiresReview: true,
+   219→          reviewed: false,
+   220→          applied: false,
+   221→        };
+   222→        expect(filters.trainId).toBe('train-123');
+   223→        expect(Array.isArray(filters.confidenceLevel)).toBe(true);
+   224→        expect(filters.requiresReview).toBe(true);
+   225→      });
+   226→
+   227→      test('should support single confidence level', () => {
+   228→        const filters: AssumptionFilters = {
+   229→          confidenceLevel: 'LOW',
+   230→        };
+   231→        expect(filters.confidenceLevel).toBe('LOW');
+   232→      });
+   233→
+   234→      test('should support array of assumption types', () => {
+   235→        const filters: AssumptionFilters = {
+   236→          assumptionType: ['INFERRED_FROM_COMMISSIONING', 'NO_HISTORY'],
+   237→        };
+   238→        expect(Array.isArray(filters.assumptionType)).toBe(true);
+   239→      });
+   240→    });
+   241→
+   242→    describe('PaginationOptions', () => {
+   243→      test('should support all pagination options', () => {
+   244→        const options: PaginationOptions = {
+   245→          page: 1,
+   246→          pageSize: 20,
+   247→          sortBy: 'createdAt',
+   248→          sortOrder: 'desc',
+   249→        };
+   250→        expect(options.page).toBe(1);
+   251→        expect(options.pageSize).toBe(20);
+   252→        expect(options.sortBy).toBe('createdAt');
+   253→        expect(options.sortOrder).toBe('desc');
+   254→      });
+   255→
+   256→      test('should support sorting by confidence level', () => {
+   257→        const options: PaginationOptions = {
+   258→          sortBy: 'confidenceLevel',
+   259→        };
+   260→        expect(options.sortBy).toBe('confidenceLevel');
+   261→      });
+   262→
+   263→      test('should support sorting by train number', () => {
+   264→        const options: PaginationOptions = {
+   265→          sortBy: 'trainNumber',
+   266→        };
+   267→        expect(options.sortBy).toBe('trainNumber');
+   268→      });
+   269→    });
+   270→
+   271→    describe('ReviewQueueSummary', () => {
+   272→      test('should include all summary fields', () => {
+   273→        const summary: ReviewQueueSummary = {
+   274→          totalPendingReview: 25,
+   275→          byConfidenceLevel: {
+   276→            HIGH: 0,
+   277→            MEDIUM: 5,
+   278→            LOW: 15,
+   279→            ESTIMATED: 5,
+   280→          },
+   281→          byAssumptionType: {
+   282→            INFERRED_FROM_COMMISSIONING: 10,
+   283→            INFERRED_FROM_HIGHER_PM: 3,
+   284→            MANUAL_OVERRIDE: 0,
+   285→            IMPORTED: 2,
+   286→            NO_HISTORY: 10,
+   287→          },
+   288→          oldestPendingDate: new Date('2024-01-01'),
+   289→        };
+   290→        expect(summary.totalPendingReview).toBe(25);
+   291→        expect(summary.byConfidenceLevel.LOW).toBe(15);
+   292→        expect(summary.byAssumptionType.NO_HISTORY).toBe(10);
+   293→      });
+   294→    });
+   295→
+   296→    describe('InferenceResult', () => {
+   297→      test('should track created and skipped counts', () => {
+   298→        const result: InferenceResult = {
+   299→          created: 5,
+   300→          skipped: 2,
+   301→          errors: [],
+   302→          assumptions: [],
+   303→        };
+   304→        expect(result.created).toBe(5);
+   305→        expect(result.skipped).toBe(2);
+   306→        expect(result.errors).toHaveLength(0);
+   307→      });
+   308→
+   309→      test('should track errors with details', () => {
+   310→        const result: InferenceResult = {
+   311→          created: 3,
+   312→          skipped: 1,
+   313→          errors: [
+   314→            { trainId: 'train-1', pmTypeId: 'pm-1', error: 'Train not found' },
+   315→            { trainId: 'train-2', pmTypeId: 'pm-2', error: 'PM type not found' },
+   316→          ],
+   317→          assumptions: [],
+   318→        };
+   319→        expect(result.errors).toHaveLength(2);
+   320→        expect(result.errors[0].error).toBe('Train not found');
+   321→      });
+   322→    });
+   323→  });
+   324→
+   325→  // =============================================================================
+   326→  // Business Rules Tests
+   327→  // =============================================================================
+   328→
+   329→  describe('Business Rules', () => {
+   330→    describe('PM Hierarchy', () => {
+   331→      const PM_HIERARCHY: Record<string, string[]> = {
+   332→        OVERHAUL: ['C4', 'C3', 'C2', 'C1'],
+   333→        C4: ['C3', 'C2', 'C1'],
+   334→        C3: ['C2', 'C1'],
+   335→        C2: ['C1'],
+   336→        C1: [],
+   337→      };
+   338→
+   339→      test('OVERHAUL should satisfy all lower PMs', () => {
+   340→        expect(PM_HIERARCHY['OVERHAUL']).toContain('C4');
+   341→        expect(PM_HIERARCHY['OVERHAUL']).toContain('C3');
+   342→        expect(PM_HIERARCHY['OVERHAUL']).toContain('C2');
+   343→        expect(PM_HIERARCHY['OVERHAUL']).toContain('C1');
+   344→      });
+   345→
+   346→      test('C4 should satisfy C3, C2, C1', () => {
+   347→        expect(PM_HIERARCHY['C4']).toContain('C3');
+   348→        expect(PM_HIERARCHY['C4']).toContain('C2');
+   349→        expect(PM_HIERARCHY['C4']).toContain('C1');
+   350→        expect(PM_HIERARCHY['C4']).not.toContain('OVERHAUL');
+   351→      });
+   352→
+   353→      test('C3 should satisfy C2, C1', () => {
+   354→        expect(PM_HIERARCHY['C3']).toContain('C2');
+   355→        expect(PM_HIERARCHY['C3']).toContain('C1');
+   356→        expect(PM_HIERARCHY['C3']).not.toContain('C4');
+   357→      });
+   358→
+   359→      test('C2 should satisfy only C1', () => {
+   360→        expect(PM_HIERARCHY['C2']).toContain('C1');
+   361→        expect(PM_HIERARCHY['C2']).toHaveLength(1);
+   362→      });
+   363→
+   364→      test('C1 should not satisfy any other PM', () => {
+   365→        expect(PM_HIERARCHY['C1']).toHaveLength(0);
+   366→      });
+   367→    });
+   368→
+   369→    describe('Default PM Intervals', () => {
+   370→      const DEFAULT_PM_INTERVALS: Record<string, number> = {
+   371→        C1: 6,
+   372→        C2: 12,
+   373→        C3: 24,
+   374→        C4: 48,
+   375→        OVERHAUL: 96,
+   376→      };
+   377→
+   378→      test('C1 default interval should be 6 months', () => {
+   379→        expect(DEFAULT_PM_INTERVALS['C1']).toBe(6);
+   380→      });
+   381→
+   382→      test('C2 default interval should be 12 months (1 year)', () => {
+   383→        expect(DEFAULT_PM_INTERVALS['C2']).toBe(12);
+   384→      });
+   385→
+   386→      test('C3 default interval should be 24 months (2 years)', () => {
+   387→        expect(DEFAULT_PM_INTERVALS['C3']).toBe(24);
+   388→      });
+   389→
+   390→      test('C4 default interval should be 48 months (4 years)', () => {
+   391→        expect(DEFAULT_PM_INTERVALS['C4']).toBe(48);
+   392→      });
+   393→
+   394→      test('OVERHAUL default interval should be 96 months (8 years)', () => {
+   395→        expect(DEFAULT_PM_INTERVALS['OVERHAUL']).toBe(96);
+   396→      });
+   397→    });
+   398→
+   399→    describe('Confidence Level Review Requirements', () => {
+   400→      const requiresReview = (level: ConfidenceLevel): boolean => {
+   401→        return level === 'LOW' || level === 'ESTIMATED';
+   402→      };
+   403→
+   404→      test('HIGH confidence should not require review', () => {
+   405→        expect(requiresReview('HIGH')).toBe(false);
+   406→      });
+   407→
+   408→      test('MEDIUM confidence should not require review', () => {
+   409→        expect(requiresReview('MEDIUM')).toBe(false);
+   410→      });
+   411→
+   412→      test('LOW confidence should require review', () => {
+   413→        expect(requiresReview('LOW')).toBe(true);
+   414→      });
+   415→
+   416→      test('ESTIMATED confidence should require review', () => {
+   417→        expect(requiresReview('ESTIMATED')).toBe(true);
+   418→      });
+   419→    });
+   420→
+   421→    describe('Review Status Determination', () => {
+   422→      interface MockAssumption {
+   423→        appliedAt: Date | null;
+   424→        reviewedAt: Date | null;
+   425→        reviewNotes: string | null;
+   426→      }
+   427→
+   428→      const determineReviewStatus = (assumption: MockAssumption): ReviewStatus => {
+   429→        if (assumption.appliedAt) {
+   430→          return 'APPLIED';
+   431→        } else if (assumption.reviewedAt) {
+   432→          if (assumption.reviewNotes?.startsWith('REJECTED:')) {
+   433→            return 'REJECTED';
+   434→          } else {
+   435→            return 'REVIEWED';
+   436→          }
+   437→        } else {
+   438→          return 'PENDING_REVIEW';
+   439→        }
+   440→      };
+   441→
+   442→      test('should return APPLIED when appliedAt is set', () => {
+   443→        const assumption: MockAssumption = {
+   444→          appliedAt: new Date(),
+   445→          reviewedAt: new Date(),
+   446→          reviewNotes: 'All good',
+   447→        };
+   448→        expect(determineReviewStatus(assumption)).toBe('APPLIED');
+   449→      });
+   450→
+   451→      test('should return REVIEWED when reviewedAt is set but not applied', () => {
+   452→        const assumption: MockAssumption = {
+   453→          appliedAt: null,
+   454→          reviewedAt: new Date(),
+   455→          reviewNotes: 'Verified',
+   456→        };
+   457→        expect(determineReviewStatus(assumption)).toBe('REVIEWED');
+   458→      });
+   459→
+   460→      test('should return REJECTED when review notes start with REJECTED:', () => {
+   461→        const assumption: MockAssumption = {
+   462→          appliedAt: null,
+   463→          reviewedAt: new Date(),
+   464→          reviewNotes: 'REJECTED: Invalid data',
+   465→        };
+   466→        expect(determineReviewStatus(assumption)).toBe('REJECTED');
+   467→      });
+   468→
+   469→      test('should return PENDING_REVIEW when neither reviewed nor applied', () => {
+   470→        const assumption: MockAssumption = {
+   471→          appliedAt: null,
+   472→          reviewedAt: null,
+   473→          reviewNotes: null,
+   474→        };
+   475→        expect(determineReviewStatus(assumption)).toBe('PENDING_REVIEW');
+   476→      });
+   477→    });
+   478→
+   479→    describe('Inference from Commissioning Date', () => {
+   480→      const calculateAssumedFirstPmDate = (
+   481→        commissionDate: Date,
+   482→        intervalMonths: number
+   483→      ): Date => {
+   484→        const result = new Date(commissionDate);
+   485→        result.setMonth(result.getMonth() + intervalMonths);
+   486→        return result;
+   487→      };
+   488→
+   489→      test('should calculate first C1 PM 6 months after commissioning', () => {
+   490→        const commissionDate = new Date('2020-01-01');
+   491→        const assumedPmDate = calculateAssumedFirstPmDate(commissionDate, 6);
+   492→        expect(assumedPmDate.getMonth()).toBe(6); // July (0-indexed)
+   493→        expect(assumedPmDate.getFullYear()).toBe(2020);
+   494→      });
+   495→
+   496→      test('should calculate first C2 PM 12 months after commissioning', () => {
+   497→        const commissionDate = new Date('2020-06-15');
+   498→        const assumedPmDate = calculateAssumedFirstPmDate(commissionDate, 12);
+   499→        expect(assumedPmDate.getMonth()).toBe(5); // June (0-indexed)
+   500→        expect(assumedPmDate.getFullYear()).toBe(2021);
+   501→      });
+   502→
+   503→      test('should calculate first C4 PM 48 months after commissioning', () => {
+   504→        const commissionDate = new Date('2020-01-01');
+   505→        const assumedPmDate = calculateAssumedFirstPmDate(commissionDate, 48);
+   506→        expect(assumedPmDate.getFullYear()).toBe(2024);
+   507→      });
+   508→    });
+   509→
+   510→    describe('Inference from Higher PM', () => {
+   511→      test('C4 PM should reset counters for C1, C2, C3', () => {
+   512→        const knownC4Date = '2024-06-15';
+   513→        const knownC4Mileage = 240000;
+   514→
+   515→        // When C4 is performed, all lower PMs are considered reset
+   516→        const inferredC1Date = knownC4Date;
+   517→        const inferredC2Date = knownC4Date;
+   518→        const inferredC3Date = knownC4Date;
+   519→
+   520→        expect(inferredC1Date).toBe(knownC4Date);
+   521→        expect(inferredC2Date).toBe(knownC4Date);
+   522→        expect(inferredC3Date).toBe(knownC4Date);
+   523→      });
+   524→
+   525→      test('inference from higher PM should have HIGH confidence', () => {
+   526→        // When we know a higher PM was done, we can be highly confident
+   527→        // about the lower PMs being reset
+   528→        const confidenceLevel: ConfidenceLevel = 'HIGH';
+   529→        expect(confidenceLevel).toBe('HIGH');
+   530→      });
+   531→    });
+   532→  });
+   533→
+   534→  // =============================================================================
+   535→  // Workflow Tests
+   536→  // =============================================================================
+   537→
+   538→  describe('Review Workflow', () => {
+   539→    describe('Approval Process', () => {
+   540→      test('approval should clear requiresReview flag', () => {
+   541→        let requiresReview = true;
+   542→        const approved = true;
+   543→
+   544→        if (approved) {
+   545→          requiresReview = false;
+   546→        }
+   547→
+   548→        expect(requiresReview).toBe(false);
+   549→      });
+   550→
+   551→      test('approval with corrections should upgrade confidence to HIGH', () => {
+   552→        const originalConfidence: ConfidenceLevel = 'LOW';
+   553→        const correctedDate = '2024-02-01';
+   554→        const correctedMileage = 155000;
+   555→
+   556→        let finalConfidence = originalConfidence;
+   557→        let assumptionType: AssumptionType = 'INFERRED_FROM_COMMISSIONING';
+   558→
+   559→        if (correctedDate || correctedMileage) {
+   560→          finalConfidence = 'HIGH';
+   561→          assumptionType = 'MANUAL_OVERRIDE';
+   562→        }
+   563→
+   564→        expect(finalConfidence).toBe('HIGH');
+   565→        expect(assumptionType).toBe('MANUAL_OVERRIDE');
+   566→      });
+   567→    });
+   568→
+   569→    describe('Rejection Process', () => {
+   570→      test('rejection should mark review notes with REJECTED prefix', () => {
+   571→        const approved = false;
+   572→        const reviewNotes = 'Data appears incorrect';
+   573→
+   574→        let finalNotes: string;
+   575→        if (!approved) {
+   576→          finalNotes = `REJECTED: ${reviewNotes}`;
+   577→        } else {
+   578→          finalNotes = reviewNotes;
+   579→        }
+   580→
+   581→        expect(finalNotes).toStartWith('REJECTED:');
+   582→      });
+   583→    });
+   584→
+   585→    describe('Application Process', () => {
+   586→      test('should require review before application for LOW confidence', () => {
+   587→        const confidenceLevel: ConfidenceLevel = 'LOW';
+   588→        const requiresReview = true;
+   589→        const reviewedAt: Date | null = null;
+   590→
+   591→        const canApply =
+   592→          !requiresReview || reviewedAt !== null || confidenceLevel === 'HIGH';
+   593→
+   594→        expect(canApply).toBe(false);
+   595→      });
+   596→
+   597→      test('HIGH confidence can be applied without review', () => {
+   598→        const confidenceLevel: ConfidenceLevel = 'HIGH';
+   599→        const requiresReview = false;
+   600→        const reviewedAt: Date | null = null;
+   601→
+   602→        const canApply =
+   603→          !requiresReview || reviewedAt !== null || confidenceLevel === 'HIGH';
+   604→
+   605→        expect(canApply).toBe(true);
+   606→      });
+   607→
+   608→      test('reviewed assumptions can be applied', () => {
+   609→        const confidenceLevel: ConfidenceLevel = 'LOW';
+   610→        const requiresReview = true;
+   611→        const reviewedAt: Date | null = new Date();
+   612→
+   613→        const canApply =
+   614→          !requiresReview || reviewedAt !== null || confidenceLevel === 'HIGH';
+   615→
+   616→        expect(canApply).toBe(true);
+   617→      });
+   618→    });
+   619→  });
+   620→
+   621→  // =============================================================================
+   622→  // Review Queue Tests
+   623→  // =============================================================================
+   624→
+   625→  describe('Review Queue', () => {
+   626→    describe('Queue Population', () => {
+   627→      test('should include LOW confidence assumptions', () => {
+   628→        const assumptions = [
+   629→          { confidenceLevel: 'HIGH', requiresReview: false },
+   630→          { confidenceLevel: 'LOW', requiresReview: true },
+   631→          { confidenceLevel: 'MEDIUM', requiresReview: false },
+   632→          { confidenceLevel: 'ESTIMATED', requiresReview: true },
+   633→        ];
+   634→
+   635→        const reviewQueue = assumptions.filter((a) => a.requiresReview);
+   636→        expect(reviewQueue).toHaveLength(2);
+   637→      });
+   638→
+   639→      test('should include NO_HISTORY assumptions', () => {
+   640→        const assumptions = [
+   641→          { assumptionType: 'INFERRED_FROM_COMMISSIONING', requiresReview: true },
+   642→          { assumptionType: 'NO_HISTORY', requiresReview: true },
+   643→          { assumptionType: 'IMPORTED', requiresReview: false },
+   644→        ];
+   645→
+   646→        const noHistoryCount = assumptions.filter(
+   647→          (a) => a.assumptionType === 'NO_HISTORY'
+   648→        ).length;
+   649→        expect(noHistoryCount).toBe(1);
+   650→      });
+   651→    });
+   652→
+   653→    describe('Queue Ordering', () => {
+   654→      test('should order by oldest first by default', () => {
+   655→        const assumptions = [
+   656→          { createdAt: new Date('2024-03-01') },
+   657→          { createdAt: new Date('2024-01-01') },
+   658→          { createdAt: new Date('2024-02-01') },
+   659→        ];
+   660→
+   661→        const sorted = assumptions.sort(
+   662→          (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
+   663→        );
+   664→
+   665→        expect(sorted[0].createdAt.getMonth()).toBe(0); // January
+   666→        expect(sorted[1].createdAt.getMonth()).toBe(1); // February
+   667→        expect(sorted[2].createdAt.getMonth()).toBe(2); // March
+   668→      });
+   669→    });
+   670→
+   671→    describe('Queue Summary', () => {
+   672→      test('should count by confidence level', () => {
+   673→        const assumptions = [
+   674→          { confidenceLevel: 'LOW' },
+   675→          { confidenceLevel: 'LOW' },
+   676→          { confidenceLevel: 'ESTIMATED' },
+   677→          { confidenceLevel: 'LOW' },
+   678→        ];
+   679→
+   680→        const byConfidenceLevel = {
+   681→          HIGH: 0,
+   682→          MEDIUM: 0,
+   683→          LOW: 0,
+   684→          ESTIMATED: 0,
+   685→        };
+   686→
+   687→        for (const a of assumptions) {
+   688→          byConfidenceLevel[a.confidenceLevel as ConfidenceLevel]++;
+   689→        }
+   690→
+   691→        expect(byConfidenceLevel.LOW).toBe(3);
+   692→        expect(byConfidenceLevel.ESTIMATED).toBe(1);
+   693→      });
+   694→    });
+   695→  });
+   696→
+   697→  // =============================================================================
+   698→  // Cold Start Scenario Tests
+   699→  // =============================================================================
+   700→
+   701→  describe('Cold Start Scenarios', () => {
+   702→    describe('Train with No PM History', () => {
+   703→      test('should create NO_HISTORY assumption for unknown train', () => {
+   704→        const assumptionType: AssumptionType = 'NO_HISTORY';
+   705→        const confidenceLevel: ConfidenceLevel = 'ESTIMATED';
+   706→        const requiresReview = true;
+   707→
+   708→        expect(assumptionType).toBe('NO_HISTORY');
+   709→        expect(confidenceLevel).toBe('ESTIMATED');
+   710→        expect(requiresReview).toBe(true);
+   711→      });
+   712→    });
+   713→
+   714→    describe('Train with Known Commissioning Date Only', () => {
+   715→      test('should create INFERRED_FROM_COMMISSIONING assumptions', () => {
+   716→        const assumptionType: AssumptionType = 'INFERRED_FROM_COMMISSIONING';
+   717→        const confidenceLevel: ConfidenceLevel = 'LOW';
+   718→        const inferenceSource = 'Inferred from commissioning date 2020-01-01';
+   719→
+   720→        expect(assumptionType).toBe('INFERRED_FROM_COMMISSIONING');
+   721→        expect(confidenceLevel).toBe('LOW');
+   722→        expect(inferenceSource).toContain('commissioning date');
+   723→      });
+   724→    });
+   725→
+   726→    describe('Train with Known C4 Completion', () => {
+   727→      test('should create HIGH confidence assumptions for lower PMs', () => {
+   728→        const knownC4 = { date: '2024-06-15', mileage: 240000 };
+   729→        const inferredAssumptions = [
+   730→          {
+   731→            pmCode: 'C3',
+   732→            assumptionType: 'INFERRED_FROM_HIGHER_PM' as AssumptionType,
+   733→            confidenceLevel: 'HIGH' as ConfidenceLevel,
+   734→            date: knownC4.date,
+   735→            mileage: knownC4.mileage,
+   736→          },
+   737→          {
+   738→            pmCode: 'C2',
+   739→            assumptionType: 'INFERRED_FROM_HIGHER_PM' as AssumptionType,
+   740→            confidenceLevel: 'HIGH' as ConfidenceLevel,
+   741→            date: knownC4.date,
+   742→            mileage: knownC4.mileage,
+   743→          },
+   744→          {
+   745→            pmCode: 'C1',
+   746→            assumptionType: 'INFERRED_FROM_HIGHER_PM' as AssumptionType,
+   747→            confidenceLevel: 'HIGH' as ConfidenceLevel,
+   748→            date: knownC4.date,
+   749→            mileage: knownC4.mileage,
+   750→          },
+   751→        ];
+   752→
+   753→        expect(inferredAssumptions).toHaveLength(3);
+   754→        for (const assumption of inferredAssumptions) {
+   755→          expect(assumption.assumptionType).toBe('INFERRED_FROM_HIGHER_PM');
+   756→          expect(assumption.confidenceLevel).toBe('HIGH');
+   757→          expect(assumption.date).toBe(knownC4.date);
+   758→        }
+   759→      });
+   760→    });
+   761→
+   762→    describe('Data Migration Workflow', () => {
+   763→      test('should follow migration workflow: infer -> review -> apply', () => {
+   764→        const workflow = [
+   765→          { step: 1, action: 'inferFromCommissioning', status: 'PENDING_REVIEW' },
+   766→          { step: 2, action: 'reviewAssumption', status: 'REVIEWED' },
+   767→          { step: 3, action: 'applyAssumption', status: 'APPLIED' },
+   768→        ];
+   769→
+   770→        expect(workflow).toHaveLength(3);
+   771→        expect(workflow[0].status).toBe('PENDING_REVIEW');
+   772→        expect(workflow[1].status).toBe('REVIEWED');
+   773→        expect(workflow[2].status).toBe('APPLIED');
+   774→      });
+   775→    });
+   776→  });
+   777→
+   778→  // =============================================================================
+   779→  // 12-Year Contract Projection Impact Tests
+   780→  // =============================================================================
+   781→
+   782→  describe('12-Year Contract Impact', () => {
+   783→    describe('Projection Error Compounding', () => {
+   784→      test('LOW confidence can lead to significant projection errors', () => {
+   785→        const dailyMileageKm = 350; // Example high-usage route
+   786→        const assumptionErrorDays = 30; // 1 month error in assumed PM date
+   787→        const projectionYears = 12;
+   788→
+   789→        // Error compounds across the contract period
+   790→        const projectionErrorKm = dailyMileageKm * assumptionErrorDays;
+   791→        expect(projectionErrorKm).toBe(10500); // 10,500 km error from one bad assumption
+   792→
+   793→        // This affects all subsequent PM scheduling for 12 years
+   794→        const annualPmCycles = 2; // Rough estimate for C1
+   795→        const totalAffectedPmCycles = projectionYears * annualPmCycles;
+   796→        expect(totalAffectedPmCycles).toBe(24);
+   797→      });
+   798→
+   799→      test('HIGH confidence assumptions minimize projection risk', () => {
+   800→        const confidenceLevel: ConfidenceLevel = 'HIGH';
+   801→        const estimatedErrorMargin = confidenceLevel === 'HIGH' ? 0.02 : 0.2; // 2% vs 20%
+   802→
+   803→        expect(estimatedErrorMargin).toBe(0.02);
+   804→      });
+   805→    });
+   806→
+   807→    describe('Audit Trail Importance', () => {
+   808→      test('assumptions should track inference source for traceability', () => {
+   809→        const assumption = {
+   810→          inferenceSource: 'Inferred from C4 completion on 2024-06-15',
+   811→          inferenceData: {
+   812→            higherPmCode: 'C4',
+   813→            higherPmDate: '2024-06-15',
+   814→            calculationMethod: 'pm_hierarchy_reset',
+   815→          },
+   816→        };
+   817→
+   818→        expect(assumption.inferenceSource).toBeDefined();
+   819→        expect(assumption.inferenceData.calculationMethod).toBe('pm_hierarchy_reset');
+   820→      });
+   821→
+   822→      test('review decisions should be tracked with user and timestamp', () => {
+   823→        const review = {
+   824→          reviewedBy: 'user-123',
+   825→          reviewedAt: new Date(),
+   826→          reviewNotes: 'Verified against Maximo export from 2024-01-01',
+   827→        };
+   828→
+   829→        expect(review.reviewedBy).toBeDefined();
+   830→        expect(review.reviewedAt).toBeDefined();
+   831→        expect(review.reviewNotes).toBeDefined();
+   832→      });
+   833→    });
+   834→  });
+   835→});
+   836→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

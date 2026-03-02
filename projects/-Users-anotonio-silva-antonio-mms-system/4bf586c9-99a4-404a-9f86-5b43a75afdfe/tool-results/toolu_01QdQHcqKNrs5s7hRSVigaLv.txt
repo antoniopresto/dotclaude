@@ -1,0 +1,554 @@
+     1→/**
+     2→ * MMS Authentication Service
+     3→ *
+     4→ * Handles user authentication, JWT token management, and session lifecycle.
+     5→ * Uses Bun's native password hashing and Hono's JWT helper.
+     6→ *
+     7→ * Security features:
+     8→ * - bcrypt-compatible password hashing (Bun.password)
+     9→ * - JWT access tokens with short expiry (1 hour)
+    10→ * - Refresh tokens with longer expiry (7 days)
+    11→ * - Session tracking for audit trail
+    12→ * - Account lockout after failed attempts
+    13→ * - Rate limiting support via failed_login_attempts
+    14→ *
+    15→ * @see specs/005-api.md Section 5.2 (Authentication Endpoints)
+    16→ */
+    17→
+    18→import { eq, and, lt } from 'drizzle-orm';
+    19→import { sign, verify, decode } from 'hono/jwt';
+    20→import type { JWTPayload } from 'hono/utils/jwt/types';
+    21→import { BaseService } from '../lib/services/base';
+    22→import { users, sessions } from '../lib/db/schema';
+    23→import {
+    24→  AuthenticationError,
+    25→  TokenExpiredError,
+    26→  InvalidTokenError,
+    27→} from '../lib/errors';
+    28→import { randomUUID } from 'crypto';
+    29→
+    30→// =============================================================================
+    31→// Constants
+    32→// =============================================================================
+    33→
+    34→const ACCESS_TOKEN_EXPIRY_SECONDS = 3600; // 1 hour
+    35→const REFRESH_TOKEN_EXPIRY_SECONDS = 7 * 24 * 3600; // 7 days
+    36→const MAX_FAILED_ATTEMPTS = 5;
+    37→const LOCKOUT_DURATION_MINUTES = 30;
+    38→
+    39→/** JWT signing algorithm */
+    40→const JWT_ALGORITHM = 'HS256' as const;
+    41→
+    42→/**
+    43→ * JWT secret - in production, this should come from environment variables
+    44→ * or a secrets manager. Using a placeholder that MUST be overridden.
+    45→ */
+    46→const JWT_SECRET = process.env.JWT_SECRET || 'mms-development-secret-change-in-production';
+    47→const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || 'mms-refresh-secret-change-in-production';
+    48→
+    49→// =============================================================================
+    50→// Types
+    51→// =============================================================================
+    52→
+    53→/** User with role details for authentication response */
+    54→export interface AuthenticatedUser {
+    55→  id: string;
+    56→  email: string;
+    57→  displayName: string | null;
+    58→  firstName: string | null;
+    59→  lastName: string | null;
+    60→  roles: string[];
+    61→  primaryDepotId: string | null;
+    62→}
+    63→
+    64→/** Login request */
+    65→export interface LoginRequest {
+    66→  email: string;
+    67→  password: string;
+    68→  ipAddress?: string;
+    69→  userAgent?: string;
+    70→}
+    71→
+    72→/** Login response */
+    73→export interface LoginResponse {
+    74→  accessToken: string;
+    75→  refreshToken: string;
+    76→  expiresIn: number;
+    77→  user: AuthenticatedUser;
+    78→}
+    79→
+    80→/** Token refresh request */
+    81→export interface RefreshRequest {
+    82→  refreshToken: string;
+    83→  ipAddress?: string;
+    84→  userAgent?: string;
+    85→}
+    86→
+    87→/** Token refresh response */
+    88→export interface RefreshResponse {
+    89→  accessToken: string;
+    90→  refreshToken: string;
+    91→  expiresIn: number;
+    92→}
+    93→
+    94→/** JWT payload structure - compatible with Hono's JWTPayload */
+    95→export interface JwtPayload extends JWTPayload {
+    96→  sub: string;
+    97→  email: string;
+    98→  roles: string[];
+    99→  depotId: string | null;
+   100→  sessionId: string;
+   101→  iat: number;
+   102→  exp: number;
+   103→}
+   104→
+   105→/** Refresh token payload - compatible with Hono's JWTPayload */
+   106→export interface RefreshTokenPayload extends JWTPayload {
+   107→  sub: string;
+   108→  sessionId: string;
+   109→  type: 'refresh';
+   110→  iat: number;
+   111→  exp: number;
+   112→}
+   113→
+   114→/** Session data */
+   115→export interface SessionData {
+   116→  userId: string;
+   117→  sessionId: string;
+   118→  email: string;
+   119→  roles: string[];
+   120→  depotId: string | null;
+   121→}
+   122→
+   123→// =============================================================================
+   124→// Auth Service
+   125→// =============================================================================
+   126→
+   127→export class AuthService extends BaseService {
+   128→  constructor() {
+   129→    super({ name: 'auth-service', version: '1.0.0' });
+   130→  }
+   131→
+   132→  /**
+   133→   * Authenticate user with email and password
+   134→   */
+   135→  async login(request: LoginRequest): Promise<LoginResponse> {
+   136→    return this.traced('login', async (span) => {
+   137→      span.setAttribute('auth.email', request.email);
+   138→
+   139→      // Find user by email
+   140→      const user = await this.db.query.users.findFirst({
+   141→        where: eq(users.email, request.email.toLowerCase()),
+   142→      });
+   143→
+   144→      if (!user) {
+   145→        this.log.warn({ email: request.email }, 'Login attempt for non-existent user');
+   146→        throw new AuthenticationError('Invalid email or password');
+   147→      }
+   148→
+   149→      // Check if account is locked
+   150→      if (user.lockedUntil && new Date(user.lockedUntil) > new Date()) {
+   151→        const remainingMinutes = Math.ceil(
+   152→          (new Date(user.lockedUntil).getTime() - Date.now()) / (1000 * 60)
+   153→        );
+   154→        this.log.warn({ userId: user.id, remainingMinutes }, 'Login attempt on locked account');
+   155→        throw new AuthenticationError(
+   156→          `Account is locked. Please try again in ${remainingMinutes} minutes.`
+   157→        );
+   158→      }
+   159→
+   160→      // Check if user is active
+   161→      if (!user.isActive) {
+   162→        this.log.warn({ userId: user.id }, 'Login attempt on inactive account');
+   163→        throw new AuthenticationError('Account is disabled. Please contact an administrator.');
+   164→      }
+   165→
+   166→      // Verify password using Bun's native password hashing
+   167→      const isValidPassword = await Bun.password.verify(request.password, user.passwordHash);
+   168→
+   169→      if (!isValidPassword) {
+   170→        // Increment failed attempts
+   171→        const newFailedAttempts = (user.failedLoginAttempts || 0) + 1;
+   172→        const updates: Record<string, unknown> = {
+   173→          failedLoginAttempts: newFailedAttempts,
+   174→          updatedAt: new Date(),
+   175→        };
+   176→
+   177→        // Lock account if max attempts exceeded
+   178→        if (newFailedAttempts >= MAX_FAILED_ATTEMPTS) {
+   179→          updates.lockedUntil = new Date(Date.now() + LOCKOUT_DURATION_MINUTES * 60 * 1000);
+   180→          this.log.warn({ userId: user.id, attempts: newFailedAttempts }, 'Account locked due to failed attempts');
+   181→        }
+   182→
+   183→        await this.db.update(users).set(updates).where(eq(users.id, user.id));
+   184→
+   185→        throw new AuthenticationError('Invalid email or password');
+   186→      }
+   187→
+   188→      // Reset failed attempts on successful login
+   189→      await this.db
+   190→        .update(users)
+   191→        .set({
+   192→          failedLoginAttempts: 0,
+   193→          lockedUntil: null,
+   194→          lastLoginAt: new Date(),
+   195→          updatedAt: new Date(),
+   196→        })
+   197→        .where(eq(users.id, user.id));
+   198→
+   199→      // Create session
+   200→      const sessionId = randomUUID();
+   201→      const now = new Date();
+   202→      const refreshTokenExpiry = new Date(now.getTime() + REFRESH_TOKEN_EXPIRY_SECONDS * 1000);
+   203→
+   204→      // Generate tokens
+   205→      const accessToken = await this.generateAccessToken({
+   206→        userId: user.id,
+   207→        email: user.email,
+   208→        roles: user.roleIds || [],
+   209→        depotId: user.primaryDepotId,
+   210→        sessionId,
+   211→      });
+   212→
+   213→      const refreshToken = await this.generateRefreshToken({
+   214→        userId: user.id,
+   215→        sessionId,
+   216→      });
+   217→
+   218→      // Hash refresh token for storage
+   219→      const tokenHash = await this.hashToken(refreshToken);
+   220→
+   221→      // Store session in database
+   222→      await this.db.insert(sessions).values({
+   223→        id: sessionId,
+   224→        userId: user.id,
+   225→        tokenHash,
+   226→        expiresAt: refreshTokenExpiry,
+   227→        lastActivityAt: now,
+   228→        ipAddress: request.ipAddress,
+   229→        userAgent: request.userAgent,
+   230→      });
+   231→
+   232→      this.log.info({ userId: user.id, sessionId }, 'User logged in successfully');
+   233→
+   234→      return {
+   235→        accessToken,
+   236→        refreshToken,
+   237→        expiresIn: ACCESS_TOKEN_EXPIRY_SECONDS,
+   238→        user: {
+   239→          id: user.id,
+   240→          email: user.email,
+   241→          displayName: user.displayName,
+   242→          firstName: user.firstName,
+   243→          lastName: user.lastName,
+   244→          roles: user.roleIds || [],
+   245→          primaryDepotId: user.primaryDepotId,
+   246→        },
+   247→      };
+   248→    });
+   249→  }
+   250→
+   251→  /**
+   252→   * Refresh access token using refresh token
+   253→   */
+   254→  async refreshToken(request: RefreshRequest): Promise<RefreshResponse> {
+   255→    return this.traced('refreshToken', async (span) => {
+   256→      // Verify and decode refresh token
+   257→      let payload: RefreshTokenPayload;
+   258→      try {
+   259→        const verified = await verify(request.refreshToken, REFRESH_TOKEN_SECRET, JWT_ALGORITHM);
+   260→        payload = verified as RefreshTokenPayload;
+   261→      } catch {
+   262→        throw new InvalidTokenError('Invalid refresh token');
+   263→      }
+   264→
+   265→      if (payload.type !== 'refresh') {
+   266→        throw new InvalidTokenError('Invalid token type');
+   267→      }
+   268→
+   269→      span.setAttribute('auth.session_id', payload.sessionId);
+   270→
+   271→      // Find session
+   272→      const session = await this.db.query.sessions.findFirst({
+   273→        where: and(
+   274→          eq(sessions.id, payload.sessionId),
+   275→          eq(sessions.userId, payload.sub)
+   276→        ),
+   277→      });
+   278→
+   279→      if (!session) {
+   280→        throw new InvalidTokenError('Session not found');
+   281→      }
+   282→
+   283→      // Check if session is expired
+   284→      if (new Date(session.expiresAt) < new Date()) {
+   285→        await this.db.delete(sessions).where(eq(sessions.id, session.id));
+   286→        throw new TokenExpiredError('Session has expired');
+   287→      }
+   288→
+   289→      // Verify token hash
+   290→      const isValidToken = await this.verifyTokenHash(request.refreshToken, session.tokenHash);
+   291→      if (!isValidToken) {
+   292→        throw new InvalidTokenError('Token mismatch');
+   293→      }
+   294→
+   295→      // Get user
+   296→      const user = await this.db.query.users.findFirst({
+   297→        where: eq(users.id, session.userId),
+   298→      });
+   299→
+   300→      if (!user || !user.isActive) {
+   301→        throw new AuthenticationError('User account is not available');
+   302→      }
+   303→
+   304→      // Generate new tokens
+   305→      const newSessionId = randomUUID();
+   306→      const now = new Date();
+   307→      const newRefreshTokenExpiry = new Date(now.getTime() + REFRESH_TOKEN_EXPIRY_SECONDS * 1000);
+   308→
+   309→      const newAccessToken = await this.generateAccessToken({
+   310→        userId: user.id,
+   311→        email: user.email,
+   312→        roles: user.roleIds || [],
+   313→        depotId: user.primaryDepotId,
+   314→        sessionId: newSessionId,
+   315→      });
+   316→
+   317→      const newRefreshToken = await this.generateRefreshToken({
+   318→        userId: user.id,
+   319→        sessionId: newSessionId,
+   320→      });
+   321→
+   322→      // Hash new refresh token
+   323→      const newTokenHash = await this.hashToken(newRefreshToken);
+   324→
+   325→      // Delete old session and create new one (token rotation)
+   326→      await this.db.delete(sessions).where(eq(sessions.id, session.id));
+   327→
+   328→      await this.db.insert(sessions).values({
+   329→        id: newSessionId,
+   330→        userId: user.id,
+   331→        tokenHash: newTokenHash,
+   332→        expiresAt: newRefreshTokenExpiry,
+   333→        lastActivityAt: now,
+   334→        ipAddress: request.ipAddress,
+   335→        userAgent: request.userAgent,
+   336→      });
+   337→
+   338→      this.log.info({ userId: user.id, oldSessionId: session.id, newSessionId }, 'Token refreshed');
+   339→
+   340→      return {
+   341→        accessToken: newAccessToken,
+   342→        refreshToken: newRefreshToken,
+   343→        expiresIn: ACCESS_TOKEN_EXPIRY_SECONDS,
+   344→      };
+   345→    });
+   346→  }
+   347→
+   348→  /**
+   349→   * Logout and invalidate session
+   350→   */
+   351→  async logout(accessToken: string): Promise<void> {
+   352→    return this.traced('logout', async (span) => {
+   353→      // Decode access token to get session ID
+   354→      let payload: JwtPayload;
+   355→      try {
+   356→        const verified = await verify(accessToken, JWT_SECRET, JWT_ALGORITHM);
+   357→        payload = verified as JwtPayload;
+   358→      } catch {
+   359→        // Token might be expired but we still want to invalidate the session
+   360→        try {
+   361→          const decoded = decode(accessToken);
+   362→          if (decoded && decoded.payload && typeof decoded.payload === 'object') {
+   363→            payload = decoded.payload as JwtPayload;
+   364→          } else {
+   365→            throw new InvalidTokenError('Cannot decode token');
+   366→          }
+   367→        } catch {
+   368→          throw new InvalidTokenError('Invalid access token');
+   369→        }
+   370→      }
+   371→
+   372→      span.setAttribute('auth.session_id', payload.sessionId);
+   373→
+   374→      // Delete session
+   375→      const result = await this.db
+   376→        .delete(sessions)
+   377→        .where(eq(sessions.id, payload.sessionId))
+   378→        .returning({ id: sessions.id });
+   379→
+   380→      if (result.length > 0) {
+   381→        this.log.info({ userId: payload.sub, sessionId: payload.sessionId }, 'User logged out');
+   382→      }
+   383→    });
+   384→  }
+   385→
+   386→  /**
+   387→   * Verify access token and return session data
+   388→   */
+   389→  async verifyAccessToken(token: string): Promise<SessionData> {
+   390→    return this.traced('verifyAccessToken', async (span) => {
+   391→      let payload: JwtPayload;
+   392→      try {
+   393→        const verified = await verify(token, JWT_SECRET, JWT_ALGORITHM);
+   394→        payload = verified as JwtPayload;
+   395→      } catch (error) {
+   396→        if (error instanceof Error && error.message.includes('expired')) {
+   397→          throw new TokenExpiredError('Access token has expired');
+   398→        }
+   399→        throw new InvalidTokenError('Invalid access token');
+   400→      }
+   401→
+   402→      span.setAttribute('auth.user_id', payload.sub);
+   403→      span.setAttribute('auth.session_id', payload.sessionId);
+   404→
+   405→      // Verify session exists
+   406→      const session = await this.db.query.sessions.findFirst({
+   407→        where: eq(sessions.id, payload.sessionId),
+   408→      });
+   409→
+   410→      if (!session) {
+   411→        throw new InvalidTokenError('Session not found');
+   412→      }
+   413→
+   414→      // Update last activity
+   415→      await this.db
+   416→        .update(sessions)
+   417→        .set({ lastActivityAt: new Date() })
+   418→        .where(eq(sessions.id, payload.sessionId));
+   419→
+   420→      return {
+   421→        userId: payload.sub,
+   422→        sessionId: payload.sessionId,
+   423→        email: payload.email,
+   424→        roles: payload.roles,
+   425→        depotId: payload.depotId,
+   426→      };
+   427→    });
+   428→  }
+   429→
+   430→  /**
+   431→   * Get user by ID
+   432→   */
+   433→  async getUserById(userId: string): Promise<AuthenticatedUser | null> {
+   434→    return this.traced('getUserById', async (span) => {
+   435→      span.setAttribute('auth.user_id', userId);
+   436→
+   437→      const user = await this.db.query.users.findFirst({
+   438→        where: eq(users.id, userId),
+   439→      });
+   440→
+   441→      if (!user) {
+   442→        return null;
+   443→      }
+   444→
+   445→      return {
+   446→        id: user.id,
+   447→        email: user.email,
+   448→        displayName: user.displayName,
+   449→        firstName: user.firstName,
+   450→        lastName: user.lastName,
+   451→        roles: user.roleIds || [],
+   452→        primaryDepotId: user.primaryDepotId,
+   453→      };
+   454→    });
+   455→  }
+   456→
+   457→  /**
+   458→   * Hash a password for storage
+   459→   */
+   460→  async hashPassword(password: string): Promise<string> {
+   461→    return Bun.password.hash(password, {
+   462→      algorithm: 'bcrypt',
+   463→      cost: 10,
+   464→    });
+   465→  }
+   466→
+   467→  /**
+   468→   * Clean up expired sessions
+   469→   */
+   470→  async cleanupExpiredSessions(): Promise<number> {
+   471→    return this.traced('cleanupExpiredSessions', async () => {
+   472→      const result = await this.db
+   473→        .delete(sessions)
+   474→        .where(lt(sessions.expiresAt, new Date()))
+   475→        .returning({ id: sessions.id });
+   476→
+   477→      this.log.info({ count: result.length }, 'Cleaned up expired sessions');
+   478→      return result.length;
+   479→    });
+   480→  }
+   481→
+   482→  // ===========================================================================
+   483→  // Private Helpers
+   484→  // ===========================================================================
+   485→
+   486→  private async generateAccessToken(data: {
+   487→    userId: string;
+   488→    email: string;
+   489→    roles: string[];
+   490→    depotId: string | null;
+   491→    sessionId: string;
+   492→  }): Promise<string> {
+   493→    const now = Math.floor(Date.now() / 1000);
+   494→    const payload: JwtPayload = {
+   495→      sub: data.userId,
+   496→      email: data.email,
+   497→      roles: data.roles,
+   498→      depotId: data.depotId,
+   499→      sessionId: data.sessionId,
+   500→      iat: now,
+   501→      exp: now + ACCESS_TOKEN_EXPIRY_SECONDS,
+   502→    };
+   503→
+   504→    return sign(payload, JWT_SECRET, JWT_ALGORITHM);
+   505→  }
+   506→
+   507→  private async generateRefreshToken(data: {
+   508→    userId: string;
+   509→    sessionId: string;
+   510→  }): Promise<string> {
+   511→    const now = Math.floor(Date.now() / 1000);
+   512→    const payload: RefreshTokenPayload = {
+   513→      sub: data.userId,
+   514→      sessionId: data.sessionId,
+   515→      type: 'refresh',
+   516→      iat: now,
+   517→      exp: now + REFRESH_TOKEN_EXPIRY_SECONDS,
+   518→    };
+   519→
+   520→    return sign(payload, REFRESH_TOKEN_SECRET, JWT_ALGORITHM);
+   521→  }
+   522→
+   523→  private async hashToken(token: string): Promise<string> {
+   524→    const hasher = new Bun.CryptoHasher('sha256');
+   525→    hasher.update(token);
+   526→    return hasher.digest('hex');
+   527→  }
+   528→
+   529→  private async verifyTokenHash(token: string, hash: string): Promise<boolean> {
+   530→    const computedHash = await this.hashToken(token);
+   531→    return computedHash === hash;
+   532→  }
+   533→}
+   534→
+   535→// =============================================================================
+   536→// Singleton Instance
+   537→// =============================================================================
+   538→
+   539→let authServiceInstance: AuthService | null = null;
+   540→
+   541→/**
+   542→ * Get the singleton AuthService instance
+   543→ */
+   544→export function getAuthService(): AuthService {
+   545→  if (!authServiceInstance) {
+   546→    authServiceInstance = new AuthService();
+   547→  }
+   548→  return authServiceInstance;
+   549→}
+   550→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

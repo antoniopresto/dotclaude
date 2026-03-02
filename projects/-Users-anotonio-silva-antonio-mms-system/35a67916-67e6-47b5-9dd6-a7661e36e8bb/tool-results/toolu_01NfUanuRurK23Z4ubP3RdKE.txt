@@ -1,0 +1,1329 @@
+     1→/**
+     2→ * MMS Simulation Service (Simulation Engine)
+     3→ *
+     4→ * Enables what-if scenario analysis with persistent storage and comparison capabilities.
+     5→ * Uses event-sourcing pattern for tracking changes through deltas.
+     6→ *
+     7→ * Key responsibilities:
+     8→ * - Create scenarios forked from baselines or other scenarios
+     9→ * - Apply changes (PM_MOVE, PM_ADD, PM_REMOVE) as deltas
+    10→ * - Materialize scenarios by recursively applying deltas
+    11→ * - Compare scenarios side-by-side
+    12→ * - Promote winning scenarios to new baselines
+    13→ *
+    14→ * Scenario lifecycle:
+    15→ * ACTIVE -> (changes) -> PROMOTED or EXPIRED
+    16→ *
+    17→ * Auto-expiration: Scenarios expire after 30 days of inactivity.
+    18→ *
+    19→ * @see specs/004-domain-services.md Section 4.9
+    20→ */
+    21→
+    22→import { eq, and, desc, asc, sql, inArray, lte, isNull, count, or } from 'drizzle-orm';
+    23→import { addDays, format, parseISO, differenceInDays } from 'date-fns';
+    24→import { BaseService } from '../lib/services/base';
+    25→import {
+    26→  scenarios,
+    27→  scenarioDeltas,
+    28→  scenarioComparisons,
+    29→  planBaselines,
+    30→  baselinePmSchedule,
+    31→  pmSchedule,
+    32→  auditLog,
+    33→  type Scenario,
+    34→  type ScenarioDelta,
+    35→  type PlanBaseline,
+    36→} from '../lib/db/schema';
+    37→import {
+    38→  NotFoundError,
+    39→  ValidationError,
+    40→  BusinessRuleError,
+    41→} from '../lib/errors';
+    42→
+    43→// =============================================================================
+    44→// Types
+    45→// =============================================================================
+    46→
+    47→/** Status of a scenario in its lifecycle */
+    48→export type ScenarioStatus = 'ACTIVE' | 'PROMOTED' | 'DISCARDED' | 'EXPIRED';
+    49→
+    50→/** Delta types for scenario changes */
+    51→export type DeltaType =
+    52→  | 'PM_MOVE'
+    53→  | 'PM_ADD'
+    54→  | 'PM_REMOVE'
+    55→  | 'CAPACITY_CHANGE'
+    56→  | 'TRAIN_STATUS_CHANGE';
+    57→
+    58→/** Entity types that can be modified in scenarios */
+    59→export type EntityType = 'pm_schedule' | 'manhour_capacity' | 'train';
+    60→
+    61→/** Fork source specification */
+    62→export interface ForkSource {
+    63→  type: 'BASELINE' | 'SCENARIO' | 'PRODUCTION';
+    64→  id?: string; // Required for BASELINE and SCENARIO, not for PRODUCTION
+    65→}
+    66→
+    67→/** Request to create a new scenario */
+    68→export interface CreateScenarioRequest {
+    69→  name: string;
+    70→  description?: string;
+    71→  forkFrom: ForkSource;
+    72→  userId: string;
+    73→  expirationDays?: number; // Default: 30
+    74→}
+    75→
+    76→/** Change to apply to a scenario */
+    77→export interface ScenarioChange {
+    78→  type: DeltaType;
+    79→  entityType: EntityType;
+    80→  entityId: string;
+    81→  oldValues?: Record<string, unknown>;
+    82→  newValues?: Record<string, unknown>;
+    83→  reason?: string;
+    84→}
+    85→
+    86→/** Materialized PM record with scenario context */
+    87→export interface MaterializedPmRecord {
+    88→  id: string;
+    89→  trainId: string;
+    90→  pmTypeId: string;
+    91→  targetDate: string;
+    92→  assignedTrackId?: string | null;
+    93→  assignedHours?: number | null;
+    94→  status?: string | null;
+    95→  constraintStart?: string | null;
+    96→  constraintEnd?: string | null;
+    97→  isLocked?: boolean;
+    98→  // Additional fields for display
+    99→  trainNumber?: string;
+   100→  pmCode?: string;
+   101→}
+   102→
+   103→/** Result of scenario materialization */
+   104→export interface MaterializedScenario {
+   105→  scenario: Scenario | null;
+   106→  pmSchedule: MaterializedPmRecord[];
+   107→  deltasApplied: number;
+   108→  baselineId?: string;
+   109→  baselineVersion?: string;
+   110→}
+   111→
+   112→/** PM difference in comparison */
+   113→export interface PMDifference {
+   114→  pmId: string;
+   115→  trainId?: string;
+   116→  trainNumber?: string;
+   117→  pmTypeId?: string;
+   118→  pmCode?: string;
+   119→  changeType: 'ADDED' | 'REMOVED' | 'MOVED' | 'UNCHANGED';
+   120→  scenarioADate?: string;
+   121→  scenarioBDate?: string;
+   122→  daysDifference?: number;
+   123→}
+   124→
+   125→/** Aggregated PM differences */
+   126→export interface PMDifferenceSummary {
+   127→  countDelta: number;
+   128→  added: number;
+   129→  removed: number;
+   130→  moved: number;
+   131→  unchanged: number;
+   132→  details: PMDifference[];
+   133→}
+   134→
+   135→/** Man-hour difference in comparison */
+   136→export interface ManhourDifferenceSummary {
+   137→  totalDelta: number;
+   138→  overloadedWeeksDelta: number;
+   139→  scenarioATotalHours: number;
+   140→  scenarioBTotalHours: number;
+   141→  details: Array<{
+   142→    weekStart: string;
+   143→    depotId: string;
+   144→    scenarioAHours: number;
+   145→    scenarioBHours: number;
+   146→    difference: number;
+   147→  }>;
+   148→}
+   149→
+   150→/** Cost difference in comparison */
+   151→export interface CostDifferenceSummary {
+   152→  totalDelta: number;
+   153→  laborDelta: number;
+   154→  materialDelta: number;
+   155→  scenarioATotalCost: number;
+   156→  scenarioBTotalCost: number;
+   157→}
+   158→
+   159→/** Full scenario comparison result */
+   160→export interface ScenarioComparisonResult {
+   161→  comparisonId: string;
+   162→  scenarioAId: string;
+   163→  scenarioAName?: string;
+   164→  scenarioBId?: string;
+   165→  scenarioBName?: string;
+   166→  baselineId?: string;
+   167→  baselineVersion?: string;
+   168→  comparisonDate: string;
+   169→  pmDifferences: PMDifferenceSummary;
+   170→  manhourDifferences: ManhourDifferenceSummary;
+   171→  costDifferences: CostDifferenceSummary;
+   172→}
+   173→
+   174→/** Filters for listing scenarios */
+   175→export interface ScenarioListFilters {
+   176→  status?: ScenarioStatus | ScenarioStatus[];
+   177→  createdBy?: string;
+   178→  forkedFromBaselineId?: string;
+   179→  forkedFromScenarioId?: string;
+   180→  searchName?: string;
+   181→  includeExpired?: boolean;
+   182→}
+   183→
+   184→/** Pagination options */
+   185→export interface ScenarioPaginationOptions {
+   186→  page?: number;
+   187→  pageSize?: number;
+   188→  sortBy?: 'name' | 'createdAt' | 'lastModifiedAt' | 'expiresAt';
+   189→  sortOrder?: 'asc' | 'desc';
+   190→}
+   191→
+   192→/** Paginated result for scenarios */
+   193→export interface PaginatedScenarioResult {
+   194→  data: ScenarioWithMeta[];
+   195→  total: number;
+   196→  page: number;
+   197→  pageSize: number;
+   198→  totalPages: number;
+   199→}
+   200→
+   201→/** Scenario with additional metadata */
+   202→export interface ScenarioWithMeta extends Scenario {
+   203→  deltaCount?: number;
+   204→  forkedFromBaselineName?: string;
+   205→  forkedFromScenarioName?: string;
+   206→  createdByEmail?: string;
+   207→}
+   208→
+   209→/** Request to promote a scenario to baseline */
+   210→export interface PromoteScenarioRequest {
+   211→  scenarioId: string;
+   212→  baselineName: string;
+   213→  baselineDescription?: string;
+   214→  userId: string;
+   215→}
+   216→
+   217→// =============================================================================
+   218→// Singleton instance
+   219→// =============================================================================
+   220→
+   221→let instance: SimulationService | null = null;
+   222→
+   223→/**
+   224→ * Get the singleton SimulationService instance
+   225→ */
+   226→export function getSimulationService(): SimulationService {
+   227→  if (!instance) {
+   228→    instance = new SimulationService();
+   229→  }
+   230→  return instance;
+   231→}
+   232→
+   233→// =============================================================================
+   234→// SimulationService Implementation
+   235→// =============================================================================
+   236→
+   237→/**
+   238→ * Simulation Service for what-if scenario analysis
+   239→ *
+   240→ * @example
+   241→ * ```typescript
+   242→ * const simulationService = getSimulationService();
+   243→ *
+   244→ * // Create a scenario from published baseline
+   245→ * const scenario = await simulationService.createScenario({
+   246→ *   name: 'Q2 PM Deferral Analysis',
+   247→ *   description: 'What if we defer Q2 overhauls?',
+   248→ *   forkFrom: { type: 'BASELINE', id: 'baseline-123' },
+   249→ *   userId: 'user-456'
+   250→ * });
+   251→ *
+   252→ * // Apply a change
+   253→ * await simulationService.applyChange(scenario.id, {
+   254→ *   type: 'PM_MOVE',
+   255→ *   entityType: 'pm_schedule',
+   256→ *   entityId: 'pm-789',
+   257→ *   oldValues: { targetDate: '2026-03-15' },
+   258→ *   newValues: { targetDate: '2026-04-15' },
+   259→ *   reason: 'Defer to Q2 for resource leveling'
+   260→ * }, 'user-456');
+   261→ *
+   262→ * // Compare with baseline
+   263→ * const comparison = await simulationService.compareScenarios(scenario.id, null);
+   264→ * console.log(`PM count delta: ${comparison.pmDifferences.countDelta}`);
+   265→ *
+   266→ * // Promote if approved
+   267→ * const baseline = await simulationService.promoteToBaseline({
+   268→ *   scenarioId: scenario.id,
+   269→ *   baselineName: 'Q2 2026 Optimized Plan',
+   270→ *   userId: 'user-456'
+   271→ * });
+   272→ * ```
+   273→ */
+   274→export class SimulationService extends BaseService {
+   275→  /** Default expiration days for scenarios */
+   276→  private readonly defaultExpirationDays = 30;
+   277→
+   278→  constructor() {
+   279→    super({ name: 'simulation-service' });
+   280→  }
+   281→
+   282→  // ===========================================================================
+   283→  // Scenario CRUD Operations
+   284→  // ===========================================================================
+   285→
+   286→  /**
+   287→   * Create a new scenario forked from baseline, another scenario, or production
+   288→   */
+   289→  async createScenario(request: CreateScenarioRequest): Promise<Scenario> {
+   290→    return this.traced('createScenario', async (span) => {
+   291→      span.setAttribute('scenario.name', request.name);
+   292→      span.setAttribute('scenario.forkType', request.forkFrom.type);
+   293→      if (request.forkFrom.id) {
+   294→        span.setAttribute('scenario.forkId', request.forkFrom.id);
+   295→      }
+   296→
+   297→      // Validate fork source
+   298→      await this.validateForkSource(request.forkFrom);
+   299→
+   300→      const expirationDays = request.expirationDays ?? this.defaultExpirationDays;
+   301→      const expiresAt = addDays(new Date(), expirationDays);
+   302→
+   303→      const [scenario] = await this.db
+   304→        .insert(scenarios)
+   305→        .values({
+   306→          name: request.name,
+   307→          description: request.description ?? null,
+   308→          forkedFromBaselineId:
+   309→            request.forkFrom.type === 'BASELINE' ? request.forkFrom.id : null,
+   310→          forkedFromScenarioId:
+   311→            request.forkFrom.type === 'SCENARIO' ? request.forkFrom.id : null,
+   312→          forkedAt: new Date(),
+   313→          status: 'ACTIVE',
+   314→          createdBy: request.userId,
+   315→          createdAt: new Date(),
+   316→          lastModifiedAt: new Date(),
+   317→          expiresAt,
+   318→        })
+   319→        .returning();
+   320→
+   321→      // Audit log
+   322→      await this.db.insert(auditLog).values({
+   323→        entityType: 'scenario',
+   324→        entityId: scenario.id,
+   325→        action: 'CREATE',
+   326→        userId: request.userId,
+   327→        newValues: {
+   328→          name: request.name,
+   329→          forkFrom: request.forkFrom,
+   330→        },
+   331→      });
+   332→
+   333→      this.log.info(
+   334→        { scenarioId: scenario.id, name: request.name, forkFrom: request.forkFrom },
+   335→        'Created new scenario'
+   336→      );
+   337→
+   338→      return scenario;
+   339→    });
+   340→  }
+   341→
+   342→  /**
+   343→   * Get a scenario by ID
+   344→   */
+   345→  async getScenario(scenarioId: string): Promise<ScenarioWithMeta> {
+   346→    return this.traced('getScenario', async (span) => {
+   347→      span.setAttribute('scenario.id', scenarioId);
+   348→
+   349→      const scenario = await this.db.query.scenarios.findFirst({
+   350→        where: eq(scenarios.id, scenarioId),
+   351→        with: {
+   352→          forkedFromBaseline: true,
+   353→          forkedFromScenario: true,
+   354→          createdByUser: true,
+   355→          deltas: true,
+   356→        },
+   357→      });
+   358→
+   359→      if (!scenario) {
+   360→        throw new NotFoundError(`Scenario not found: ${scenarioId}`);
+   361→      }
+   362→
+   363→      return {
+   364→        ...scenario,
+   365→        deltaCount: scenario.deltas?.length ?? 0,
+   366→        forkedFromBaselineName: (scenario.forkedFromBaseline as PlanBaseline | null)?.name,
+   367→        forkedFromScenarioName: (scenario.forkedFromScenario as Scenario | null)?.name,
+   368→        createdByEmail: (scenario.createdByUser as { email?: string } | null)?.email,
+   369→      };
+   370→    });
+   371→  }
+   372→
+   373→  /**
+   374→   * List scenarios with filtering and pagination
+   375→   */
+   376→  async listScenarios(
+   377→    filters?: ScenarioListFilters,
+   378→    pagination?: ScenarioPaginationOptions
+   379→  ): Promise<PaginatedScenarioResult> {
+   380→    return this.traced('listScenarios', async (span) => {
+   381→      const page = pagination?.page ?? 1;
+   382→      const pageSize = Math.min(pagination?.pageSize ?? 20, 100);
+   383→      const offset = (page - 1) * pageSize;
+   384→
+   385→      // Build where conditions
+   386→      const conditions: ReturnType<typeof eq>[] = [];
+   387→
+   388→      if (filters?.status) {
+   389→        const statuses = Array.isArray(filters.status) ? filters.status : [filters.status];
+   390→        conditions.push(inArray(scenarios.status, statuses));
+   391→      } else if (!filters?.includeExpired) {
+   392→        // By default, exclude expired scenarios
+   393→        conditions.push(
+   394→          or(
+   395→            eq(scenarios.status, 'ACTIVE'),
+   396→            eq(scenarios.status, 'PROMOTED')
+   397→          )!
+   398→        );
+   399→      }
+   400→
+   401→      if (filters?.createdBy) {
+   402→        conditions.push(eq(scenarios.createdBy, filters.createdBy));
+   403→      }
+   404→
+   405→      if (filters?.forkedFromBaselineId) {
+   406→        conditions.push(eq(scenarios.forkedFromBaselineId, filters.forkedFromBaselineId));
+   407→      }
+   408→
+   409→      if (filters?.forkedFromScenarioId) {
+   410→        conditions.push(eq(scenarios.forkedFromScenarioId, filters.forkedFromScenarioId));
+   411→      }
+   412→
+   413→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   414→
+   415→      // Get total count
+   416→      const [{ total }] = await this.db
+   417→        .select({ total: count() })
+   418→        .from(scenarios)
+   419→        .where(whereClause);
+   420→
+   421→      // Get scenarios with sorting
+   422→      const sortField = pagination?.sortBy ?? 'lastModifiedAt';
+   423→      const sortOrder = pagination?.sortOrder ?? 'desc';
+   424→
+   425→      const orderByClause = sortOrder === 'desc' ? desc(scenarios[sortField]) : asc(scenarios[sortField]);
+   426→
+   427→      const data = await this.db.query.scenarios.findMany({
+   428→        where: whereClause,
+   429→        orderBy: orderByClause,
+   430→        limit: pageSize,
+   431→        offset,
+   432→        with: {
+   433→          forkedFromBaseline: true,
+   434→          forkedFromScenario: true,
+   435→          deltas: true,
+   436→        },
+   437→      });
+   438→
+   439→      const scenariosWithMeta: ScenarioWithMeta[] = data.map((s) => ({
+   440→        ...s,
+   441→        deltaCount: s.deltas?.length ?? 0,
+   442→        forkedFromBaselineName: (s.forkedFromBaseline as PlanBaseline | null)?.name,
+   443→        forkedFromScenarioName: (s.forkedFromScenario as Scenario | null)?.name,
+   444→      }));
+   445→
+   446→      span.setAttribute('scenario.count', scenariosWithMeta.length);
+   447→      span.setAttribute('scenario.total', total);
+   448→
+   449→      return {
+   450→        data: scenariosWithMeta,
+   451→        total,
+   452→        page,
+   453→        pageSize,
+   454→        totalPages: Math.ceil(total / pageSize),
+   455→      };
+   456→    });
+   457→  }
+   458→
+   459→  /**
+   460→   * Delete a scenario (only if ACTIVE and not promoted)
+   461→   */
+   462→  async deleteScenario(scenarioId: string, userId: string): Promise<void> {
+   463→    return this.traced('deleteScenario', async (span) => {
+   464→      span.setAttribute('scenario.id', scenarioId);
+   465→
+   466→      const scenario = await this.db.query.scenarios.findFirst({
+   467→        where: eq(scenarios.id, scenarioId),
+   468→      });
+   469→
+   470→      if (!scenario) {
+   471→        throw new NotFoundError(`Scenario not found: ${scenarioId}`);
+   472→      }
+   473→
+   474→      if (scenario.status === 'PROMOTED') {
+   475→        throw new BusinessRuleError(
+   476→          'Cannot delete a promoted scenario',
+   477→          { rule: 'SCENARIO_PROMOTED' }
+   478→        );
+   479→      }
+   480→
+   481→      // Delete scenario (cascades to deltas)
+   482→      await this.db.delete(scenarios).where(eq(scenarios.id, scenarioId));
+   483→
+   484→      // Audit log
+   485→      await this.db.insert(auditLog).values({
+   486→        entityType: 'scenario',
+   487→        entityId: scenarioId,
+   488→        action: 'DELETE',
+   489→        userId,
+   490→        oldValues: { name: scenario.name, status: scenario.status },
+   491→      });
+   492→
+   493→      this.log.info({ scenarioId, name: scenario.name }, 'Deleted scenario');
+   494→    });
+   495→  }
+   496→
+   497→  // ===========================================================================
+   498→  // Delta Management (Event Sourcing)
+   499→  // ===========================================================================
+   500→
+   501→  /**
+   502→   * Apply a change to a scenario (event-sourced)
+   503→   */
+   504→  async applyChange(
+   505→    scenarioId: string,
+   506→    change: ScenarioChange,
+   507→    userId: string
+   508→  ): Promise<ScenarioDelta> {
+   509→    return this.traced('applyChange', async (span) => {
+   510→      span.setAttribute('scenario.id', scenarioId);
+   511→      span.setAttribute('delta.type', change.type);
+   512→      span.setAttribute('delta.entityType', change.entityType);
+   513→      span.setAttribute('delta.entityId', change.entityId);
+   514→
+   515→      // Validate scenario is active
+   516→      const scenario = await this.db.query.scenarios.findFirst({
+   517→        where: eq(scenarios.id, scenarioId),
+   518→      });
+   519→
+   520→      if (!scenario) {
+   521→        throw new NotFoundError(`Scenario not found: ${scenarioId}`);
+   522→      }
+   523→
+   524→      if (scenario.status !== 'ACTIVE') {
+   525→        throw new BusinessRuleError(
+   526→          `Cannot apply changes to a ${scenario.status} scenario`,
+   527→          { rule: 'SCENARIO_NOT_ACTIVE' }
+   528→        );
+   529→      }
+   530→
+   531→      // Validate the change
+   532→      await this.validateChange(scenarioId, change);
+   533→
+   534→      // Get next sequence number
+   535→      const lastDelta = await this.db.query.scenarioDeltas.findFirst({
+   536→        where: eq(scenarioDeltas.scenarioId, scenarioId),
+   537→        orderBy: desc(scenarioDeltas.sequenceNum),
+   538→      });
+   539→
+   540→      const sequenceNum = (lastDelta?.sequenceNum ?? 0) + 1;
+   541→
+   542→      // Record delta
+   543→      const [delta] = await this.db
+   544→        .insert(scenarioDeltas)
+   545→        .values({
+   546→          scenarioId,
+   547→          sequenceNum,
+   548→          deltaType: change.type,
+   549→          entityType: change.entityType,
+   550→          entityId: change.entityId,
+   551→          oldValues: change.oldValues ?? null,
+   552→          newValues: change.newValues ?? null,
+   553→          changeReason: change.reason ?? null,
+   554→          createdBy: userId,
+   555→          createdAt: new Date(),
+   556→        })
+   557→        .returning();
+   558→
+   559→      // Update scenario timestamp and reset expiration
+   560→      await this.db
+   561→        .update(scenarios)
+   562→        .set({
+   563→          lastModifiedAt: new Date(),
+   564→          expiresAt: addDays(new Date(), this.defaultExpirationDays),
+   565→        })
+   566→        .where(eq(scenarios.id, scenarioId));
+   567→
+   568→      this.log.info(
+   569→        { scenarioId, deltaId: delta.id, deltaType: change.type, sequenceNum },
+   570→        'Applied change to scenario'
+   571→      );
+   572→
+   573→      return delta;
+   574→    });
+   575→  }
+   576→
+   577→  /**
+   578→   * Get all deltas for a scenario in order
+   579→   */
+   580→  async getScenarioDeltas(scenarioId: string): Promise<ScenarioDelta[]> {
+   581→    return this.traced('getScenarioDeltas', async (span) => {
+   582→      span.setAttribute('scenario.id', scenarioId);
+   583→
+   584→      const deltas = await this.db.query.scenarioDeltas.findMany({
+   585→        where: eq(scenarioDeltas.scenarioId, scenarioId),
+   586→        orderBy: asc(scenarioDeltas.sequenceNum),
+   587→      });
+   588→
+   589→      span.setAttribute('delta.count', deltas.length);
+   590→      return deltas;
+   591→    });
+   592→  }
+   593→
+   594→  /**
+   595→   * Undo the last delta applied to a scenario
+   596→   */
+   597→  async undoLastChange(scenarioId: string, userId: string): Promise<void> {
+   598→    return this.traced('undoLastChange', async (span) => {
+   599→      span.setAttribute('scenario.id', scenarioId);
+   600→
+   601→      const scenario = await this.db.query.scenarios.findFirst({
+   602→        where: eq(scenarios.id, scenarioId),
+   603→      });
+   604→
+   605→      if (!scenario) {
+   606→        throw new NotFoundError(`Scenario not found: ${scenarioId}`);
+   607→      }
+   608→
+   609→      if (scenario.status !== 'ACTIVE') {
+   610→        throw new BusinessRuleError(
+   611→          `Cannot undo changes on a ${scenario.status} scenario`,
+   612→          { rule: 'SCENARIO_NOT_ACTIVE' }
+   613→        );
+   614→      }
+   615→
+   616→      // Get last delta
+   617→      const lastDelta = await this.db.query.scenarioDeltas.findFirst({
+   618→        where: eq(scenarioDeltas.scenarioId, scenarioId),
+   619→        orderBy: desc(scenarioDeltas.sequenceNum),
+   620→      });
+   621→
+   622→      if (!lastDelta) {
+   623→        throw new BusinessRuleError(
+   624→          'No changes to undo',
+   625→          { rule: 'NO_CHANGES_TO_UNDO' }
+   626→        );
+   627→      }
+   628→
+   629→      // Delete the last delta
+   630→      await this.db
+   631→        .delete(scenarioDeltas)
+   632→        .where(eq(scenarioDeltas.id, lastDelta.id));
+   633→
+   634→      // Update scenario timestamp
+   635→      await this.db
+   636→        .update(scenarios)
+   637→        .set({ lastModifiedAt: new Date() })
+   638→        .where(eq(scenarios.id, scenarioId));
+   639→
+   640→      // Audit log
+   641→      await this.db.insert(auditLog).values({
+   642→        entityType: 'scenario_delta',
+   643→        entityId: lastDelta.id,
+   644→        action: 'DELETE',
+   645→        userId,
+   646→        oldValues: {
+   647→          deltaType: lastDelta.deltaType,
+   648→          entityId: lastDelta.entityId,
+   649→          sequenceNum: lastDelta.sequenceNum,
+   650→          undoOperation: true,
+   651→        },
+   652→      });
+   653→
+   654→      this.log.info(
+   655→        { scenarioId, deltaId: lastDelta.id, deltaType: lastDelta.deltaType },
+   656→        'Undid last change'
+   657→      );
+   658→    });
+   659→  }
+   660→
+   661→  // ===========================================================================
+   662→  // Scenario Materialization
+   663→  // ===========================================================================
+   664→
+   665→  /**
+   666→   * Materialize a scenario (apply all deltas to get full state)
+   667→   */
+   668→  async materializeScenario(scenarioId: string): Promise<MaterializedScenario> {
+   669→    return this.traced('materializeScenario', async (span) => {
+   670→      span.setAttribute('scenario.id', scenarioId);
+   671→
+   672→      const scenario = await this.db.query.scenarios.findFirst({
+   673→        where: eq(scenarios.id, scenarioId),
+   674→        with: {
+   675→          forkedFromBaseline: true,
+   676→        },
+   677→      });
+   678→
+   679→      if (!scenario) {
+   680→        throw new NotFoundError(`Scenario not found: ${scenarioId}`);
+   681→      }
+   682→
+   683→      // Get base state
+   684→      let basePMSchedule: MaterializedPmRecord[];
+   685→      let baselineId: string | undefined;
+   686→      let baselineVersion: string | undefined;
+   687→
+   688→      if (scenario.forkedFromBaselineId) {
+   689→        // Fork from baseline
+   690→        baselineId = scenario.forkedFromBaselineId;
+   691→        baselineVersion = (scenario.forkedFromBaseline as PlanBaseline | null)?.version ?? undefined;
+   692→
+   693→        const baselineRecords = await this.db.query.baselinePmSchedule.findMany({
+   694→          where: eq(baselinePmSchedule.baselineId, scenario.forkedFromBaselineId),
+   695→        });
+   696→
+   697→        basePMSchedule = baselineRecords.map((r) => ({
+   698→          id: r.id,
+   699→          trainId: r.trainId,
+   700→          pmTypeId: r.pmTypeId,
+   701→          targetDate: r.projectedDate,
+   702→          assignedTrackId: null,
+   703→          assignedHours: null,
+   704→          status: 'SCHEDULED',
+   705→        }));
+   706→      } else if (scenario.forkedFromScenarioId) {
+   707→        // Recursive materialization from parent scenario
+   708→        const parentScenario = await this.materializeScenario(scenario.forkedFromScenarioId);
+   709→        basePMSchedule = parentScenario.pmSchedule;
+   710→        baselineId = parentScenario.baselineId;
+   711→        baselineVersion = parentScenario.baselineVersion;
+   712→      } else {
+   713→        // Fork from current production
+   714→        const productionRecords = await this.db.query.pmSchedule.findMany({
+   715→          where: isNull(pmSchedule.scenarioId),
+   716→        });
+   717→
+   718→        basePMSchedule = productionRecords.map((r) => ({
+   719→          id: r.id,
+   720→          trainId: r.trainId,
+   721→          pmTypeId: r.pmTypeId,
+   722→          targetDate: r.targetDate,
+   723→          assignedTrackId: r.assignedTrackId,
+   724→          assignedHours: r.assignedHours ? Number(r.assignedHours) : null,
+   725→          status: r.status,
+   726→          constraintStart: r.constraintStart,
+   727→          constraintEnd: r.constraintEnd,
+   728→          isLocked: r.isLocked ?? false,
+   729→        }));
+   730→      }
+   731→
+   732→      // Get all deltas in order
+   733→      const deltas = await this.db.query.scenarioDeltas.findMany({
+   734→        where: eq(scenarioDeltas.scenarioId, scenarioId),
+   735→        orderBy: asc(scenarioDeltas.sequenceNum),
+   736→      });
+   737→
+   738→      // Apply deltas
+   739→      const materializedPMSchedule = [...basePMSchedule];
+   740→
+   741→      for (const delta of deltas) {
+   742→        if (delta.entityType !== 'pm_schedule') continue;
+   743→
+   744→        switch (delta.deltaType) {
+   745→          case 'PM_MOVE': {
+   746→            const idx = materializedPMSchedule.findIndex((pm) => pm.id === delta.entityId);
+   747→            if (idx >= 0 && delta.newValues) {
+   748→              const newValues = delta.newValues as Record<string, unknown>;
+   749→              materializedPMSchedule[idx] = {
+   750→                ...materializedPMSchedule[idx],
+   751→                targetDate: newValues.targetDate as string ?? materializedPMSchedule[idx].targetDate,
+   752→                assignedTrackId: newValues.assignedTrackId as string ?? materializedPMSchedule[idx].assignedTrackId,
+   753→                assignedHours: newValues.assignedHours as number ?? materializedPMSchedule[idx].assignedHours,
+   754→              };
+   755→            }
+   756→            break;
+   757→          }
+   758→          case 'PM_ADD': {
+   759→            if (delta.newValues) {
+   760→              const newValues = delta.newValues as Record<string, unknown>;
+   761→              materializedPMSchedule.push({
+   762→                id: delta.entityId,
+   763→                trainId: newValues.trainId as string,
+   764→                pmTypeId: newValues.pmTypeId as string,
+   765→                targetDate: newValues.targetDate as string,
+   766→                assignedTrackId: newValues.assignedTrackId as string | null ?? null,
+   767→                assignedHours: newValues.assignedHours as number | null ?? null,
+   768→                status: 'SCHEDULED',
+   769→              });
+   770→            }
+   771→            break;
+   772→          }
+   773→          case 'PM_REMOVE': {
+   774→            const idx = materializedPMSchedule.findIndex((pm) => pm.id === delta.entityId);
+   775→            if (idx >= 0) {
+   776→              materializedPMSchedule.splice(idx, 1);
+   777→            }
+   778→            break;
+   779→          }
+   780→        }
+   781→      }
+   782→
+   783→      span.setAttribute('materialized.pmCount', materializedPMSchedule.length);
+   784→      span.setAttribute('materialized.deltasApplied', deltas.length);
+   785→
+   786→      return {
+   787→        scenario,
+   788→        pmSchedule: materializedPMSchedule,
+   789→        deltasApplied: deltas.length,
+   790→        baselineId,
+   791→        baselineVersion,
+   792→      };
+   793→    });
+   794→  }
+   795→
+   796→  // ===========================================================================
+   797→  // Scenario Comparison
+   798→  // ===========================================================================
+   799→
+   800→  /**
+   801→   * Compare two scenarios or scenario vs baseline
+   802→   */
+   803→  async compareScenarios(
+   804→    scenarioAId: string,
+   805→    scenarioBId: string | null,
+   806→    baselineId?: string
+   807→  ): Promise<ScenarioComparisonResult> {
+   808→    return this.traced('compareScenarios', async (span) => {
+   809→      span.setAttribute('comparison.scenarioAId', scenarioAId);
+   810→      if (scenarioBId) span.setAttribute('comparison.scenarioBId', scenarioBId);
+   811→      if (baselineId) span.setAttribute('comparison.baselineId', baselineId);
+   812→
+   813→      // Materialize scenario A
+   814→      const scenarioA = await this.materializeScenario(scenarioAId);
+   815→
+   816→      // Get scenario B (another scenario or baseline)
+   817→      let scenarioB: MaterializedScenario;
+   818→      let scenarioBName: string | undefined;
+   819→
+   820→      if (scenarioBId) {
+   821→        scenarioB = await this.materializeScenario(scenarioBId);
+   822→        scenarioBName = scenarioB.scenario?.name;
+   823→      } else {
+   824→        // Use baseline
+   825→        const baseline = baselineId
+   826→          ? await this.db.query.planBaselines.findFirst({
+   827→              where: eq(planBaselines.id, baselineId),
+   828→            })
+   829→          : await this.getPublishedBaseline();
+   830→
+   831→        if (!baseline) {
+   832→          throw new NotFoundError('No baseline for comparison');
+   833→        }
+   834→
+   835→        const baselinePMs = await this.db.query.baselinePmSchedule.findMany({
+   836→          where: eq(baselinePmSchedule.baselineId, baseline.id),
+   837→        });
+   838→
+   839→        scenarioB = {
+   840→          scenario: null,
+   841→          pmSchedule: baselinePMs.map((r) => ({
+   842→            id: r.id,
+   843→            trainId: r.trainId,
+   844→            pmTypeId: r.pmTypeId,
+   845→            targetDate: r.projectedDate,
+   846→            assignedTrackId: null,
+   847→            assignedHours: null,
+   848→            status: 'SCHEDULED',
+   849→          })),
+   850→          deltasApplied: 0,
+   851→          baselineId: baseline.id,
+   852→          baselineVersion: baseline.version ?? undefined,
+   853→        };
+   854→        scenarioBName = `Baseline: ${baseline.name}`;
+   855→      }
+   856→
+   857→      // Calculate differences
+   858→      const pmDifferences = this.calculatePMDifferences(
+   859→        scenarioA.pmSchedule,
+   860→        scenarioB.pmSchedule
+   861→      );
+   862→
+   863→      const manhourDifferences = await this.calculateManhourDifferences(
+   864→        scenarioA.pmSchedule,
+   865→        scenarioB.pmSchedule
+   866→      );
+   867→
+   868→      const costDifferences = await this.calculateCostDifferences(
+   869→        scenarioA.pmSchedule,
+   870→        scenarioB.pmSchedule
+   871→      );
+   872→
+   873→      // Persist comparison
+   874→      const comparisonDate = format(new Date(), 'yyyy-MM-dd');
+   875→      const [comparison] = await this.db
+   876→        .insert(scenarioComparisons)
+   877→        .values({
+   878→          scenarioAId,
+   879→          scenarioBId,
+   880→          baselineId: scenarioBId ? null : (baselineId ?? scenarioB.baselineId),
+   881→          comparisonDate,
+   882→          pmCountDelta: pmDifferences.countDelta,
+   883→          totalHoursDelta: String(manhourDifferences.totalDelta),
+   884→          totalCostDelta: String(costDifferences.totalDelta),
+   885→          overloadedWeeksDelta: manhourDifferences.overloadedWeeksDelta,
+   886→          pmDifferences: pmDifferences.details,
+   887→          manhourDifferences: manhourDifferences.details,
+   888→        })
+   889→        .returning();
+   890→
+   891→      span.setAttribute('comparison.pmCountDelta', pmDifferences.countDelta);
+   892→      span.setAttribute('comparison.totalHoursDelta', manhourDifferences.totalDelta);
+   893→
+   894→      return {
+   895→        comparisonId: comparison.id,
+   896→        scenarioAId,
+   897→        scenarioAName: scenarioA.scenario?.name,
+   898→        scenarioBId: scenarioBId ?? undefined,
+   899→        scenarioBName,
+   900→        baselineId: scenarioB.baselineId,
+   901→        baselineVersion: scenarioB.baselineVersion,
+   902→        comparisonDate,
+   903→        pmDifferences,
+   904→        manhourDifferences,
+   905→        costDifferences,
+   906→      };
+   907→    });
+   908→  }
+   909→
+   910→  // ===========================================================================
+   911→  // Scenario Promotion
+   912→  // ===========================================================================
+   913→
+   914→  /**
+   915→   * Promote a scenario to become the new baseline
+   916→   */
+   917→  async promoteToBaseline(request: PromoteScenarioRequest): Promise<PlanBaseline> {
+   918→    return this.inTransaction('promoteToBaseline', async (tx, span) => {
+   919→      span.setAttribute('scenario.id', request.scenarioId);
+   920→      span.setAttribute('baseline.name', request.baselineName);
+   921→
+   922→      // Verify scenario exists and is active
+   923→      const scenario = await tx.query.scenarios.findFirst({
+   924→        where: eq(scenarios.id, request.scenarioId),
+   925→      });
+   926→
+   927→      if (!scenario) {
+   928→        throw new NotFoundError(`Scenario not found: ${request.scenarioId}`);
+   929→      }
+   930→
+   931→      if (scenario.status !== 'ACTIVE') {
+   932→        throw new BusinessRuleError(
+   933→          `Cannot promote a ${scenario.status} scenario`,
+   934→          { rule: 'SCENARIO_NOT_ACTIVE' }
+   935→        );
+   936→      }
+   937→
+   938→      // Materialize the scenario
+   939→      const materialized = await this.materializeScenario(request.scenarioId);
+   940→
+   941→      // Get next version
+   942→      const latestBaseline = await tx.query.planBaselines.findFirst({
+   943→        orderBy: desc(planBaselines.version),
+   944→      });
+   945→
+   946→      const version = this.incrementVersion(latestBaseline?.version);
+   947→
+   948→      // Create new baseline
+   949→      const [baseline] = await tx
+   950→        .insert(planBaselines)
+   951→        .values({
+   952→          name: request.baselineName,
+   953→          version,
+   954→          baselineDate: format(new Date(), 'yyyy-MM-dd'),
+   955→          status: 'PUBLISHED',
+   956→          description: request.baselineDescription ?? `Promoted from scenario: ${scenario.name}`,
+   957→          createdBy: request.userId,
+   958→          publishedBy: request.userId,
+   959→          publishedAt: new Date(),
+   960→          horizonEnd: format(addDays(new Date(), 365 * 10), 'yyyy-MM-dd'), // 10-year horizon
+   961→          fleetCount: null, // Will be calculated
+   962→          totalPmScheduled: materialized.pmSchedule.length,
+   963→          totalManhourProjected: null,
+   964→        })
+   965→        .returning();
+   966→
+   967→      // Copy materialized PM schedule to baseline snapshots
+   968→      if (materialized.pmSchedule.length > 0) {
+   969→        await tx.insert(baselinePmSchedule).values(
+   970→          materialized.pmSchedule.map((pm) => ({
+   971→            baselineId: baseline.id,
+   972→            trainId: pm.trainId,
+   973→            pmTypeId: pm.pmTypeId,
+   974→            projectedDate: pm.targetDate,
+   975→          }))
+   976→        );
+   977→      }
+   978→
+   979→      // Apply scenario deltas to production PM schedule
+   980→      const deltas = await this.getScenarioDeltas(request.scenarioId);
+   981→      for (const delta of deltas) {
+   982→        if (delta.entityType !== 'pm_schedule') continue;
+   983→
+   984→        switch (delta.deltaType) {
+   985→          case 'PM_MOVE': {
+   986→            if (delta.newValues) {
+   987→              const newValues = delta.newValues as Record<string, unknown>;
+   988→              await tx
+   989→                .update(pmSchedule)
+   990→                .set({
+   991→                  targetDate: newValues.targetDate as string,
+   992→                  assignedTrackId: newValues.assignedTrackId as string | undefined,
+   993→                  assignedHours: newValues.assignedHours as string | undefined,
+   994→                  updatedAt: new Date(),
+   995→                })
+   996→                .where(eq(pmSchedule.id, delta.entityId));
+   997→            }
+   998→            break;
+   999→          }
+  1000→          case 'PM_ADD': {
+  1001→            if (delta.newValues) {
+  1002→              const newValues = delta.newValues as Record<string, unknown>;
+  1003→              // Use target date +/- 14 days as default compliance window if not specified
+  1004→              const targetDateStr = newValues.targetDate as string;
+  1005→              const targetDateObj = parseISO(targetDateStr);
+  1006→              const constraintStart = (newValues.constraintStart as string) ??
+  1007→                format(addDays(targetDateObj, -14), 'yyyy-MM-dd');
+  1008→              const constraintEnd = (newValues.constraintEnd as string) ??
+  1009→                format(addDays(targetDateObj, 14), 'yyyy-MM-dd');
+  1010→
+  1011→              await tx.insert(pmSchedule).values({
+  1012→                trainId: newValues.trainId as string,
+  1013→                pmTypeId: newValues.pmTypeId as string,
+  1014→                targetDate: targetDateStr,
+  1015→                constraintStart,
+  1016→                constraintEnd,
+  1017→                status: 'SCHEDULED',
+  1018→                scenarioId: null, // Production
+  1019→              });
+  1020→            }
+  1021→            break;
+  1022→          }
+  1023→          case 'PM_REMOVE': {
+  1024→            await tx
+  1025→              .update(pmSchedule)
+  1026→              .set({ status: 'CANCELLED', updatedAt: new Date() })
+  1027→              .where(eq(pmSchedule.id, delta.entityId));
+  1028→            break;
+  1029→          }
+  1030→        }
+  1031→      }
+  1032→
+  1033→      // Mark scenario as promoted
+  1034→      await tx
+  1035→        .update(scenarios)
+  1036→        .set({
+  1037→          status: 'PROMOTED',
+  1038→          promotedToBaselineId: baseline.id,
+  1039→          promotedAt: new Date(),
+  1040→          promotedBy: request.userId,
+  1041→        })
+  1042→        .where(eq(scenarios.id, request.scenarioId));
+  1043→
+  1044→      // Supersede previous published baseline
+  1045→      await tx
+  1046→        .update(planBaselines)
+  1047→        .set({ status: 'SUPERSEDED' })
+  1048→        .where(
+  1049→          and(
+  1050→            eq(planBaselines.status, 'PUBLISHED'),
+  1051→            sql`${planBaselines.id} != ${baseline.id}`
+  1052→          )
+  1053→        );
+  1054→
+  1055→      // Audit log
+  1056→      await tx.insert(auditLog).values({
+  1057→        entityType: 'baseline',
+  1058→        entityId: baseline.id,
+  1059→        action: 'CREATE',
+  1060→        userId: request.userId,
+  1061→        newValues: {
+  1062→          name: baseline.name,
+  1063→          version: baseline.version,
+  1064→          promotedFromScenario: request.scenarioId,
+  1065→        },
+  1066→      });
+  1067→
+  1068→      this.log.info(
+  1069→        {
+  1070→          scenarioId: request.scenarioId,
+  1071→          baselineId: baseline.id,
+  1072→          version: baseline.version,
+  1073→        },
+  1074→        'Promoted scenario to baseline'
+  1075→      );
+  1076→
+  1077→      return baseline;
+  1078→    });
+  1079→  }
+  1080→
+  1081→  // ===========================================================================
+  1082→  // Utility Functions
+  1083→  // ===========================================================================
+  1084→
+  1085→  /**
+  1086→   * Get the current published baseline
+  1087→   */
+  1088→  async getPublishedBaseline(): Promise<PlanBaseline | null> {
+  1089→    const baseline = await this.db.query.planBaselines.findFirst({
+  1090→      where: eq(planBaselines.status, 'PUBLISHED'),
+  1091→      orderBy: desc(planBaselines.publishedAt),
+  1092→    });
+  1093→    return baseline ?? null;
+  1094→  }
+  1095→
+  1096→  /**
+  1097→   * Cleanup expired scenarios
+  1098→   */
+  1099→  async cleanupExpiredScenarios(): Promise<number> {
+  1100→    return this.traced('cleanupExpiredScenarios', async (span) => {
+  1101→      const now = new Date();
+  1102→
+  1103→      const result = await this.db
+  1104→        .update(scenarios)
+  1105→        .set({ status: 'EXPIRED' })
+  1106→        .where(
+  1107→          and(
+  1108→            eq(scenarios.status, 'ACTIVE'),
+  1109→            lte(scenarios.expiresAt, now)
+  1110→          )
+  1111→        )
+  1112→        .returning({ id: scenarios.id });
+  1113→
+  1114→      span.setAttribute('expired.count', result.length);
+  1115→      this.log.info({ expiredCount: result.length }, 'Cleaned up expired scenarios');
+  1116→
+  1117→      return result.length;
+  1118→    });
+  1119→  }
+  1120→
+  1121→  // ===========================================================================
+  1122→  // Private Helper Methods
+  1123→  // ===========================================================================
+  1124→
+  1125→  /**
+  1126→   * Validate that the fork source exists
+  1127→   */
+  1128→  private async validateForkSource(forkFrom: ForkSource): Promise<void> {
+  1129→    if (forkFrom.type === 'PRODUCTION') {
+  1130→      // No validation needed for production fork
+  1131→      return;
+  1132→    }
+  1133→
+  1134→    if (!forkFrom.id) {
+  1135→      throw new ValidationError(`Fork ID required for type ${forkFrom.type}`);
+  1136→    }
+  1137→
+  1138→    if (forkFrom.type === 'BASELINE') {
+  1139→      const baseline = await this.db.query.planBaselines.findFirst({
+  1140→        where: eq(planBaselines.id, forkFrom.id),
+  1141→      });
+  1142→      if (!baseline) {
+  1143→        throw new NotFoundError(`Baseline not found: ${forkFrom.id}`);
+  1144→      }
+  1145→    } else if (forkFrom.type === 'SCENARIO') {
+  1146→      const scenario = await this.db.query.scenarios.findFirst({
+  1147→        where: eq(scenarios.id, forkFrom.id),
+  1148→      });
+  1149→      if (!scenario) {
+  1150→        throw new NotFoundError(`Scenario not found: ${forkFrom.id}`);
+  1151→      }
+  1152→      if (scenario.status !== 'ACTIVE' && scenario.status !== 'PROMOTED') {
+  1153→        throw new BusinessRuleError(
+  1154→          `Cannot fork from a ${scenario.status} scenario`,
+  1155→          { rule: 'INVALID_FORK_SOURCE' }
+  1156→        );
+  1157→      }
+  1158→    }
+  1159→  }
+  1160→
+  1161→  /**
+  1162→   * Validate a change before applying
+  1163→   */
+  1164→  private async validateChange(scenarioId: string, change: ScenarioChange): Promise<void> {
+  1165→    if (change.type === 'PM_MOVE' || change.type === 'PM_REMOVE') {
+  1166→      // Verify the entity exists in the materialized scenario
+  1167→      const materialized = await this.materializeScenario(scenarioId);
+  1168→      const exists = materialized.pmSchedule.some((pm) => pm.id === change.entityId);
+  1169→      if (!exists) {
+  1170→        throw new NotFoundError(
+  1171→          `PM schedule entry not found in scenario: ${change.entityId}`
+  1172→        );
+  1173→      }
+  1174→    }
+  1175→
+  1176→    if (change.type === 'PM_ADD') {
+  1177→      if (!change.newValues) {
+  1178→        throw new ValidationError('PM_ADD requires newValues with trainId, pmTypeId, targetDate');
+  1179→      }
+  1180→      const newValues = change.newValues as Record<string, unknown>;
+  1181→      if (!newValues.trainId || !newValues.pmTypeId || !newValues.targetDate) {
+  1182→        throw new ValidationError('PM_ADD requires trainId, pmTypeId, and targetDate');
+  1183→      }
+  1184→    }
+  1185→
+  1186→    if (change.type === 'PM_MOVE') {
+  1187→      if (!change.newValues || !change.newValues.targetDate) {
+  1188→        throw new ValidationError('PM_MOVE requires newValues with targetDate');
+  1189→      }
+  1190→    }
+  1191→  }
+  1192→
+  1193→  /**
+  1194→   * Calculate PM differences between two schedules
+  1195→   */
+  1196→  private calculatePMDifferences(
+  1197→    scheduleA: MaterializedPmRecord[],
+  1198→    scheduleB: MaterializedPmRecord[]
+  1199→  ): PMDifferenceSummary {
+  1200→    const differences: PMDifference[] = [];
+  1201→    const bMap = new Map(scheduleB.map((pm) => [pm.id, pm]));
+  1202→    const aSet = new Set(scheduleA.map((pm) => pm.id));
+  1203→
+  1204→    let added = 0;
+  1205→    let removed = 0;
+  1206→    let moved = 0;
+  1207→    let unchanged = 0;
+  1208→
+  1209→    // Check A against B
+  1210→    for (const pmA of scheduleA) {
+  1211→      const pmB = bMap.get(pmA.id);
+  1212→      if (!pmB) {
+  1213→        // Added in A (not in B)
+  1214→        differences.push({
+  1215→          pmId: pmA.id,
+  1216→          trainId: pmA.trainId,
+  1217→          pmTypeId: pmA.pmTypeId,
+  1218→          changeType: 'ADDED',
+  1219→          scenarioADate: pmA.targetDate,
+  1220→        });
+  1221→        added++;
+  1222→      } else if (pmA.targetDate !== pmB.targetDate) {
+  1223→        // Moved
+  1224→        const daysDiff = differenceInDays(
+  1225→          parseISO(pmA.targetDate),
+  1226→          parseISO(pmB.targetDate)
+  1227→        );
+  1228→        differences.push({
+  1229→          pmId: pmA.id,
+  1230→          trainId: pmA.trainId,
+  1231→          pmTypeId: pmA.pmTypeId,
+  1232→          changeType: 'MOVED',
+  1233→          scenarioADate: pmA.targetDate,
+  1234→          scenarioBDate: pmB.targetDate,
+  1235→          daysDifference: daysDiff,
+  1236→        });
+  1237→        moved++;
+  1238→      } else {
+  1239→        unchanged++;
+  1240→      }
+  1241→    }
+  1242→
+  1243→    // Check for removed (in B but not in A)
+  1244→    for (const pmB of scheduleB) {
+  1245→      if (!aSet.has(pmB.id)) {
+  1246→        differences.push({
+  1247→          pmId: pmB.id,
+  1248→          trainId: pmB.trainId,
+  1249→          pmTypeId: pmB.pmTypeId,
+  1250→          changeType: 'REMOVED',
+  1251→          scenarioBDate: pmB.targetDate,
+  1252→        });
+  1253→        removed++;
+  1254→      }
+  1255→    }
+  1256→
+  1257→    return {
+  1258→      countDelta: added - removed,
+  1259→      added,
+  1260→      removed,
+  1261→      moved,
+  1262→      unchanged,
+  1263→      details: differences,
+  1264→    };
+  1265→  }
+  1266→
+  1267→  /**
+  1268→   * Calculate man-hour differences (simplified)
+  1269→   */
+  1270→  private async calculateManhourDifferences(
+  1271→    scheduleA: MaterializedPmRecord[],
+  1272→    scheduleB: MaterializedPmRecord[]
+  1273→  ): Promise<ManhourDifferenceSummary> {
+  1274→    // Simplified calculation - sum assigned hours
+  1275→    const totalA = scheduleA.reduce((sum, pm) => sum + (pm.assignedHours ?? 0), 0);
+  1276→    const totalB = scheduleB.reduce((sum, pm) => sum + (pm.assignedHours ?? 0), 0);
+  1277→
+  1278→    return {
+  1279→      totalDelta: totalA - totalB,
+  1280→      overloadedWeeksDelta: 0, // Would require more complex calculation
+  1281→      scenarioATotalHours: totalA,
+  1282→      scenarioBTotalHours: totalB,
+  1283→      details: [],
+  1284→    };
+  1285→  }
+  1286→
+  1287→  /**
+  1288→   * Calculate cost differences (simplified)
+  1289→   */
+  1290→  private async calculateCostDifferences(
+  1291→    scheduleA: MaterializedPmRecord[],
+  1292→    scheduleB: MaterializedPmRecord[]
+  1293→  ): Promise<CostDifferenceSummary> {
+  1294→    // Simplified calculation - estimate based on hours
+  1295→    const hourlyRate = 150; // Default shop rate
+  1296→    const totalA = scheduleA.reduce((sum, pm) => sum + (pm.assignedHours ?? 0), 0) * hourlyRate;
+  1297→    const totalB = scheduleB.reduce((sum, pm) => sum + (pm.assignedHours ?? 0), 0) * hourlyRate;
+  1298→
+  1299→    return {
+  1300→      totalDelta: totalA - totalB,
+  1301→      laborDelta: totalA - totalB,
+  1302→      materialDelta: 0, // Would require material cost lookup
+  1303→      scenarioATotalCost: totalA,
+  1304→      scenarioBTotalCost: totalB,
+  1305→    };
+  1306→  }
+  1307→
+  1308→  /**
+  1309→   * Increment semantic version string
+  1310→   */
+  1311→  private incrementVersion(currentVersion?: string | null): string {
+  1312→    if (!currentVersion) {
+  1313→      return '1.0.0';
+  1314→    }
+  1315→
+  1316→    const parts = currentVersion.split('.');
+  1317→    if (parts.length !== 3) {
+  1318→      return '1.0.0';
+  1319→    }
+  1320→
+  1321→    const [major, minor] = parts.map(Number);
+  1322→    return `${major}.${minor + 1}.0`;
+  1323→  }
+  1324→}
+  1325→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

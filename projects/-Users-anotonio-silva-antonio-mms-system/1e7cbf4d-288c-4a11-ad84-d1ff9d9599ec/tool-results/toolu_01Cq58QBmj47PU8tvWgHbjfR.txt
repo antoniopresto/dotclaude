@@ -1,0 +1,828 @@
+     1→/**
+     2→ * Operational Detail Layer
+     3→ *
+     4→ * Konva-based detailed PM card layer for operational view (zoom levels 12-16).
+     5→ * Renders individual PM cards with comprehensive information including:
+     6→ * - Train identification with fleet colors
+     7→ * - PM details (code, description, dates, status)
+     8→ * - Track and depot assignment
+     9→ * - Material availability indicators
+    10→ * - Compliance window visualization
+    11→ * - Action indicators (lock, edit, history)
+    12→ *
+    13→ * Features:
+    14→ * - Card-based layout with vertical train stacking
+    15→ * - Daily timeline granularity (4-week view)
+    16→ * - Interactive hover and click handlers
+    17→ * - Status-based color coding
+    18→ * - Material availability badges
+    19→ *
+    20→ * @see specs/006-user-interface.md Section 6.3.4
+    21→ */
+    22→
+    23→import { useRef } from 'react';
+    24→import { Stage, Layer, Rect, Text, Line, Group } from 'react-konva';
+    25→import type { Stage as StageType } from 'konva/lib/Stage';
+    26→
+    27→import type { OperationalPmBlock, OperationalCanvasData, MaterialStatus } from './types';
+    28→import { PM_STATUS_COLORS, CONSTRAINT_COLORS, FLEET_COLORS, MATERIAL_STATUS_COLORS } from '../../theme/colors';
+    29→
+    30→// =============================================================================
+    31→// Constants
+    32→// =============================================================================
+    33→
+    34→/** Layout constants for operational cards */
+    35→const LAYOUT = {
+    36→  HEADER_HEIGHT: 64,
+    37→  TRAIN_LABEL_WIDTH: 140,
+    38→  CARD_WIDTH: 280,
+    39→  CARD_HEIGHT: 180,
+    40→  CARD_MARGIN: 12,
+    41→  CARD_PADDING: 12,
+    42→  DAY_WIDTH: 48,
+    43→  ROW_HEIGHT: 200,
+    44→  MIN_CARD_WIDTH: 200,
+    45→  GRID_LINE_COLOR: '#e2e8f0',
+    46→  HEADER_BG: '#f8fafc',
+    47→  CARD_BG: '#ffffff',
+    48→  FONT_FAMILY: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    49→};
+    50→
+    51→/** PM status to color mapping */
+    52→function getPmStatusColor(status: string): string {
+    53→  switch (status) {
+    54→    case 'SCHEDULED':
+    55→      return PM_STATUS_COLORS.scheduled;
+    56→    case 'IN_PROGRESS':
+    57→      return PM_STATUS_COLORS.inProgress;
+    58→    case 'COMPLETED':
+    59→      return PM_STATUS_COLORS.completed;
+    60→    case 'CANCELLED':
+    61→      return PM_STATUS_COLORS.cancelled;
+    62→    case 'DEFERRED':
+    63→      return PM_STATUS_COLORS.deferred;
+    64→    default:
+    65→      return PM_STATUS_COLORS.scheduled;
+    66→  }
+    67→}
+    68→
+    69→/** Material status to color mapping */
+    70→function getMaterialStatusColor(status: MaterialStatus): string {
+    71→  return MATERIAL_STATUS_COLORS[status] ?? MATERIAL_STATUS_COLORS.AVAILABLE;
+    72→}
+    73→
+    74→/** Material status to icon mapping */
+    75→function getMaterialStatusIcon(status: MaterialStatus): string {
+    76→  switch (status) {
+    77→    case 'AVAILABLE':
+    78→      return '✓';
+    79→    case 'LOW_STOCK':
+    80→      return '⚠';
+    81→    case 'UNAVAILABLE':
+    82→      return '✗';
+    83→    case 'ARRIVING':
+    84→      return '⏳';
+    85→    default:
+    86→      return '?';
+    87→  }
+    88→}
+    89→
+    90→// =============================================================================
+    91→// Types
+    92→// =============================================================================
+    93→
+    94→export interface OperationalDetailLayerProps {
+    95→  data: OperationalCanvasData | null;
+    96→  fromDate: Date;
+    97→  toDate: Date;
+    98→  width: number;
+    99→  height: number;
+   100→  selectedPmIds?: string[];
+   101→  onPmClick?: (pmId: string) => void;
+   102→  onPmHover?: (pm: OperationalPmBlock | null) => void;
+   103→  onPmEdit?: (pmId: string) => void;
+   104→  onPmLock?: (pmId: string) => void;
+   105→  showGrid?: boolean;
+   106→}
+   107→
+   108→interface DayData {
+   109→  date: Date;
+   110→  dateStr: string;
+   111→  dayOfWeek: number;
+   112→  isWeekStart: boolean;
+   113→  isToday: boolean;
+   114→  label: string;
+   115→}
+   116→
+   117→interface WeekData {
+   118→  weekStart: Date;
+   119→  weekNum: number;
+   120→  month: string;
+   121→  daysInWeek: number;
+   122→}
+   123→
+   124→// =============================================================================
+   125→// Pure Utility Functions
+   126→// =============================================================================
+   127→
+   128→function getDays(fromDate: Date, toDate: Date): DayData[] {
+   129→  const days: DayData[] = [];
+   130→  const current = new Date(fromDate);
+   131→  const today = new Date();
+   132→  today.setHours(0, 0, 0, 0);
+   133→
+   134→  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+   135→
+   136→  while (current <= toDate) {
+   137→    const dayOfWeek = current.getDay();
+   138→    days.push({
+   139→      date: new Date(current),
+   140→      dateStr: current.toISOString().split('T')[0],
+   141→      dayOfWeek,
+   142→      isWeekStart: dayOfWeek === 0,
+   143→      isToday: current.getTime() === today.getTime(),
+   144→      label: `${dayNames[dayOfWeek]} ${current.getDate()}`,
+   145→    });
+   146→    current.setDate(current.getDate() + 1);
+   147→  }
+   148→  return days;
+   149→}
+   150→
+   151→function getWeeks(days: DayData[]): WeekData[] {
+   152→  const weeks: WeekData[] = [];
+   153→  let currentWeek: WeekData | null = null;
+   154→  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+   155→
+   156→  for (const day of days) {
+   157→    if (day.isWeekStart || currentWeek === null) {
+   158→      if (currentWeek) {
+   159→        weeks.push(currentWeek);
+   160→      }
+   161→      const weekNum = getWeekNumber(day.date);
+   162→      currentWeek = {
+   163→        weekStart: day.date,
+   164→        weekNum,
+   165→        month: monthNames[day.date.getMonth()],
+   166→        daysInWeek: 1,
+   167→      };
+   168→    } else {
+   169→      currentWeek.daysInWeek++;
+   170→    }
+   171→  }
+   172→  if (currentWeek) {
+   173→    weeks.push(currentWeek);
+   174→  }
+   175→  return weeks;
+   176→}
+   177→
+   178→function getWeekNumber(date: Date): number {
+   179→  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+   180→  const dayNum = d.getUTCDay() || 7;
+   181→  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+   182→  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+   183→  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+   184→}
+   185→
+   186→function dateDiffDays(a: Date, b: Date): number {
+   187→  return Math.floor((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24));
+   188→}
+   189→
+   190→function parseDate(dateStr: string): Date {
+   191→  return new Date(dateStr + 'T00:00:00');
+   192→}
+   193→
+   194→function formatDateRange(startDate: string, endDate: string): string {
+   195→  const start = new Date(startDate);
+   196→  const end = new Date(endDate);
+   197→  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+   198→
+   199→  if (startDate === endDate) {
+   200→    return `${monthNames[start.getMonth()]} ${start.getDate()}`;
+   201→  }
+   202→
+   203→  if (start.getMonth() === end.getMonth()) {
+   204→    return `${monthNames[start.getMonth()]} ${start.getDate()}-${end.getDate()}`;
+   205→  }
+   206→
+   207→  return `${monthNames[start.getMonth()]} ${start.getDate()} - ${monthNames[end.getMonth()]} ${end.getDate()}`;
+   208→}
+   209→
+   210→function buildTrainGroups(pmBlocks: OperationalPmBlock[]): Map<string, OperationalPmBlock[]> {
+   211→  const groups = new Map<string, OperationalPmBlock[]>();
+   212→
+   213→  for (const pm of pmBlocks) {
+   214→    if (!groups.has(pm.trainId)) {
+   215→      groups.set(pm.trainId, []);
+   216→    }
+   217→    groups.get(pm.trainId)!.push(pm);
+   218→  }
+   219→
+   220→  return groups;
+   221→}
+   222→
+   223→// =============================================================================
+   224→// Sub-Components
+   225→// =============================================================================
+   226→
+   227→interface TimelineHeaderProps {
+   228→  days: DayData[];
+   229→  weeks: WeekData[];
+   230→  offsetX: number;
+   231→}
+   232→
+   233→function TimelineHeader({ days, weeks, offsetX }: TimelineHeaderProps) {
+   234→  return (
+   235→    <Group x={offsetX} y={0}>
+   236→      {/* Week/Month row */}
+   237→      <Rect
+   238→        x={0}
+   239→        y={0}
+   240→        width={days.length * LAYOUT.DAY_WIDTH}
+   241→        height={LAYOUT.HEADER_HEIGHT / 2}
+   242→        fill={LAYOUT.HEADER_BG}
+   243→      />
+   244→      {weeks.map((week, i) => {
+   245→        const x = days.findIndex((d) => d.date.getTime() === week.weekStart.getTime()) * LAYOUT.DAY_WIDTH;
+   246→        const width = week.daysInWeek * LAYOUT.DAY_WIDTH;
+   247→        return (
+   248→          <Group key={i} x={x} y={0}>
+   249→            <Rect
+   250→              width={width}
+   251→              height={LAYOUT.HEADER_HEIGHT / 2}
+   252→              stroke={LAYOUT.GRID_LINE_COLOR}
+   253→              strokeWidth={1}
+   254→            />
+   255→            <Text
+   256→              x={8}
+   257→              y={8}
+   258→              text={`${week.month} - Week ${week.weekNum}`}
+   259→              fontSize={12}
+   260→              fontFamily={LAYOUT.FONT_FAMILY}
+   261→              fill="#475569"
+   262→              fontStyle="bold"
+   263→            />
+   264→          </Group>
+   265→        );
+   266→      })}
+   267→
+   268→      {/* Day row */}
+   269→      {days.map((day, i) => (
+   270→        <Group key={day.dateStr} x={i * LAYOUT.DAY_WIDTH} y={LAYOUT.HEADER_HEIGHT / 2}>
+   271→          <Rect
+   272→            width={LAYOUT.DAY_WIDTH}
+   273→            height={LAYOUT.HEADER_HEIGHT / 2}
+   274→            fill={day.isToday ? '#dbeafe' : day.dayOfWeek === 0 || day.dayOfWeek === 6 ? '#f1f5f9' : LAYOUT.HEADER_BG}
+   275→            stroke={LAYOUT.GRID_LINE_COLOR}
+   276→            strokeWidth={0.5}
+   277→          />
+   278→          <Text
+   279→            x={4}
+   280→            y={8}
+   281→            text={day.label}
+   282→            fontSize={10}
+   283→            fontFamily={LAYOUT.FONT_FAMILY}
+   284→            fill={day.isToday ? '#2563eb' : '#64748b'}
+   285→            fontStyle={day.isToday ? 'bold' : 'normal'}
+   286→          />
+   287→        </Group>
+   288→      ))}
+   289→    </Group>
+   290→  );
+   291→}
+   292→
+   293→interface TrainLabelsPanelProps {
+   294→  trainGroups: Map<string, OperationalPmBlock[]>;
+   295→  trainOrder: string[];
+   296→}
+   297→
+   298→function TrainLabelsPanel({ trainGroups, trainOrder }: TrainLabelsPanelProps) {
+   299→  return (
+   300→    <Group x={0} y={LAYOUT.HEADER_HEIGHT}>
+   301→      <Rect
+   302→        width={LAYOUT.TRAIN_LABEL_WIDTH}
+   303→        height={trainOrder.length * LAYOUT.ROW_HEIGHT}
+   304→        fill="#ffffff"
+   305→      />
+   306→      {trainOrder.map((trainId, i) => {
+   307→        const pms = trainGroups.get(trainId) || [];
+   308→        const firstPm = pms[0];
+   309→        if (!firstPm) return null;
+   310→
+   311→        const fleetCode = firstPm.fleetCode || 'KS';
+   312→        const fleetColor = FLEET_COLORS[fleetCode as keyof typeof FLEET_COLORS] || FLEET_COLORS.KS;
+   313→
+   314→        return (
+   315→          <Group key={trainId} y={i * LAYOUT.ROW_HEIGHT}>
+   316→            <Rect
+   317→              width={LAYOUT.TRAIN_LABEL_WIDTH}
+   318→              height={LAYOUT.ROW_HEIGHT}
+   319→              stroke={LAYOUT.GRID_LINE_COLOR}
+   320→              strokeWidth={0.5}
+   321→              fill="#fafafa"
+   322→            />
+   323→            {/* Fleet color bar */}
+   324→            <Rect
+   325→              x={6}
+   326→              y={12}
+   327→              width={6}
+   328→              height={LAYOUT.ROW_HEIGHT - 24}
+   329→              fill={fleetColor}
+   330→              cornerRadius={3}
+   331→            />
+   332→            {/* Train number */}
+   333→            <Text
+   334→              x={18}
+   335→              y={16}
+   336→              text={firstPm.trainNumber}
+   337→              fontSize={14}
+   338→              fontFamily={LAYOUT.FONT_FAMILY}
+   339→              fill="#1e293b"
+   340→              fontStyle="bold"
+   341→            />
+   342→            {/* Fleet code */}
+   343→            <Text
+   344→              x={18}
+   345→              y={34}
+   346→              text={fleetCode}
+   347→              fontSize={11}
+   348→              fontFamily={LAYOUT.FONT_FAMILY}
+   349→              fill="#64748b"
+   350→            />
+   351→            {/* PM count */}
+   352→            <Text
+   353→              x={18}
+   354→              y={52}
+   355→              text={`${pms.length} PM${pms.length !== 1 ? 's' : ''}`}
+   356→              fontSize={10}
+   357→              fontFamily={LAYOUT.FONT_FAMILY}
+   358→              fill="#94a3b8"
+   359→            />
+   360→          </Group>
+   361→        );
+   362→      })}
+   363→    </Group>
+   364→  );
+   365→}
+   366→
+   367→interface GridLayerProps {
+   368→  days: DayData[];
+   369→  rowCount: number;
+   370→  offsetX: number;
+   371→}
+   372→
+   373→function GridLayer({ days, rowCount, offsetX }: GridLayerProps) {
+   374→  const todayIndex = days.findIndex((d) => d.isToday);
+   375→
+   376→  return (
+   377→    <Group x={offsetX} y={LAYOUT.HEADER_HEIGHT}>
+   378→      {/* Row backgrounds */}
+   379→      {Array.from({ length: rowCount }).map((_, i) => (
+   380→        <Rect
+   381→          key={i}
+   382→          y={i * LAYOUT.ROW_HEIGHT}
+   383→          width={days.length * LAYOUT.DAY_WIDTH}
+   384→          height={LAYOUT.ROW_HEIGHT}
+   385→          fill={i % 2 === 0 ? '#ffffff' : '#fafafa'}
+   386→          stroke={LAYOUT.GRID_LINE_COLOR}
+   387→          strokeWidth={0.5}
+   388→        />
+   389→      ))}
+   390→
+   391→      {/* Today highlight column */}
+   392→      {todayIndex >= 0 && (
+   393→        <Rect
+   394→          x={todayIndex * LAYOUT.DAY_WIDTH}
+   395→          y={0}
+   396→          width={LAYOUT.DAY_WIDTH}
+   397→          height={rowCount * LAYOUT.ROW_HEIGHT}
+   398→          fill="rgba(37, 99, 235, 0.05)"
+   399→        />
+   400→      )}
+   401→
+   402→      {/* Week separator lines */}
+   403→      {days.filter((d) => d.isWeekStart).map((day) => {
+   404→        const x = days.indexOf(day) * LAYOUT.DAY_WIDTH;
+   405→        return (
+   406→          <Line
+   407→            key={`week-${day.dateStr}`}
+   408→            points={[x, 0, x, rowCount * LAYOUT.ROW_HEIGHT]}
+   409→            stroke="#cbd5e1"
+   410→            strokeWidth={1}
+   411→          />
+   412→        );
+   413→      })}
+   414→
+   415→      {/* Today indicator line */}
+   416→      {todayIndex >= 0 && (
+   417→        <Line
+   418→          points={[
+   419→            todayIndex * LAYOUT.DAY_WIDTH + LAYOUT.DAY_WIDTH / 2,
+   420→            0,
+   421→            todayIndex * LAYOUT.DAY_WIDTH + LAYOUT.DAY_WIDTH / 2,
+   422→            rowCount * LAYOUT.ROW_HEIGHT,
+   423→          ]}
+   424→          stroke="#2563eb"
+   425→          strokeWidth={2}
+   426→          dash={[6, 4]}
+   427→        />
+   428→      )}
+   429→    </Group>
+   430→  );
+   431→}
+   432→
+   433→interface PmCardProps {
+   434→  pm: OperationalPmBlock;
+   435→  x: number;
+   436→  y: number;
+   437→  width: number;
+   438→  isSelected: boolean;
+   439→  onHover?: (pm: OperationalPmBlock | null) => void;
+   440→  onClick?: (pmId: string) => void;
+   441→  onEdit?: (pmId: string) => void;
+   442→  onLock?: (pmId: string) => void;
+   443→}
+   444→
+   445→function PmCard({
+   446→  pm,
+   447→  x,
+   448→  y,
+   449→  width,
+   450→  isSelected,
+   451→  onHover,
+   452→  onClick,
+   453→}: PmCardProps) {
+   454→  const statusColor = pm.displayColor || getPmStatusColor(pm.status);
+   455→  const cardWidth = Math.max(width, LAYOUT.MIN_CARD_WIDTH);
+   456→  const cardHeight = LAYOUT.CARD_HEIGHT;
+   457→
+   458→  // Calculate compliance window progress
+   459→  const constraintStart = parseDate(pm.constraintStart);
+   460→  const constraintEnd = parseDate(pm.constraintEnd);
+   461→  const targetDate = parseDate(pm.targetDate);
+   462→  const totalWindow = dateDiffDays(constraintEnd, constraintStart) || 1;
+   463→  const positionInWindow = dateDiffDays(targetDate, constraintStart);
+   464→  const progressPct = Math.min(100, Math.max(0, (positionInWindow / totalWindow) * 100));
+   465→
+   466→  // Determine compliance status
+   467→  let complianceColor: string = CONSTRAINT_COLORS.ok;
+   468→  if (progressPct > 90) {
+   469→    complianceColor = CONSTRAINT_COLORS.hardViolation;
+   470→  } else if (progressPct > 70) {
+   471→    complianceColor = CONSTRAINT_COLORS.approaching;
+   472→  }
+   473→
+   474→  return (
+   475→    <Group
+   476→      x={x}
+   477→      y={y}
+   478→      onMouseEnter={() => onHover?.(pm)}
+   479→      onMouseLeave={() => onHover?.(null)}
+   480→      onClick={() => onClick?.(pm.pmId)}
+   481→    >
+   482→      {/* Selection highlight */}
+   483→      {isSelected && (
+   484→        <Rect
+   485→          x={-3}
+   486→          y={-3}
+   487→          width={cardWidth + 6}
+   488→          height={cardHeight + 6}
+   489→          fill="transparent"
+   490→          stroke="#3b82f6"
+   491→          strokeWidth={2}
+   492→          cornerRadius={10}
+   493→        />
+   494→      )}
+   495→
+   496→      {/* Card background */}
+   497→      <Rect
+   498→        width={cardWidth}
+   499→        height={cardHeight}
+   500→        fill={LAYOUT.CARD_BG}
+   501→        stroke={isSelected ? '#2563eb' : '#e2e8f0'}
+   502→        strokeWidth={1}
+   503→        cornerRadius={8}
+   504→        shadowColor="#000"
+   505→        shadowBlur={4}
+   506→        shadowOpacity={0.08}
+   507→        shadowOffsetY={2}
+   508→      />
+   509→
+   510→      {/* Status color bar */}
+   511→      <Rect
+   512→        x={0}
+   513→        y={0}
+   514→        width={8}
+   515→        height={cardHeight}
+   516→        fill={statusColor}
+   517→        cornerRadius={[8, 0, 0, 8]}
+   518→      />
+   519→
+   520→      {/* Header section */}
+   521→      <Group x={LAYOUT.CARD_PADDING + 4} y={LAYOUT.CARD_PADDING}>
+   522→        {/* PM Code */}
+   523→        <Text
+   524→          text={pm.pmCode}
+   525→          fontSize={14}
+   526→          fontFamily={LAYOUT.FONT_FAMILY}
+   527→          fill="#1e293b"
+   528→          fontStyle="bold"
+   529→        />
+   530→
+   531→        {/* Train number */}
+   532→        <Text
+   533→          y={18}
+   534→          text={pm.trainNumber}
+   535→          fontSize={11}
+   536→          fontFamily={LAYOUT.FONT_FAMILY}
+   537→          fill="#64748b"
+   538→        />
+   539→
+   540→        {/* Lock indicator */}
+   541→        {pm.isLocked && (
+   542→          <Text
+   543→            x={cardWidth - 40}
+   544→            y={0}
+   545→            text="🔒"
+   546→            fontSize={14}
+   547→          />
+   548→        )}
+   549→
+   550→        {/* Status badge */}
+   551→        <Group x={cardWidth - 90} y={0}>
+   552→          <Rect
+   553→            width={60}
+   554→            height={20}
+   555→            fill={statusColor}
+   556→            cornerRadius={4}
+   557→            opacity={0.2}
+   558→          />
+   559→          <Text
+   560→            x={4}
+   561→            y={4}
+   562→            text={pm.status.replace('_', ' ')}
+   563→            fontSize={9}
+   564→            fontFamily={LAYOUT.FONT_FAMILY}
+   565→            fill={statusColor}
+   566→            fontStyle="bold"
+   567→          />
+   568→        </Group>
+   569→      </Group>
+   570→
+   571→      {/* Date and details section */}
+   572→      <Group x={LAYOUT.CARD_PADDING + 4} y={48}>
+   573→        {/* Date range */}
+   574→        <Text
+   575→          text={formatDateRange(pm.targetDate, pm.endDate)}
+   576→          fontSize={11}
+   577→          fontFamily={LAYOUT.FONT_FAMILY}
+   578→          fill="#475569"
+   579→        />
+   580→
+   581→        {/* Duration */}
+   582→        <Text
+   583→          x={100}
+   584→          text={`${pm.durationDays}d`}
+   585→          fontSize={11}
+   586→          fontFamily={LAYOUT.FONT_FAMILY}
+   587→          fill="#64748b"
+   588→        />
+   589→
+   590→        {/* Hours */}
+   591→        {pm.estimatedHours && (
+   592→          <Text
+   593→            x={130}
+   594→            text={`${pm.estimatedHours}h`}
+   595→            fontSize={11}
+   596→            fontFamily={LAYOUT.FONT_FAMILY}
+   597→            fill="#64748b"
+   598→          />
+   599→        )}
+   600→
+   601→        {/* Track and depot */}
+   602→        <Text
+   603→          y={16}
+   604→          text={[pm.depotCode, pm.trackNumber].filter(Boolean).join(' • ') || 'Unassigned'}
+   605→          fontSize={10}
+   606→          fontFamily={LAYOUT.FONT_FAMILY}
+   607→          fill="#94a3b8"
+   608→        />
+   609→
+   610→        {/* Shift */}
+   611→        {pm.assignedShift && (
+   612→          <Text
+   613→            y={30}
+   614→            text={`Shift: ${pm.assignedShift}`}
+   615→            fontSize={10}
+   616→            fontFamily={LAYOUT.FONT_FAMILY}
+   617→            fill="#94a3b8"
+   618→          />
+   619→        )}
+   620→      </Group>
+   621→
+   622→      {/* Compliance window visualization */}
+   623→      <Group x={LAYOUT.CARD_PADDING + 4} y={100}>
+   624→        <Text
+   625→          text="Compliance Window"
+   626→          fontSize={9}
+   627→          fontFamily={LAYOUT.FONT_FAMILY}
+   628→          fill="#94a3b8"
+   629→        />
+   630→
+   631→        {/* Progress bar background */}
+   632→        <Rect
+   633→          y={14}
+   634→          width={cardWidth - LAYOUT.CARD_PADDING * 2 - 8}
+   635→          height={8}
+   636→          fill="#f1f5f9"
+   637→          cornerRadius={4}
+   638→        />
+   639→
+   640→        {/* Progress bar fill */}
+   641→        <Rect
+   642→          y={14}
+   643→          width={(cardWidth - LAYOUT.CARD_PADDING * 2 - 8) * (progressPct / 100)}
+   644→          height={8}
+   645→          fill={complianceColor}
+   646→          cornerRadius={4}
+   647→        />
+   648→
+   649→        {/* Target date marker */}
+   650→        <Line
+   651→          points={[
+   652→            (cardWidth - LAYOUT.CARD_PADDING * 2 - 8) * (progressPct / 100),
+   653→            12,
+   654→            (cardWidth - LAYOUT.CARD_PADDING * 2 - 8) * (progressPct / 100),
+   655→            24,
+   656→          ]}
+   657→          stroke="#1e293b"
+   658→          strokeWidth={2}
+   659→        />
+   660→
+   661→        {/* Date labels */}
+   662→        <Text
+   663→          y={26}
+   664→          text={pm.constraintStart.slice(5)}
+   665→          fontSize={8}
+   666→          fontFamily={LAYOUT.FONT_FAMILY}
+   667→          fill="#94a3b8"
+   668→        />
+   669→        <Text
+   670→          x={cardWidth - LAYOUT.CARD_PADDING * 2 - 40}
+   671→          y={26}
+   672→          text={pm.constraintEnd.slice(5)}
+   673→          fontSize={8}
+   674→          fontFamily={LAYOUT.FONT_FAMILY}
+   675→          fill="#94a3b8"
+   676→        />
+   677→      </Group>
+   678→
+   679→      {/* Materials section */}
+   680→      <Group x={LAYOUT.CARD_PADDING + 4} y={140}>
+   681→        <Text
+   682→          text="Materials"
+   683→          fontSize={9}
+   684→          fontFamily={LAYOUT.FONT_FAMILY}
+   685→          fill="#94a3b8"
+   686→        />
+   687→
+   688→        {pm.materials.length > 0 ? (
+   689→          pm.materials.slice(0, 2).map((material, idx) => (
+   690→            <Group key={material.materialId} y={14 + idx * 14}>
+   691→              <Text
+   692→                text={getMaterialStatusIcon(material.status)}
+   693→                fontSize={10}
+   694→                fill={getMaterialStatusColor(material.status)}
+   695→              />
+   696→              <Text
+   697→                x={14}
+   698→                text={`${material.materialName.slice(0, 20)}${material.materialName.length > 20 ? '...' : ''}`}
+   699→                fontSize={9}
+   700→                fontFamily={LAYOUT.FONT_FAMILY}
+   701→                fill="#64748b"
+   702→              />
+   703→              <Text
+   704→                x={cardWidth - 60}
+   705→                text={`${material.quantityAvailable}/${material.quantityRequired}`}
+   706→                fontSize={9}
+   707→                fontFamily={LAYOUT.FONT_FAMILY}
+   708→                fill={getMaterialStatusColor(material.status)}
+   709→              />
+   710→            </Group>
+   711→          ))
+   712→        ) : (
+   713→          <Text
+   714→            y={14}
+   715→            text="No materials required"
+   716→            fontSize={9}
+   717→            fontFamily={LAYOUT.FONT_FAMILY}
+   718→            fill="#94a3b8"
+   719→            fontStyle="italic"
+   720→          />
+   721→        )}
+   722→      </Group>
+   723→    </Group>
+   724→  );
+   725→}
+   726→
+   727→// =============================================================================
+   728→// Main Component
+   729→// =============================================================================
+   730→
+   731→export function OperationalDetailLayer({
+   732→  data,
+   733→  fromDate,
+   734→  toDate,
+   735→  width,
+   736→  height,
+   737→  selectedPmIds = [],
+   738→  onPmClick,
+   739→  onPmHover,
+   740→  showGrid = true,
+   741→}: OperationalDetailLayerProps) {
+   742→  const stageRef = useRef<StageType>(null);
+   743→
+   744→  if (!data) {
+   745→    return null;
+   746→  }
+   747→
+   748→  // Compute derived data
+   749→  const days = getDays(fromDate, toDate);
+   750→  const weeks = getWeeks(days);
+   751→  const trainGroups = buildTrainGroups(data.pmBlocks);
+   752→  const trainOrder = Array.from(trainGroups.keys());
+   753→  const selectedSet = new Set(selectedPmIds);
+   754→
+   755→  const gridOffsetX = LAYOUT.TRAIN_LABEL_WIDTH;
+   756→  const contentWidth = days.length * LAYOUT.DAY_WIDTH + gridOffsetX;
+   757→  const contentHeight = trainOrder.length * LAYOUT.ROW_HEIGHT + LAYOUT.HEADER_HEIGHT;
+   758→
+   759→  return (
+   760→    <Stage
+   761→      ref={stageRef}
+   762→      width={width}
+   763→      height={height}
+   764→      style={{ backgroundColor: '#f8fafc' }}
+   765→    >
+   766→      {/* Background layer */}
+   767→      <Layer>
+   768→        <Rect width={contentWidth} height={contentHeight} fill="#ffffff" />
+   769→      </Layer>
+   770→
+   771→      {/* Grid layer */}
+   772→      {showGrid && (
+   773→        <Layer>
+   774→          <GridLayer days={days} rowCount={trainOrder.length} offsetX={gridOffsetX} />
+   775→        </Layer>
+   776→      )}
+   777→
+   778→      {/* PM Cards layer */}
+   779→      <Layer>
+   780→        <Group x={gridOffsetX} y={LAYOUT.HEADER_HEIGHT}>
+   781→          {trainOrder.map((trainId, trainIndex) => {
+   782→            const pms = trainGroups.get(trainId) || [];
+   783→
+   784→            return pms.map((pm) => {
+   785→              const pmDate = parseDate(pm.targetDate);
+   786→              const dayOffset = dateDiffDays(pmDate, fromDate);
+   787→              if (dayOffset < 0 || dayOffset >= days.length) return null;
+   788→
+   789→              const x = dayOffset * LAYOUT.DAY_WIDTH + LAYOUT.CARD_MARGIN;
+   790→              const y = trainIndex * LAYOUT.ROW_HEIGHT + LAYOUT.CARD_MARGIN;
+   791→              const cardWidth = pm.durationDays * LAYOUT.DAY_WIDTH - LAYOUT.CARD_MARGIN * 2;
+   792→
+   793→              return (
+   794→                <PmCard
+   795→                  key={pm.pmId}
+   796→                  pm={pm}
+   797→                  x={x}
+   798→                  y={y}
+   799→                  width={cardWidth}
+   800→                  isSelected={selectedSet.has(pm.pmId)}
+   801→                  onHover={onPmHover}
+   802→                  onClick={onPmClick}
+   803→                />
+   804→              );
+   805→            });
+   806→          })}
+   807→        </Group>
+   808→      </Layer>
+   809→
+   810→      {/* Timeline header layer (on top) */}
+   811→      <Layer>
+   812→        <TimelineHeader days={days} weeks={weeks} offsetX={gridOffsetX} />
+   813→      </Layer>
+   814→
+   815→      {/* Train labels layer (fixed left) */}
+   816→      <Layer>
+   817→        <TrainLabelsPanel trainGroups={trainGroups} trainOrder={trainOrder} />
+   818→      </Layer>
+   819→    </Stage>
+   820→  );
+   821→}
+   822→
+   823→export default OperationalDetailLayer;
+   824→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

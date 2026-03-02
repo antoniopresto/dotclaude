@@ -1,0 +1,241 @@
+     1→# Intentional Behaviors Documentation
+     2→
+     3→> **Purpose**: Document behaviors in Ralph configuration that appear to be defects but are intentional design decisions for this project's specific needs.
+     4→
+     5→---
+     6→
+     7→## 1. NO_PUSH=true Default
+     8→
+     9→**Location**: `ralph/loop.sh:348`
+    10→
+    11→```bash
+    12→NO_PUSH=true
+    13→```
+    14→
+    15→**Appears to be a defect because**:
+    16→- Work only exists locally — risk of total loss
+    17→- Community best practice is `NO_PUSH=false`
+    18→- Geoffrey Huntley recommends pushing to preserve work
+    19→
+    20→**Why it's intentional**:
+    21→- **VPN interference**: When connected to VPN, git push can fail unpredictably
+    22→- **Push failures stop Ralph**: A failed push breaks the loop, interrupting 24h+ runs
+    23→- **Local work is acceptable risk**: Git commits still preserve work locally; manual push when convenient
+    24→
+    25→**Mitigation**:
+    26→- Git commits still happen — work is preserved in local repo
+    27→- Periodic manual `git push` when VPN allows
+    28→- Can override with `NO_PUSH=false` when on stable network
+    29→
+    30→**To change temporarily**:
+    31→```bash
+    32→NO_PUSH=false ./ralph/loop.sh
+    33→```
+    34→
+    35→---
+    36→
+    37→## 2. Circuit Breaker Thresholds (9999999)
+    38→
+    39→**Location**: `ralph/circuit-breaker.sh`
+    40→
+    41→```bash
+    42→CB_NO_PROGRESS_THRESHOLD=${CB_NO_PROGRESS_THRESHOLD:-9999999}
+    43→CB_MAX_COST_USD=${CB_MAX_COST_USD:-9999999}
+    44→```
+    45→
+    46→**Appears to be a defect because**:
+    47→- No practical limit on iterations without progress
+    48→- No practical cost limit ($10 million)
+    49→- Could run infinitely on stuck tasks
+    50→
+    51→**Why it's intentional**:
+    52→- **24h+ continuous runs required**: Project needs Ralph to run overnight and over weekends
+    53→- **Progress detection is unreliable**: "No progress" is subjective — large refactors may take many iterations without visible git commits
+    54→- **Cost is pre-approved**: This is a funded project with budget allocated for AI development
+    55→- **Human monitoring exists**: Developer monitors dashboard periodically, not relying on automated stops
+    56→
+    57→**Mitigation**:
+    58→- `Ctrl+C` available for manual intervention
+    59→- `monitor.sh dashboard` for human oversight
+    60→- Git history allows reverting bad iterations
+    61→
+    62→**To use stricter limits temporarily**:
+    63→```bash
+    64→CB_NO_PROGRESS_THRESHOLD=10 CB_MAX_COST_USD=100 ./ralph/loop.sh
+    65→```
+    66→
+    67→---
+    68→
+    69→## 3. MAX_CALLS_PER_HOUR=9999999
+    70→
+    71→**Location**: `ralph/loop.sh:53`
+    72→
+    73→```bash
+    74→MAX_CALLS_PER_HOUR=${MAX_CALLS_PER_HOUR:-9999999}
+    75→```
+    76→
+    77→**Appears to be a defect because**:
+    78→- Documentation says "default: 100"
+    79→- No practical rate limiting
+    80→- Could hit API limits
+    81→
+    82→**Why it's intentional**:
+    83→- **API limits handled upstream**: Anthropic API has its own rate limits
+    84→- **Retry logic handles throttling**: `run_claude_with_retry()` handles 503/504/rate limit errors
+    85→- **Maximizing throughput**: For 24h+ runs, artificial limits reduce productivity
+    86→
+    87→**Mitigation**:
+    88→- Anthropic's rate limits still apply
+    89→- Retry logic with exponential backoff
+    90→- Cost monitoring via circuit breaker (even if high threshold)
+    91→
+    92→---
+    93→
+    94→## 4. "500 Parallel Subagents" in Prompts
+    95→
+    96→**Location**: `ralph/PROMPT_build.md:1,45`
+    97→
+    98→```markdown
+    99→0a. Study `specs/*` with up to 500 parallel Opus (Min 4.5) subagents
+   100→```
+   101→
+   102→**Appears to be a defect because**:
+   103→- Claude Code doesn't support 500 parallel subagents
+   104→- Realistic limit is ~3-5 concurrent
+   105→- Could confuse the agent
+   106→
+   107→**Why it might be intentional** (speculative):
+   108→- May be aspirational instruction ("use as many as beneficial")
+   109→- Could be legacy from different tooling
+   110→- Agent generally interprets reasonably despite impossible numbers
+   111→
+   112→**Recommendation**: Change to realistic language:
+   113→```markdown
+   114→0a. Study `specs/*` systematically. Use subagents for parallel reads when beneficial.
+   115→```
+   116→
+   117→**Status**: This one likely IS a defect worth fixing — documented for review.
+   118→
+   119→---
+   120→
+   121→## 5. Absurd Line Numbers (99, 999, 9999...)
+   122→
+   123→**Location**: `ralph/PROMPT_build.md:83-178`
+   124→
+   125→```markdown
+   126→99. Required tests...
+   127→999. Important: When authoring documentation...
+   128→9999. Important: Single sources of truth...
+   129→99999. As soon as there are no build or test errors...
+   130→```
+   131→
+   132→**Appears to be a defect because**:
+   133→- Non-sequential numbering is confusing
+   134→- Hard to reference specific instructions
+   135→- Unconventional documentation style
+   136→
+   137→**Why it's intentional**:
+   138→- **Huntley's guardrail pattern**: High numbers indicate "always applicable" rules vs sequential steps
+   139→- **Priority signaling**: Lower numbers = do first; high numbers = always consider
+   140→- **Insertion flexibility**: Can add new instructions without renumbering
+   141→
+   142→**Community precedent**: This pattern appears in [ghuntley/how-to-ralph-wiggum](https://github.com/ghuntley/how-to-ralph-wiggum/blob/main/files/PROMPT_build.md).
+   143→
+   144→---
+   145→
+   146→## 6. grep Without -i (Case-Sensitive Completion Detection)
+   147→
+   148→**Location**: `ralph/loop.sh:187`
+   149→
+   150→```bash
+   151→if grep -q "$signal" "$output_file" 2>/dev/null; then
+   152→```
+   153→
+   154→**Appears to be a defect because**:
+   155→- `ALL_TASKS_COMPLETE` detected but `all_tasks_complete` isn't
+   156→- Could miss valid completion signals
+   157→
+   158→**Why it might be intentional**:
+   159→- Completion signals are defined in code, not typed by humans
+   160→- Case-sensitive matching prevents false positives
+   161→- Defined signals are uppercase by convention
+   162→
+   163→**Recommendation**: Add `-i` flag for robustness:
+   164→```bash
+   165→if grep -qi "$signal" "$output_file" 2>/dev/null; then
+   166→```
+   167→
+   168→**Status**: Likely worth fixing — low risk improvement.
+   169→
+   170→---
+   171→
+   172→## 7. Missing Edit Hook in PostToolUse
+   173→
+   174→**Location**: `.claude/settings.json:52-63`
+   175→
+   176→```json
+   177→"PostToolUse": [
+   178→  {
+   179→    "matcher": "Write",
+   180→    "hooks": [...]
+   181→  }
+   182→  // No Edit matcher
+   183→]
+   184→```
+   185→
+   186→**Appears to be a defect because**:
+   187→- Forbidden imports blocked on Write but not Edit
+   188→- Could bypass import restrictions via Edit tool
+   189→
+   190→**Why it might be intentional**:
+   191→- Edit is for small changes; Write is for new files
+   192→- Forbidden imports more likely in new files
+   193→- Hook overhead on every Edit could slow iterations
+   194→
+   195→**Recommendation**: Add Edit matcher for consistency:
+   196→```json
+   197→{
+   198→  "matcher": "Edit",
+   199→  "hooks": [{
+   200→    "type": "command",
+   201→    "command": "bash .claude/hooks/block-forbidden-imports.sh"
+   202→  }]
+   203→}
+   204→```
+   205→
+   206→**Status**: Worth adding — minimal overhead, improved safety.
+   207→
+   208→---
+   209→
+   210→## Summary Table
+   211→
+   212→| Behavior | Appears As | Actually Is | Action |
+   213→|----------|------------|-------------|--------|
+   214→| NO_PUSH=true | Data loss risk | VPN protection | Keep, document |
+   215→| CB thresholds 9999999 | No safety | 24h+ run support | Keep, document |
+   216→| Rate limit 9999999 | No throttling | API handles it | Keep, document |
+   217→| 500 subagents | Impossible | Legacy/aspirational | Fix recommended |
+   218→| Absurd numbering | Typos | Guardrail pattern | Keep, document |
+   219→| grep without -i | Bug | Conservative matching | Fix recommended |
+   220→| Missing Edit hook | Oversight | Perf optimization | Fix recommended |
+   221→
+   222→---
+   223→
+   224→## How to Override Intentional Behaviors
+   225→
+   226→```bash
+   227→# Strict mode for testing
+   228→CB_NO_PROGRESS_THRESHOLD=5 \
+   229→CB_MAX_COST_USD=50 \
+   230→MAX_CALLS_PER_HOUR=100 \
+   231→NO_PUSH=false \
+   232→./ralph/loop.sh
+   233→
+   234→# Normal mode (uses intentional defaults)
+   235→./ralph/loop.sh
+   236→```
+   237→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

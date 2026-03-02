@@ -1,0 +1,604 @@
+  1000→
+  1001→      if (!train) {
+  1002→        throw new TrainNotFoundError(trainId);
+  1003→      }
+  1004→
+  1005→      span.setAttribute(MmsAttributes.TRAIN_NUMBER, train.trainNumber);
+  1006→
+  1007→      // Get PM type
+  1008→      const pmType = await tx.query.pmTypes.findFirst({
+  1009→        where: eq(pmTypes.id, pmTypeId),
+  1010→      });
+  1011→
+  1012→      if (!pmType) {
+  1013→        throw new NotFoundError(`PM type not found: ${pmTypeId}`, {
+  1014→          entityType: 'pm_type',
+  1015→          entityId: pmTypeId,
+  1016→        });
+  1017→      }
+  1018→
+  1019→      // Calculate compliance window
+  1020→      const dueResult = await this.calculateComplianceWindow(trainId, pmTypeId);
+  1021→
+  1022→      // Validate target date is within compliance window
+  1023→      if (targetDate < dueResult.complianceWindow.startDate ||
+  1024→          targetDate > dueResult.complianceWindow.endDate) {
+  1025→        throw new ComplianceWindowError(
+  1026→          `Target date ${targetDate} is outside compliance window [${dueResult.complianceWindow.startDate}, ${dueResult.complianceWindow.endDate}]`,
+  1027→          {
+  1028→            windowStart: new Date(dueResult.complianceWindow.startDate),
+  1029→            windowEnd: new Date(dueResult.complianceWindow.endDate),
+  1030→            targetDate: new Date(targetDate),
+  1031→          }
+  1032→        );
+  1033→      }
+  1034→
+  1035→      // Check service demand (unless skipped)
+  1036→      if (!skipServiceDemandCheck) {
+  1037→        const { canSchedule, validation } = await this.serviceDemandService.canScheduleTrainForMaintenance(
+  1038→          trainId,
+  1039→          targetDate
+  1040→        );
+  1041→
+  1042→        if (!canSchedule) {
+  1043→          throw new ServiceDemandViolationError(
+  1044→            validation.message,
+  1045→            {
+  1046→              fleetId: validation.fleetId,
+  1047→              requiredTrains: validation.required,
+  1048→              availableTrains: validation.availableTrains,
+  1049→            }
+  1050→          );
+  1051→        }
+  1052→      }
+  1053→
+  1054→      // Check unavailability
+  1055→      const activeUnavailability = await this.unavailabilityService.getActiveEventsForTrain(trainId);
+  1056→      const blockingEvent = activeUnavailability.find(e => e.blocksPmScheduling);
+  1057→
+  1058→      if (blockingEvent) {
+  1059→        throw new BusinessRuleError(
+  1060→          `Train ${train.trainNumber} has active unavailability blocking PM scheduling: ${blockingEvent.eventType}`,
+  1061→          {
+  1062→            rule: 'unavailability_blocks_pm',
+  1063→            context: { eventId: blockingEvent.id, eventType: blockingEvent.eventType },
+  1064→          }
+  1065→        );
+  1066→      }
+  1067→
+  1068→      // Determine depot
+  1069→      const depotId = assignedDepotId ?? train.currentDepotId ?? train.homeDepotId;
+  1070→      if (!depotId) {
+  1071→        throw new ValidationError('No depot assigned and train has no current/home depot');
+  1072→      }
+  1073→
+  1074→      // Check material availability (unless skipped)
+  1075→      let materialResult: MaterialConstraintResult | null = null;
+  1076→      if (!skipMaterialCheck) {
+  1077→        materialResult = await this.checkMaterialAvailability(pmTypeId, depotId, targetDate);
+  1078→
+  1079→        if (materialResult.isBlocked) {
+  1080→          const blockingParts = materialResult.hardConstraintViolations
+  1081→            .map(v => v.partNumber)
+  1082→            .join(', ');
+  1083→
+  1084→          throw new MaterialConstraintError(
+  1085→            `Blocking materials not available: ${blockingParts}`,
+  1086→            {
+  1087→              partNumber: materialResult.hardConstraintViolations[0]?.partNumber,
+  1088→              requiredQuantity: materialResult.hardConstraintViolations[0]?.requiredQuantity,
+  1089→              availableQuantity: materialResult.hardConstraintViolations[0]?.availableQuantity,
+  1090→            }
+  1091→          );
+  1092→        }
+  1093→      }
+  1094→
+  1095→      // Find or validate track
+  1096→      let trackId = assignedTrackId;
+  1097→      if (!trackId) {
+  1098→        const trackDuration = pmType.minTrackDays ?? 1;
+  1099→        const suitableTracks = await this.findSuitableTracks(
+  1100→          pmTypeId,
+  1101→          depotId,
+  1102→          targetDate,
+  1103→          trackDuration
+  1104→        );
+  1105→
+  1106→        if (suitableTracks.length > 0) {
+  1107→          trackId = suitableTracks[0].trackId;
+  1108→        }
+  1109→      } else {
+  1110→        // Validate provided track
+  1111→        const conflict = await this.checkTrackConflict(
+  1112→          trackId,
+  1113→          targetDate,
+  1114→          pmType.minTrackDays ?? 1
+  1115→        );
+  1116→
+  1117→        if (conflict) {
+  1118→          throw new TrackConflictError(
+  1119→            `Track is already occupied on ${targetDate}`,
+  1120→            {
+  1121→              trackId,
+  1122→              conflictingScheduleId: conflict.id,
+  1123→            }
+  1124→          );
+  1125→        }
+  1126→      }
+  1127→
+  1128→      // Estimate mileage at target date
+  1129→      const dailyKm = await this.getAverageDailyKm(trainId);
+  1130→      const today = new Date();
+  1131→      const daysUntilTarget = Math.ceil(
+  1132→        (new Date(targetDate).getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+  1133→      );
+  1134→      const targetMileageKm = (train.currentMileageKm ?? 0) + (daysUntilTarget * dailyKm);
+  1135→
+  1136→      // Create PM schedule record
+  1137→      const pmData: NewPmScheduleRecord = {
+  1138→        trainId,
+  1139→        pmTypeId,
+  1140→        targetDate,
+  1141→        targetMileageKm: Math.round(targetMileageKm),
+  1142→        status: 'SCHEDULED',
+  1143→        constraintStart: dueResult.complianceWindow.startDate,
+  1144→        constraintEnd: dueResult.complianceWindow.endDate,
+  1145→        assignedDepotId: depotId,
+  1146→        assignedTrackId: trackId ?? null,
+  1147→        assignedHours: pmType.estimatedHours,
+  1148→        assignedShift: assignedShift ?? null,
+  1149→        createdBy: createdBy ?? null,
+  1150→      };
+  1151→
+  1152→      const [created] = await tx.insert(pmSchedule).values(pmData).returning();
+  1153→      span.setAttribute('pm.scheduleId', created.id);
+  1154→
+  1155→      // Create audit history record
+  1156→      if (createdBy) {
+  1157→        const historyRecord: NewPmScheduleHistory = {
+  1158→          pmScheduleId: created.id,
+  1159→          changeType: 'CREATED',
+  1160→          newTargetDate: targetDate,
+  1161→          newStatus: 'SCHEDULED',
+  1162→          newAssignedTrackId: trackId ?? null,
+  1163→          newAssignedHours: pmType.estimatedHours,
+  1164→          changedBy: createdBy,
+  1165→          changeReason: notes ?? 'PM scheduled',
+  1166→          changeSource: 'USER',
+  1167→        };
+  1168→
+  1169→        await tx.insert(pmScheduleHistory).values(historyRecord);
+  1170→      }
+  1171→
+  1172→      // Create material reservations
+  1173→      if (materialResult?.reservations && materialResult.reservations.length > 0) {
+  1174→        for (const reservation of materialResult.reservations) {
+  1175→          const inventory = await tx.query.inventoryPositions.findFirst({
+  1176→            where: and(
+  1177→              eq(inventoryPositions.depotId, depotId),
+  1178→              eq(inventoryPositions.partNumber, reservation.partNumber)
+  1179→            ),
+  1180→          });
+  1181→
+  1182→          if (inventory) {
+  1183→            await tx.insert(materialReservations).values({
+  1184→              pmScheduleId: created.id,
+  1185→              inventoryPositionId: inventory.id,
+  1186→              partNumber: reservation.partNumber,
+  1187→              quantityReserved: reservation.quantity,
+  1188→              reservationType: reservation.type,
+  1189→              reservedBy: createdBy ?? null,
+  1190→              expiresAt: reservation.type === 'SOFT'
+  1191→                ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+  1192→                : null,
+  1193→            });
+  1194→
+  1195→            // Update inventory reserved quantity
+  1196→            await tx
+  1197→              .update(inventoryPositions)
+  1198→              .set({
+  1199→                quantityReserved: sql`${inventoryPositions.quantityReserved} + ${reservation.quantity}`,
+  1200→              })
+  1201→              .where(eq(inventoryPositions.id, inventory.id));
+  1202→          }
+  1203→        }
+  1204→      }
+  1205→
+  1206→      this.log.info(
+  1207→        {
+  1208→          pmScheduleId: created.id,
+  1209→          trainId,
+  1210→          trainNumber: train.trainNumber,
+  1211→          pmCode: pmType.pmCode,
+  1212→          targetDate,
+  1213→          trackId,
+  1214→          depotId,
+  1215→        },
+  1216→        `PM scheduled: ${pmType.pmCode} for ${train.trainNumber} on ${targetDate}`
+  1217→      );
+  1218→
+  1219→      return created;
+  1220→    });
+  1221→  }
+  1222→
+  1223→  /**
+  1224→   * Move an existing PM to a new date.
+  1225→   */
+  1226→  async movePm(request: MovePmRequest): Promise<PmScheduleRecord> {
+  1227→    return this.inTransaction('movePm', async (tx, span) => {
+  1228→      const { pmScheduleId, newTargetDate, newTrackId, reason, movedBy } = request;
+  1229→
+  1230→      span.setAttribute('pm.scheduleId', pmScheduleId);
+  1231→      span.setAttribute('pm.newTargetDate', newTargetDate);
+  1232→
+  1233→      // Get existing PM with relations
+  1234→      const existingPm = await tx.query.pmSchedule.findFirst({
+  1235→        where: eq(pmSchedule.id, pmScheduleId),
+  1236→        with: {
+  1237→          train: true,
+  1238→          pmType: true,
+  1239→          assignedTrack: true,
+  1240→        },
+  1241→      }) as PmWithDetails | null;
+  1242→
+  1243→      if (!existingPm) {
+  1244→        throw new PmScheduleNotFoundError(pmScheduleId);
+  1245→      }
+  1246→
+  1247→      // Check Maximo lock
+  1248→      const lockStatus = await this.checkMaximoLock(pmScheduleId);
+  1249→      if (lockStatus.isLocked) {
+  1250→        throw new MaximoLockError(
+  1251→          `PM cannot be moved: ${lockStatus.reason}`,
+  1252→          {
+  1253→            workOrderId: lockStatus.workOrderId ?? undefined,
+  1254→            maximoStatus: lockStatus.maximoStatus ?? undefined,
+  1255→          }
+  1256→        );
+  1257→      }
+  1258→
+  1259→      // Check status - only SCHEDULED can be moved
+  1260→      if (existingPm.status !== 'SCHEDULED') {
+  1261→        throw new BusinessRuleError(
+  1262→          `PM cannot be moved: status is ${existingPm.status}`,
+  1263→          {
+  1264→            rule: 'pm_status_move',
+  1265→            context: { currentStatus: existingPm.status },
+  1266→          }
+  1267→        );
+  1268→      }
+  1269→
+  1270→      // Validate new date is within compliance window
+  1271→      if (newTargetDate < existingPm.constraintStart ||
+  1272→          newTargetDate > existingPm.constraintEnd) {
+  1273→        throw new ComplianceWindowError(
+  1274→          `New target date ${newTargetDate} is outside compliance window [${existingPm.constraintStart}, ${existingPm.constraintEnd}]`,
+  1275→          {
+  1276→            windowStart: new Date(existingPm.constraintStart),
+  1277→            windowEnd: new Date(existingPm.constraintEnd),
+  1278→            targetDate: new Date(newTargetDate),
+  1279→          }
+  1280→        );
+  1281→      }
+  1282→
+  1283→      // Check service demand at new date
+  1284→      const { canSchedule, validation } = await this.serviceDemandService.canScheduleTrainForMaintenance(
+  1285→        existingPm.trainId,
+  1286→        newTargetDate
+  1287→      );
+  1288→
+  1289→      if (!canSchedule) {
+  1290→        throw new ServiceDemandViolationError(
+  1291→          validation.message,
+  1292→          {
+  1293→            fleetId: validation.fleetId,
+  1294→            requiredTrains: validation.required,
+  1295→            availableTrains: validation.availableTrains,
+  1296→          }
+  1297→        );
+  1298→      }
+  1299→
+  1300→      // Handle track change
+  1301→      let trackId = newTrackId ?? existingPm.assignedTrackId;
+  1302→      if (trackId) {
+  1303→        const conflict = await this.checkTrackConflict(
+  1304→          trackId,
+  1305→          newTargetDate,
+  1306→          existingPm.pmType?.minTrackDays ?? 1,
+  1307→          pmScheduleId
+  1308→        );
+  1309→
+  1310→        if (conflict) {
+  1311→          // Try to find alternative track
+  1312→          if (!newTrackId) {
+  1313→            const alternatives = await this.findSuitableTracks(
+  1314→              existingPm.pmTypeId,
+  1315→              existingPm.assignedDepotId,
+  1316→              newTargetDate,
+  1317→              existingPm.pmType?.minTrackDays ?? 1
+  1318→            );
+  1319→
+  1320→            if (alternatives.length > 0) {
+  1321→              trackId = alternatives[0].trackId;
+  1322→            } else {
+  1323→              trackId = null; // Clear track assignment
+  1324→            }
+  1325→          } else {
+  1326→            throw new TrackConflictError(
+  1327→              `Track is already occupied on ${newTargetDate}`,
+  1328→              {
+  1329→                trackId,
+  1330→                conflictingScheduleId: conflict.id,
+  1331→              }
+  1332→            );
+  1333→          }
+  1334→        }
+  1335→      }
+  1336→
+  1337→      // Calculate new target mileage
+  1338→      const dailyKm = await this.getAverageDailyKm(existingPm.trainId);
+  1339→      const today = new Date();
+  1340→      const daysUntilTarget = Math.ceil(
+  1341→        (new Date(newTargetDate).getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+  1342→      );
+  1343→      const currentMileage = existingPm.train?.currentMileageKm ?? 0;
+  1344→      const newTargetMileageKm = currentMileage + (daysUntilTarget * dailyKm);
+  1345→
+  1346→      // Record old values for history
+  1347→      const oldTargetDate = existingPm.targetDate;
+  1348→      const oldTrackId = existingPm.assignedTrackId;
+  1349→
+  1350→      // Update PM schedule
+  1351→      const [updated] = await tx
+  1352→        .update(pmSchedule)
+  1353→        .set({
+  1354→          targetDate: newTargetDate,
+  1355→          targetMileageKm: Math.round(newTargetMileageKm),
+  1356→          assignedTrackId: trackId,
+  1357→          updatedAt: new Date(),
+  1358→        })
+  1359→        .where(eq(pmSchedule.id, pmScheduleId))
+  1360→        .returning();
+  1361→
+  1362→      // Create audit history record
+  1363→      const historyRecord: NewPmScheduleHistory = {
+  1364→        pmScheduleId,
+  1365→        changeType: 'DATE_CHANGED',
+  1366→        oldTargetDate,
+  1367→        newTargetDate,
+  1368→        oldAssignedTrackId: oldTrackId,
+  1369→        newAssignedTrackId: trackId,
+  1370→        changedBy: movedBy,
+  1371→        changeReason: reason,
+  1372→        changeSource: 'USER',
+  1373→      };
+  1374→
+  1375→      await tx.insert(pmScheduleHistory).values(historyRecord);
+  1376→
+  1377→      const trainNumber = existingPm.train?.trainNumber ?? 'unknown';
+  1378→      const pmCode = existingPm.pmType?.pmCode ?? 'unknown';
+  1379→
+  1380→      this.log.info(
+  1381→        {
+  1382→          pmScheduleId,
+  1383→          trainNumber,
+  1384→          pmCode,
+  1385→          oldTargetDate,
+  1386→          newTargetDate,
+  1387→          reason,
+  1388→          movedBy,
+  1389→        },
+  1390→        `PM moved: ${pmCode} for ${trainNumber} from ${oldTargetDate} to ${newTargetDate}`
+  1391→      );
+  1392→
+  1393→      return updated;
+  1394→    });
+  1395→  }
+  1396→
+  1397→  /**
+  1398→   * Lock a PM to prevent optimizer changes.
+  1399→   */
+  1400→  async lockPm(
+  1401→    pmScheduleId: string,
+  1402→    reason: string,
+  1403→    lockedBy: string
+  1404→  ): Promise<PmScheduleRecord> {
+  1405→    return this.inTransaction('lockPm', async (tx, span) => {
+  1406→      span.setAttribute('pm.scheduleId', pmScheduleId);
+  1407→
+  1408→      const existing = await tx.query.pmSchedule.findFirst({
+  1409→        where: eq(pmSchedule.id, pmScheduleId),
+  1410→      });
+  1411→
+  1412→      if (!existing) {
+  1413→        throw new PmScheduleNotFoundError(pmScheduleId);
+  1414→      }
+  1415→
+  1416→      if (existing.isLocked) {
+  1417→        throw new BusinessRuleError('PM is already locked', {
+  1418→          rule: 'pm_already_locked',
+  1419→          context: { lockedBy: existing.lockedBy, lockedAt: existing.lockedAt },
+  1420→        });
+  1421→      }
+  1422→
+  1423→      const [updated] = await tx
+  1424→        .update(pmSchedule)
+  1425→        .set({
+  1426→          isLocked: true,
+  1427→          lockedReason: reason,
+  1428→          lockedBy,
+  1429→          lockedAt: new Date(),
+  1430→          updatedAt: new Date(),
+  1431→        })
+  1432→        .where(eq(pmSchedule.id, pmScheduleId))
+  1433→        .returning();
+  1434→
+  1435→      // Create audit history
+  1436→      const historyRecord: NewPmScheduleHistory = {
+  1437→        pmScheduleId,
+  1438→        changeType: 'LOCKED',
+  1439→        changedBy: lockedBy,
+  1440→        changeReason: reason,
+  1441→        changeSource: 'USER',
+  1442→      };
+  1443→
+  1444→      await tx.insert(pmScheduleHistory).values(historyRecord);
+  1445→
+  1446→      this.log.info(
+  1447→        { pmScheduleId, reason, lockedBy },
+  1448→        `PM locked: ${pmScheduleId}`
+  1449→      );
+  1450→
+  1451→      return updated;
+  1452→    });
+  1453→  }
+  1454→
+  1455→  /**
+  1456→   * Unlock a PM to allow optimizer changes.
+  1457→   */
+  1458→  async unlockPm(pmScheduleId: string, unlockedBy: string): Promise<PmScheduleRecord> {
+  1459→    return this.inTransaction('unlockPm', async (tx, span) => {
+  1460→      span.setAttribute('pm.scheduleId', pmScheduleId);
+  1461→
+  1462→      const existing = await tx.query.pmSchedule.findFirst({
+  1463→        where: eq(pmSchedule.id, pmScheduleId),
+  1464→      });
+  1465→
+  1466→      if (!existing) {
+  1467→        throw new PmScheduleNotFoundError(pmScheduleId);
+  1468→      }
+  1469→
+  1470→      if (!existing.isLocked) {
+  1471→        throw new BusinessRuleError('PM is not locked', {
+  1472→          rule: 'pm_not_locked',
+  1473→        });
+  1474→      }
+  1475→
+  1476→      // Cannot unlock if Maximo work order is in progress
+  1477→      if (existing.maximoWoId && existing.status === 'IN_PROGRESS') {
+  1478→        throw new MaximoLockError(
+  1479→          'Cannot unlock PM with in-progress Maximo work order',
+  1480→          {
+  1481→            workOrderId: existing.maximoWoId,
+  1482→            maximoStatus: 'INPRG',
+  1483→          }
+  1484→        );
+  1485→      }
+  1486→
+  1487→      const [updated] = await tx
+  1488→        .update(pmSchedule)
+  1489→        .set({
+  1490→          isLocked: false,
+  1491→          lockedReason: null,
+  1492→          lockedBy: null,
+  1493→          lockedAt: null,
+  1494→          updatedAt: new Date(),
+  1495→        })
+  1496→        .where(eq(pmSchedule.id, pmScheduleId))
+  1497→        .returning();
+  1498→
+  1499→      // Create audit history
+  1500→      const historyRecord: NewPmScheduleHistory = {
+  1501→        pmScheduleId,
+  1502→        changeType: 'UNLOCKED',
+  1503→        changedBy: unlockedBy,
+  1504→        changeReason: 'Manual unlock',
+  1505→        changeSource: 'USER',
+  1506→      };
+  1507→
+  1508→      await tx.insert(pmScheduleHistory).values(historyRecord);
+  1509→
+  1510→      this.log.info(
+  1511→        { pmScheduleId, unlockedBy },
+  1512→        `PM unlocked: ${pmScheduleId}`
+  1513→      );
+  1514→
+  1515→      return updated;
+  1516→    });
+  1517→  }
+  1518→
+  1519→  // ===========================================================================
+  1520→  // Tactical Scheduling Run
+  1521→  // ===========================================================================
+  1522→
+  1523→  /**
+  1524→   * Run tactical scheduling for the 12-week horizon.
+  1525→   *
+  1526→   * This method:
+  1527→   * 1. Calculates PM due dates for all trains in scope
+  1528→   * 2. Prioritizes by overdue status and due date
+  1529→   * 3. Attempts to schedule each PM respecting constraints
+  1530→   * 4. Returns a detailed result with scheduled, deferred, and blocked PMs
+  1531→   */
+  1532→  async runTacticalSchedule(request: TacticalScheduleRequest): Promise<SchedulingResult> {
+  1533→    return this.traced('runTacticalSchedule', async (span) => {
+  1534→      const {
+  1535→        fleetId,
+  1536→        depotId,
+  1537→        horizonWeeks = DEFAULT_HORIZON_WEEKS,
+  1538→        dryRun = false,
+  1539→        respectLocks = true,
+  1540→      } = request;
+  1541→
+  1542→      span.setAttribute('schedule.horizonWeeks', horizonWeeks);
+  1543→      span.setAttribute('schedule.dryRun', dryRun);
+  1544→
+  1545→      const today = new Date();
+  1546→      const horizonStart = today.toISOString().split('T')[0];
+  1547→      const horizonEnd = new Date(today.getTime() + horizonWeeks * 7 * 24 * 60 * 60 * 1000)
+  1548→        .toISOString()
+  1549→        .split('T')[0];
+  1550→
+  1551→      // Get trains in scope
+  1552→      const trainConditions: SQL<unknown>[] = [
+  1553→        eq(trains.active, true),
+  1554→        eq(trains.fitnessStatus, 'FIT'),
+  1555→      ];
+  1556→
+  1557→      if (fleetId) {
+  1558→        trainConditions.push(eq(trains.fleetId, fleetId));
+  1559→      }
+  1560→      if (depotId) {
+  1561→        trainConditions.push(eq(trains.currentDepotId, depotId));
+  1562→      }
+  1563→
+  1564→      const trainsInScope = await this.db.query.trains.findMany({
+  1565→        where: and(...trainConditions),
+  1566→        with: { fleet: true },
+  1567→      });
+  1568→
+  1569→      span.setAttribute('schedule.trainsInScope', trainsInScope.length);
+  1570→
+  1571→      // Calculate PM due for all trains
+  1572→      const allDueResults: PmDueResult[] = [];
+  1573→
+  1574→      for (const train of trainsInScope) {
+  1575→        const dueResults = await this.calculateAllPmDue(train.id);
+  1576→        allDueResults.push(...dueResults);
+  1577→      }
+  1578→
+  1579→      // Filter to PMs due within horizon
+  1580→      const pmsDueInHorizon = allDueResults.filter(pm =>
+  1581→        pm.complianceWindow.startDate <= horizonEnd &&
+  1582→        pm.complianceWindow.endDate >= horizonStart
+  1583→      );
+  1584→
+  1585→      // Sort by priority (overdue first, then by due date)
+  1586→      pmsDueInHorizon.sort((a, b) => {
+  1587→        if (a.isOverdue && !b.isOverdue) return -1;
+  1588→        if (!a.isOverdue && b.isOverdue) return 1;
+  1589→        return a.complianceWindow.idealDate.localeCompare(b.complianceWindow.idealDate);
+  1590→      });
+  1591→
+  1592→      span.setAttribute('schedule.pmsDueInHorizon', pmsDueInHorizon.length);
+  1593→
+  1594→      // Process each PM
+  1595→      const scheduled: SchedulingResultItem[] = [];
+  1596→      const deferred: SchedulingResultItem[] = [];
+  1597→      const blocked: SchedulingResultItem[] = [];
+  1598→      const materialWarnings: SchedulingResult['materialWarnings'] = [];
+  1599→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

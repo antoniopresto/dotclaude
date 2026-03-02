@@ -1,0 +1,408 @@
+     1→/**
+     2→ * MMS Date/Time Utilities
+     3→ *
+     4→ * Timezone-aware date utilities for PM scheduling and compliance windows.
+     5→ * All operations use Asia/Hong_Kong timezone as the default depot timezone.
+     6→ *
+     7→ * @see specs/004-backend-specification.md Section 4.4
+     8→ */
+     9→
+    10→import {
+    11→  addDays,
+    12→  addMonths,
+    13→  addWeeks,
+    14→  differenceInDays,
+    15→  endOfDay,
+    16→  endOfWeek,
+    17→  format,
+    18→  isAfter,
+    19→  isBefore,
+    20→  isValid,
+    21→  isWithinInterval,
+    22→  parseISO,
+    23→  startOfDay,
+    24→  startOfWeek,
+    25→} from 'date-fns';
+    26→import { formatInTimeZone, toZonedTime, fromZonedTime } from 'date-fns-tz';
+    27→
+    28→/** Default timezone for MMS operations */
+    29→export const DEFAULT_TIMEZONE = 'Asia/Hong_Kong';
+    30→
+    31→/** PM compliance window tolerance (±10%) */
+    32→export const COMPLIANCE_TOLERANCE_PCT = 0.10;
+    33→
+    34→/** Day type for service demand */
+    35→export type DayType = 'WEEKDAY' | 'SATURDAY' | 'SUNDAY' | 'HOLIDAY';
+    36→
+    37→// =============================================================================
+    38→// Timezone Utilities
+    39→// =============================================================================
+    40→
+    41→/**
+    42→ * Convert UTC date to local timezone
+    43→ */
+    44→export function toLocalTime(date: Date, timezone: string = DEFAULT_TIMEZONE): Date {
+    45→  return toZonedTime(date, timezone);
+    46→}
+    47→
+    48→/**
+    49→ * Convert local timezone to UTC
+    50→ */
+    51→export function toUtc(date: Date, timezone: string = DEFAULT_TIMEZONE): Date {
+    52→  return fromZonedTime(date, timezone);
+    53→}
+    54→
+    55→/**
+    56→ * Format date in specific timezone
+    57→ */
+    58→export function formatInTimezone(
+    59→  date: Date,
+    60→  formatStr: string,
+    61→  timezone: string = DEFAULT_TIMEZONE
+    62→): string {
+    63→  return formatInTimeZone(date, timezone, formatStr);
+    64→}
+    65→
+    66→/**
+    67→ * Get current date in timezone (start of day)
+    68→ */
+    69→export function getTodayInTimezone(timezone: string = DEFAULT_TIMEZONE): Date {
+    70→  const now = new Date();
+    71→  const zoned = toZonedTime(now, timezone);
+    72→  return startOfDay(zoned);
+    73→}
+    74→
+    75→// =============================================================================
+    76→// Compliance Window Utilities
+    77→// =============================================================================
+    78→
+    79→export interface ComplianceWindow {
+    80→  start: Date;
+    81→  end: Date;
+    82→  targetDate: Date;
+    83→  isValid: boolean;
+    84→}
+    85→
+    86→/**
+    87→ * Calculate compliance window for a PM
+    88→ *
+    89→ * The compliance window is calculated based on the PM interval (km or months)
+    90→ * with a ±10% tolerance.
+    91→ *
+    92→ * @param lastPmDate - Date of last PM completion
+    93→ * @param intervalMonths - PM interval in months (e.g., 12 for annual)
+    94→ * @param intervalKm - PM interval in km (e.g., 180000)
+    95→ * @param currentMileageKm - Current train mileage
+    96→ * @param dailyKmRate - Expected daily mileage accrual
+    97→ */
+    98→export function calculateComplianceWindow(options: {
+    99→  lastPmDate: Date;
+   100→  intervalMonths?: number;
+   101→  intervalKm?: number;
+   102→  currentMileageKm?: number;
+   103→  dailyKmRate?: number;
+   104→  lastPmMileageKm?: number;
+   105→}): ComplianceWindow {
+   106→  const {
+   107→    lastPmDate,
+   108→    intervalMonths,
+   109→    intervalKm,
+   110→    currentMileageKm,
+   111→    dailyKmRate = 280, // Default: 280 km/day
+   112→    lastPmMileageKm = 0,
+   113→  } = options;
+   114→
+   115→  let targetDate: Date;
+   116→  let windowStart: Date;
+   117→  let windowEnd: Date;
+   118→
+   119→  // Time-based trigger
+   120→  if (intervalMonths) {
+   121→    targetDate = addMonths(lastPmDate, intervalMonths);
+   122→    const toleranceDays = Math.floor(intervalMonths * 30 * COMPLIANCE_TOLERANCE_PCT);
+   123→    windowStart = addDays(targetDate, -toleranceDays);
+   124→    windowEnd = addDays(targetDate, toleranceDays);
+   125→  }
+   126→  // Mileage-based trigger
+   127→  else if (intervalKm && currentMileageKm !== undefined) {
+   128→    const targetMileage = lastPmMileageKm + intervalKm;
+   129→    const remainingKm = targetMileage - currentMileageKm;
+   130→    const daysToTarget = Math.ceil(remainingKm / dailyKmRate);
+   131→
+   132→    targetDate = addDays(new Date(), daysToTarget);
+   133→
+   134→    const toleranceKm = intervalKm * COMPLIANCE_TOLERANCE_PCT;
+   135→    const toleranceDays = Math.ceil(toleranceKm / dailyKmRate);
+   136→
+   137→    windowStart = addDays(targetDate, -toleranceDays);
+   138→    windowEnd = addDays(targetDate, toleranceDays);
+   139→  } else {
+   140→    // Fallback: use last PM date + 1 year
+   141→    targetDate = addMonths(lastPmDate, 12);
+   142→    windowStart = addMonths(targetDate, -1);
+   143→    windowEnd = addMonths(targetDate, 1);
+   144→  }
+   145→
+   146→  return {
+   147→    start: windowStart,
+   148→    end: windowEnd,
+   149→    targetDate,
+   150→    isValid: true,
+   151→  };
+   152→}
+   153→
+   154→/**
+   155→ * Check if a date falls within a compliance window
+   156→ */
+   157→export function isWithinComplianceWindow(date: Date, window: ComplianceWindow): boolean {
+   158→  return isWithinInterval(date, { start: window.start, end: window.end });
+   159→}
+   160→
+   161→/**
+   162→ * Check if a PM is overdue (past compliance window)
+   163→ */
+   164→export function isPmOverdue(window: ComplianceWindow, currentDate: Date = new Date()): boolean {
+   165→  return isAfter(currentDate, window.end);
+   166→}
+   167→
+   168→/**
+   169→ * Check if a PM is upcoming (within compliance window or before)
+   170→ */
+   171→export function isPmUpcoming(window: ComplianceWindow, currentDate: Date = new Date()): boolean {
+   172→  return isBefore(currentDate, window.start);
+   173→}
+   174→
+   175→/**
+   176→ * Get days until PM compliance window ends
+   177→ */
+   178→export function getDaysToDeadline(window: ComplianceWindow, currentDate: Date = new Date()): number {
+   179→  return differenceInDays(window.end, currentDate);
+   180→}
+   181→
+   182→// =============================================================================
+   183→// PM Hierarchy Utilities
+   184→// =============================================================================
+   185→
+   186→/** PM code hierarchy (higher PMs satisfy lower PMs) */
+   187→export const PM_HIERARCHY: Record<string, string[]> = {
+   188→  'OVERHAUL': ['C4', 'C3', 'C2', 'C1'],
+   189→  'C4': ['C3', 'C2', 'C1'],
+   190→  'C3': ['C2', 'C1'],
+   191→  'C2': ['C1'],
+   192→  'C1': [],
+   193→};
+   194→
+   195→/**
+   196→ * Get list of PM codes that a given PM satisfies
+   197→ */
+   198→export function getSatisfiedPmCodes(pmCode: string): string[] {
+   199→  return PM_HIERARCHY[pmCode] ?? [];
+   200→}
+   201→
+   202→/**
+   203→ * Check if completing PM A satisfies PM B
+   204→ */
+   205→export function pmSatisfies(pmCodeA: string, pmCodeB: string): boolean {
+   206→  const satisfies = PM_HIERARCHY[pmCodeA];
+   207→  return satisfies?.includes(pmCodeB) ?? false;
+   208→}
+   209→
+   210→// =============================================================================
+   211→// Mileage Projection Utilities
+   212→// =============================================================================
+   213→
+   214→export interface MileageProjection {
+   215→  date: Date;
+   216→  projectedMileageKm: number;
+   217→  dailyRateKm: number;
+   218→  confidence: 'HIGH' | 'MEDIUM' | 'LOW' | 'ESTIMATED';
+   219→}
+   220→
+   221→/**
+   222→ * Project mileage at a future date
+   223→ *
+   224→ * @param currentMileageKm - Current train mileage
+   225→ * @param targetDate - Date to project to
+   226→ * @param dailyRateKm - Daily mileage accrual rate
+   227→ * @param currentDate - Starting date (defaults to today)
+   228→ */
+   229→export function projectMileage(
+   230→  currentMileageKm: number,
+   231→  targetDate: Date,
+   232→  dailyRateKm: number = 280,
+   233→  currentDate: Date = new Date()
+   234→): MileageProjection {
+   235→  const daysDiff = differenceInDays(targetDate, currentDate);
+   236→  const projectedKm = currentMileageKm + daysDiff * dailyRateKm;
+   237→
+   238→  // Confidence decreases with projection distance
+   239→  let confidence: MileageProjection['confidence'];
+   240→  if (daysDiff <= 30) {
+   241→    confidence = 'HIGH';
+   242→  } else if (daysDiff <= 90) {
+   243→    confidence = 'MEDIUM';
+   244→  } else if (daysDiff <= 365) {
+   245→    confidence = 'LOW';
+   246→  } else {
+   247→    confidence = 'ESTIMATED';
+   248→  }
+   249→
+   250→  return {
+   251→    date: targetDate,
+   252→    projectedMileageKm: Math.round(projectedKm),
+   253→    dailyRateKm,
+   254→    confidence,
+   255→  };
+   256→}
+   257→
+   258→/**
+   259→ * Calculate date when train will reach target mileage
+   260→ */
+   261→export function projectDateForMileage(
+   262→  currentMileageKm: number,
+   263→  targetMileageKm: number,
+   264→  dailyRateKm: number = 280,
+   265→  currentDate: Date = new Date()
+   266→): Date {
+   267→  const remainingKm = targetMileageKm - currentMileageKm;
+   268→  const daysToTarget = Math.ceil(remainingKm / dailyRateKm);
+   269→  return addDays(currentDate, daysToTarget);
+   270→}
+   271→
+   272→// =============================================================================
+   273→// Week/Period Utilities
+   274→// =============================================================================
+   275→
+   276→/**
+   277→ * Get week boundaries (Monday-Sunday)
+   278→ */
+   279→export function getWeekBoundaries(date: Date): { start: Date; end: Date } {
+   280→  return {
+   281→    start: startOfWeek(date, { weekStartsOn: 1 }), // Monday
+   282→    end: endOfWeek(date, { weekStartsOn: 1 }), // Sunday
+   283→  };
+   284→}
+   285→
+   286→/**
+   287→ * Get day type for a given date
+   288→ */
+   289→export function getDayType(date: Date): DayType {
+   290→  const dayOfWeek = date.getDay();
+   291→  if (dayOfWeek === 0) return 'SUNDAY';
+   292→  if (dayOfWeek === 6) return 'SATURDAY';
+   293→  return 'WEEKDAY';
+   294→  // Note: Holiday detection requires external calendar data
+   295→}
+   296→
+   297→/**
+   298→ * Generate date range array
+   299→ */
+   300→export function generateDateRange(start: Date, end: Date): Date[] {
+   301→  const dates: Date[] = [];
+   302→  let current = startOfDay(start);
+   303→  const endDay = endOfDay(end);
+   304→
+   305→  while (isBefore(current, endDay) || current.getTime() === startOfDay(endDay).getTime()) {
+   306→    dates.push(current);
+   307→    current = addDays(current, 1);
+   308→  }
+   309→
+   310→  return dates;
+   311→}
+   312→
+   313→/**
+   314→ * Generate weekly periods for a date range
+   315→ */
+   316→export function generateWeeklyPeriods(
+   317→  start: Date,
+   318→  end: Date
+   319→): Array<{ start: Date; end: Date }> {
+   320→  const periods: Array<{ start: Date; end: Date }> = [];
+   321→  let current = startOfWeek(start, { weekStartsOn: 1 });
+   322→
+   323→  while (isBefore(current, end)) {
+   324→    periods.push({
+   325→      start: current,
+   326→      end: endOfWeek(current, { weekStartsOn: 1 }),
+   327→    });
+   328→    current = addWeeks(current, 1);
+   329→  }
+   330→
+   331→  return periods;
+   332→}
+   333→
+   334→// =============================================================================
+   335→// Parsing Utilities
+   336→// =============================================================================
+   337→
+   338→/**
+   339→ * Parse date string (YYYY-MM-DD format)
+   340→ */
+   341→export function parseDateString(dateStr: string): Date | null {
+   342→  const parsed = parseISO(dateStr);
+   343→  return isValid(parsed) ? parsed : null;
+   344→}
+   345→
+   346→/**
+   347→ * Format date for display
+   348→ */
+   349→export function formatDisplayDate(date: Date, formatStr: string = 'yyyy-MM-dd'): string {
+   350→  return format(date, formatStr);
+   351→}
+   352→
+   353→/**
+   354→ * Format date for API response
+   355→ */
+   356→export function formatIsoDate(date: Date): string {
+   357→  return date.toISOString();
+   358→}
+   359→
+   360→// =============================================================================
+   361→// Performance Utilities
+   362→// =============================================================================
+   363→
+   364→/**
+   365→ * Measure duration of an async operation
+   366→ */
+   367→export async function measureDuration<T>(
+   368→  operation: () => Promise<T>
+   369→): Promise<{ result: T; durationMs: number }> {
+   370→  const start = performance.now();
+   371→  const result = await operation();
+   372→  const durationMs = Math.round(performance.now() - start);
+   373→  return { result, durationMs };
+   374→}
+   375→
+   376→/**
+   377→ * Create a stopwatch for manual timing
+   378→ */
+   379→export function createStopwatch(): {
+   380→  start: () => void;
+   381→  stop: () => number;
+   382→  elapsed: () => number;
+   383→} {
+   384→  let startTime: number | null = null;
+   385→  let endTime: number | null = null;
+   386→
+   387→  return {
+   388→    start: () => {
+   389→      startTime = performance.now();
+   390→      endTime = null;
+   391→    },
+   392→    stop: () => {
+   393→      if (startTime === null) return 0;
+   394→      endTime = performance.now();
+   395→      return Math.round(endTime - startTime);
+   396→    },
+   397→    elapsed: () => {
+   398→      if (startTime === null) return 0;
+   399→      const end = endTime ?? performance.now();
+   400→      return Math.round(end - startTime);
+   401→    },
+   402→  };
+   403→}
+   404→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,217 @@
+     1→/**
+     2→ * MMS Worker Daemon Runner
+     3→ *
+     4→ * Entry point for starting all background workers.
+     5→ * Handles graceful shutdown and health monitoring.
+     6→ *
+     7→ * Usage:
+     8→ *   bun run src/workers/runner.ts
+     9→ *   or
+    10→ *   WORKERS=optimizer,drift_monitor bun run src/workers/runner.ts
+    11→ *
+    12→ * Environment Variables:
+    13→ *   WORKERS - Comma-separated list of workers to start (default: all)
+    14→ *   REDIS_HOST - Redis server host (default: localhost)
+    15→ *   REDIS_PORT - Redis server port (default: 6379)
+    16→ *   REDIS_PASSWORD - Redis password (optional)
+    17→ *
+    18→ * @see specs/002-architecture.md Section 2.4 - Worker Layer
+    19→ * @see specs/004-domain-services.md Section 4.8
+    20→ */
+    21→
+    22→import { logger } from '../lib/logging/logger';
+    23→import {
+    24→  registerWorker,
+    25→  closeAllWorkers,
+    26→  getWorkersHealth,
+    27→  QUEUE_NAMES,
+    28→  type WorkerJobContext,
+    29→} from './index';
+    30→
+    31→// Import all worker processors
+    32→import { processOptimizerJob } from './processors/optimizer';
+    33→import { processDriftMonitorJob } from './processors/drift-monitor';
+    34→import { processIngestionJob } from './processors/ingestion';
+    35→import { processMaximoSyncJob } from './processors/maximo-sync';
+    36→import { processStrategicPlannerJob } from './processors/strategic-planner';
+    37→
+    38→
+    39→// =============================================================================
+    40→// Worker Registry
+    41→// =============================================================================
+    42→
+    43→const log = logger.child({ module: 'worker-runner' });
+    44→
+    45→/**
+    46→ * Available worker processors
+    47→ */
+    48→const WORKER_PROCESSORS: Record<
+    49→  keyof typeof QUEUE_NAMES,
+    50→  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    51→  ((context: WorkerJobContext<any>) => Promise<unknown>) | null
+    52→> = {
+    53→  INGESTION: processIngestionJob,
+    54→  TACTICAL_SCHEDULER: null, // TODO: Implement tactical scheduler processor
+    55→  STRATEGIC_PLANNER: processStrategicPlannerJob,
+    56→  OPTIMIZER: processOptimizerJob,
+    57→  MANHOUR_LEVELING: null, // TODO: Implement manhour leveling processor
+    58→  DRIFT_MONITOR: processDriftMonitorJob,
+    59→  NOTIFICATION: null, // TODO: Implement notification processor
+    60→  REPORT: null, // TODO: Implement report processor
+    61→  MAXIMO_SYNC: processMaximoSyncJob,
+    62→};
+    63→
+    64→// =============================================================================
+    65→// Worker Startup
+    66→// =============================================================================
+    67→
+    68→/**
+    69→ * Start specified workers or all available workers
+    70→ *
+    71→ * @param workerKeys - Optional list of worker keys to start
+    72→ */
+    73→export async function startWorkers(
+    74→  workerKeys?: Array<keyof typeof QUEUE_NAMES>
+    75→): Promise<void> {
+    76→  const keys = workerKeys ?? (Object.keys(WORKER_PROCESSORS) as Array<keyof typeof QUEUE_NAMES>);
+    77→
+    78→  log.info({ workers: keys }, 'Starting workers');
+    79→
+    80→  for (const key of keys) {
+    81→    const processor = WORKER_PROCESSORS[key];
+    82→
+    83→    if (!processor) {
+    84→      log.warn({ worker: key }, 'Worker processor not implemented, skipping');
+    85→      continue;
+    86→    }
+    87→
+    88→    try {
+    89→      registerWorker(key, processor);
+    90→      log.info({ worker: key, queue: QUEUE_NAMES[key] }, 'Worker registered');
+    91→    } catch (error) {
+    92→      log.error({ worker: key, error }, 'Failed to register worker');
+    93→      throw error;
+    94→    }
+    95→  }
+    96→
+    97→  const health = await getWorkersHealth();
+    98→  log.info(
+    99→    {
+   100→      totalWorkers: health.length,
+   101→      running: health.filter((w) => w.isRunning).length,
+   102→    },
+   103→    'All workers started'
+   104→  );
+   105→}
+   106→
+   107→// =============================================================================
+   108→// Graceful Shutdown
+   109→// =============================================================================
+   110→
+   111→let isShuttingDown = false;
+   112→
+   113→async function handleShutdown(signal: string): Promise<void> {
+   114→  if (isShuttingDown) {
+   115→    log.warn({ signal }, 'Shutdown already in progress');
+   116→    return;
+   117→  }
+   118→
+   119→  isShuttingDown = true;
+   120→  log.info({ signal }, 'Received shutdown signal, closing workers');
+   121→
+   122→  try {
+   123→    await closeAllWorkers();
+   124→    log.info('All workers closed successfully');
+   125→    process.exit(0);
+   126→  } catch (error) {
+   127→    log.error({ error }, 'Error during worker shutdown');
+   128→    process.exit(1);
+   129→  }
+   130→}
+   131→
+   132→// =============================================================================
+   133→// Main Entry Point
+   134→// =============================================================================
+   135→
+   136→async function main(): Promise<void> {
+   137→  log.info('MMS Worker Daemon starting');
+   138→
+   139→  // Register signal handlers for graceful shutdown
+   140→  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+   141→  process.on('SIGINT', () => handleShutdown('SIGINT'));
+   142→
+   143→  // Parse WORKERS environment variable
+   144→  const workersEnv = process.env['WORKERS'];
+   145→  let workerKeys: Array<keyof typeof QUEUE_NAMES> | undefined;
+   146→
+   147→  if (workersEnv) {
+   148→    const requestedWorkers = workersEnv.split(',').map((w) => w.trim().toUpperCase());
+   149→    workerKeys = requestedWorkers.filter((w) =>
+   150→      Object.keys(QUEUE_NAMES).includes(w)
+   151→    ) as Array<keyof typeof QUEUE_NAMES>;
+   152→
+   153→    if (workerKeys.length === 0) {
+   154→      log.error({ requested: requestedWorkers }, 'No valid workers specified');
+   155→      process.exit(1);
+   156→    }
+   157→
+   158→    log.info({ workers: workerKeys }, 'Starting specified workers');
+   159→  } else {
+   160→    log.info('Starting all available workers');
+   161→  }
+   162→
+   163→  try {
+   164→    await startWorkers(workerKeys);
+   165→  } catch (error) {
+   166→    log.error({ error }, 'Failed to start workers');
+   167→    process.exit(1);
+   168→  }
+   169→
+   170→  // Log health status periodically
+   171→  const healthInterval = setInterval(async () => {
+   172→    if (isShuttingDown) {
+   173→      clearInterval(healthInterval);
+   174→      return;
+   175→    }
+   176→
+   177→    try {
+   178→      const health = await getWorkersHealth();
+   179→      const running = health.filter((w) => w.isRunning).length;
+   180→      const paused = health.filter((w) => w.isPaused).length;
+   181→
+   182→      log.debug(
+   183→        { total: health.length, running, paused },
+   184→        'Worker health check'
+   185→      );
+   186→
+   187→      // Alert if any workers are not running
+   188→      const notRunning = health.filter((w) => !w.isRunning && !w.isPaused);
+   189→      if (notRunning.length > 0) {
+   190→        log.warn(
+   191→          { workers: notRunning.map((w) => w.queueName) },
+   192→          'Some workers are not running'
+   193→        );
+   194→      }
+   195→    } catch (error) {
+   196→      log.error({ error }, 'Health check failed');
+   197→    }
+   198→  }, 60000); // Every minute
+   199→
+   200→  log.info('Worker daemon running. Press Ctrl+C to stop.');
+   201→}
+   202→
+   203→// Run if this is the main module
+   204→if (import.meta.main) {
+   205→  main().catch((error) => {
+   206→    console.error('Worker daemon failed:', error);
+   207→    process.exit(1);
+   208→  });
+   209→}
+   210→
+   211→// Export for testing
+   212→export { handleShutdown, WORKER_PROCESSORS };
+   213→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

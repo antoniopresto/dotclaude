@@ -1,0 +1,632 @@
+     1→/**
+     2→ * Export Service
+     3→ *
+     4→ * Manages export jobs for PM schedules (Excel) and reports (PDF).
+     5→ * Uses BullMQ for async job processing with status tracking.
+     6→ *
+     7→ * Key features:
+     8→ * - Queue Excel exports with filters and column selection
+     9→ * - Queue PDF report generation with templates
+    10→ * - Track job status and provide download URLs
+    11→ * - Automatic file cleanup after expiration
+    12→ *
+    13→ * @see specs/005-api.md Section 5.15
+    14→ */
+    15→
+    16→import { addJob, getJob, QUEUE_NAMES, type ReportJobData } from '../lib/queue';
+    17→import { logger } from '../lib/logging/logger';
+    18→import { withSpan } from '../lib/tracing';
+    19→import { ValidationError, NotFoundError } from '../lib/errors';
+    20→import { v4 as uuid } from 'uuid';
+    21→
+    22→// =============================================================================
+    23→// Types
+    24→// =============================================================================
+    25→
+    26→/**
+    27→ * Export format types
+    28→ */
+    29→export type ExportFormat = 'xlsx' | 'csv' | 'pdf';
+    30→
+    31→/**
+    32→ * Export job status
+    33→ */
+    34→export type ExportJobStatus = 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'EXPIRED';
+    35→
+    36→/**
+    37→ * PM schedule export request
+    38→ */
+    39→export interface PmScheduleExportRequest {
+    40→  format: 'xlsx' | 'csv';
+    41→  filters?: {
+    42→    depotId?: string;
+    43→    fleetId?: string;
+    44→    trainId?: string;
+    45→    fromDate?: string;
+    46→    toDate?: string;
+    47→    status?: string[];
+    48→    pmTypeId?: string;
+    49→    scenarioId?: string;
+    50→  };
+    51→  columns?: string[];
+    52→  requestedBy: string;
+    53→}
+    54→
+    55→/**
+    56→ * Report type for PDF generation
+    57→ */
+    58→export type ReportType =
+    59→  | 'WEEKLY_COMPLIANCE'
+    60→  | 'MONTHLY_SUMMARY'
+    61→  | 'FLEET_STATUS'
+    62→  | 'DRIFT_REPORT'
+    63→  | 'TCO_PROJECTION'
+    64→  | 'BOW_WAVE_ANALYSIS'
+    65→  | 'MANHOUR_UTILIZATION';
+    66→
+    67→/**
+    68→ * Report export request
+    69→ */
+    70→export interface ReportExportRequest {
+    71→  reportType: ReportType;
+    72→  parameters: Record<string, unknown>;
+    73→  requestedBy: string;
+    74→}
+    75→
+    76→/**
+    77→ * Export job metadata stored in-memory (would be in DB in production)
+    78→ */
+    79→interface ExportJobMeta {
+    80→  id: string;
+    81→  type: 'pm_schedule' | 'report';
+    82→  status: ExportJobStatus;
+    83→  format: ExportFormat;
+    84→  createdAt: Date;
+    85→  startedAt?: Date;
+    86→  completedAt?: Date;
+    87→  estimatedSizeBytes?: number;
+    88→  fileSizeBytes?: number;
+    89→  downloadUrl?: string;
+    90→  expiresAt?: Date;
+    91→  errorMessage?: string;
+    92→  requestedBy: string;
+    93→  filters?: Record<string, unknown>;
+    94→  reportType?: ReportType;
+    95→}
+    96→
+    97→// =============================================================================
+    98→// In-Memory Storage (would be database in production)
+    99→// =============================================================================
+   100→
+   101→/**
+   102→ * Export job metadata storage
+   103→ * In production, this would be stored in the database
+   104→ */
+   105→const exportJobs: Map<string, ExportJobMeta> = new Map();
+   106→
+   107→/**
+   108→ * Default column list for PM schedule exports
+   109→ */
+   110→const DEFAULT_PM_SCHEDULE_COLUMNS = [
+   111→  'trainNumber',
+   112→  'fleetCode',
+   113→  'pmCode',
+   114→  'targetDate',
+   115→  'status',
+   116→  'constraintStart',
+   117→  'constraintEnd',
+   118→  'assignedTrack',
+   119→  'assignedDepot',
+   120→  'estimatedHours',
+   121→  'notes',
+   122→];
+   123→
+   124→/**
+   125→ * Valid column names for PM schedule exports
+   126→ */
+   127→const VALID_PM_SCHEDULE_COLUMNS = new Set([
+   128→  'id',
+   129→  'trainId',
+   130→  'trainNumber',
+   131→  'fleetCode',
+   132→  'pmCode',
+   133→  'pmTypeId',
+   134→  'targetDate',
+   135→  'status',
+   136→  'constraintStart',
+   137→  'constraintEnd',
+   138→  'assignedTrack',
+   139→  'assignedDepot',
+   140→  'estimatedHours',
+   141→  'actualHours',
+   142→  'completedDate',
+   143→  'completedMileageKm',
+   144→  'notes',
+   145→  'isLocked',
+   146→  'maximoWoId',
+   147→  'createdAt',
+   148→  'updatedAt',
+   149→]);
+   150→
+   151→// =============================================================================
+   152→// Service Implementation
+   153→// =============================================================================
+   154→
+   155→/**
+   156→ * Queue a PM schedule export job
+   157→ *
+   158→ * @param request - Export request with format, filters, and columns
+   159→ * @returns Job metadata including ID and estimated size
+   160→ */
+   161→export async function queuePmScheduleExport(
+   162→  request: PmScheduleExportRequest
+   163→): Promise<{ jobId: string; status: ExportJobStatus; estimatedSizeBytes: number }> {
+   164→  return withSpan('export.queuePmScheduleExport', async (span) => {
+   165→    // Validate format
+   166→    if (!['xlsx', 'csv'].includes(request.format)) {
+   167→      throw new ValidationError(`Invalid export format: ${request.format}`, {
+   168→        field: 'format',
+   169→        context: {
+   170→          expected: ['xlsx', 'csv'],
+   171→          received: request.format,
+   172→        },
+   173→      });
+   174→    }
+   175→
+   176→    // Validate columns if provided
+   177→    const columns = request.columns ?? DEFAULT_PM_SCHEDULE_COLUMNS;
+   178→    const invalidColumns = columns.filter((col) => !VALID_PM_SCHEDULE_COLUMNS.has(col));
+   179→    if (invalidColumns.length > 0) {
+   180→      throw new ValidationError(`Invalid column names: ${invalidColumns.join(', ')}`, {
+   181→        field: 'columns',
+   182→        context: {
+   183→          invalidColumns,
+   184→          validColumns: Array.from(VALID_PM_SCHEDULE_COLUMNS),
+   185→        },
+   186→      });
+   187→    }
+   188→
+   189→    // Generate job ID
+   190→    const jobId = `export-${uuid()}`;
+   191→
+   192→    // Estimate file size based on filters
+   193→    const estimatedSizeBytes = estimateExportSize(request.filters, columns.length, request.format);
+   194→
+   195→    // Create job metadata
+   196→    const jobMeta: ExportJobMeta = {
+   197→      id: jobId,
+   198→      type: 'pm_schedule',
+   199→      status: 'QUEUED',
+   200→      format: request.format,
+   201→      createdAt: new Date(),
+   202→      estimatedSizeBytes,
+   203→      requestedBy: request.requestedBy,
+   204→      filters: request.filters,
+   205→    };
+   206→    exportJobs.set(jobId, jobMeta);
+   207→
+   208→    // Queue the job
+   209→    const jobData: ReportJobData = {
+   210→      type: 'pm_schedule',
+   211→      format: request.format === 'xlsx' ? 'excel' : 'pdf',
+   212→      filters: {
+   213→        ...request.filters,
+   214→        columns,
+   215→        exportJobId: jobId,
+   216→      },
+   217→      requestedBy: request.requestedBy,
+   218→    };
+   219→
+   220→    await addJob(QUEUE_NAMES.REPORT, 'pm-schedule-export', jobData);
+   221→
+   222→    span?.setAttribute('export.jobId', jobId);
+   223→    span?.setAttribute('export.format', request.format);
+   224→    span?.setAttribute('export.estimatedSize', estimatedSizeBytes);
+   225→
+   226→    logger.info(
+   227→      { jobId, format: request.format, filters: request.filters },
+   228→      'PM schedule export job queued'
+   229→    );
+   230→
+   231→    return {
+   232→      jobId,
+   233→      status: 'QUEUED' as ExportJobStatus,
+   234→      estimatedSizeBytes,
+   235→    };
+   236→  });
+   237→}
+   238→
+   239→/**
+   240→ * Queue a report generation job
+   241→ *
+   242→ * @param request - Report request with type and parameters
+   243→ * @returns Job metadata including ID and status
+   244→ */
+   245→export async function queueReportExport(
+   246→  request: ReportExportRequest
+   247→): Promise<{ jobId: string; status: ExportJobStatus; estimatedSizeBytes: number }> {
+   248→  return withSpan('export.queueReportExport', async (span) => {
+   249→    // Validate report type
+   250→    const validTypes: ReportType[] = [
+   251→      'WEEKLY_COMPLIANCE',
+   252→      'MONTHLY_SUMMARY',
+   253→      'FLEET_STATUS',
+   254→      'DRIFT_REPORT',
+   255→      'TCO_PROJECTION',
+   256→      'BOW_WAVE_ANALYSIS',
+   257→      'MANHOUR_UTILIZATION',
+   258→    ];
+   259→
+   260→    if (!validTypes.includes(request.reportType)) {
+   261→      throw new ValidationError(`Invalid report type: ${request.reportType}`, {
+   262→        field: 'reportType',
+   263→        context: {
+   264→          expected: validTypes,
+   265→          received: request.reportType,
+   266→        },
+   267→      });
+   268→    }
+   269→
+   270→    // Generate job ID
+   271→    const jobId = `report-${uuid()}`;
+   272→
+   273→    // Estimate PDF size based on report type
+   274→    const estimatedSizeBytes = estimateReportSize(request.reportType);
+   275→
+   276→    // Create job metadata
+   277→    const jobMeta: ExportJobMeta = {
+   278→      id: jobId,
+   279→      type: 'report',
+   280→      status: 'QUEUED',
+   281→      format: 'pdf',
+   282→      createdAt: new Date(),
+   283→      estimatedSizeBytes,
+   284→      requestedBy: request.requestedBy,
+   285→      reportType: request.reportType,
+   286→      filters: request.parameters,
+   287→    };
+   288→    exportJobs.set(jobId, jobMeta);
+   289→
+   290→    // Queue the job
+   291→    const jobData: ReportJobData = {
+   292→      type: mapReportTypeToJobType(request.reportType),
+   293→      format: 'pdf',
+   294→      filters: {
+   295→        ...request.parameters,
+   296→        exportJobId: jobId,
+   297→        reportType: request.reportType,
+   298→      },
+   299→      requestedBy: request.requestedBy,
+   300→    };
+   301→
+   302→    await addJob(QUEUE_NAMES.REPORT, 'report-generation', jobData);
+   303→
+   304→    span?.setAttribute('export.jobId', jobId);
+   305→    span?.setAttribute('export.reportType', request.reportType);
+   306→
+   307→    logger.info(
+   308→      { jobId, reportType: request.reportType, parameters: request.parameters },
+   309→      'Report generation job queued'
+   310→    );
+   311→
+   312→    return {
+   313→      jobId,
+   314→      status: 'QUEUED' as ExportJobStatus,
+   315→      estimatedSizeBytes,
+   316→    };
+   317→  });
+   318→}
+   319→
+   320→/**
+   321→ * Get export job status
+   322→ *
+   323→ * @param jobId - Export job ID
+   324→ * @returns Job status and download URL if completed
+   325→ */
+   326→export async function getExportJobStatus(jobId: string): Promise<{
+   327→  jobId: string;
+   328→  status: ExportJobStatus;
+   329→  downloadUrl?: string;
+   330→  expiresAt?: string;
+   331→  fileSizeBytes?: number;
+   332→  errorMessage?: string;
+   333→  progress?: number;
+   334→}> {
+   335→  return withSpan('export.getJobStatus', async (span) => {
+   336→    span?.setAttribute('export.jobId', jobId);
+   337→
+   338→    // Check in-memory storage first
+   339→    const jobMeta = exportJobs.get(jobId);
+   340→    if (!jobMeta) {
+   341→      throw new NotFoundError(`Export job not found: ${jobId}`, {
+   342→        entityType: 'exportJob',
+   343→        entityId: jobId,
+   344→      });
+   345→    }
+   346→
+   347→    // Check BullMQ job status for progress updates
+   348→    const queueJob = await getJob(QUEUE_NAMES.REPORT, jobId);
+   349→    let progress: number | undefined;
+   350→
+   351→    if (queueJob) {
+   352→      // Update status from queue if job is still processing
+   353→      if (queueJob.status === 'active') {
+   354→        jobMeta.status = 'PROCESSING';
+   355→        if (!jobMeta.startedAt) {
+   356→          jobMeta.startedAt = new Date();
+   357→        }
+   358→      } else if (queueJob.status === 'completed' && jobMeta.status !== 'COMPLETED') {
+   359→        jobMeta.status = 'COMPLETED';
+   360→        jobMeta.completedAt = new Date();
+   361→        // In production, the worker would set the download URL
+   362→        if (!jobMeta.downloadUrl) {
+   363→          jobMeta.downloadUrl = generateDownloadUrl(jobId, jobMeta.format);
+   364→          jobMeta.expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+   365→          jobMeta.fileSizeBytes = jobMeta.estimatedSizeBytes;
+   366→        }
+   367→      } else if (queueJob.status === 'failed') {
+   368→        jobMeta.status = 'FAILED';
+   369→        jobMeta.errorMessage = 'Export job failed';
+   370→      }
+   371→    }
+   372→
+   373→    // Check expiration
+   374→    if (jobMeta.expiresAt && new Date() > jobMeta.expiresAt) {
+   375→      jobMeta.status = 'EXPIRED';
+   376→      jobMeta.downloadUrl = undefined;
+   377→    }
+   378→
+   379→    logger.debug({ jobId, status: jobMeta.status }, 'Export job status retrieved');
+   380→
+   381→    return {
+   382→      jobId: jobMeta.id,
+   383→      status: jobMeta.status,
+   384→      downloadUrl: jobMeta.downloadUrl,
+   385→      expiresAt: jobMeta.expiresAt?.toISOString(),
+   386→      fileSizeBytes: jobMeta.fileSizeBytes,
+   387→      errorMessage: jobMeta.errorMessage,
+   388→      progress,
+   389→    };
+   390→  });
+   391→}
+   392→
+   393→/**
+   394→ * Update export job status (called by worker)
+   395→ *
+   396→ * @param jobId - Export job ID
+   397→ * @param update - Status update
+   398→ */
+   399→export function updateExportJobStatus(
+   400→  jobId: string,
+   401→  update: {
+   402→    status?: ExportJobStatus;
+   403→    downloadUrl?: string;
+   404→    fileSizeBytes?: number;
+   405→    errorMessage?: string;
+   406→  }
+   407→): void {
+   408→  const jobMeta = exportJobs.get(jobId);
+   409→  if (!jobMeta) {
+   410→    logger.warn({ jobId }, 'Attempted to update non-existent export job');
+   411→    return;
+   412→  }
+   413→
+   414→  if (update.status) {
+   415→    jobMeta.status = update.status;
+   416→    if (update.status === 'PROCESSING' && !jobMeta.startedAt) {
+   417→      jobMeta.startedAt = new Date();
+   418→    } else if (update.status === 'COMPLETED') {
+   419→      jobMeta.completedAt = new Date();
+   420→      jobMeta.expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+   421→    }
+   422→  }
+   423→
+   424→  if (update.downloadUrl) {
+   425→    jobMeta.downloadUrl = update.downloadUrl;
+   426→  }
+   427→
+   428→  if (update.fileSizeBytes) {
+   429→    jobMeta.fileSizeBytes = update.fileSizeBytes;
+   430→  }
+   431→
+   432→  if (update.errorMessage) {
+   433→    jobMeta.errorMessage = update.errorMessage;
+   434→  }
+   435→
+   436→  exportJobs.set(jobId, jobMeta);
+   437→  logger.debug({ jobId, update }, 'Export job status updated');
+   438→}
+   439→
+   440→/**
+   441→ * List export jobs for a user
+   442→ *
+   443→ * @param userId - User ID to filter by
+   444→ * @param options - Pagination and filter options
+   445→ * @returns List of export jobs
+   446→ */
+   447→export function listExportJobs(
+   448→  userId: string,
+   449→  options: {
+   450→    page?: number;
+   451→    pageSize?: number;
+   452→    status?: ExportJobStatus[];
+   453→    type?: 'pm_schedule' | 'report';
+   454→  } = {}
+   455→): { jobs: ExportJobMeta[]; total: number } {
+   456→  const { page = 1, pageSize = 20, status, type } = options;
+   457→
+   458→  let jobs = Array.from(exportJobs.values()).filter((job) => job.requestedBy === userId);
+   459→
+   460→  if (status && status.length > 0) {
+   461→    jobs = jobs.filter((job) => status.includes(job.status));
+   462→  }
+   463→
+   464→  if (type) {
+   465→    jobs = jobs.filter((job) => job.type === type);
+   466→  }
+   467→
+   468→  // Sort by creation date descending
+   469→  jobs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+   470→
+   471→  const total = jobs.length;
+   472→  const offset = (page - 1) * pageSize;
+   473→  const paginatedJobs = jobs.slice(offset, offset + pageSize);
+   474→
+   475→  return { jobs: paginatedJobs, total };
+   476→}
+   477→
+   478→/**
+   479→ * Clean up expired export jobs
+   480→ */
+   481→export function cleanupExpiredExports(): number {
+   482→  const now = new Date();
+   483→  let cleanedCount = 0;
+   484→
+   485→  for (const [jobId, jobMeta] of exportJobs.entries()) {
+   486→    // Remove jobs older than 7 days regardless of status
+   487→    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+   488→    if (jobMeta.createdAt < sevenDaysAgo) {
+   489→      exportJobs.delete(jobId);
+   490→      cleanedCount++;
+   491→      continue;
+   492→    }
+   493→
+   494→    // Mark expired completed jobs
+   495→    if (jobMeta.status === 'COMPLETED' && jobMeta.expiresAt && now > jobMeta.expiresAt) {
+   496→      jobMeta.status = 'EXPIRED';
+   497→      jobMeta.downloadUrl = undefined;
+   498→    }
+   499→  }
+   500→
+   501→  if (cleanedCount > 0) {
+   502→    logger.info({ cleanedCount }, 'Cleaned up expired export jobs');
+   503→  }
+   504→
+   505→  return cleanedCount;
+   506→}
+   507→
+   508→// =============================================================================
+   509→// Helper Functions
+   510→// =============================================================================
+   511→
+   512→/**
+   513→ * Estimate export file size based on filters
+   514→ */
+   515→function estimateExportSize(
+   516→  filters: PmScheduleExportRequest['filters'],
+   517→  columnCount: number,
+   518→  format: 'xlsx' | 'csv'
+   519→): number {
+   520→  // Base estimate: 100 rows with average data
+   521→  let estimatedRows = 1000;
+   522→
+   523→  // Reduce estimate if date range is narrow
+   524→  if (filters?.fromDate && filters?.toDate) {
+   525→    const from = new Date(filters.fromDate);
+   526→    const to = new Date(filters.toDate);
+   527→    const days = Math.ceil((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
+   528→    estimatedRows = Math.min(estimatedRows, days * 5); // ~5 PMs per day
+   529→  }
+   530→
+   531→  // Reduce if filtering by single train
+   532→  if (filters?.trainId) {
+   533→    estimatedRows = Math.min(estimatedRows, 50);
+   534→  }
+   535→
+   536→  // Bytes per row depends on format and columns
+   537→  const bytesPerRow = format === 'xlsx' ? columnCount * 50 : columnCount * 30;
+   538→
+   539→  // Add overhead for headers and format structure
+   540→  const overhead = format === 'xlsx' ? 10000 : 500;
+   541→
+   542→  return estimatedRows * bytesPerRow + overhead;
+   543→}
+   544→
+   545→/**
+   546→ * Estimate report file size based on type
+   547→ */
+   548→function estimateReportSize(reportType: ReportType): number {
+   549→  const estimates: Record<ReportType, number> = {
+   550→    WEEKLY_COMPLIANCE: 150000, // 150KB
+   551→    MONTHLY_SUMMARY: 300000, // 300KB
+   552→    FLEET_STATUS: 200000, // 200KB
+   553→    DRIFT_REPORT: 250000, // 250KB
+   554→    TCO_PROJECTION: 500000, // 500KB
+   555→    BOW_WAVE_ANALYSIS: 400000, // 400KB
+   556→    MANHOUR_UTILIZATION: 350000, // 350KB
+   557→  };
+   558→
+   559→  return estimates[reportType] ?? 200000;
+   560→}
+   561→
+   562→/**
+   563→ * Map report type to job queue type
+   564→ */
+   565→function mapReportTypeToJobType(
+   566→  reportType: ReportType
+   567→): 'pm_schedule' | 'fleet_status' | 'drift_report' | 'tco_projection' {
+   568→  const mapping: Record<ReportType, 'pm_schedule' | 'fleet_status' | 'drift_report' | 'tco_projection'> = {
+   569→    WEEKLY_COMPLIANCE: 'pm_schedule',
+   570→    MONTHLY_SUMMARY: 'pm_schedule',
+   571→    FLEET_STATUS: 'fleet_status',
+   572→    DRIFT_REPORT: 'drift_report',
+   573→    TCO_PROJECTION: 'tco_projection',
+   574→    BOW_WAVE_ANALYSIS: 'pm_schedule',
+   575→    MANHOUR_UTILIZATION: 'pm_schedule',
+   576→  };
+   577→
+   578→  return mapping[reportType] ?? 'pm_schedule';
+   579→}
+   580→
+   581→/**
+   582→ * Generate download URL for completed export
+   583→ */
+   584→function generateDownloadUrl(jobId: string, format: ExportFormat): string {
+   585→  // In production, this would be a signed URL to MinIO/S3
+   586→  const baseUrl = process.env['MINIO_PUBLIC_URL'] ?? 'http://localhost:9000';
+   587→  const bucket = process.env['MINIO_EXPORT_BUCKET'] ?? 'mms-exports';
+   588→  const extension = format === 'xlsx' ? 'xlsx' : format === 'csv' ? 'csv' : 'pdf';
+   589→
+   590→  return `${baseUrl}/${bucket}/${jobId}.${extension}`;
+   591→}
+   592→
+   593→// =============================================================================
+   594→// Service Singleton
+   595→// =============================================================================
+   596→
+   597→/**
+   598→ * Export service interface
+   599→ */
+   600→export interface ExportService {
+   601→  queuePmScheduleExport: typeof queuePmScheduleExport;
+   602→  queueReportExport: typeof queueReportExport;
+   603→  getExportJobStatus: typeof getExportJobStatus;
+   604→  updateExportJobStatus: typeof updateExportJobStatus;
+   605→  listExportJobs: typeof listExportJobs;
+   606→  cleanupExpiredExports: typeof cleanupExpiredExports;
+   607→}
+   608→
+   609→let serviceInstance: ExportService | null = null;
+   610→
+   611→/**
+   612→ * Get or create the export service singleton
+   613→ */
+   614→export function getExportService(): ExportService {
+   615→  if (!serviceInstance) {
+   616→    serviceInstance = {
+   617→      queuePmScheduleExport,
+   618→      queueReportExport,
+   619→      getExportJobStatus,
+   620→      updateExportJobStatus,
+   621→      listExportJobs,
+   622→      cleanupExpiredExports,
+   623→    };
+   624→    logger.info('ExportService initialized');
+   625→  }
+   626→  return serviceInstance;
+   627→}
+   628→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

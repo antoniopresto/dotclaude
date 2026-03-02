@@ -1,0 +1,1204 @@
+     1→# Metro Fleet Mileage Management System
+     2→# Part 4: Domain Services
+     3→
+     4→**Document Version:** 2.0  
+     5→**Status:** APPROVED FOR DEVELOPMENT
+     6→
+     7→---
+     8→
+     9→## 4.1 Service Overview
+    10→
+    11→```
+    12→┌─────────────────────────────────────────────────────────────────────────────────┐
+    13→│                            DOMAIN SERVICES LAYER                                 │
+    14→├─────────────────────────────────────────────────────────────────────────────────┤
+    15→│                                                                                  │
+    16→│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+    17→│   │   INGESTION     │     │  RUN ASSIGNMENT │     │  PM SCHEDULER   │          │
+    18→│   │   SERVICE       │────►│   OPTIMIZER     │────►│   (Tactical)    │          │
+    19→│   │                 │     │                 │     │                 │          │
+    20→│   │ • File parsing  │     │ • C++ CP-SAT    │     │ • 12-week       │          │
+    21→│   │ • Validation    │     │ • Soft const.   │     │ • Material chk  │          │
+    22→│   │ • Meter swaps   │     │ • Explanations  │     │ • Track alloc   │          │
+    23→│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+    24→│            │                       │                       │                    │
+    25→│            ▼                       ▼                       ▼                    │
+    26→│   ┌─────────────────────────────────────────────────────────────────┐          │
+    27→│   │                    CONSTRAINT AGGREGATION LAYER                 │          │
+    28→│   │                                                                 │          │
+    29→│   │  Computes capacity envelopes for strategic planning from       │          │
+    30→│   │  detailed tactical constraints (tracks, labor, materials)       │          │
+    31→│   └─────────────────────────────────────────────────────────────────┘          │
+    32→│                                    │                                            │
+    33→│                                    ▼                                            │
+    34→│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+    35→│   │   STRATEGIC     │     │   MAN-HOUR      │     │    COSTING      │          │
+    36→│   │   PLANNER       │◄───►│   LEVELING      │◄───►│    SERVICE      │          │
+    37→│   │                 │     │   ENGINE        │     │                 │          │
+    38→│   │ • 10-year       │     │ • Projections   │     │ • TCO forecast  │          │
+    39→│   │ • GA heuristic  │     │ • Adjustments   │     │ • Variance      │          │
+    40→│   │ • Envelope      │     │ • Multi-strat   │     │ • Budgeting     │          │
+    41→│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+    42→│            │                       │                       │                    │
+    43→│            ▼                       ▼                       ▼                    │
+    44→│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+    45→│   │   BASELINE      │     │    DRIFT        │     │   SIMULATION    │          │
+    46→│   │   SERVICE       │◄───►│   MONITOR       │     │    ENGINE       │          │
+    47→│   │                 │     │                 │     │                 │          │
+    48→│   │ • Snapshots     │     │ • Nightly       │     │ • Scenarios     │          │
+    49→│   │ • Publishing    │     │ • Thresholds    │     │ • What-if       │          │
+    50→│   │ • Versioning    │     │ • Alerts        │     │ • Comparison    │          │
+    51→│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+    52→│                                                                                  │
+    53→└─────────────────────────────────────────────────────────────────────────────────┘
+    54→```
+    55→
+    56→---
+    57→
+    58→## 4.2 Ingestion Service
+    59→
+    60→### 4.2.1 Purpose
+    61→
+    62→Process daily CSV files containing mileage data, validate records, handle meter events, and update the database.
+    63→
+    64→### 4.2.2 File Watcher
+    65→
+    66→```typescript
+    67→interface FileWatcherConfig {
+    68→  inboxPath: string;           // /data/inbox
+    69→  processedPath: string;       // /data/processed
+    70→  quarantinePath: string;      // /data/quarantine
+    71→  expectedFilePattern: RegExp; // /^mileage_\d{8}\.csv$/
+    72→  maxFileSizeBytes: number;    // 10MB
+    73→  alertThresholdHours: number; // 2
+    74→}
+    75→
+    76→class FileWatcherService {
+    77→  private watcher: FSWatcher;
+    78→  private lastFileReceivedAt: Date | null = null;
+    79→  
+    80→  async start(): Promise<void> {
+    81→    this.watcher = chokidar.watch(this.config.inboxPath, {
+    82→      persistent: true,
+    83→      awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 500 }
+    84→    });
+    85→    
+    86→    this.watcher.on('add', async (filePath) => {
+    87→      this.lastFileReceivedAt = new Date();
+    88→      await this.processFile(filePath);
+    89→    });
+    90→    
+    91→    // Health check interval
+    92→    setInterval(() => this.checkFileArrivalHealth(), 30 * 60 * 1000);
+    93→  }
+    94→  
+    95→  private async processFile(filePath: string): Promise<void> {
+    96→    const filename = path.basename(filePath);
+    97→    const jobId = crypto.randomUUID();
+    98→    
+    99→    try {
+   100→      // Validate file
+   101→      await this.validateFile(filePath);
+   102→      
+   103→      // Queue for processing
+   104→      await this.jobQueue.add('ingestion', {
+   105→        jobId,
+   106→        filePath,
+   107→        filename,
+   108→        receivedAt: new Date().toISOString()
+   109→      }, {
+   110→        attempts: 3,
+   111→        backoff: { type: 'exponential', delay: 5000 }
+   112→      });
+   113→      
+   114→      this.logger.info({ jobId, filename }, 'File queued for ingestion');
+   115→      
+   116→    } catch (error) {
+   117→      // Move to quarantine
+   118→      const quarantinePath = path.join(
+   119→        this.config.quarantinePath, 
+   120→        `${Date.now()}_${filename}`
+   121→      );
+   122→      await fs.rename(filePath, quarantinePath);
+   123→      
+   124→      this.logger.error({ filename, error }, 'File quarantined');
+   125→      
+   126→      await this.alertService.send({
+   127→        type: 'FILE_VALIDATION_FAILED',
+   128→        severity: 'WARNING',
+   129→        message: `File ${filename} failed validation: ${error.message}`,
+   130→        filePath: quarantinePath
+   131→      });
+   132→    }
+   133→  }
+   134→  
+   135→  private async validateFile(filePath: string): Promise<void> {
+   136→    const stats = await fs.stat(filePath);
+   137→    
+   138→    // Size check
+   139→    if (stats.size > this.config.maxFileSizeBytes) {
+   140→      throw new Error(`File exceeds maximum size: ${stats.size} bytes`);
+   141→    }
+   142→    
+   143→    // Format check
+   144→    const filename = path.basename(filePath);
+   145→    if (!this.config.expectedFilePattern.test(filename)) {
+   146→      throw new Error(`Filename does not match expected pattern: ${filename}`);
+   147→    }
+   148→    
+   149→    // Content check (first 10 lines)
+   150→    const sample = await this.readFirstLines(filePath, 10);
+   151→    await this.validateCSVStructure(sample);
+   152→  }
+   153→  
+   154→  private async checkFileArrivalHealth(): Promise<void> {
+   155→    if (!this.lastFileReceivedAt) return;
+   156→    
+   157→    const hoursSinceLastFile = 
+   158→      (Date.now() - this.lastFileReceivedAt.getTime()) / (1000 * 60 * 60);
+   159→    
+   160→    if (hoursSinceLastFile > this.config.alertThresholdHours) {
+   161→      await this.alertService.send({
+   162→        type: 'FILE_ARRIVAL_DELAYED',
+   163→        severity: 'WARNING',
+   164→        message: `No mileage files received in ${hoursSinceLastFile.toFixed(1)} hours`,
+   165→        lastFileAt: this.lastFileReceivedAt.toISOString(),
+   166→        expectedInterval: `${this.config.alertThresholdHours} hours`
+   167→      });
+   168→    }
+   169→  }
+   170→}
+   171→```
+   172→
+   173→### 4.2.3 Ingestion Worker
+   174→
+   175→```typescript
+   176→interface MileageRecord {
+   177→  trainNumber: string;
+   178→  readingDate: string;  // YYYY-MM-DD
+   179→  odometerValue: number;
+   180→  source?: string;
+   181→}
+   182→
+   183→interface IngestionResult {
+   184→  jobId: string;
+   185→  filename: string;
+   186→  totalRecords: number;
+   187→  validRecords: number;
+   188→  invalidRecords: number;
+   189→  anomalies: AnomalyRecord[];
+   190→  meterEvents: MeterEventRecord[];
+   191→  processingTimeMs: number;
+   192→}
+   193→
+   194→class IngestionWorker {
+   195→  async process(job: Job<IngestionJobData>): Promise<IngestionResult> {
+   196→    const startTime = Date.now();
+   197→    const { jobId, filePath, filename } = job.data;
+   198→    
+   199→    const result: IngestionResult = {
+   200→      jobId,
+   201→      filename,
+   202→      totalRecords: 0,
+   203→      validRecords: 0,
+   204→      invalidRecords: 0,
+   205→      anomalies: [],
+   206→      meterEvents: [],
+   207→      processingTimeMs: 0
+   208→    };
+   209→    
+   210→    // Parse CSV
+   211→    const records = await this.parseCSV(filePath);
+   212→    result.totalRecords = records.length;
+   213→    
+   214→    // Process in batches
+   215→    const batches = this.chunk(records, 100);
+   216→    
+   217→    for (const batch of batches) {
+   218→      await this.db.transaction(async (tx) => {
+   219→        for (const record of batch) {
+   220→          try {
+   221→            await this.processRecord(tx, record, result);
+   222→            result.validRecords++;
+   223→          } catch (error) {
+   224→            result.invalidRecords++;
+   225→            this.logger.warn({ record, error }, 'Record processing failed');
+   226→          }
+   227→        }
+   228→      });
+   229→    }
+   230→    
+   231→    // Move file to processed
+   232→    const processedPath = path.join(
+   233→      this.config.processedPath,
+   234→      `${Date.now()}_${filename}`
+   235→    );
+   236→    await fs.rename(filePath, processedPath);
+   237→    
+   238→    // Update train current mileage
+   239→    await this.updateTrainMileage(records);
+   240→    
+   241→    // Trigger downstream processing
+   242→    await this.triggerDriftCheck();
+   243→    
+   244→    result.processingTimeMs = Date.now() - startTime;
+   245→    
+   246→    return result;
+   247→  }
+   248→  
+   249→  private async processRecord(
+   250→    tx: Transaction,
+   251→    record: MileageRecord,
+   252→    result: IngestionResult
+   253→  ): Promise<void> {
+   254→    // Find train
+   255→    const train = await tx.query.trains.findFirst({
+   256→      where: eq(trains.trainNumber, record.trainNumber)
+   257→    });
+   258→    
+   259→    if (!train) {
+   260→      throw new Error(`Unknown train: ${record.trainNumber}`);
+   261→    }
+   262→    
+   263→    // Get previous reading
+   264→    const previousReading = await tx.query.mileageReadings.findFirst({
+   265→      where: and(
+   266→        eq(mileageReadings.trainId, train.id),
+   267→        lt(mileageReadings.readingDate, record.readingDate)
+   268→      ),
+   269→      orderBy: desc(mileageReadings.readingDate)
+   270→    });
+   271→    
+   272→    // Calculate adjusted value (handle meter events)
+   273→    const adjustment = await this.getMeterAdjustment(tx, train.id, record.readingDate);
+   274→    const adjustedReading = record.odometerValue + adjustment;
+   275→    
+   276→    // Calculate daily km
+   277→    let dailyKm: number | null = null;
+   278→    let anomalyType: string | null = null;
+   279→    
+   280→    if (previousReading) {
+   281→      dailyKm = adjustedReading - previousReading.adjustedReading;
+   282→      
+   283→      // Anomaly detection
+   284→      if (dailyKm < 0) {
+   285→        anomalyType = 'NEGATIVE';
+   286→        result.anomalies.push({
+   287→          trainNumber: record.trainNumber,
+   288→          date: record.readingDate,
+   289→          type: 'NEGATIVE',
+   290→          value: dailyKm,
+   291→          message: `Negative daily mileage: ${dailyKm} km`
+   292→        });
+   293→      } else if (dailyKm > 1000) {  // Spike threshold
+   294→        anomalyType = 'SPIKE';
+   295→        result.anomalies.push({
+   296→          trainNumber: record.trainNumber,
+   297→          date: record.readingDate,
+   298→          type: 'SPIKE',
+   299→          value: dailyKm,
+   300→          message: `Unusually high daily mileage: ${dailyKm} km`
+   301→        });
+   302→      }
+   303→    }
+   304→    
+   305→    // Insert or update reading
+   306→    await tx.insert(mileageReadings)
+   307→      .values({
+   308→        trainId: train.id,
+   309→        readingDate: record.readingDate,
+   310→        rawReading: record.odometerValue,
+   311→        adjustedReading,
+   312→        dailyKm,
+   313→        validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+   314→        anomalyType,
+   315→        sourceFile: result.filename
+   316→      })
+   317→      .onConflictDoUpdate({
+   318→        target: [mileageReadings.trainId, mileageReadings.readingDate],
+   319→        set: {
+   320→          rawReading: record.odometerValue,
+   321→          adjustedReading,
+   322→          dailyKm,
+   323→          validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+   324→          anomalyType,
+   325→          sourceFile: result.filename
+   326→        }
+   327→      });
+   328→  }
+   329→  
+   330→  private async getMeterAdjustment(
+   331→    tx: Transaction,
+   332→    trainId: string,
+   333→    asOfDate: string
+   334→  ): Promise<number> {
+   335→    // Sum all meter event adjustments up to this date
+   336→    const events = await tx.query.meterEvents.findMany({
+   337→      where: and(
+   338→        eq(meterEvents.trainId, trainId),
+   339→        lte(meterEvents.eventDate, asOfDate)
+   340→      )
+   341→    });
+   342→    
+   343→    return events.reduce((sum, e) => sum + (e.adjustmentKm || 0), 0);
+   344→  }
+   345→  
+   346→  private async updateTrainMileage(records: MileageRecord[]): Promise<void> {
+   347→    // Group by train, find latest reading
+   348→    const latestByTrain = new Map<string, MileageRecord>();
+   349→    
+   350→    for (const record of records) {
+   351→      const existing = latestByTrain.get(record.trainNumber);
+   352→      if (!existing || record.readingDate > existing.readingDate) {
+   353→        latestByTrain.set(record.trainNumber, record);
+   354→      }
+   355→    }
+   356→    
+   357→    // Update train current_mileage
+   358→    for (const [trainNumber, record] of latestByTrain) {
+   359→      await this.db.update(trains)
+   360→        .set({ 
+   361→          currentMileageKm: record.odometerValue,
+   362→          updatedAt: new Date()
+   363→        })
+   364→        .where(eq(trains.trainNumber, trainNumber));
+   365→    }
+   366→    
+   367→    // Update fleet mileage targets
+   368→    await this.db.execute(sql`SELECT update_fleet_mileage_targets()`);
+   369→  }
+   370→}
+   371→```
+   372→
+   373→---
+   374→
+   375→## 4.3 Run Assignment Optimizer
+   376→
+   377→### 4.3.1 Purpose
+   378→
+   379→Optimize daily train-to-route assignments for mileage balancing while respecting hard constraints (fitness, PM due) and minimizing soft constraint penalties.
+   380→
+   381→### 4.3.2 Optimizer Service (TypeScript Wrapper)
+   382→
+   383→```typescript
+   384→interface OptimizerConfig {
+   385→  binaryPath: string;          // ./mms-optimizer
+   386→  maxSolveTimeSeconds: number; // 30
+   387→  numWorkers: number;          // 4
+   388→  timeoutMs: number;           // 60000
+   389→  fallbackEnabled: boolean;    // true
+   390→}
+   391→
+   392→class RunAssignmentOptimizer {
+   393→  private process: Subprocess | null = null;
+   394→  
+   395→  async optimize(input: OptimizerInput): Promise<OptimizerResult> {
+   396→    const startTime = Date.now();
+   397→    
+   398→    try {
+   399→      // Try C++ optimizer first
+   400→      const result = await this.runCppOptimizer(input);
+   401→      
+   402→      // Validate result
+   403→      if (result.status === 'INFEASIBLE' && this.config.fallbackEnabled) {
+   404→        this.logger.warn('C++ optimizer returned INFEASIBLE, using fallback');
+   405→        return await this.runFallbackOptimizer(input);
+   406→      }
+   407→      
+   408→      return result;
+   409→      
+   410→    } catch (error) {
+   411→      this.logger.error({ error }, 'C++ optimizer failed, using fallback');
+   412→      
+   413→      if (this.config.fallbackEnabled) {
+   414→        return await this.runFallbackOptimizer(input);
+   415→      }
+   416→      
+   417→      throw error;
+   418→    }
+   419→  }
+   420→  
+   421→  private async runCppOptimizer(input: OptimizerInput): Promise<OptimizerResult> {
+   422→    return new Promise((resolve, reject) => {
+   423→      const timeout = setTimeout(() => {
+   424→        this.process?.kill();
+   425→        reject(new Error('Optimizer timeout'));
+   426→      }, this.config.timeoutMs);
+   427→      
+   428→      this.process = Bun.spawn([this.config.binaryPath], {
+   429→        stdin: 'pipe',
+   430→        stdout: 'pipe',
+   431→        stderr: 'pipe'
+   432→      });
+   433→      
+   434→      // Write input
+   435→      const writer = this.process.stdin.getWriter();
+   436→      writer.write(new TextEncoder().encode(JSON.stringify(input) + '\n'));
+   437→      writer.close();
+   438→      
+   439→      // Read stdout (results)
+   440→      const results: any[] = [];
+   441→      const reader = this.process.stdout.getReader();
+   442→      const decoder = new TextDecoder();
+   443→      let buffer = '';
+   444→      
+   445→      const readStream = async () => {
+   446→        while (true) {
+   447→          const { done, value } = await reader.read();
+   448→          if (done) break;
+   449→          
+   450→          buffer += decoder.decode(value, { stream: true });
+   451→          const lines = buffer.split('\n');
+   452→          buffer = lines.pop() || '';
+   453→          
+   454→          for (const line of lines) {
+   455→            if (!line.trim()) continue;
+   456→            
+   457→            try {
+   458→              const msg = JSON.parse(line);
+   459→              
+   460→              if (msg.type === 'PROGRESS') {
+   461→                this.emitProgress(msg);
+   462→              } else if (msg.type === 'RESULT') {
+   463→                clearTimeout(timeout);
+   464→                resolve(this.mapResult(msg));
+   465→                return;
+   466→              }
+   467→            } catch (e) {
+   468→              this.logger.warn({ line }, 'Failed to parse optimizer output');
+   469→            }
+   470→          }
+   471→        }
+   472→      };
+   473→      
+   474→      // Read stderr (metrics/logs)
+   475→      this.readStderr(this.process.stderr);
+   476→      
+   477→      readStream().catch(reject);
+   478→      
+   479→      this.process.exited.then((code) => {
+   480→        clearTimeout(timeout);
+   481→        if (code !== 0 && results.length === 0) {
+   482→          reject(new Error(`Optimizer exited with code ${code}`));
+   483→        }
+   484→      });
+   485→    });
+   486→  }
+   487→  
+   488→  private async runFallbackOptimizer(input: OptimizerInput): Promise<OptimizerResult> {
+   489→    // TypeScript greedy fallback
+   490→    const assignments: Assignment[] = [];
+   491→    const unassigned: UnassignedTrain[] = [];
+   492→    const assignedTrainIds = new Set<string>();
+   493→    
+   494→    // Sort routes by priority (required trains desc)
+   495→    const sortedRoutes = [...input.routes].sort(
+   496→      (a, b) => b.required_trains - a.required_trains
+   497→    );
+   498→    
+   499→    // Sort trains by fitness and mileage balance
+   500→    const sortedTrains = [...input.trains]
+   501→      .filter(t => t.fitness_status === 'FIT')
+   502→      .sort((a, b) => {
+   503→        // Prioritize under-utilized trains
+   504→        const aBalance = a.current_mileage - a.target_mileage;
+   505→        const bBalance = b.current_mileage - b.target_mileage;
+   506→        return aBalance - bBalance;
+   507→      });
+   508→    
+   509→    for (const route of sortedRoutes) {
+   510→      let assigned = 0;
+   511→      
+   512→      for (const train of sortedTrains) {
+   513→        if (assigned >= route.required_trains) break;
+   514→        if (assignedTrainIds.has(train.id)) continue;
+   515→        
+   516→        // Check hard constraints
+   517→        const hardViolation = this.checkHardConstraints(train, route, input);
+   518→        if (hardViolation) {
+   519→          continue;
+   520→        }
+   521→        
+   522→        // Check fleet compatibility
+   523→        if (route.allowed_fleets.length > 0 && 
+   524→            !route.allowed_fleets.includes(train.fleet_id)) {
+   525→          continue;
+   526→        }
+   527→        
+   528→        // Assign
+   529→        assignments.push({
+   530→          train_id: train.id,
+   531→          route_id: route.id,
+   532→          score: this.calculateScore(train, route),
+   533→          explanation: [
+   534→            {
+   535→              constraint_type: 'SOFT',
+   536→              constraint_name: 'MILEAGE_BALANCE',
+   537→              impact: train.current_mileage - train.target_mileage,
+   538→              description: `Train is ${Math.abs(train.current_mileage - train.target_mileage)}km ${
+   539→                train.current_mileage < train.target_mileage ? 'under' : 'over'
+   540→              } target`
+   541→            }
+   542→          ]
+   543→        });
+   544→        
+   545→        assignedTrainIds.add(train.id);
+   546→        assigned++;
+   547→      }
+   548→      
+   549→      // Record shortfall
+   550→      if (assigned < route.required_trains) {
+   551→        unassigned.push({
+   552→          route_id: route.id,
+   553→          shortfall: route.required_trains - assigned,
+   554→          reason: 'Insufficient fit trains available'
+   555→        });
+   556→      }
+   557→    }
+   558→    
+   559→    // Record unassigned trains with reasons
+   560→    for (const train of input.trains) {
+   561→      if (assignedTrainIds.has(train.id)) continue;
+   562→      
+   563→      const reason = train.fitness_status !== 'FIT' 
+   564→        ? `Train is ${train.fitness_status}`
+   565→        : this.findBlockingConstraint(train, input);
+   566→      
+   567→      unassigned.push({
+   568→        train_id: train.id,
+   569→        reason,
+   570→        blocking_constraints: this.getBlockingConstraints(train, input)
+   571→      });
+   572→    }
+   573→    
+   574→    return {
+   575→      type: 'RESULT',
+   576→      request_id: input.request_id,
+   577→      status: 'FALLBACK',
+   578→      solve_time_ms: 0,
+   579→      assignments,
+   580→      unassigned,
+   581→      material_warnings: [],
+   582→      summary: {
+   583→        total_penalty: 1e6,  // High penalty for fallback
+   584→        trains_assigned: assignments.length,
+   585→        trains_unassigned: unassigned.length,
+   586→        soft_constraint_breakdown: {},
+   587→        material_blocks: 0
+   588→      }
+   589→    };
+   590→  }
+   591→  
+   592→  private checkHardConstraints(
+   593→    train: Train,
+   594→    route: Route,
+   595→    input: OptimizerInput
+   596→  ): string | null {
+   597→    // Check explicit hard constraints
+   598→    for (const constraint of input.hard_constraints) {
+   599→      if (constraint.train_id === train.id) {
+   600→        return constraint.description;
+   601→      }
+   602→    }
+   603→    
+   604→    // Check pending PMs that block assignment
+   605→    for (const pm of input.pending_pms) {
+   606→      if (pm.train_id === train.id && 
+   607→          pm.target_date <= new Date().toISOString().split('T')[0]) {
+   608→        // Check if materials are available
+   609→        const blocked = pm.required_materials.some(mat => {
+   610→          if (mat.criticality !== 'BLOCKING') return false;
+   611→          
+   612→          const position = input.material_positions.find(
+   613→            p => p.part_number === mat.part_number && 
+   614→                 p.depot_id === train.home_depot_id
+   615→          );
+   616→          
+   617→          return !position || position.quantity_available < mat.quantity;
+   618→        });
+   619→        
+   620→        if (!blocked) {
+   621→          return `PM ${pm.pm_type} due today`;
+   622→        }
+   623→      }
+   624→    }
+   625→    
+   626→    return null;
+   627→  }
+   628→}
+   629→```
+   630→
+   631→### 4.3.3 C++ Optimizer Core
+   632→
+   633→```cpp
+   634→// mms-optimizer/src/solver.cpp
+   635→
+   636→#include <ortools/sat/cp_model.h>
+   637→#include <nlohmann/json.hpp>
+   638→#include <vector>
+   639→#include <unordered_map>
+   640→
+   641→using namespace operations_research::sat;
+   642→using json = nlohmann::json;
+   643→
+   644→struct ExplanationFactor {
+   645→    std::string constraint_type;  // "HARD" or "SOFT"
+   646→    std::string constraint_name;
+   647→    double impact;
+   648→    std::string description;
+   649→};
+   650→
+   651→class MmsSolver {
+   652→public:
+   653→    json solve(const json& input) {
+   654→        CpModelBuilder model;
+   655→        std::string request_id = input["request_id"];
+   656→        
+   657→        auto trains = input["trains"];
+   658→        auto routes = input["routes"];
+   659→        auto config = input["config"];
+   660→        
+   661→        // Decision variables: assign[t][r] = 1 if train t assigned to route r
+   662→        std::vector<std::vector<BoolVar>> assign;
+   663→        assign.resize(trains.size());
+   664→        
+   665→        for (size_t t = 0; t < trains.size(); t++) {
+   666→            assign[t].resize(routes.size());
+   667→            for (size_t r = 0; r < routes.size(); r++) {
+   668→                assign[t][r] = model.NewBoolVar();
+   669→            }
+   670→        }
+   671→        
+   672→        // Hard constraint: Each train assigned to at most one route
+   673→        for (size_t t = 0; t < trains.size(); t++) {
+   674→            std::vector<BoolVar> train_routes;
+   675→            for (size_t r = 0; r < routes.size(); r++) {
+   676→                train_routes.push_back(assign[t][r]);
+   677→            }
+   678→            model.AddAtMostOne(train_routes);
+   679→        }
+   680→        
+   681→        // Hard constraint: Route requirements (exactly N trains)
+   682→        for (size_t r = 0; r < routes.size(); r++) {
+   683→            std::vector<BoolVar> route_trains;
+   684→            for (size_t t = 0; t < trains.size(); t++) {
+   685→                // Check fleet compatibility
+   686→                if (isFleetAllowed(trains[t], routes[r])) {
+   687→                    route_trains.push_back(assign[t][r]);
+   688→                }
+   689→            }
+   690→            
+   691→            int required = routes[r]["required_trains"];
+   692→            model.AddEquality(LinearExpr::Sum(route_trains), required);
+   693→        }
+   694→        
+   695→        // Hard constraint: Fitness status
+   696→        for (size_t t = 0; t < trains.size(); t++) {
+   697→            if (trains[t]["fitness_status"] != "FIT") {
+   698→                for (size_t r = 0; r < routes.size(); r++) {
+   699→                    model.AddEquality(assign[t][r], 0);
+   700→                }
+   701→            }
+   702→        }
+   703→        
+   704→        // Hard constraints from input
+   705→        for (const auto& constraint : input["hard_constraints"]) {
+   706→            size_t train_idx = findTrainIndex(trains, constraint["train_id"]);
+   707→            if (train_idx < trains.size()) {
+   708→                for (size_t r = 0; r < routes.size(); r++) {
+   709→                    model.AddEquality(assign[train_idx][r], 0);
+   710→                }
+   711→            }
+   712→        }
+   713→        
+   714→        // Soft constraint: Mileage balance
+   715→        std::vector<IntVar> mileage_penalties;
+   716→        auto penalties = config["soft_constraint_penalties"];
+   717→        int mileage_weight = penalties["mileage_imbalance"].get<int>();
+   718→        
+   719→        for (size_t t = 0; t < trains.size(); t++) {
+   720→            int current = trains[t]["current_mileage"];
+   721→            int target = trains[t]["target_mileage"];
+   722→            int variance = std::abs(current - target);
+   723→            
+   724→            for (size_t r = 0; r < routes.size(); r++) {
+   725→                int route_km = routes[r]["expected_km"];
+   726→                
+   727→                // Penalty for assigning over-utilized train to high-km route
+   728→                if (current > target && route_km > 200) {
+   729→                    IntVar penalty = model.NewIntVar({0, variance * mileage_weight});
+   730→                    model.AddEquality(penalty, variance * mileage_weight)
+   731→                        .OnlyEnforceIf(assign[t][r]);
+   732→                    model.AddEquality(penalty, 0)
+   733→                        .OnlyEnforceIf(assign[t][r].Not());
+   734→                    mileage_penalties.push_back(penalty);
+   735→                }
+   736→            }
+   737→        }
+   738→        
+   739→        // Objective: Minimize total penalty
+   740→        model.Minimize(LinearExpr::Sum(mileage_penalties));
+   741→        
+   742→        // Solve
+   743→        SatParameters params;
+   744→        params.set_max_time_in_seconds(
+   745→            config["max_solve_time_seconds"].get<double>()
+   746→        );
+   747→        params.set_num_search_workers(
+   748→            config["num_workers"].get<int>()
+   749→        );
+   750→        
+   751→        Model cp_model;
+   752→        cp_model.Add(NewSatParameters(params));
+   753→        
+   754→        // Progress callback
+   755→        int callback_count = 0;
+   756→        cp_model.Add(NewFeasibleSolutionObserver([&](const CpSolverResponse& r) {
+   757→            callback_count++;
+   758→            if (callback_count % 5 == 0) {
+   759→                emitProgress(request_id, 
+   760→                    std::min(90.0, callback_count * 3.0),
+   761→                    r.objective_value(), true);
+   762→            }
+   763→        }));
+   764→        
+   765→        CpSolverResponse response = SolveCpModel(model.Build(), &cp_model);
+   766→        
+   767→        // Build result
+   768→        json result;
+   769→        result["type"] = "RESULT";
+   770→        result["request_id"] = request_id;
+   771→        result["solve_time_ms"] = response.wall_time() * 1000;
+   772→        
+   773→        if (response.status() == CpSolverStatus::OPTIMAL ||
+   774→            response.status() == CpSolverStatus::FEASIBLE) {
+   775→            
+   776→            result["status"] = response.status() == CpSolverStatus::OPTIMAL 
+   777→                ? "OPTIMAL" : "FEASIBLE";
+   778→            
+   779→            json assignments = json::array();
+   780→            
+   781→            for (size_t t = 0; t < trains.size(); t++) {
+   782→                for (size_t r = 0; r < routes.size(); r++) {
+   783→                    if (SolutionBooleanValue(response, assign[t][r])) {
+   784→                        json assignment;
+   785→                        assignment["train_id"] = trains[t]["id"];
+   786→                        assignment["route_id"] = routes[r]["id"];
+   787→                        assignment["score"] = computeScore(trains[t], routes[r], response);
+   788→                        assignment["explanation"] = generateExplanation(
+   789→                            trains[t], routes[r], input, response
+   790→                        );
+   791→                        assignments.push_back(assignment);
+   792→                    }
+   793→                }
+   794→            }
+   795→            
+   796→            result["assignments"] = assignments;
+   797→            result["unassigned"] = findUnassigned(trains, assignments, input);
+   798→            result["material_warnings"] = checkMaterialWarnings(input);
+   799→            result["summary"] = buildSummary(response, assignments);
+   800→            
+   801→        } else {
+   802→            result["status"] = "INFEASIBLE";
+   803→            result["assignments"] = json::array();
+   804→            result["unassigned"] = json::array();
+   805→            result["summary"] = {
+   806→                {"total_penalty", -1},
+   807→                {"trains_assigned", 0},
+   808→                {"trains_unassigned", trains.size()}
+   809→            };
+   810→        }
+   811→        
+   812→        return result;
+   813→    }
+   814→    
+   815→private:
+   816→    json generateExplanation(
+   817→        const json& train,
+   818→        const json& route,
+   819→        const json& input,
+   820→        const CpSolverResponse& response
+   821→    ) {
+   822→        json factors = json::array();
+   823→        
+   824→        // Mileage balance factor
+   825→        int current = train["current_mileage"];
+   826→        int target = train["target_mileage"];
+   827→        int variance = current - target;
+   828→        
+   829→        factors.push_back({
+   830→            {"constraint_type", "SOFT"},
+   831→            {"constraint_name", "MILEAGE_BALANCE"},
+   832→            {"impact", std::abs(variance)},
+   833→            {"description", fmt::format(
+   834→                "Train is {}km {} fleet target",
+   835→                std::abs(variance),
+   836→                variance < 0 ? "under" : "over"
+   837→            )}
+   838→        });
+   839→        
+   840→        // Route match factor
+   841→        int route_km = route["expected_km"];
+   842→        std::string route_advice = "";
+   843→        
+   844→        if (variance < -1000 && route_km > 300) {
+   845→            route_advice = "High-km route helps balance under-utilized train";
+   846→        } else if (variance > 1000 && route_km < 150) {
+   847→            route_advice = "Low-km route reduces over-utilization";
+   848→        }
+   849→        
+   850→        if (!route_advice.empty()) {
+   851→            factors.push_back({
+   852→                {"constraint_type", "SOFT"},
+   853→                {"constraint_name", "ROUTE_MATCH"},
+   854→                {"impact", route_km},
+   855→                {"description", route_advice}
+   856→            });
+   857→        }
+   858→        
+   859→        // Check if alternatives were blocked
+   860→        for (const auto& constraint : input["hard_constraints"]) {
+   861→            // Find trains that could have taken this route but were blocked
+   862→            factors.push_back({
+   863→                {"constraint_type", "HARD"},
+   864→                {"constraint_name", constraint["type"]},
+   865→                {"impact", 0},
+   866→                {"description", fmt::format(
+   867→                    "Alternative train {} blocked: {}",
+   868→                    constraint["train_id"].get<std::string>().substr(0, 8),
+   869→                    constraint["description"].get<std::string>()
+   870→                )}
+   871→            });
+   872→        }
+   873→        
+   874→        return factors;
+   875→    }
+   876→};
+   877→```
+   878→
+   879→---
+   880→
+   881→## 4.4 PM Scheduler (Tactical)
+   882→
+   883→### 4.4.1 Purpose
+   884→
+   885→Schedule preventive maintenance for the 12-week tactical horizon, respecting track availability, labor capacity, and material constraints.
+   886→
+   887→### 4.4.2 Implementation
+   888→
+   889→```typescript
+   890→interface TacticalSchedulerConfig {
+   891→  horizonWeeks: number;           // 12
+   892→  materialCheckDaysHard: number;  // 14 (hard constraint)
+   893→  materialCheckDaysSoft: number;  // 90 (soft constraint)
+   894→  trackUtilizationTarget: number; // 0.85
+   895→}
+   896→
+   897→class TacticalPMScheduler {
+   898→  async schedule(depotId: string): Promise<SchedulingResult> {
+   899→    const config = this.config;
+   900→    const horizonEnd = addWeeks(new Date(), config.horizonWeeks);
+   901→    
+   902→    // 1. Get pending PMs that need scheduling
+   903→    const pendingPMs = await this.getPendingPMs(depotId, horizonEnd);
+   904→    
+   905→    // 2. Get resource availability
+   906→    const trackAvailability = await this.getTrackAvailability(depotId, horizonEnd);
+   907→    const laborCapacity = await this.getLaborCapacity(depotId, horizonEnd);
+   908→    const materialPositions = await this.getMaterialPositions(depotId);
+   909→    
+   910→    // 3. Sort PMs by priority (urgency, criticality)
+   911→    const sortedPMs = this.prioritizePMs(pendingPMs);
+   912→    
+   913→    // 4. Schedule each PM
+   914→    const scheduled: ScheduledPM[] = [];
+   915→    const deferred: DeferredPM[] = [];
+   916→    const materialWarnings: MaterialWarning[] = [];
+   917→    
+   918→    for (const pm of sortedPMs) {
+   919→      const result = await this.scheduleSinglePM(
+   920→        pm,
+   921→        trackAvailability,
+   922→        laborCapacity,
+   923→        materialPositions,
+   924→        scheduled
+   925→      );
+   926→      
+   927→      if (result.scheduled) {
+   928→        scheduled.push(result.scheduled);
+   929→        
+   930→        // Reserve materials
+   931→        await this.reserveMaterials(result.scheduled, materialPositions);
+   932→        
+   933→        // Update availability
+   934→        this.updateAvailability(
+   935→          result.scheduled,
+   936→          trackAvailability,
+   937→          laborCapacity
+   938→        );
+   939→      } else {
+   940→        deferred.push({
+   941→          pm,
+   942→          reason: result.reason,
+   943→          suggestedDate: result.suggestedDate
+   944→        });
+   945→      }
+   946→      
+   947→      if (result.materialWarning) {
+   948→        materialWarnings.push(result.materialWarning);
+   949→      }
+   950→    }
+   951→    
+   952→    // 5. Persist schedule
+   953→    await this.persistSchedule(scheduled, deferred);
+   954→    
+   955→    // 6. Notify if material blocks exist
+   956→    if (materialWarnings.length > 0) {
+   957→      await this.notifyMaterialBlocks(materialWarnings);
+   958→    }
+   959→    
+   960→    return {
+   961→      scheduled,
+   962→      deferred,
+   963→      materialWarnings,
+   964→      summary: {
+   965→        totalPMs: sortedPMs.length,
+   966→        scheduledCount: scheduled.length,
+   967→        deferredCount: deferred.length,
+   968→        trackUtilization: this.calculateTrackUtilization(trackAvailability),
+   969→        laborUtilization: this.calculateLaborUtilization(laborCapacity)
+   970→      }
+   971→    };
+   972→  }
+   973→  
+   974→  private async scheduleSinglePM(
+   975→    pm: PendingPM,
+   976→    trackAvailability: TrackAvailability[],
+   977→    laborCapacity: LaborCapacity[],
+   978→    materialPositions: MaterialPosition[],
+   979→    alreadyScheduled: ScheduledPM[]
+   980→  ): Promise<ScheduleAttemptResult> {
+   981→    const pmType = pm.pmType;
+   982→    
+   983→    // Find valid dates within compliance window
+   984→    const validDates = this.getValidDates(
+   985→      pm.constraintStart,
+   986→      pm.constraintEnd,
+   987→      pmType.minTrackDays
+   988→    );
+   989→    
+   990→    for (const targetDate of validDates) {
+   991→      // Check track availability
+   992→      const track = this.findAvailableTrack(
+   993→        targetDate,
+   994→        pmType.trackType,
+   995→        pmType.minTrackDays,
+   996→        trackAvailability
+   997→      );
+   998→      
+   999→      if (!track) continue;
+  1000→      
+  1001→      // Check labor capacity
+  1002→      const laborOk = this.checkLaborCapacity(
+  1003→        targetDate,
+  1004→        pmType.estimatedHours,
+  1005→        laborCapacity
+  1006→      );
+  1007→      
+  1008→      if (!laborOk) continue;
+  1009→      
+  1010→      // Check material availability
+  1011→      const materialCheck = await this.checkMaterialAvailability(
+  1012→        pm,
+  1013→        targetDate,
+  1014→        materialPositions
+  1015→      );
+  1016→      
+  1017→      if (materialCheck.blocked) {
+  1018→        // Within hard constraint window - cannot schedule
+  1019→        if (this.isWithinHardWindow(targetDate)) {
+  1020→          return {
+  1021→            scheduled: null,
+  1022→            reason: `Material unavailable: ${materialCheck.missingParts.join(', ')}`,
+  1023→            suggestedDate: materialCheck.suggestedDate,
+  1024→            materialWarning: {
+  1025→              pmId: pm.id,
+  1026→              trainId: pm.trainId,
+  1027→              missingParts: materialCheck.missingParts,
+  1028→              expectedAvailability: materialCheck.expectedDelivery
+  1029→            }
+  1030→          };
+  1031→        }
+  1032→        // Soft constraint window - add warning but continue
+  1033→        continue;
+  1034→      }
+  1035→      
+  1036→      // Schedule found!
+  1037→      return {
+  1038→        scheduled: {
+  1039→          pmId: pm.id,
+  1040→          trainId: pm.trainId,
+  1041→          pmTypeId: pmType.id,
+  1042→          targetDate,
+  1043→          trackId: track.id,
+  1044→          assignedHours: pmType.estimatedHours,
+  1045→          constraintStart: pm.constraintStart,
+  1046→          constraintEnd: pm.constraintEnd
+  1047→        },
+  1048→        reason: null,
+  1049→        materialWarning: materialCheck.warning
+  1050→      };
+  1051→    }
+  1052→    
+  1053→    // No valid slot found
+  1054→    return {
+  1055→      scheduled: null,
+  1056→      reason: 'No available slot within compliance window',
+  1057→      suggestedDate: addDays(pm.constraintEnd, 7)
+  1058→    };
+  1059→  }
+  1060→  
+  1061→  private async checkMaterialAvailability(
+  1062→    pm: PendingPM,
+  1063→    targetDate: Date,
+  1064→    materialPositions: MaterialPosition[]
+  1065→  ): Promise<MaterialCheckResult> {
+  1066→    const requirements = await this.getPMRequirements(pm.pmType.id);
+  1067→    const missingParts: string[] = [];
+  1068→    let earliestDelivery: Date | null = null;
+  1069→    
+  1070→    for (const req of requirements) {
+  1071→      if (req.criticality === 'CONSUMABLE') continue;
+  1072→      
+  1073→      const position = materialPositions.find(
+  1074→        p => p.partNumber === req.partNumber && p.depotId === pm.depotId
+  1075→      );
+  1076→      
+  1077→      const available = position?.quantityAvailable || 0;
+  1078→      
+  1079→      if (available < req.quantityPerPM) {
+  1080→        if (req.criticality === 'BLOCKING') {
+  1081→          missingParts.push(req.partNumber);
+  1082→          
+  1083→          if (position?.nextDeliveryDate) {
+  1084→            const delivery = new Date(position.nextDeliveryDate);
+  1085→            if (!earliestDelivery || delivery < earliestDelivery) {
+  1086→              earliestDelivery = delivery;
+  1087→            }
+  1088→          }
+  1089→        }
+  1090→      }
+  1091→    }
+  1092→    
+  1093→    return {
+  1094→      blocked: missingParts.length > 0 && 
+  1095→               this.isWithinHardWindow(targetDate),
+  1096→      missingParts,
+  1097→      expectedDelivery: earliestDelivery,
+  1098→      suggestedDate: earliestDelivery 
+  1099→        ? addDays(earliestDelivery, 1)
+  1100→        : null,
+  1101→      warning: missingParts.length > 0 ? {
+  1102→        type: 'LOW_STOCK',
+  1103→        parts: missingParts,
+  1104→        message: `Parts may be unavailable: ${missingParts.join(', ')}`
+  1105→      } : null
+  1106→    };
+  1107→  }
+  1108→}
+  1109→```
+  1110→
+  1111→### 4.4.3 PM Schedule Management Service
+  1112→
+  1113→Handles manual PM modifications (drag-and-drop, manual reschedules) with full validation including Maximo status locks.
+  1114→
+  1115→```typescript
+  1116→/**
+  1117→ * Service for manual PM schedule modifications.
+  1118→ * 
+  1119→ * CRITICAL: All modifications MUST validate against Maximo status to prevent
+  1120→ * race conditions with in-progress work orders. The PMEditValidator from the
+  1121→ * Integration layer (Part 7) provides this validation.
+  1122→ * 
+  1123→ * Operational reality (Maximo) MUST override planning data (MMS).
+  1124→ */
+  1125→class PMScheduleManagementService {
+  1126→  private pmEditValidator: PMEditValidator;  // From Part 7
+  1127→  private auditLogger: AuditLogger;
+  1128→  
+  1129→  /**
+  1130→   * Move a PM to a new date (e.g., from canvas drag-and-drop).
+  1131→   * 
+  1132→   * @throws MaximoLockError if PM is in-progress in Maximo
+  1133→   * @throws ComplianceWindowError if new date is outside allowed window
+  1134→   * @throws TrackConflictError if track is occupied on new date
+  1135→   */
+  1136→  async movePM(
+  1137→    pmId: string,
+  1138→    newTargetDate: Date,
+  1139→    newTrackId: string | null,
+  1140→    userId: string
+  1141→  ): Promise<PMScheduleRecord> {
+  1142→    
+  1143→    // 1. CRITICAL: Validate Maximo status lock
+  1144→    const editValidation = await this.pmEditValidator.validateEdit(pmId);
+  1145→    
+  1146→    if (!editValidation.valid) {
+  1147→      throw new PMEditBlockedError(
+  1148→        editValidation.reason,
+  1149→        editValidation.message,
+  1150→        {
+  1151→          maximoStatus: editValidation.maximoStatus,
+  1152→          maximoWonum: editValidation.maximoWonum,
+  1153→          suggestion: editValidation.suggestion
+  1154→        }
+  1155→      );
+  1156→    }
+  1157→    
+  1158→    // 2. Load PM with all relationships
+  1159→    const pm = await this.db.query.pmSchedule.findFirst({
+  1160→      where: eq(pmSchedule.id, pmId),
+  1161→      with: {
+  1162→        pmType: true,
+  1163→        train: true,
+  1164→        assignedTrack: true
+  1165→      }
+  1166→    });
+  1167→    
+  1168→    if (!pm) {
+  1169→      throw new NotFoundError('PM not found');
+  1170→    }
+  1171→    
+  1172→    // 3. Validate compliance window
+  1173→    if (newTargetDate < pm.constraintStart || newTargetDate > pm.constraintEnd) {
+  1174→      throw new ComplianceWindowError(
+  1175→        `Target date ${newTargetDate.toISOString().split('T')[0]} is outside compliance window`,
+  1176→        {
+  1177→          constraintStart: pm.constraintStart,
+  1178→          constraintEnd: pm.constraintEnd,
+  1179→          requestedDate: newTargetDate
+  1180→        }
+  1181→      );
+  1182→    }
+  1183→    
+  1184→    // 4. Validate track availability (if track specified)
+  1185→    if (newTrackId) {
+  1186→      const conflict = await this.checkTrackConflict(
+  1187→        newTrackId,
+  1188→        newTargetDate,
+  1189→        pm.pmType.minTrackDays,
+  1190→        pmId  // Exclude self from conflict check
+  1191→      );
+  1192→      
+  1193→      if (conflict) {
+  1194→        throw new TrackConflictError(
+  1195→          `Track ${conflict.trackNumber} is occupied by ${conflict.conflictingPMCode}`,
+  1196→          conflict
+  1197→        );
+  1198→      }
+  1199→    }
+  1200→    
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

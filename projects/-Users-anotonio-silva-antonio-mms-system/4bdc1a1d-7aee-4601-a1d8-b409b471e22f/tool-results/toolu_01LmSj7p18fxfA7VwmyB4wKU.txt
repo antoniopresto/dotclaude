@@ -1,0 +1,1036 @@
+     1→/**
+     2→ * MMS Service Demand Service
+     3→ *
+     4→ * Manages fleet availability requirements - a CRITICAL v2.1 service.
+     5→ * Service demand is a HARD CONSTRAINT for the optimizer: schedules that
+     6→ * violate minimum train availability must be rejected.
+     7→ *
+     8→ * Key responsibilities:
+     9→ * - Define minimum train requirements by fleet, day type, and time period
+    10→ * - Validate that proposed PM schedules don't violate availability
+    11→ * - Calculate default demand (85% of fleet) when no explicit config exists
+    12→ * - Support peak period requirements (AM, midday, PM, evening)
+    13→ *
+    14→ * Business rules:
+    15→ * - Optimizer CANNOT schedule PM that would drop fleet below minTrainsRequired
+    16→ * - Day types: WEEKDAY, SATURDAY, SUNDAY, HOLIDAY
+    17→ * - Demand records are versioned by effectiveDate (most recent applies)
+    18→ * - Peak period requirements are optional but enforced if defined
+    19→ *
+    20→ * @see specs/003-database-schema.md Section 3.2.1 (Service Demand)
+    21→ * @see specs/004-domain-services.md Section 4.2.6 (Service Demand Service)
+    22→ */
+    23→
+    24→import { eq, and, sql, desc, lte, count, inArray, gte } from 'drizzle-orm';
+    25→import type { SQL } from 'drizzle-orm';
+    26→import { BaseService, MmsAttributes } from '../lib/services/base';
+    27→import {
+    28→  serviceDemand,
+    29→  trains,
+    30→  fleets,
+    31→  pmSchedule,
+    32→  type ServiceDemand,
+    33→  type NewServiceDemand,
+    34→} from '../lib/db/schema';
+    35→import {
+    36→  NotFoundError,
+    37→  ValidationError,
+    38→  DuplicateError,
+    39→} from '../lib/errors';
+    40→
+    41→// =============================================================================
+    42→// Types
+    43→// =============================================================================
+    44→
+    45→/** Day type enum values */
+    46→export type DayType = 'WEEKDAY' | 'SATURDAY' | 'SUNDAY' | 'HOLIDAY';
+    47→
+    48→/** Time period for peak requirements */
+    49→export type TimePeriod = 'PEAK_AM' | 'MIDDAY' | 'PEAK_PM' | 'EVENING' | 'ALL_DAY';
+    50→
+    51→/** Demand configuration for a specific fleet/date */
+    52→export interface DemandConfig {
+    53→  fleetId: string;
+    54→  fleetCode: string;
+    55→  date: string;
+    56→  dayType: DayType;
+    57→  minTrainsRequired: number;
+    58→  standbyBuffer: number;
+    59→  totalRequired: number; // minTrainsRequired + standbyBuffer
+    60→  peakAmRequirement: number | null;
+    61→  middayRequirement: number | null;
+    62→  peakPmRequirement: number | null;
+    63→  eveningRequirement: number | null;
+    64→  source: 'CONFIG' | 'DEFAULT';
+    65→  sourceRecord: ServiceDemand | null;
+    66→}
+    67→
+    68→/** Availability validation result */
+    69→export interface AvailabilityValidation {
+    70→  isValid: boolean;
+    71→  fleetId: string;
+    72→  date: string;
+    73→  dayType: DayType;
+    74→  totalTrains: number;
+    75→  fitTrains: number;
+    76→  unavailableTrains: number;
+    77→  inMaintenanceTrains: number;
+    78→  additionalUnavailable: number;
+    79→  availableTrains: number;
+    80→  required: number;
+    81→  surplus: number; // Positive = OK, Negative = VIOLATION
+    82→  severity: 'OK' | 'WARNING' | 'VIOLATION';
+    83→  message: string;
+    84→}
+    85→
+    86→/** Violation detected for proposed PM */
+    87→export interface DemandViolation {
+    88→  date: string;
+    89→  dayType: DayType;
+    90→  trainId: string;
+    91→  trainNumber: string;
+    92→  pmCode: string;
+    93→  required: number;
+    94→  available: number;
+    95→  shortfall: number;
+    96→  severity: 'HARD' | 'SOFT';
+    97→  message: string;
+    98→}
+    99→
+   100→/** Proposed PM for violation checking */
+   101→export interface ProposedPM {
+   102→  trainId: string;
+   103→  targetDate: string;
+   104→  pmTypeId?: string;
+   105→  pmCode?: string;
+   106→  durationDays?: number;
+   107→}
+   108→
+   109→/** Create demand request */
+   110→export interface CreateDemandRequest {
+   111→  fleetId: string;
+   112→  effectiveDate: string;
+   113→  dayType: DayType;
+   114→  minTrainsRequired: number;
+   115→  peakAmRequirement?: number;
+   116→  middayRequirement?: number;
+   117→  peakPmRequirement?: number;
+   118→  eveningRequirement?: number;
+   119→  standbyBuffer?: number;
+   120→  source?: string;
+   121→  notes?: string;
+   122→  createdBy?: string;
+   123→}
+   124→
+   125→/** Query filters for listing demand records */
+   126→export interface DemandListFilters {
+   127→  fleetId?: string;
+   128→  dayType?: DayType | DayType[];
+   129→  effectiveDateFrom?: string;
+   130→  effectiveDateTo?: string;
+   131→}
+   132→
+   133→/** Fleet availability summary */
+   134→export interface FleetAvailabilitySummary {
+   135→  fleetId: string;
+   136→  fleetCode: string;
+   137→  totalTrains: number;
+   138→  fitTrains: number;
+   139→  restrictedTrains: number;
+   140→  groundedTrains: number;
+   141→  inMaintenanceTrains: number;
+   142→  availableTrains: number;
+   143→  demandConfig: DemandConfig;
+   144→  utilizationPct: number;
+   145→  status: 'OK' | 'WARNING' | 'CRITICAL';
+   146→}
+   147→
+   148→// =============================================================================
+   149→// Constants
+   150→// =============================================================================
+   151→
+   152→/** Default fleet availability percentage when no config exists */
+   153→const DEFAULT_AVAILABILITY_PCT = 0.85;
+   154→
+   155→/** Default standby buffer */
+   156→const DEFAULT_STANDBY_BUFFER = 2;
+   157→
+   158→/** Warning threshold: < this % surplus triggers warning */
+   159→const WARNING_THRESHOLD_PCT = 0.10;
+   160→
+   161→// =============================================================================
+   162→// Service Demand Service
+   163→// =============================================================================
+   164→
+   165→export class ServiceDemandService extends BaseService {
+   166→  constructor() {
+   167→    super({ name: 'service-demand-service', version: '1.0.0' });
+   168→  }
+   169→
+   170→  // ===========================================================================
+   171→  // Demand Configuration
+   172→  // ===========================================================================
+   173→
+   174→  /**
+   175→   * Get demand configuration for a fleet on a specific date.
+   176→   *
+   177→   * This is the primary method for the optimizer to determine minimum
+   178→   * train requirements. It:
+   179→   * 1. Determines the day type for the date
+   180→   * 2. Finds the most recent effective demand config
+   181→   * 3. Falls back to 85% of fleet size if no config exists
+   182→   *
+   183→   * @param fleetId - Fleet to get demand for
+   184→   * @param targetDate - Date to check (YYYY-MM-DD)
+   185→   * @param holidays - Optional array of holiday dates (YYYY-MM-DD)
+   186→   * @returns Demand configuration for the date
+   187→   */
+   188→  async getDemand(
+   189→    fleetId: string,
+   190→    targetDate: string,
+   191→    holidays?: string[]
+   192→  ): Promise<DemandConfig> {
+   193→    return this.traced('getDemand', async (span) => {
+   194→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   195→      span.setAttribute('demand.targetDate', targetDate);
+   196→
+   197→      // Verify fleet exists
+   198→      const fleet = await this.db.query.fleets.findFirst({
+   199→        where: eq(fleets.id, fleetId),
+   200→      });
+   201→
+   202→      if (!fleet) {
+   203→        throw new NotFoundError(`Fleet not found: ${fleetId}`, {
+   204→          entityType: 'fleet',
+   205→          entityId: fleetId,
+   206→        });
+   207→      }
+   208→
+   209→      // Determine day type
+   210→      const dayType = this.getDayType(targetDate, holidays);
+   211→      span.setAttribute('demand.dayType', dayType);
+   212→
+   213→      // Find most recent effective demand config
+   214→      const demandRecord = await this.db.query.serviceDemand.findFirst({
+   215→        where: and(
+   216→          eq(serviceDemand.fleetId, fleetId),
+   217→          eq(serviceDemand.dayType, dayType),
+   218→          lte(serviceDemand.effectiveDate, targetDate)
+   219→        ),
+   220→        orderBy: desc(serviceDemand.effectiveDate),
+   221→      });
+   222→
+   223→      if (demandRecord) {
+   224→        span.setAttribute('demand.source', 'CONFIG');
+   225→        span.setAttribute('demand.minTrains', demandRecord.minTrainsRequired);
+   226→
+   227→        return {
+   228→          fleetId,
+   229→          fleetCode: fleet.code,
+   230→          date: targetDate,
+   231→          dayType,
+   232→          minTrainsRequired: demandRecord.minTrainsRequired,
+   233→          standbyBuffer: demandRecord.standbyBuffer ?? DEFAULT_STANDBY_BUFFER,
+   234→          totalRequired:
+   235→            demandRecord.minTrainsRequired + (demandRecord.standbyBuffer ?? DEFAULT_STANDBY_BUFFER),
+   236→          peakAmRequirement: demandRecord.peakAmRequirement,
+   237→          middayRequirement: demandRecord.middayRequirement,
+   238→          peakPmRequirement: demandRecord.peakPmRequirement,
+   239→          eveningRequirement: demandRecord.eveningRequirement,
+   240→          source: 'CONFIG',
+   241→          sourceRecord: demandRecord,
+   242→        };
+   243→      }
+   244→
+   245→      // No config found - calculate default (85% of fleet)
+   246→      const defaultDemand = await this.calculateDefaultDemand(fleetId);
+   247→      span.setAttribute('demand.source', 'DEFAULT');
+   248→      span.setAttribute('demand.minTrains', defaultDemand.minTrainsRequired);
+   249→
+   250→      this.log.warn(
+   251→        {
+   252→          fleetId,
+   253→          fleetCode: fleet.code,
+   254→          targetDate,
+   255→          dayType,
+   256→          calculatedDemand: defaultDemand.minTrainsRequired,
+   257→        },
+   258→        `No service demand config found for ${fleet.code} on ${targetDate} (${dayType}). Using default 85% of fleet.`
+   259→      );
+   260→
+   261→      return {
+   262→        fleetId,
+   263→        fleetCode: fleet.code,
+   264→        date: targetDate,
+   265→        dayType,
+   266→        minTrainsRequired: defaultDemand.minTrainsRequired,
+   267→        standbyBuffer: DEFAULT_STANDBY_BUFFER,
+   268→        totalRequired: defaultDemand.minTrainsRequired + DEFAULT_STANDBY_BUFFER,
+   269→        peakAmRequirement: null,
+   270→        middayRequirement: null,
+   271→        peakPmRequirement: null,
+   272→        eveningRequirement: null,
+   273→        source: 'DEFAULT',
+   274→        sourceRecord: null,
+   275→      };
+   276→    });
+   277→  }
+   278→
+   279→  /**
+   280→   * Get demand for a specific time period within a day.
+   281→   *
+   282→   * Used for more granular availability checking during peak hours.
+   283→   */
+   284→  async getDemandForPeriod(
+   285→    fleetId: string,
+   286→    targetDate: string,
+   287→    period: TimePeriod,
+   288→    holidays?: string[]
+   289→  ): Promise<number> {
+   290→    return this.traced('getDemandForPeriod', async (span) => {
+   291→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   292→      span.setAttribute('demand.period', period);
+   293→
+   294→      const demandConfig = await this.getDemand(fleetId, targetDate, holidays);
+   295→
+   296→      if (period === 'ALL_DAY') {
+   297→        return demandConfig.totalRequired;
+   298→      }
+   299→
+   300→      // Check period-specific requirement, fall back to base requirement
+   301→      const periodRequirement = {
+   302→        PEAK_AM: demandConfig.peakAmRequirement,
+   303→        MIDDAY: demandConfig.middayRequirement,
+   304→        PEAK_PM: demandConfig.peakPmRequirement,
+   305→        EVENING: demandConfig.eveningRequirement,
+   306→      }[period];
+   307→
+   308→      return periodRequirement ?? demandConfig.minTrainsRequired;
+   309→    });
+   310→  }
+   311→
+   312→  // ===========================================================================
+   313→  // Availability Validation
+   314→  // ===========================================================================
+   315→
+   316→  /**
+   317→   * Validate fleet availability for a date.
+   318→   *
+   319→   * This is a CRITICAL method for the optimizer. It checks whether the
+   320→   * fleet has enough available trains to meet service demand, considering:
+   321→   * - Current train fitness status
+   322→   * - Active unavailability events
+   323→   * - Scheduled PM on that date
+   324→   * - Any additional proposed unavailability
+   325→   *
+   326→   * @param fleetId - Fleet to validate
+   327→   * @param targetDate - Date to check
+   328→   * @param additionalUnavailable - Number of additional trains that would be unavailable (e.g., proposed PM)
+   329→   * @param holidays - Optional array of holiday dates
+   330→   * @returns Validation result with detailed breakdown
+   331→   */
+   332→  async validateAvailability(
+   333→    fleetId: string,
+   334→    targetDate: string,
+   335→    additionalUnavailable: number = 0,
+   336→    holidays?: string[]
+   337→  ): Promise<AvailabilityValidation> {
+   338→    return this.traced('validateAvailability', async (span) => {
+   339→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   340→      span.setAttribute('availability.targetDate', targetDate);
+   341→      span.setAttribute('availability.additionalUnavailable', additionalUnavailable);
+   342→
+   343→      // Get demand config
+   344→      const demandConfig = await this.getDemand(fleetId, targetDate, holidays);
+   345→
+   346→      // Count total and FIT trains in fleet
+   347→      const trainCounts = await this.db
+   348→        .select({
+   349→          total: count(),
+   350→          fit: sql<number>`COUNT(*) FILTER (WHERE ${trains.fitnessStatus} = 'FIT')`,
+   351→          restricted: sql<number>`COUNT(*) FILTER (WHERE ${trains.fitnessStatus} = 'RESTRICTED')`,
+   352→          grounded: sql<number>`COUNT(*) FILTER (WHERE ${trains.fitnessStatus} = 'GROUNDED')`,
+   353→        })
+   354→        .from(trains)
+   355→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+   356→
+   357→      const { total, fit, restricted, grounded } = trainCounts[0];
+   358→      const unavailableTrains = restricted + grounded;
+   359→
+   360→      // Count trains in maintenance on that date
+   361→      const pmCounts = await this.db
+   362→        .select({ inMaintenance: count() })
+   363→        .from(pmSchedule)
+   364→        .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   365→        .where(
+   366→          and(
+   367→            eq(trains.fleetId, fleetId),
+   368→            eq(pmSchedule.targetDate, targetDate),
+   369→            inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   370→            sql`${pmSchedule.scenarioId} IS NULL` // Production only
+   371→          )
+   372→        );
+   373→
+   374→      const inMaintenanceTrains = pmCounts[0]?.inMaintenance ?? 0;
+   375→
+   376→      // Calculate available
+   377→      const availableTrains = fit - inMaintenanceTrains - additionalUnavailable;
+   378→      const required = demandConfig.totalRequired;
+   379→      const surplus = availableTrains - required;
+   380→
+   381→      // Determine severity
+   382→      let severity: 'OK' | 'WARNING' | 'VIOLATION';
+   383→      let message: string;
+   384→
+   385→      if (surplus < 0) {
+   386→        severity = 'VIOLATION';
+   387→        message = `HARD CONSTRAINT VIOLATED: ${demandConfig.fleetCode} needs ${required} trains but only ${availableTrains} available (shortfall: ${Math.abs(surplus)})`;
+   388→      } else if (surplus < total * WARNING_THRESHOLD_PCT) {
+   389→        severity = 'WARNING';
+   390→        message = `Low availability margin: ${demandConfig.fleetCode} has ${surplus} surplus trains (${((availableTrains / required) * 100).toFixed(1)}% of requirement)`;
+   391→      } else {
+   392→        severity = 'OK';
+   393→        message = `${demandConfig.fleetCode} availability OK: ${availableTrains} available, ${required} required, ${surplus} surplus`;
+   394→      }
+   395→
+   396→      const result: AvailabilityValidation = {
+   397→        isValid: surplus >= 0,
+   398→        fleetId,
+   399→        date: targetDate,
+   400→        dayType: demandConfig.dayType,
+   401→        totalTrains: total,
+   402→        fitTrains: fit,
+   403→        unavailableTrains,
+   404→        inMaintenanceTrains,
+   405→        additionalUnavailable,
+   406→        availableTrains,
+   407→        required,
+   408→        surplus,
+   409→        severity,
+   410→        message,
+   411→      };
+   412→
+   413→      span.setAttribute('availability.isValid', result.isValid);
+   414→      span.setAttribute('availability.surplus', surplus);
+   415→      span.setAttribute('availability.severity', severity);
+   416→
+   417→      if (severity === 'VIOLATION') {
+   418→        this.log.error(
+   419→          {
+   420→            fleetId,
+   421→            fleetCode: demandConfig.fleetCode,
+   422→            targetDate,
+   423→            required,
+   424→            availableTrains,
+   425→            surplus,
+   426→          },
+   427→          message
+   428→        );
+   429→      } else if (severity === 'WARNING') {
+   430→        this.log.warn(
+   431→          {
+   432→            fleetId,
+   433→            fleetCode: demandConfig.fleetCode,
+   434→            targetDate,
+   435→            required,
+   436→            availableTrains,
+   437→            surplus,
+   438→          },
+   439→          message
+   440→        );
+   441→      }
+   442→
+   443→      return result;
+   444→    });
+   445→  }
+   446→
+   447→  /**
+   448→   * Check if a specific train can be scheduled for maintenance on a date
+   449→   * without violating service demand.
+   450→   *
+   451→   * @param trainId - Train to check
+   452→   * @param targetDate - Proposed PM date
+   453→   * @param holidays - Optional array of holiday dates
+   454→   * @returns true if scheduling this train would NOT violate demand
+   455→   */
+   456→  async canScheduleTrainForMaintenance(
+   457→    trainId: string,
+   458→    targetDate: string,
+   459→    holidays?: string[]
+   460→  ): Promise<{ canSchedule: boolean; validation: AvailabilityValidation }> {
+   461→    return this.traced('canScheduleTrainForMaintenance', async (span) => {
+   462→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   463→      span.setAttribute('pm.targetDate', targetDate);
+   464→
+   465→      // Get train's fleet
+   466→      const train = await this.db.query.trains.findFirst({
+   467→        where: eq(trains.id, trainId),
+   468→      });
+   469→
+   470→      if (!train) {
+   471→        throw new NotFoundError(`Train not found: ${trainId}`, {
+   472→          entityType: 'train',
+   473→          entityId: trainId,
+   474→        });
+   475→      }
+   476→
+   477→      // Validate with this train as additional unavailable
+   478→      const validation = await this.validateAvailability(
+   479→        train.fleetId,
+   480→        targetDate,
+   481→        1, // This train would become unavailable
+   482→        holidays
+   483→      );
+   484→
+   485→      return {
+   486→        canSchedule: validation.isValid,
+   487→        validation,
+   488→      };
+   489→    });
+   490→  }
+   491→
+   492→  // ===========================================================================
+   493→  // Violation Detection
+   494→  // ===========================================================================
+   495→
+   496→  /**
+   497→   * Find all service demand violations for a set of proposed PMs.
+   498→   *
+   499→   * Used by the optimizer to validate a proposed schedule before committing.
+   500→   * Returns detailed violation information for each date/train combination.
+   501→   *
+   502→   * @param fleetId - Fleet to check
+   503→   * @param proposedPMs - Array of proposed PM schedules
+   504→   * @param holidays - Optional array of holiday dates
+   505→   * @returns Array of violations (empty if no violations)
+   506→   */
+   507→  async findViolations(
+   508→    fleetId: string,
+   509→    proposedPMs: ProposedPM[],
+   510→    holidays?: string[]
+   511→  ): Promise<DemandViolation[]> {
+   512→    return this.traced('findViolations', async (span) => {
+   513→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   514→      span.setAttribute('violations.proposedCount', proposedPMs.length);
+   515→
+   516→      if (proposedPMs.length === 0) {
+   517→        return [];
+   518→      }
+   519→
+   520→      // Group proposed PMs by date
+   521→      const pmsByDate = new Map<string, ProposedPM[]>();
+   522→      for (const pm of proposedPMs) {
+   523→        const existing = pmsByDate.get(pm.targetDate) ?? [];
+   524→        existing.push(pm);
+   525→        pmsByDate.set(pm.targetDate, existing);
+   526→      }
+   527→
+   528→      // Get train details for error messages
+   529→      const trainIds = [...new Set(proposedPMs.map((p) => p.trainId))];
+   530→      const trainMap = new Map<string, { trainNumber: string }>();
+   531→
+   532→      if (trainIds.length > 0) {
+   533→        const trainRecords = await this.db.query.trains.findMany({
+   534→          where: inArray(trains.id, trainIds),
+   535→          columns: { id: true, trainNumber: true },
+   536→        });
+   537→        for (const t of trainRecords) {
+   538→          trainMap.set(t.id, { trainNumber: t.trainNumber });
+   539→        }
+   540→      }
+   541→
+   542→      // Check each date
+   543→      const violations: DemandViolation[] = [];
+   544→
+   545→      for (const [date, pms] of pmsByDate) {
+   546→        const validation = await this.validateAvailability(
+   547→          fleetId,
+   548→          date,
+   549→          pms.length, // All proposed PMs on this date
+   550→          holidays
+   551→        );
+   552→
+   553→        if (!validation.isValid) {
+   554→          // Create violation for each PM on this date
+   555→          for (const pm of pms) {
+   556→            const trainInfo = trainMap.get(pm.trainId);
+   557→            violations.push({
+   558→              date,
+   559→              dayType: validation.dayType,
+   560→              trainId: pm.trainId,
+   561→              trainNumber: trainInfo?.trainNumber ?? 'unknown',
+   562→              pmCode: pm.pmCode ?? 'unknown',
+   563→              required: validation.required,
+   564→              available: validation.availableTrains + pms.length, // What would be available without these PMs
+   565→              shortfall: Math.abs(validation.surplus),
+   566→              severity: 'HARD',
+   567→              message: `Scheduling ${pm.pmCode ?? 'PM'} for train ${trainInfo?.trainNumber ?? pm.trainId} on ${date} would violate service demand (need ${validation.required}, would have ${validation.availableTrains})`,
+   568→            });
+   569→          }
+   570→        }
+   571→      }
+   572→
+   573→      span.setAttribute('violations.count', violations.length);
+   574→
+   575→      if (violations.length > 0) {
+   576→        this.log.warn(
+   577→          {
+   578→            fleetId,
+   579→            proposedPMs: proposedPMs.length,
+   580→            violations: violations.length,
+   581→            violatedDates: [...new Set(violations.map((v) => v.date))],
+   582→          },
+   583→          `Found ${violations.length} service demand violations for proposed PM schedule`
+   584→        );
+   585→      }
+   586→
+   587→      return violations;
+   588→    });
+   589→  }
+   590→
+   591→  /**
+   592→   * Find violations for a date range (horizon planning).
+   593→   *
+   594→   * Checks existing scheduled PMs against service demand for an entire
+   595→   * horizon period. Used for drift monitoring and planning validation.
+   596→   *
+   597→   * @param fleetId - Fleet to check
+   598→   * @param startDate - Start of range (YYYY-MM-DD)
+   599→   * @param horizonDays - Number of days to check
+   600→   * @param holidays - Optional array of holiday dates
+   601→   * @returns Array of dates with violations
+   602→   */
+   603→  async findViolationsInHorizon(
+   604→    fleetId: string,
+   605→    startDate: string,
+   606→    horizonDays: number,
+   607→    holidays?: string[]
+   608→  ): Promise<{ date: string; validation: AvailabilityValidation }[]> {
+   609→    return this.traced('findViolationsInHorizon', async (span) => {
+   610→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   611→      span.setAttribute('horizon.startDate', startDate);
+   612→      span.setAttribute('horizon.days', horizonDays);
+   613→
+   614→      const violations: { date: string; validation: AvailabilityValidation }[] = [];
+   615→      const start = new Date(startDate);
+   616→
+   617→      for (let i = 0; i < horizonDays; i++) {
+   618→        const checkDate = new Date(start);
+   619→        checkDate.setDate(checkDate.getDate() + i);
+   620→        const dateStr = checkDate.toISOString().split('T')[0];
+   621→
+   622→        const validation = await this.validateAvailability(
+   623→          fleetId,
+   624→          dateStr,
+   625→          0, // Check existing schedule only
+   626→          holidays
+   627→        );
+   628→
+   629→        if (!validation.isValid) {
+   630→          violations.push({ date: dateStr, validation });
+   631→        }
+   632→      }
+   633→
+   634→      span.setAttribute('horizon.violations', violations.length);
+   635→      return violations;
+   636→    });
+   637→  }
+   638→
+   639→  // ===========================================================================
+   640→  // CRUD Operations
+   641→  // ===========================================================================
+   642→
+   643→  /**
+   644→   * Create a new service demand configuration.
+   645→   */
+   646→  async createDemand(request: CreateDemandRequest): Promise<ServiceDemand> {
+   647→    return this.inTransaction('createDemand', async (tx, span) => {
+   648→      const {
+   649→        fleetId,
+   650→        effectiveDate,
+   651→        dayType,
+   652→        minTrainsRequired,
+   653→        peakAmRequirement,
+   654→        middayRequirement,
+   655→        peakPmRequirement,
+   656→        eveningRequirement,
+   657→        standbyBuffer = DEFAULT_STANDBY_BUFFER,
+   658→        source,
+   659→        notes,
+   660→        createdBy,
+   661→      } = request;
+   662→
+   663→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   664→      span.setAttribute('demand.dayType', dayType);
+   665→      span.setAttribute('demand.effectiveDate', effectiveDate);
+   666→
+   667→      // Validate fleet exists
+   668→      const fleet = await tx.query.fleets.findFirst({
+   669→        where: eq(fleets.id, fleetId),
+   670→      });
+   671→
+   672→      if (!fleet) {
+   673→        throw new NotFoundError(`Fleet not found: ${fleetId}`, {
+   674→          entityType: 'fleet',
+   675→          entityId: fleetId,
+   676→        });
+   677→      }
+   678→
+   679→      // Validate minTrainsRequired is reasonable
+   680→      const [{ totalTrains }] = await tx
+   681→        .select({ totalTrains: count() })
+   682→        .from(trains)
+   683→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+   684→
+   685→      if (minTrainsRequired > totalTrains) {
+   686→        throw new ValidationError(
+   687→          `Minimum trains required (${minTrainsRequired}) exceeds fleet size (${totalTrains})`,
+   688→          {
+   689→            field: 'minTrainsRequired',
+   690→            context: { minTrainsRequired, fleetSize: totalTrains },
+   691→          }
+   692→        );
+   693→      }
+   694→
+   695→      // Check for duplicate (same fleet, date, day type)
+   696→      const existing = await tx.query.serviceDemand.findFirst({
+   697→        where: and(
+   698→          eq(serviceDemand.fleetId, fleetId),
+   699→          eq(serviceDemand.effectiveDate, effectiveDate),
+   700→          eq(serviceDemand.dayType, dayType)
+   701→        ),
+   702→      });
+   703→
+   704→      if (existing) {
+   705→        throw new DuplicateError(
+   706→          `Service demand already exists for ${fleet.code} on ${effectiveDate} (${dayType})`,
+   707→          {
+   708→            field: 'effectiveDate',
+   709→            value: effectiveDate,
+   710→            context: { fleetId, dayType },
+   711→          }
+   712→        );
+   713→      }
+   714→
+   715→      // Create record
+   716→      const demandData: NewServiceDemand = {
+   717→        fleetId,
+   718→        effectiveDate,
+   719→        dayType,
+   720→        minTrainsRequired,
+   721→        peakAmRequirement: peakAmRequirement ?? null,
+   722→        middayRequirement: middayRequirement ?? null,
+   723→        peakPmRequirement: peakPmRequirement ?? null,
+   724→        eveningRequirement: eveningRequirement ?? null,
+   725→        standbyBuffer,
+   726→        source: source ?? null,
+   727→        notes: notes ?? null,
+   728→        createdBy: createdBy ?? null,
+   729→      };
+   730→
+   731→      const [result] = await tx.insert(serviceDemand).values(demandData).returning();
+   732→      span.setAttribute('demand.id', result.id);
+   733→
+   734→      this.log.info(
+   735→        {
+   736→          demandId: result.id,
+   737→          fleetId,
+   738→          fleetCode: fleet.code,
+   739→          effectiveDate,
+   740→          dayType,
+   741→          minTrainsRequired,
+   742→        },
+   743→        `Service demand created: ${fleet.code} ${dayType} requires ${minTrainsRequired} trains from ${effectiveDate}`
+   744→      );
+   745→
+   746→      return result;
+   747→    });
+   748→  }
+   749→
+   750→  /**
+   751→   * Update an existing service demand configuration.
+   752→   */
+   753→  async updateDemand(
+   754→    id: string,
+   755→    data: Partial<Omit<CreateDemandRequest, 'fleetId' | 'effectiveDate' | 'dayType'>>
+   756→  ): Promise<ServiceDemand> {
+   757→    return this.inTransaction('updateDemand', async (tx, span) => {
+   758→      span.setAttribute('demand.id', id);
+   759→
+   760→      const existing = await tx.query.serviceDemand.findFirst({
+   761→        where: eq(serviceDemand.id, id),
+   762→        with: { fleet: true },
+   763→      });
+   764→
+   765→      if (!existing) {
+   766→        throw new NotFoundError(`Service demand not found: ${id}`, {
+   767→          entityType: 'service_demand',
+   768→          entityId: id,
+   769→        });
+   770→      }
+   771→
+   772→      // Validate minTrainsRequired if changing
+   773→      if (data.minTrainsRequired !== undefined) {
+   774→        const [{ totalTrains }] = await tx
+   775→          .select({ totalTrains: count() })
+   776→          .from(trains)
+   777→          .where(and(eq(trains.fleetId, existing.fleetId), eq(trains.active, true)));
+   778→
+   779→        if (data.minTrainsRequired > totalTrains) {
+   780→          throw new ValidationError(
+   781→            `Minimum trains required (${data.minTrainsRequired}) exceeds fleet size (${totalTrains})`,
+   782→            {
+   783→              field: 'minTrainsRequired',
+   784→              context: { minTrainsRequired: data.minTrainsRequired, fleetSize: totalTrains },
+   785→            }
+   786→          );
+   787→        }
+   788→      }
+   789→
+   790→      const [result] = await tx
+   791→        .update(serviceDemand)
+   792→        .set({
+   793→          ...data,
+   794→          updatedAt: new Date(),
+   795→        })
+   796→        .where(eq(serviceDemand.id, id))
+   797→        .returning();
+   798→
+   799→      this.log.info(
+   800→        { demandId: id, updates: data },
+   801→        'Service demand updated'
+   802→      );
+   803→
+   804→      return result;
+   805→    });
+   806→  }
+   807→
+   808→  /**
+   809→   * Get a demand configuration by ID.
+   810→   */
+   811→  async getDemandById(id: string): Promise<ServiceDemand> {
+   812→    return this.traced('getDemandById', async (span) => {
+   813→      span.setAttribute('demand.id', id);
+   814→
+   815→      const result = await this.db.query.serviceDemand.findFirst({
+   816→        where: eq(serviceDemand.id, id),
+   817→      });
+   818→
+   819→      if (!result) {
+   820→        throw new NotFoundError(`Service demand not found: ${id}`, {
+   821→          entityType: 'service_demand',
+   822→          entityId: id,
+   823→        });
+   824→      }
+   825→
+   826→      return result;
+   827→    });
+   828→  }
+   829→
+   830→  /**
+   831→   * List demand configurations with filtering.
+   832→   */
+   833→  async listDemand(filters?: DemandListFilters): Promise<ServiceDemand[]> {
+   834→    return this.traced('listDemand', async (span) => {
+   835→      const conditions: SQL<unknown>[] = [];
+   836→
+   837→      if (filters?.fleetId) {
+   838→        conditions.push(eq(serviceDemand.fleetId, filters.fleetId));
+   839→      }
+   840→      if (filters?.dayType) {
+   841→        if (Array.isArray(filters.dayType)) {
+   842→          conditions.push(inArray(serviceDemand.dayType, filters.dayType));
+   843→        } else {
+   844→          conditions.push(eq(serviceDemand.dayType, filters.dayType));
+   845→        }
+   846→      }
+   847→      if (filters?.effectiveDateFrom) {
+   848→        conditions.push(gte(serviceDemand.effectiveDate, filters.effectiveDateFrom));
+   849→      }
+   850→      if (filters?.effectiveDateTo) {
+   851→        conditions.push(lte(serviceDemand.effectiveDate, filters.effectiveDateTo));
+   852→      }
+   853→
+   854→      const result = await this.db.query.serviceDemand.findMany({
+   855→        where: conditions.length > 0 ? and(...conditions) : undefined,
+   856→        orderBy: [desc(serviceDemand.effectiveDate), desc(serviceDemand.dayType)],
+   857→      });
+   858→
+   859→      span.setAttribute('result.count', result.length);
+   860→      return result;
+   861→    });
+   862→  }
+   863→
+   864→  /**
+   865→   * Delete a demand configuration.
+   866→   */
+   867→  async deleteDemand(id: string): Promise<void> {
+   868→    return this.inTransaction('deleteDemand', async (tx, span) => {
+   869→      span.setAttribute('demand.id', id);
+   870→
+   871→      const existing = await tx.query.serviceDemand.findFirst({
+   872→        where: eq(serviceDemand.id, id),
+   873→      });
+   874→
+   875→      if (!existing) {
+   876→        throw new NotFoundError(`Service demand not found: ${id}`, {
+   877→          entityType: 'service_demand',
+   878→          entityId: id,
+   879→        });
+   880→      }
+   881→
+   882→      await tx.delete(serviceDemand).where(eq(serviceDemand.id, id));
+   883→
+   884→      this.log.info(
+   885→        { demandId: id, fleetId: existing.fleetId, dayType: existing.dayType },
+   886→        'Service demand deleted'
+   887→      );
+   888→    });
+   889→  }
+   890→
+   891→  // ===========================================================================
+   892→  // Summary & Reports
+   893→  // ===========================================================================
+   894→
+   895→  /**
+   896→   * Get fleet availability summary for today.
+   897→   */
+   898→  async getFleetAvailabilitySummary(
+   899→    fleetId: string,
+   900→    holidays?: string[]
+   901→  ): Promise<FleetAvailabilitySummary> {
+   902→    return this.traced('getFleetAvailabilitySummary', async (span) => {
+   903→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   904→
+   905→      const today = new Date().toISOString().split('T')[0];
+   906→      const demandConfig = await this.getDemand(fleetId, today, holidays);
+   907→      const validation = await this.validateAvailability(fleetId, today, 0, holidays);
+   908→
+   909→      // Get detailed counts
+   910→      const trainCounts = await this.db
+   911→        .select({
+   912→          fit: sql<number>`COUNT(*) FILTER (WHERE ${trains.fitnessStatus} = 'FIT')`,
+   913→          restricted: sql<number>`COUNT(*) FILTER (WHERE ${trains.fitnessStatus} = 'RESTRICTED')`,
+   914→          grounded: sql<number>`COUNT(*) FILTER (WHERE ${trains.fitnessStatus} = 'GROUNDED')`,
+   915→        })
+   916→        .from(trains)
+   917→        .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+   918→
+   919→      const { fit, restricted, grounded } = trainCounts[0];
+   920→
+   921→      // Determine status
+   922→      let status: 'OK' | 'WARNING' | 'CRITICAL';
+   923→      if (!validation.isValid) {
+   924→        status = 'CRITICAL';
+   925→      } else if (validation.severity === 'WARNING') {
+   926→        status = 'WARNING';
+   927→      } else {
+   928→        status = 'OK';
+   929→      }
+   930→
+   931→      return {
+   932→        fleetId,
+   933→        fleetCode: demandConfig.fleetCode,
+   934→        totalTrains: validation.totalTrains,
+   935→        fitTrains: fit,
+   936→        restrictedTrains: restricted,
+   937→        groundedTrains: grounded,
+   938→        inMaintenanceTrains: validation.inMaintenanceTrains,
+   939→        availableTrains: validation.availableTrains,
+   940→        demandConfig,
+   941→        utilizationPct:
+   942→          validation.availableTrains > 0
+   943→            ? (demandConfig.totalRequired / validation.availableTrains) * 100
+   944→            : 0,
+   945→        status,
+   946→      };
+   947→    });
+   948→  }
+   949→
+   950→  /**
+   951→   * Get all fleets' availability summaries.
+   952→   */
+   953→  async getAllFleetsAvailabilitySummary(
+   954→    holidays?: string[]
+   955→  ): Promise<FleetAvailabilitySummary[]> {
+   956→    return this.traced('getAllFleetsAvailabilitySummary', async (span) => {
+   957→      const allFleets = await this.db.query.fleets.findMany({
+   958→        where: eq(fleets.active, true),
+   959→      });
+   960→
+   961→      const summaries = await Promise.all(
+   962→        allFleets.map((f) => this.getFleetAvailabilitySummary(f.id, holidays))
+   963→      );
+   964→
+   965→      span.setAttribute('result.count', summaries.length);
+   966→      span.setAttribute(
+   967→        'result.criticalCount',
+   968→        summaries.filter((s) => s.status === 'CRITICAL').length
+   969→      );
+   970→
+   971→      return summaries;
+   972→    });
+   973→  }
+   974→
+   975→  // ===========================================================================
+   976→  // Helper Methods
+   977→  // ===========================================================================
+   978→
+   979→  /**
+   980→   * Determine day type for a given date.
+   981→   *
+   982→   * @param dateStr - Date string (YYYY-MM-DD)
+   983→   * @param holidays - Optional array of holiday dates
+   984→   * @returns Day type enum value
+   985→   */
+   986→  getDayType(dateStr: string, holidays?: string[]): DayType {
+   987→    // Check if it's a holiday first
+   988→    if (holidays?.includes(dateStr)) {
+   989→      return 'HOLIDAY';
+   990→    }
+   991→
+   992→    const date = new Date(dateStr);
+   993→    const dayOfWeek = date.getDay();
+   994→
+   995→    if (dayOfWeek === 0) return 'SUNDAY';
+   996→    if (dayOfWeek === 6) return 'SATURDAY';
+   997→    return 'WEEKDAY';
+   998→  }
+   999→
+  1000→  /**
+  1001→   * Calculate default demand when no config exists.
+  1002→   * Uses 85% of fleet size as the default requirement.
+  1003→   */
+  1004→  private async calculateDefaultDemand(
+  1005→    fleetId: string
+  1006→  ): Promise<{ minTrainsRequired: number }> {
+  1007→    const [{ totalTrains }] = await this.db
+  1008→      .select({ totalTrains: count() })
+  1009→      .from(trains)
+  1010→      .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+  1011→
+  1012→    const minTrainsRequired = Math.ceil(totalTrains * DEFAULT_AVAILABILITY_PCT);
+  1013→
+  1014→    return { minTrainsRequired };
+  1015→  }
+  1016→}
+  1017→
+  1018→// =============================================================================
+  1019→// Singleton Export
+  1020→// =============================================================================
+  1021→
+  1022→let serviceDemandServiceInstance: ServiceDemandService | null = null;
+  1023→
+  1024→export function getServiceDemandService(): ServiceDemandService {
+  1025→  if (!serviceDemandServiceInstance) {
+  1026→    serviceDemandServiceInstance = new ServiceDemandService();
+  1027→  }
+  1028→  return serviceDemandServiceInstance;
+  1029→}
+  1030→
+  1031→export default ServiceDemandService;
+  1032→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

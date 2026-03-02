@@ -1,0 +1,181 @@
+     1→/**
+     2→ * MMS Component Tracking Tables
+     3→ *
+     4→ * Tracks individual train components (bogies, motors, pantographs, etc.)
+     5→ * through their lifecycle including installations and PM history.
+     6→ *
+     7→ * Key concept: When a component is swapped between trains, PM thresholds
+     8→ * follow the component, not the train. This ensures accurate maintenance
+     9→ * scheduling based on actual component usage.
+    10→ *
+    11→ * @see specs/003-database-schema.md Section 3.4
+    12→ */
+    13→
+    14→import { relations } from 'drizzle-orm';
+    15→import {
+    16→  date,
+    17→  index,
+    18→  integer,
+    19→  pgTable,
+    20→  timestamp,
+    21→  uniqueIndex,
+    22→  uuid,
+    23→  varchar,
+    24→} from 'drizzle-orm/pg-core';
+    25→import { trains } from './core-fleet';
+    26→import { componentStatusEnum, removalReasonEnum } from './enums';
+    27→import { pmTypes } from './pm-management';
+    28→
+    29→/**
+    30→ * Train Components - Individual trackable parts
+    31→ *
+    32→ * Components that have their own mileage tracking and PM requirements.
+    33→ * Examples: bogies, traction motors, pantographs, brake units.
+    34→ *
+    35→ * Key fields:
+    36→ * - component_mileage_km: Cumulative mileage on this specific component
+    37→ * - condition_score: 1-100 rating for predictive maintenance
+    38→ */
+    39→export const trainComponents = pgTable(
+    40→  'train_components',
+    41→  {
+    42→    id: uuid('id').primaryKey().defaultRandom(),
+    43→    componentType: varchar('component_type', { length: 50 }).notNull(), // 'BOGIE', 'TRACTION_MOTOR', etc.
+    44→    serialNumber: varchar('serial_number', { length: 100 }).notNull().unique(),
+    45→    manufacturer: varchar('manufacturer', { length: 100 }),
+    46→    model: varchar('model', { length: 100 }),
+    47→
+    48→    // Current installation
+    49→    currentTrainId: uuid('current_train_id').references(() => trains.id),
+    50→    currentPosition: varchar('current_position', { length: 50 }), // 'CAR_1_BOGIE_A', 'CAR_3_MOTOR_L'
+    51→    installedDate: date('installed_date'),
+    52→    installedMileageKm: integer('installed_mileage_km'), // Train mileage at installation
+    53→
+    54→    // Component lifecycle
+    55→    commissioningDate: date('commissioning_date'),
+    56→    componentMileageKm: integer('component_mileage_km').notNull().default(0),
+    57→    lastOverhaulDate: date('last_overhaul_date'),
+    58→    lastOverhaulMileageKm: integer('last_overhaul_mileage_km'),
+    59→
+    60→    // Status
+    61→    status: componentStatusEnum('status').default('IN_SERVICE'),
+    62→    conditionScore: integer('condition_score'), // 1-100
+    63→
+    64→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    65→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+    66→  },
+    67→  (table) => [
+    68→    index('idx_components_train').on(table.currentTrainId),
+    69→    index('idx_components_type').on(table.componentType, table.status),
+    70→    uniqueIndex('idx_components_serial').on(table.serialNumber),
+    71→  ]
+    72→);
+    73→
+    74→/**
+    75→ * Component Installations - Installation history
+    76→ *
+    77→ * Tracks the movement of components between trains.
+    78→ * Used to calculate component-specific mileage accumulation.
+    79→ */
+    80→export const componentInstallations = pgTable(
+    81→  'component_installations',
+    82→  {
+    83→    id: uuid('id').primaryKey().defaultRandom(),
+    84→    componentId: uuid('component_id')
+    85→      .notNull()
+    86→      .references(() => trainComponents.id),
+    87→    trainId: uuid('train_id')
+    88→      .notNull()
+    89→      .references(() => trains.id),
+    90→    position: varchar('position', { length: 50 }),
+    91→
+    92→    // Installation data
+    93→    installedDate: date('installed_date').notNull(),
+    94→    installedTrainMileageKm: integer('installed_train_mileage_km').notNull(),
+    95→    installedComponentMileageKm: integer('installed_component_mileage_km').notNull(),
+    96→
+    97→    // Removal data (NULL if still installed)
+    98→    removedDate: date('removed_date'),
+    99→    removedTrainMileageKm: integer('removed_train_mileage_km'),
+   100→    removedComponentMileageKm: integer('removed_component_mileage_km'),
+   101→
+   102→    removalReason: removalReasonEnum('removal_reason'),
+   103→    workOrderId: varchar('work_order_id', { length: 50 }), // Link to Maximo
+   104→
+   105→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   106→  },
+   107→  (table) => [
+   108→    index('idx_installations_component').on(table.componentId, table.installedDate),
+   109→    index('idx_installations_train').on(table.trainId, table.installedDate),
+   110→  ]
+   111→);
+   112→
+   113→/**
+   114→ * Component PM Tracking - Component-level PM history
+   115→ *
+   116→ * PM thresholds for components that move between trains.
+   117→ * When a component is swapped, its PM schedule stays with the component.
+   118→ */
+   119→export const componentPmTracking = pgTable(
+   120→  'component_pm_tracking',
+   121→  {
+   122→    id: uuid('id').primaryKey().defaultRandom(),
+   123→    componentId: uuid('component_id')
+   124→      .notNull()
+   125→      .references(() => trainComponents.id),
+   126→    pmTypeId: uuid('pm_type_id')
+   127→      .notNull()
+   128→      .references(() => pmTypes.id),
+   129→
+   130→    lastPmDate: date('last_pm_date'),
+   131→    lastPmMileageKm: integer('last_pm_mileage_km'),
+   132→    nextPmDueMileageKm: integer('next_pm_due_mileage_km'),
+   133→    nextPmDueDate: date('next_pm_due_date'),
+   134→
+   135→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+   136→  },
+   137→  (table) => [
+   138→    uniqueIndex('idx_component_pm_unique').on(table.componentId, table.pmTypeId),
+   139→    index('idx_component_pm_component').on(table.componentId),
+   140→  ]
+   141→);
+   142→
+   143→// ============================================================================
+   144→// Relations
+   145→// ============================================================================
+   146→
+   147→export const trainComponentsRelations = relations(trainComponents, ({ one, many }) => ({
+   148→  currentTrain: one(trains, {
+   149→    fields: [trainComponents.currentTrainId],
+   150→    references: [trains.id],
+   151→  }),
+   152→  installations: many(componentInstallations),
+   153→  pmTracking: many(componentPmTracking),
+   154→}));
+   155→
+   156→export const componentInstallationsRelations = relations(componentInstallations, ({ one }) => ({
+   157→  component: one(trainComponents, {
+   158→    fields: [componentInstallations.componentId],
+   159→    references: [trainComponents.id],
+   160→  }),
+   161→  train: one(trains, {
+   162→    fields: [componentInstallations.trainId],
+   163→    references: [trains.id],
+   164→  }),
+   165→}));
+   166→
+   167→export const componentPmTrackingRelations = relations(componentPmTracking, ({ one }) => ({
+   168→  component: one(trainComponents, {
+   169→    fields: [componentPmTracking.componentId],
+   170→    references: [trainComponents.id],
+   171→  }),
+   172→  pmType: one(pmTypes, {
+   173→    fields: [componentPmTracking.pmTypeId],
+   174→    references: [pmTypes.id],
+   175→  }),
+   176→}));
+   177→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

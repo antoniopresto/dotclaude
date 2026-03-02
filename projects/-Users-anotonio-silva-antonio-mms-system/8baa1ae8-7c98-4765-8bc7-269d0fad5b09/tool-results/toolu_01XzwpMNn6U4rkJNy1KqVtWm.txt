@@ -1,0 +1,980 @@
+     1→# MMS Implementation Plan
+     2→
+     3→> **Status**: Comprehensive plan generated from spec analysis (v2.1)
+     4→> **Last Updated**: 2026-01-19
+     5→> **Priority**: P1 (Critical) → P2 (High) → P3 (Medium) → P4 (Low)
+     6→
+     7→---
+     8→
+     9→## Current State Analysis
+    10→
+    11→**Codebase Status**: Database Layer Complete (Phase 1.1)
+    12→- React 18 + Vite frontend shell (App.tsx, main.tsx)
+    13→- **Database schema**: 30+ tables across 14 schema files (Drizzle ORM)
+    14→  - Core Fleet: depots, fleets, trains, routes, tracks
+    15→  - Operational Constraints: service_demand, route_utilization_profiles, unavailability_events, train_route_compatibility
+    16→  - PM Management: pm_types, pm_material_requirements, pm_schedule
+    17→  - Mileage Tracking: mileage_readings, meter_events
+    18→  - Component Tracking: train_components, component_installations, component_pm_tracking
+    19→  - Material Management: inventory_positions, material_reservations
+    20→  - Man-hour Planning: manhour_capacity, manhour_projections, manhour_adjustments
+    21→  - Baseline & Drift: plan_baselines, baseline_pm_schedule, baseline_mileage_projection, drift_analysis
+    22→  - Scenarios: scenarios, scenario_deltas, scenario_comparisons
+    23→  - Costing: labor_rates, material_costs, cost_baselines
+    24→  - Audit & Auth: users, roles, sessions, pm_schedule_history, audit_log
+    25→- **Database utilities**: Connection pool with health checks (src/lib/db/connection.ts)
+    26→- **Drizzle config**: Migration configuration (drizzle.config.ts)
+    27→- **Manual migrations** (drizzle/manual/):
+    28→  - PostgreSQL extensions (uuid-ossp, timescaledb)
+    29→  - TimescaleDB hypertable (7-day chunks), compression (30 days), retention (13 years)
+    30→  - daily_fleet_mileage continuous aggregate
+    31→  - Database functions: train fitness sync, canvas refresh, scenario cleanup, reservation release, fleet targets, PM hierarchy, audit
+    32→  - Canvas views: v_canvas_strategic, v_canvas_tactical, v_manhour_canvas, v_drift_canvas
+    33→  - Development seed data
+    34→- Dependencies: drizzle-orm, postgres.js, pino, zod, zustand
+    35→
+    36→**Next Priority**: Core Domain Services (Ingestion, Unavailability, Service Demand, Fleet Service)
+    37→
+    38→**Critical Path**: ~~Database Schema~~ → ~~TimescaleDB Config~~ → ~~Shared Lib~~ → Domain Services → Optimizer → API → UI
+    39→
+    40→---
+    41→
+    42→## Phase 1: Foundation (P1 - Critical)
+    43→
+    44→### 1.1 Database Schema & Migrations
+    45→
+    46→#### Core Fleet Domain
+    47→- [x] P1: Create Drizzle schema for `depots` table (code, name, location, timezone)
+    48→- [x] P1: Create Drizzle schema for `fleets` table (code, name, manufacturer, cars_per_train, base_depot_id)
+    49→- [x] P1: Create Drizzle schema for `trains` table (train_number, fleet_id, current_mileage_km, fitness_status, target_mileage_km, display_color)
+    50→- [x] P1: Create Drizzle schema for `routes` table (route_code, expected_km_per_day, required_trains, allowed_fleet_ids, signaling_system, power_system)
+    51→- [x] P1: Create Drizzle schema for `tracks` table (depot_id, track_number, track_type, max_train_length_m, capabilities)
+    52→
+    53→#### Operational Constraints Domain (v2.1 Critical)
+    54→- [x] P1: Create Drizzle schema for `service_demand` table (fleet_id, day_type, min_trains_required, peak requirements)
+    55→- [x] P1: Create Drizzle schema for `route_utilization_profiles` table (route_id, weekday_km, weekend_km, confidence)
+    56→- [x] P1: Create Drizzle schema for `unavailability_events` table (train_id, event_type, status, restriction_level, estimated_return_date, source_system)
+    57→- [x] P1: Create Drizzle schema for `train_route_compatibility` table (train_id/fleet_id, route_id, is_compatible, constraint_type)
+    58→- [x] P1: Create Drizzle schema for `track_capabilities` table (track_id, capability, is_operational)
+    59→- [x] P1: Create Drizzle schema for `pm_capability_requirements` table (pm_type_id, capability, is_mandatory)
+    60→- [x] P1: Create Drizzle schema for `pm_baseline_assumptions` table (train_id, pm_type_id, assumption_type, confidence_level) - cold start handling
+    61→
+    62→#### PM Management Domain
+    63→- [x] P1: Create Drizzle schema for `pm_types` table (fleet_id, pm_code, interval_km, interval_months, satisfies_codes[], estimated_hours, track_type)
+    64→- [x] P1: Create Drizzle schema for `pm_material_requirements` table (pm_type_id, part_number, quantity_per_pm, criticality, lead_time_days)
+    65→- [x] P1: Create Drizzle schema for `pm_schedule` table (train_id, pm_type_id, target_date, status, constraint_start/end, assigned_track_id, is_locked, scenario_id)
+    66→
+    67→#### Mileage Tracking (TimescaleDB)
+    68→- [x] P1: Create Drizzle schema for `mileage_readings` hypertable (train_id, reading_date, raw_reading, adjusted_reading, daily_km, validation_status)
+    69→- [x] P1: Create Drizzle schema for `meter_events` table (train_id, event_date, event_type, old_reading, new_reading, adjustment_km)
+    70→- [x] P1: Configure TimescaleDB hypertable with 7-day chunks
+    71→- [x] P1: Configure compression policy (30 days)
+    72→- [x] P1: Configure retention policy (13 years)
+    73→- [x] P1: Create `daily_fleet_mileage` continuous aggregate view
+    74→
+    75→#### Component Tracking
+    76→- [x] P1: Create Drizzle schema for `train_components` table (component_type, serial_number, current_train_id, component_mileage_km, status)
+    77→- [x] P1: Create Drizzle schema for `component_installations` table (component_id, train_id, installed_date, removed_date)
+    78→- [x] P1: Create Drizzle schema for `component_pm_tracking` table (component_id, pm_type_id, last_pm_date, next_pm_due)
+    79→
+    80→#### Material Management
+    81→- [x] P1: Create Drizzle schema for `inventory_positions` table (depot_id, part_number, quantity_on_hand, quantity_reserved, quantity_available)
+    82→- [x] P1: Create Drizzle schema for `material_reservations` table (pm_schedule_id, inventory_position_id, quantity_reserved, reservation_type)
+    83→
+    84→#### Man-hour Planning
+    85→- [x] P1: Create Drizzle schema for `manhour_capacity` table (depot_id, day_shift_hours, night_shift_hours, technicians)
+    86→- [x] P1: Create Drizzle schema for `manhour_projections` table (depot_id, period_start, required_hours, available_hours, utilization_pct)
+    87→- [x] P1: Create Drizzle schema for `manhour_adjustments` table (projection_id, adjustment_type, hours_adjusted, status)
+    88→
+    89→#### Baseline & Drift Domain
+    90→- [x] P1: Create Drizzle schema for `plan_baselines` table (name, version, baseline_date, status, pm metrics)
+    91→- [x] P1: Create Drizzle schema for `baseline_pm_schedule` table (baseline_id, train_id, pm_type_id, projected_date)
+    92→- [x] P1: Create Drizzle schema for `baseline_mileage_projection` table (baseline_id, train_id, projection_date, projected_cumulative_km)
+    93→- [x] P1: Create Drizzle schema for `drift_analysis` table (baseline_id, train_id, mileage_drift_km, drift_pct, requires_replan)
+    94→
+    95→#### Scenario Management (Event-Sourced)
+    96→- [x] P1: Create Drizzle schema for `scenarios` table (name, forked_from_baseline_id, status, expires_at)
+    97→- [x] P1: Create Drizzle schema for `scenario_deltas` table (scenario_id, sequence_num, delta_type, entity_id, old_values, new_values)
+    98→- [x] P1: Create Drizzle schema for `scenario_comparisons` table (scenario_a_id, scenario_b_id, baseline_id, metrics)
+    99→
+   100→#### Costing Domain
+   101→- [x] P1: Create Drizzle schema for `labor_rates` table (depot_id, regular_hourly_rate, overtime_multiplier, shop_rate)
+   102→- [x] P1: Create Drizzle schema for `material_costs` table (part_number, unit_cost, effective_from)
+   103→- [x] P1: Create Drizzle schema for `cost_baselines` table (fiscal_year, depot_id, budget vs. actual)
+   104→
+   105→#### Audit & Auth Domain
+   106→- [x] P1: Create Drizzle schema for `pm_schedule_history` table (pm_schedule_id, change_type, old/new values, changed_by)
+   107→- [x] P1: Create Drizzle schema for `audit_log` table (entity_type, entity_id, action, user_id, old/new values)
+   108→- [x] P1: Create Drizzle schema for `users` table (email, password_hash, role_ids, primary_depot_id)
+   109→- [x] P1: Create Drizzle schema for `roles` table (name, permissions JSONB)
+   110→- [x] P1: Create Drizzle schema for `sessions` table (user_id, token_hash, expires_at)
+   111→
+   112→#### Enums & Types
+   113→- [x] P1: Create PostgreSQL enums: fitness_status, pm_status, track_type, shift_type, adjustment_status, baseline_status, scenario_status, material_criticality, reservation_type, day_type, unavailability_type, unavailability_status, track_capability, constraint_type, assumption_type, confidence_level
+   114→
+   115→#### Database Functions & Triggers
+   116→- [x] P1: Create trigger `sync_train_fitness_from_unavailability()` - auto-update train fitness on unavailability events
+   117→- [x] P1: Create function `refresh_canvas_views()` - concurrent materialized view refresh
+   118→- [x] P1: Create function `cleanup_expired_scenarios()` - scenario expiration
+   119→- [x] P1: Create function `release_expired_reservations()` - soft reservation cleanup
+   120→- [x] P1: Create function `update_fleet_mileage_targets()` - fleet balancing recalculation
+   121→
+   122→#### Materialized Views (Canvas Optimization)
+   123→- [x] P1: Create materialized view `v_canvas_strategic` (yearly PM aggregates per train)
+   124→- [x] P1: Create materialized view `v_canvas_tactical` (weekly PM details)
+   125→- [x] P1: Create view `v_manhour_canvas` (man-hour overlay data)
+   126→- [x] P1: Create view `v_drift_canvas` (drift severity overlay)
+   127→
+   128→#### Migrations
+   129→- [x] P1: Write migration for PostgreSQL extensions (uuid-ossp, timescaledb)
+   130→- [ ] P1: Write migration runner with rollback support
+   131→- [x] P1: Create seed data script for development
+   132→- [ ] P1: Run migrations and verify schema
+   133→
+   134→### 1.2 Shared Library (src/lib/)
+   135→
+   136→#### Database Utilities
+   137→- [x] P1: Create Drizzle database connection pool with health checks
+   138→- [x] P1: Create PostgreSQL connection configuration (max 20 connections)
+   139→- [x] P1: Create Redis connection utilities for cache/sessions/BullMQ
+   140→- [x] P1: Create transaction helper with automatic rollback
+   141→
+   142→#### Base Service Infrastructure
+   143→- [x] P1: Create base service class with OpenTelemetry tracing integration
+   144→- [x] P1: Create Pino structured logging configuration (JSON format, sensitive field redaction)
+   145→- [x] P1: Create prom-client Prometheus metrics registry
+   146→- [x] P1: Create HTTP metrics (requests_total, request_duration_seconds histogram)
+   147→- [x] P1: Create business metrics (pm_scheduled_total, optimizer_solve_seconds, fleet_mileage_km, drift_trains_requiring_replan)
+   148→
+   149→#### Queue Infrastructure
+   150→- [x] P1: Create BullMQ queue configuration (connection, default options)
+   151→- [x] P1: Create typed queue definitions for all 8 worker types
+   152→- [x] P1: Create job progress streaming utilities
+   153→
+   154→#### Validation Utilities
+   155→- [x] P1: Create Zod schemas for all API request/response types
+   156→- [x] P1: Create Zod schemas for CSV import validation
+   157→- [x] P1: Create Zod schemas for optimizer IPC protocol
+   158→
+   159→#### Date/Time Utilities
+   160→- [x] P1: Create compliance window calculation utilities (±10% tolerance)
+   161→- [x] P1: Create PM hierarchy resolution utilities (C4 satisfies C1/C2/C3)
+   162→- [x] P1: Create mileage projection utilities (velocity-based + time-based triggers)
+   163→- [x] P1: Create timezone-aware date utilities
+   164→
+   165→#### Error Handling
+   166→- [x] P1: Create typed error classes (ValidationError, NotFoundError, ConflictError, MaximoLockError, etc.)
+   167→- [x] P1: Create error code registry (FILE_001, ROW_001, SYS_001, etc.)
+   168→- [x] P1: Create retry configuration utilities (exponential backoff)
+   169→- [x] P1: Create circuit breaker implementation
+   170→
+   171→---
+   172→
+   173→## Phase 2: Core Domain Services (P1-P2)
+   174→
+   175→### 2.1 Ingestion Service (spec 004.2)
+   176→
+   177→#### File Watcher Service
+   178→- [ ] P1: Implement FileWatcherService with chokidar
+   179→- [ ] P1: Configure watch patterns (`^mileage_\d{8}\.csv$`)
+   180→- [ ] P1: Implement file stability detection (2000ms threshold)
+   181→- [ ] P1: Implement health alerting (2-hour file gap detection)
+   182→- [ ] P1: Implement quarantine handling for invalid files
+   183→- [ ] P1: Create BullMQ job dispatch for ingestion queue
+   184→
+   185→#### CSV Parser & Validation
+   186→- [ ] P1: Implement streaming CSV parser with PapaParse
+   187→- [ ] P1: Implement batch processing (100 records per transaction)
+   188→- [ ] P1: Implement validation rules:
+   189→  - [ ] File size validation (<10MB)
+   190→  - [ ] Required columns validation
+   191→  - [ ] Train existence validation
+   192→  - [ ] Date format validation (YYYY-MM-DD, not future)
+   193→  - [ ] Odometer value validation (positive integer)
+   194→- [ ] P1: Implement anomaly detection:
+   195→  - [ ] NEGATIVE: daily_km < 0
+   196→  - [ ] SPIKE: daily_km > 1000 (configurable)
+   197→  - [ ] DUPLICATE: train + date collision
+   198→
+   199→#### Meter Swap Handling
+   200→- [ ] P1: Implement meter event detection (reset, replacement, calibration)
+   201→- [ ] P1: Implement adjusted reading calculation
+   202→- [ ] P1: Implement meter event approval workflow
+   203→
+   204→#### Ingestion Worker
+   205→- [ ] P1: Create BullMQ ingestion_worker
+   206→- [ ] P1: Implement mileage record insertion with deduplication (UPDATE strategy)
+   207→- [ ] P1: Implement train current_mileage update
+   208→- [ ] P2: Implement quarantine handling for invalid files
+   209→- [ ] P2: Implement detailed ingestion result reporting
+   210→- [ ] P2: Write unit tests for all ingestion scenarios
+   211→
+   212→### 2.2 Unavailability Service (spec 004.2.5 - v2.1 Critical)
+   213→
+   214→- [x] P1: Implement UnavailabilityService class
+   215→- [x] P1: Implement createEvent() with automatic train fitness update
+   216→- [x] P1: Implement resolveEvent() with actual return date
+   217→- [x] P1: Implement queryActiveEvents() for optimizer constraints
+   218→- [x] P1: Implement detectPMConflicts() - alert on scheduled PM overlap
+   219→- [x] P1: Create trigger to sync train.fitness_status from active events (done in code, not DB trigger)
+   220→- [ ] P2: Implement Maximo webhook receiver integration
+   221→
+   222→### 2.3 Service Demand Service (spec 004.2.6 - v2.1 Critical)
+   223→
+   224→- [x] P1: Implement ServiceDemandService class
+   225→- [x] P1: Implement getDemand(fleetId, date, dayType) - hard constraint
+   226→- [x] P1: Implement validateAvailability(fleetId, date) - checks available vs. required
+   227→- [x] P1: Implement default calculation (85% of fleet when no config)
+   228→- [x] P1: Implement findViolations() for optimizer batch validation
+   229→- [x] P2: Implement peak period requirements (AM/Midday/PM/Evening)
+   230→
+   231→### 2.4 Route Utilization Service (spec 004.2.7 - v2.1 Critical)
+   232→
+   233→- [x] P1: Implement RouteUtilizationService class
+   234→- [x] P1: Implement getDailyKm(trainId, date) with hierarchy:
+   235→  - [x] Route-specific profile (preferred)
+   236→  - [x] Fleet-wide average (fallback)
+   237→  - [x] System default: 250 km/day (conservative fallback)
+   238→- [x] P1: Implement seasonal multiplier application
+   239→- [x] P2: Implement confidence scoring (HIGH/MEDIUM/LOW/ESTIMATED)
+   240→
+   241→### 2.5 Fleet Service (spec 004.3)
+   242→
+   243→- [x] P1: Implement FleetService class
+   244→- [x] P1: Implement train/car/component CRUD operations
+   245→- [x] P1: Implement lifecycle state management (fitness_status transitions)
+   246→- [x] P1: Implement mileage tracking and accumulation
+   247→- [x] P1: Implement route assignment and utilization profiles (routes CRUD done)
+   248→- [ ] P2: Implement component replacement tracking (mileage follows components)
+   249→- [x] P2: Implement fleet statistics and reporting
+   250→- [x] P2: Implement target_mileage_km calculation for fleet balancing
+   251→
+   252→### 2.6 PM Scheduler Service - Tactical (spec 004.4)
+   253→
+   254→#### Core Scheduling
+   255→- [ ] P1: Implement PMSchedulerService class
+   256→- [ ] P1: Implement compliance window calculation (mileage OR time triggers)
+   257→- [ ] P1: Implement PM hierarchy handling (C4 satisfies C1/C2/C3, resets counters)
+   258→- [ ] P1: Implement 12-week horizon scheduling
+   259→
+   260→#### Resource Allocation
+   261→- [ ] P1: Implement track allocation logic (match PM requirements to track capabilities)
+   262→- [ ] P1: Implement material constraint checking:
+   263→  - [ ] Hard constraint: 14 days before PM
+   264→  - [ ] Soft constraint: 90 days before PM
+   265→- [ ] P1: Implement track utilization target (85%)
+   266→
+   267→#### Soft Constraints
+   268→- [ ] P1: Implement soft constraint handling with penalties
+   269→- [ ] P2: Implement man-hour allocation
+   270→- [ ] P2: Implement explanation trace generation
+   271→
+   272→#### Validation
+   273→- [ ] P1: Implement Maximo status lock validation (INPRG = read-only)
+   274→- [ ] P2: Implement schedule validation against service demand
+   275→- [ ] P2: Implement conflict detection (track conflicts, material blocks)
+   276→
+   277→#### Output
+   278→- [ ] P1: Implement SchedulingResult generation (scheduled, deferred, materialWarnings)
+   279→- [ ] P2: Implement BullMQ tactical_scheduler worker
+   280→
+   281→---
+   282→
+   283→## Phase 3: Optimizers (P1-P2)
+   284→
+   285→### 3.1 C++ Run Assignment Optimizer (spec 004.5)
+   286→
+   287→#### Build Infrastructure
+   288→- [ ] P1: Setup CMake build configuration
+   289→- [ ] P1: Configure OR-Tools dependency (CP-SAT solver)
+   290→- [ ] P1: Create Dockerfile for optimizer binary (debian:slim base)
+   291→- [ ] P1: Create multi-stage build pipeline
+   292→
+   293→#### IPC Protocol
+   294→- [ ] P1: Implement NDJSON input parsing (OptimizerInput schema)
+   295→- [ ] P1: Implement NDJSON output streaming (PROGRESS, HEARTBEAT, ERROR, RESULT messages)
+   296→- [ ] P1: Implement heartbeat mechanism (5-second interval)
+   297→- [ ] P1: Implement timeout handling (default 30 seconds)
+   298→
+   299→#### CP-SAT Model
+   300→- [ ] P1: Implement hard constraints:
+   301→  - [ ] Each train assigned to ≤1 route
+   302→  - [ ] Route requirements (exact N trains)
+   303→  - [ ] Fleet compatibility
+   304→  - [ ] Fitness status validation
+   305→  - [ ] Unavailability events (train grounded/restricted)
+   306→  - [ ] Route compatibility matrix
+   307→  - [ ] Service demand minimums
+   308→- [ ] P1: Implement soft constraint penalties:
+   309→  - [ ] Mileage imbalance (penalty weight: 100)
+   310→  - [ ] Preference violation (penalty weight: 50)
+   311→  - [ ] Overtime hours (penalty weight: 200)
+   312→- [ ] P1: Implement explanation traces for each assignment
+   313→
+   314→#### Progress & Results
+   315→- [ ] P2: Implement progress streaming (percent, objective, feasibility)
+   316→- [ ] P2: Implement solution explanation traces
+   317→- [ ] P2: Implement fallback detection and signaling
+   318→
+   319→### 3.2 TypeScript Fallback Optimizer
+   320→
+   321→- [ ] P2: Implement greedy algorithm fallback
+   322→- [ ] P2: Implement same IPC protocol (NDJSON)
+   323→- [ ] P2: Implement automatic fallback detection (INFEASIBLE or crash)
+   324→- [ ] P2: Implement explanation traces for fallback decisions
+   325→
+   326→### 3.3 Optimizer Worker (TypeScript)
+   327→
+   328→- [ ] P1: Create BullMQ optimizer_worker
+   329→- [ ] P1: Implement C++ binary spawning with stream I/O
+   330→- [ ] P1: Implement heartbeat monitoring (15-second timeout = 3 missed heartbeats)
+   331→- [ ] P1: Implement process crash detection (SIGSEGV/SIGABRT/SIGFPE)
+   332→- [ ] P1: Implement SIGKILL for hung processes
+   333→- [ ] P2: Implement TypeScript fallback invocation
+   334→
+   335→### 3.4 Strategic Planner (spec 004.6)
+   336→
+   337→- [ ] P2: Implement StrategicPlannerService class
+   338→- [ ] P2: Implement PM projection logic (10-year horizon)
+   339→- [ ] P2: Implement constraint aggregation layer (capacity envelopes)
+   340→- [ ] P2: Implement genetic algorithm for optimization:
+   341→  - [ ] Population size: 100
+   342→  - [ ] Generations: 500
+   343→  - [ ] Mutation rate: 10%
+   344→  - [ ] Elite count: 10
+   345→- [ ] P2: Implement capacity envelope calculation (track, labor, material bounds)
+   346→- [ ] P2: Implement bow-wave detection and alerting
+   347→- [ ] P2: Implement strategic-tactical consistency validation
+   348→- [ ] P2: Create BullMQ strategic_planner worker
+   349→
+   350→---
+   351→
+   352→## Phase 4: Supporting Services (P2)
+   353→
+   354→### 4.1 Man-hour Leveling Engine (spec 004.7)
+   355→
+   356→- [ ] P2: Implement ManHourLevelingService class
+   357→- [ ] P2: Implement workload projection (raw weekly man-hours)
+   358→- [ ] P2: Implement imbalance detection (overloaded/underutilized weeks)
+   359→- [ ] P2: Implement multi-strategy support (priority order):
+   360→  - [ ] ADVANCE_PM (1.1x cost, LOW risk, max 40h/week)
+   361→  - [ ] DEFER_PM (1.05x cost, LOW risk, max 40h/week)
+   362→  - [ ] ADD_OVERTIME (1.5x cost, NO risk, max 80h/week)
+   363→  - [ ] CROSS_DEPOT (1.3x cost, MEDIUM risk, max 60h/week)
+   364→  - [ ] ADD_CONTRACTOR (2.0x cost, MEDIUM risk, max 100h/week)
+   365→  - [ ] MANUAL_REVIEW (flagged for high unresolvable overload)
+   366→- [ ] P2: Implement leveling visualization data
+   367→- [ ] P2: Implement utilization targets (85% target, 70% min, 100% max)
+   368→- [ ] P2: Create BullMQ manhour_leveling_worker
+   369→
+   370→### 4.2 Costing Service (spec 004.10)
+   371→
+   372→- [ ] P2: Implement CostingService class
+   373→- [ ] P2: Implement PM cost calculation (labor + materials + overhead)
+   374→- [ ] P2: Implement labor rate lookup by depot/date
+   375→- [ ] P2: Implement shift/weekend multipliers
+   376→- [ ] P2: Implement overhead calculation (18% of direct costs)
+   377→- [ ] P2: Implement TCO projection (12-year horizon):
+   378→  - [ ] Inflation: 3% annually
+   379→  - [ ] Discount rate: 5% for NPV
+   380→- [ ] P2: Implement variance analysis (budget vs. actual)
+   381→- [ ] P2: Implement cost forecasting
+   382→
+   383→### 4.3 Baseline Service (spec 004.9)
+   384→
+   385→- [ ] P2: Implement BaselineService class
+   386→- [ ] P2: Implement snapshot creation:
+   387→  - [ ] Version management (semantic versioning)
+   388→  - [ ] PM schedule snapshot
+   389→  - [ ] Mileage projection snapshot
+   390→  - [ ] Fleet metrics capture
+   391→- [ ] P2: Implement baseline publishing (DRAFT → PUBLISHED)
+   392→- [ ] P2: Implement baseline superseding (previous → SUPERSEDED)
+   393→- [ ] P2: Implement comparison utilities
+   394→
+   395→### 4.4 Drift Monitor (spec 004.10)
+   396→
+   397→- [ ] P2: Implement DriftMonitorService class
+   398→- [ ] P2: Implement nightly comparison job:
+   399→  - [ ] Mileage drift calculation (actual vs. projected)
+   400→  - [ ] PM schedule drift (days variance)
+   401→  - [ ] requires_replan flag calculation
+   402→- [ ] P2: Implement threshold configuration:
+   403→  - [ ] Mileage drift: ±5.0%
+   404→  - [ ] Schedule drift: ±14 days
+   405→  - [ ] Fleet drift: ≥5 trains requiring replan
+   406→- [ ] P2: Implement alert generation (HIGH, MEDIUM, CRITICAL)
+   407→- [ ] P2: Implement drift reporting
+   408→- [ ] P2: Create BullMQ drift_monitor_worker
+   409→
+   410→### 4.5 Simulation Engine (spec 004.11)
+   411→
+   412→- [ ] P2: Implement SimulationService class
+   413→- [ ] P2: Implement scenario creation (fork from baseline or scenario)
+   414→- [ ] P2: Implement event-sourced delta storage
+   415→- [ ] P2: Implement what-if parameter modification:
+   416→  - [ ] PM_MOVE: Reschedule to new date
+   417→  - [ ] PM_ADD: Insert new PM
+   418→  - [ ] PM_REMOVE: Delete PM
+   419→- [ ] P2: Implement scenario materialization (recursive delta application)
+   420→- [ ] P2: Implement scenario comparison (side-by-side metrics)
+   421→- [ ] P2: Implement scenario promotion (deltas → new baseline)
+   422→- [ ] P2: Implement automatic expiration (30 days default)
+   423→
+   424→---
+   425→
+   426→## Phase 5: API Layer (P2)
+   427→
+   428→### 5.1 REST API Setup (spec 005)
+   429→
+   430→- [ ] P2: Setup Hono with Bun runtime
+   431→- [ ] P2: Setup OpenAPI middleware (Swagger/OpenAPI spec generation)
+   432→- [ ] P2: Implement standard response format (success/error envelopes)
+   433→- [ ] P2: Implement pagination helper (page, pageSize, sort, filter)
+   434→- [ ] P2: Implement rate limiting (100 requests/minute per user)
+   435→- [ ] P2: Implement request tracing (requestId generation)
+   436→
+   437→### 5.2 Authentication (spec 005.2)
+   438→
+   439→- [ ] P2: Implement JWT authentication (access + refresh tokens)
+   440→- [ ] P2: Implement POST /auth/login
+   441→- [ ] P2: Implement POST /auth/refresh
+   442→- [ ] P2: Implement POST /auth/logout
+   443→
+   444→### 5.3 Authorization
+   445→
+   446→- [ ] P2: Implement RBAC authorization middleware
+   447→- [ ] P2: Create role definitions (PLANNER, DEPOT_MANAGER, SYSTEM_ADMIN, etc.)
+   448→- [ ] P2: Implement permission checking
+   449→
+   450→### 5.4 Fleet Management Endpoints (spec 005.3)
+   451→
+   452→- [ ] P2: Implement GET /fleets
+   453→- [ ] P2: Implement GET /trains (with filtering and pagination)
+   454→- [ ] P2: Implement GET /trains/:id
+   455→- [ ] P2: Implement PATCH /trains/:id (fitness status, restrictions)
+   456→
+   457→### 5.5 Mileage Endpoints (spec 005.4)
+   458→
+   459→- [ ] P2: Implement GET /mileage/readings (with filtering)
+   460→- [ ] P2: Implement GET /mileage/anomalies
+   461→- [ ] P2: Implement POST /mileage/meter-events
+   462→
+   463→### 5.6 PM Schedule Endpoints (spec 005.5)
+   464→
+   465→- [ ] P2: Implement GET /pm/schedule (with filtering)
+   466→- [ ] P2: Implement POST /pm/schedule
+   467→- [ ] P2: Implement PATCH /pm/schedule/:id (move, reassign with Maximo lock validation)
+   468→- [ ] P2: Implement POST /pm/schedule/:id/lock
+   469→- [ ] P2: Implement POST /pm/schedule/:id/unlock
+   470→- [ ] P2: Implement GET /pm/schedule/:id/history
+   471→
+   472→### 5.7 Optimizer Endpoints (spec 005.6)
+   473→
+   474→- [ ] P2: Implement POST /optimizer/run-assignment
+   475→- [ ] P2: Implement GET /optimizer/jobs/:jobId
+   476→- [ ] P2: Implement POST /optimizer/tactical-schedule
+   477→- [ ] P2: Implement POST /optimizer/strategic-plan
+   478→
+   479→### 5.8 Man-hour Endpoints (spec 005.7)
+   480→
+   481→- [ ] P2: Implement GET /manhours/projections
+   482→- [ ] P2: Implement GET /manhours/adjustments
+   483→- [ ] P2: Implement POST /manhours/adjustments/:id/approve
+   484→- [ ] P2: Implement POST /manhours/adjustments/:id/reject
+   485→
+   486→### 5.9 Baseline Endpoints (spec 005.8)
+   487→
+   488→- [ ] P2: Implement GET /baselines
+   489→- [ ] P2: Implement POST /baselines
+   490→- [ ] P2: Implement GET /baselines/:id/pm-schedule
+   491→- [ ] P2: Implement GET /baselines/:id/mileage-projections
+   492→
+   493→### 5.10 Drift Analysis Endpoints (spec 005.9)
+   494→
+   495→- [ ] P2: Implement GET /drift/analysis
+   496→
+   497→### 5.11 Scenario Endpoints (spec 005.10)
+   498→
+   499→- [ ] P2: Implement GET /scenarios
+   500→- [ ] P2: Implement POST /scenarios
+   501→- [ ] P2: Implement POST /scenarios/:id/changes
+   502→- [ ] P2: Implement GET /scenarios/:id/materialized
+   503→- [ ] P2: Implement POST /scenarios/:id/compare
+   504→- [ ] P2: Implement POST /scenarios/:id/promote
+   505→
+   506→### 5.12 Material Endpoints (spec 005.11)
+   507→
+   508→- [ ] P2: Implement GET /materials/inventory
+   509→- [ ] P2: Implement GET /materials/reservations
+   510→- [ ] P2: Implement POST /materials/reservations/:id/fulfill
+   511→
+   512→### 5.13 Costing Endpoints (spec 005.12)
+   513→
+   514→- [ ] P2: Implement GET /costing/tco-projection
+   515→- [ ] P2: Implement GET /costing/variance
+   516→
+   517→### 5.14 Canvas Data Endpoints (spec 005.13)
+   518→
+   519→- [ ] P2: Implement GET /canvas/strategic
+   520→- [ ] P2: Implement GET /canvas/tactical
+   521→- [ ] P2: Implement GET /canvas/manhour-overlay
+   522→- [ ] P2: Implement GET /canvas/drift-overlay
+   523→
+   524→### 5.15 Export Endpoints (spec 005.15)
+   525→
+   526→- [ ] P2: Implement POST /export/pm-schedule (Excel)
+   527→- [ ] P2: Implement GET /export/:jobId
+   528→- [ ] P2: Implement POST /export/report (PDF)
+   529→- [ ] P2: Create BullMQ report_worker (Puppeteer for PDF, ExcelJS for Excel)
+   530→
+   531→### 5.16 WebSocket Hub (spec 005.14)
+   532→
+   533→- [ ] P2: Implement WebSocket connection management
+   534→- [ ] P2: Implement JWT authentication over WebSocket
+   535→- [ ] P2: Implement canvas event broadcasting:
+   536→  - [ ] canvas:pm_updated
+   537→  - [ ] canvas:pm_locked
+   538→  - [ ] canvas:manhour_updated
+   539→  - [ ] canvas:drift_updated
+   540→- [ ] P2: Implement optimizer progress streaming:
+   541→  - [ ] optimizer:progress
+   542→  - [ ] optimizer:complete
+   543→- [ ] P2: Implement canvas subscription:
+   544→  - [ ] canvas:subscribe (region-based)
+   545→  - [ ] canvas:unsubscribe
+   546→- [ ] P2: Implement PM move via WebSocket:
+   547→  - [ ] canvas:move_pm (request with validation)
+   548→  - [ ] canvas:move_pm_result (response)
+   549→- [ ] P2: Implement real-time collaboration (multi-user canvas sync)
+   550→
+   551→---
+   552→
+   553→## Phase 6: Integration (P2-P3)
+   554→
+   555→### 6.1 Maximo Integration (spec 007)
+   556→
+   557→#### Sync Infrastructure
+   558→- [ ] P2: Create MaximoShadowRecord schema and service
+   559→- [ ] P2: Implement sync status tracking (PENDING, SYNCED, CONFLICT, ERROR)
+   560→- [ ] P2: Implement conflict detection (timestamp comparison)
+   561→
+   562→#### Work Order Sync
+   563→- [ ] P2: Implement webhook receiver for CM status updates
+   564→- [ ] P2: Implement polling fallback (15-minute intervals)
+   565→- [ ] P2: Implement work order creation (MMS → Maximo)
+   566→- [ ] P2: Implement work order status sync (Maximo → MMS)
+   567→- [ ] P2: Implement status mapping:
+   568→  - [ ] WAPPR/APPR → SCHEDULED (unlocked)
+   569→  - [ ] INPRG → IN_PROGRESS (LOCKED)
+   570→  - [ ] COMP/CLOSE → COMPLETED (LOCKED)
+   571→  - [ ] CAN → CANCELLED (LOCKED)
+   572→
+   573→#### Bidirectional Sync
+   574→- [ ] P2: Implement push logic (MMS → Maximo)
+   575→- [ ] P2: Implement pull logic (Maximo → MMS)
+   576→- [ ] P2: Implement conflict resolution strategies (USE_MMS, USE_MAXIMO)
+   577→- [ ] P3: Implement retry and error handling (5 retries, exponential backoff)
+   578→- [ ] P3: Implement circuit breaker pattern
+   579→
+   580→### 6.2 Inventory Integration
+   581→
+   582→- [ ] P3: Implement inventory snapshot ingestion (from Maximo)
+   583→- [ ] P3: Implement material availability checking
+   584→- [ ] P3: Implement reservation integration (reserve on schedule, release on cancel)
+   585→
+   586→### 6.3 Email Notification Service
+   587→
+   588→- [ ] P2: Implement SMTP email service
+   589→- [ ] P2: Implement notification templates:
+   590→  - [ ] drift_alert.html
+   591→  - [ ] overload_warning.html
+   592→  - [ ] pm_reminder.html
+   593→  - [ ] baseline_published.html
+   594→  - [ ] optimizer_failed.html
+   595→  - [ ] file_missing.html
+   596→  - [ ] material_shortage.html
+   597→- [ ] P2: Implement user notification preferences
+   598→- [ ] P2: Implement digest mode (IMMEDIATE, DAILY_DIGEST, WEEKLY_DIGEST)
+   599→- [ ] P2: Create BullMQ notification_worker
+   600→
+   601→---
+   602→
+   603→## Phase 7: User Interface (P2-P3)
+   604→
+   605→### 7.1 Infinite Canvas (spec 006)
+   606→
+   607→#### Canvas Architecture
+   608→- [ ] P2: Setup React 18 + Vite with proper configuration
+   609→- [ ] P2: Setup deck.gl with custom layers
+   610→- [ ] P2: Setup Konva.js for tactical/operational views
+   611→- [ ] P2: Implement hybrid rendering approach:
+   612→  - [ ] deck.gl WebGL for strategic (zoom 0-8)
+   613→  - [ ] Konva HTML5 Canvas for tactical/operational (zoom 8-16)
+   614→  - [ ] React DOM overlay for detail (zoom 16+)
+   615→
+   616→#### Semantic Zoom Levels
+   617→- [ ] P2: Implement strategic heatmap view (12-year, yearly granularity)
+   618→- [ ] P2: Implement tactical-wide view (1-year, monthly granularity)
+   619→- [ ] P2: Implement tactical Gantt view (12-week, weekly granularity)
+   620→- [ ] P2: Implement operational detail view (4-week, daily granularity)
+   621→- [ ] P3: Implement detail view (1-week, daily with crew assignment)
+   622→
+   623→#### Layers
+   624→- [ ] P2: Implement strategicHeatmapLayer (deck.gl)
+   625→- [ ] P2: Implement timelineAxisLayer (deck.gl)
+   626→- [ ] P2: Implement ganttBlockLayer (Konva)
+   627→- [ ] P2: Implement constraintWallLayer (Konva) - compliance windows
+   628→- [ ] P2: Implement trainLabelLayer (Konva)
+   629→- [ ] P3: Implement tooltipLayer (Konva)
+   630→- [ ] P3: Implement dragPreviewLayer (Konva)
+   631→- [ ] P3: Implement detailCardOverlay (React DOM)
+   632→
+   633→#### Overlays
+   634→- [ ] P3: Implement baseline/drift overlay (shadow layer)
+   635→- [ ] P3: Implement man-hour utilization overlay
+   636→- [ ] P3: Implement scenario comparison view (side-by-side)
+   637→
+   638→### 7.2 Drag-and-Drop Rescheduling
+   639→
+   640→- [ ] P3: Implement drag initiation (hover → grab → drag)
+   641→- [ ] P3: Implement real-time constraint validation:
+   642→  - [ ] Compliance window validation
+   643→  - [ ] Track conflict detection
+   644→  - [ ] Material availability check
+   645→  - [ ] Maximo lock check
+   646→- [ ] P3: Implement visual feedback:
+   647→  - [ ] Green outline = valid drop
+   648→  - [ ] Red outline = constraint violation
+   649→- [ ] P3: Implement confirmation dialog with impact summary
+   650→- [ ] P3: Implement snap-back on invalid drop
+   651→- [ ] P3: Implement WebSocket broadcast after move
+   652→
+   653→### 7.3 UI Components (BlueprintJS)
+   654→
+   655→- [ ] P3: Implement navigation and layout (Header, Toolbar, StatusBar)
+   656→- [ ] P3: Implement TrainList with filtering
+   657→- [ ] P3: Implement PMDetailCard
+   658→- [ ] P3: Implement BowWaveIndicator
+   659→- [ ] P3: Implement ImportModal (CSV drag-and-drop)
+   660→- [ ] P3: Implement data tables with filtering
+   661→- [ ] P3: Implement forms for manual entry
+   662→- [ ] P3: Implement dashboards and KPIs
+   663→- [ ] P3: Implement toast notifications
+   664→
+   665→### 7.4 State Management
+   666→
+   667→- [ ] P2: Setup Zustand store for canvas state
+   668→- [ ] P2: Implement fleetStore (trains, fleets, routes)
+   669→- [ ] P2: Implement canvasStore (zoom, pan, selection)
+   670→- [ ] P2: Implement scenarioStore (active scenario, deltas)
+   671→
+   672→### 7.5 Explanation Panels
+   673→
+   674→- [ ] P3: Implement Run Assignment Explanation panel
+   675→- [ ] P3: Implement PM Scheduling Explanation panel
+   676→- [ ] P3: Implement Drift Analysis panel
+   677→
+   678→### 7.6 Keyboard Shortcuts
+   679→
+   680→- [ ] P3: Implement zoom shortcuts (+/-, 1-5)
+   681→- [ ] P3: Implement navigation (t = today, s = strategic, o = operational)
+   682→- [ ] P3: Implement pan (arrow keys)
+   683→- [ ] P3: Implement cancel (Escape)
+   684→- [ ] P3: Implement help (?)
+   685→
+   686→### 7.7 Accessibility (WCAG 2.1 AA)
+   687→
+   688→- [ ] P3: Implement keyboard navigation
+   689→- [ ] P3: Implement ARIA labels
+   690→- [ ] P3: Implement focus indicators
+   691→- [ ] P3: Implement color contrast compliance
+   692→- [ ] P3: Implement reduced motion support
+   693→
+   694→---
+   695→
+   696→## Phase 8: Operations (P3)
+   697→
+   698→### 8.1 Docker Configuration
+   699→
+   700→- [ ] P3: Create optimized Dockerfile for mms-frontend (nginx:alpine, <50MB)
+   701→- [ ] P3: Create optimized Dockerfile for mms-backend (oven/bun:alpine, <200MB)
+   702→- [ ] P3: Create optimized Dockerfile for mms-worker (oven/bun:alpine, <200MB)
+   703→- [ ] P3: Create optimized Dockerfile for mms-optimizer (debian:slim, <500MB)
+   704→- [ ] P3: Create optimized Dockerfile for mms-file-watcher (oven/bun:alpine, <150MB)
+   705→- [ ] P3: Create docker-compose.yml for development
+   706→- [ ] P3: Implement multi-stage builds
+   707→- [ ] P3: Implement non-root user execution
+   708→
+   709→### 8.2 Kubernetes Manifests
+   710→
+   711→- [ ] P3: Create namespace manifest (mms)
+   712→- [ ] P3: Create Deployment for mms-backend (3 replicas, rolling update)
+   713→- [ ] P3: Create Deployment for mms-optimizer-worker (2 replicas, sidecar pattern)
+   714→- [ ] P3: Create Deployment for mms-file-watcher
+   715→- [ ] P3: Create Service manifests
+   716→- [ ] P3: Create ConfigMap for application config
+   717→- [ ] P3: Create Secrets (External Secrets Operator with Vault)
+   718→
+   719→### 8.3 Health Checks
+   720→
+   721→- [ ] P3: Implement /health endpoint (liveness)
+   722→- [ ] P3: Implement /ready endpoint (readiness)
+   723→- [ ] P3: Configure Kubernetes probes (10s initial, 30s period)
+   724→
+   725→### 8.4 Horizontal Pod Autoscaling
+   726→
+   727→- [ ] P3: Create HPA for mms-backend (3-10 replicas, 70% CPU, 80% memory)
+   728→- [ ] P3: Configure scale-up policy (60s stabilization, 100% increase)
+   729→- [ ] P3: Configure scale-down policy (300s stabilization, 10% decrease)
+   730→
+   731→### 8.5 Observability
+   732→
+   733→#### OpenTelemetry
+   734→- [ ] P3: Setup OpenTelemetry SDK in all services
+   735→- [ ] P3: Create OpenTelemetry Collector deployment
+   736→- [ ] P3: Configure trace exporting
+   737→
+   738→#### Prometheus
+   739→- [ ] P3: Configure Prometheus scrape annotations
+   740→- [ ] P3: Setup Prometheus ServiceMonitor
+   741→
+   742→#### Grafana
+   743→- [ ] P3: Create MMS Overview dashboard
+   744→- [ ] P3: Create Request Rate panel
+   745→- [ ] P3: Create Error Rate panel
+   746→- [ ] P3: Create Optimizer Performance heatmap
+   747→- [ ] P3: Create Drift Status gauge
+   748→
+   749→#### Alerting
+   750→- [ ] P3: Create alert rules:
+   751→  - [ ] HighErrorRate (>5% for 5 minutes)
+   752→  - [ ] OptimizerSlow (p95 >60s for 10 minutes)
+   753→  - [ ] DriftThresholdExceeded (>10 trains for 1 hour)
+   754→  - [ ] MileageFileNotReceived (>2 hours for 30 minutes)
+   755→  - [ ] DatabaseConnectionPoolExhausted (>90% for 5 minutes)
+   756→
+   757→### 8.6 Network Policies
+   758→
+   759→- [ ] P3: Create network policy for backend → PostgreSQL
+   760→- [ ] P3: Create network policy for backend → Redis
+   761→- [ ] P3: Create network policy for ingress → backend
+   762→- [ ] P3: Create default deny egress policy
+   763→
+   764→### 8.7 CI/CD Pipeline
+   765→
+   766→- [ ] P3: Create GitHub Actions workflow for lint/test/build
+   767→- [ ] P3: Create multi-platform Docker build
+   768→- [ ] P3: Configure staging deployment (develop branch)
+   769→- [ ] P3: Configure production deployment (main branch, canary strategy)
+   770→
+   771→---
+   772→
+   773→## Phase 9: Demo Application (P3)
+   774→
+   775→### 9.1 Demo Data Generator
+   776→
+   777→- [ ] P3: Create demo data generator script
+   778→- [ ] P3: Generate sample fleet roster CSV (128 trains)
+   779→- [ ] P3: Generate sample PM history CSV
+   780→- [ ] P3: Create pre-populated PM rules CSV
+   781→
+   782→### 9.2 Demo Scenarios
+   783→
+   784→- [ ] P3: Create strategic demo script (5 phases)
+   785→- [ ] P3: Create bow-wave scenario (Q2 2027, 40% fleet C4 overlap)
+   786→- [ ] P3: Implement Chaos Monkey feature (hidden activation)
+   787→
+   788→### 9.3 Guided Walkthrough
+   789→
+   790→- [ ] P3: Create step-by-step demo flow
+   791→- [ ] P3: Create tutorial documentation
+   792→
+   793→### 9.4 Sample Data
+   794→
+   795→- [ ] P3: Create 5-train sample dataset
+   796→- [ ] P3: Create PM history test data (14 completion records)
+   797→- [ ] P3: Create projection test cases
+   798→
+   799→---
+   800→
+   801→## Discovered Issues
+   802→
+   803→> Items discovered during planning. Move to appropriate phase when triaged.
+   804→
+   805→- [ ] **CRITICAL**: Maximo lock validation must be checked BEFORE any PM reschedule operation (API + WebSocket)
+   806→- [ ] **CRITICAL**: Service demand is a HARD constraint - optimizer must reject solutions that violate minimum train availability
+   807→- [ ] **CRITICAL**: Unavailability events must block both run assignment AND PM scheduling
+   808→- [ ] **HIGH**: Cold start handling (pm_baseline_assumptions) must include manual review queue for LOW confidence
+   809→- [ ] **HIGH**: Route utilization profiles must warn when using fleet-wide average (60,000+ km projection error risk)
+   810→- [ ] **MEDIUM**: TypeScript strict mode is partially disabled (noImplicitAny: false) - should be enabled
+   811→- [ ] **LOW**: Demo spec mentions deck.gl ONLY but UI spec mentions Konva hybrid - clarify rendering strategy
+   812→
+   813→---
+   814→
+   815→## Completed Items
+   816→
+   817→> Move items here when done. Keep for reference.
+   818→
+   819→### Phase 0: Project Setup
+   820→- [x] Project scaffolding (React 18 + Vite)
+   821→- [x] BlueprintJS dependency installed
+   822→- [x] deck.gl dependency installed
+   823→- [x] PapaParse dependency installed
+   824→- [x] TypeScript configuration
+   825→
+   826→### Phase 1.1a: Database Schema (2026-01-19)
+   827→- [x] All 17 PostgreSQL enums defined (src/lib/db/schema/enums.ts)
+   828→- [x] Core Fleet tables: depots, fleets, trains, routes, tracks (src/lib/db/schema/core-fleet.ts)
+   829→- [x] Users/Auth tables: users, roles, sessions (src/lib/db/schema/users.ts)
+   830→- [x] Operational Constraints tables (src/lib/db/schema/operational-constraints.ts)
+   831→- [x] Track Capabilities tables (src/lib/db/schema/track-capabilities.ts)
+   832→- [x] PM Management tables: pm_types, pm_material_requirements, pm_schedule (src/lib/db/schema/pm-management.ts)
+   833→- [x] Mileage Tracking tables: mileage_readings, meter_events (src/lib/db/schema/mileage-tracking.ts)
+   834→- [x] Component Tracking tables (src/lib/db/schema/component-tracking.ts)
+   835→- [x] Material Management tables (src/lib/db/schema/material-management.ts)
+   836→- [x] Man-hour Planning tables (src/lib/db/schema/manhour-planning.ts)
+   837→- [x] Baseline & Drift tables (src/lib/db/schema/baseline-drift.ts)
+   838→- [x] Scenario Management tables (src/lib/db/schema/scenarios.ts)
+   839→- [x] Costing tables (src/lib/db/schema/costing.ts)
+   840→- [x] Audit tables (src/lib/db/schema/audit.ts)
+   841→- [x] Database connection pool with health checks (src/lib/db/connection.ts)
+   842→- [x] Drizzle configuration (drizzle.config.ts)
+   843→- [x] Backend dependencies: drizzle-orm, postgres.js, pino, zod, zustand
+   844→
+   845→### Phase 1.1b: Database Configuration & Migrations (2026-01-19)
+   846→- [x] PostgreSQL extensions migration (uuid-ossp, timescaledb) (drizzle/manual/0001_extensions.sql)
+   847→- [x] TimescaleDB hypertable configuration (7-day chunks) (drizzle/manual/0002_timescaledb.sql)
+   848→- [x] Compression policy (30 days), retention policy (13 years)
+   849→- [x] daily_fleet_mileage continuous aggregate view
+   850→- [x] Database functions: sync_train_fitness_from_unavailability, refresh_canvas_views, cleanup_expired_scenarios, release_expired_reservations, update_fleet_mileage_targets, apply_pm_hierarchy_satisfaction, audit_pm_schedule_changes (drizzle/manual/0003_functions.sql)
+   851→- [x] Canvas materialized views: v_canvas_strategic, v_canvas_tactical, v_manhour_canvas, v_drift_canvas (drizzle/manual/0004_materialized_views.sql)
+   852→- [x] Development seed data script (drizzle/manual/seed_development.sql)
+   853→
+   854→### Phase 1.2: Shared Library (2026-01-19)
+   855→- [x] Redis connection with cache utilities (src/lib/redis/connection.ts)
+   856→- [x] Pino structured logging with redaction (src/lib/logging/logger.ts)
+   857→- [x] Typed error classes (30+) with error codes (src/lib/errors/index.ts)
+   858→- [x] Date/time utilities: compliance windows, PM hierarchy, mileage projection (src/lib/utils/date.ts)
+   859→- [x] BullMQ queue configuration for 8 worker types (src/lib/queue/index.ts)
+   860→- [x] Zod validation schemas for API/CSV/IPC (src/lib/schemas/index.ts)
+   861→- [x] Prometheus metrics: HTTP, PM, optimizer, fleet, drift, queue, ingestion (src/lib/metrics/index.ts)
+   862→- [x] Central lib export (src/lib/index.ts)
+   863→- [x] Dependencies: ioredis, bullmq, date-fns, @opentelemetry/*, prom-client
+   864→
+   865→### Phase 1.2 Continuation: Service Infrastructure (2026-01-19)
+   866→- [x] OpenTelemetry tracing infrastructure (src/lib/tracing/index.ts)
+   867→  - Span context propagation
+   868→  - MMS-specific attributes (train, PM, depot, mileage, optimizer, baseline, scenario)
+   869→  - withSpan and withSpanSync helpers
+   870→  - Error recording and trace context extraction
+   871→- [x] Base service class (src/lib/services/base.ts)
+   872→  - Consistent tracing and logging patterns for all domain services
+   873→  - Transaction integration with tracing
+   874→  - Operation result wrappers
+   875→- [x] Transaction helper utilities (src/lib/utils/transaction.ts)
+   876→  - Traced transactions with automatic rollback
+   877→  - Batch transaction support
+   878→  - Timeout protection
+   879→- [x] Resilience utilities (src/lib/utils/resilience.ts)
+   880→  - Retry with exponential backoff and jitter
+   881→  - Circuit breaker pattern (CLOSED/OPEN/HALF_OPEN states)
+   882→  - Pre-configured retry configs for different scenarios
+   883→  - Combined retry + circuit breaker utility
+   884→
+   885→### Phase 2.2: Unavailability Service (2026-01-19)
+   886→- [x] UnavailabilityService class for CM/incident tracking (src/services/unavailability.ts)
+   887→- [x] createEvent() with automatic train fitness status sync
+   888→- [x] resolveEvent() with fitness restoration logic
+   889→- [x] queryActiveEvents() returning OptimizerConstraints for optimizer
+   890→- [x] detectPMConflicts() to alert on PM scheduled during unavailability
+   891→- [x] Maximo integration helpers (updateFromMaximo, getEventByExternalReference)
+   892→- [x] Statistics endpoint for dashboard
+   893→- [x] Unit tests with 35 passing tests (src/services/unavailability.test.ts)
+   894→- [x] OpenTelemetry tracing for all operations
+   895→
+   896→### Phase 2.5: Fleet Service (2026-01-19)
+   897→- [x] FleetService class with CRUD for depots, fleets, trains, routes, tracks (src/services/fleet.ts)
+   898→- [x] Train fitness status management (FIT, RESTRICTED, GROUNDED transitions)
+   899→- [x] Mileage tracking with validation (no decrease without meter events)
+   900→- [x] Fleet mileage balancing (target calculation, variance tracking)
+   901→- [x] Fleet statistics (total trains, fitness counts, mileage stats with std dev)
+   902→- [x] Bulk operations and validation utilities
+   903→- [x] Unit tests with 36 passing tests (src/services/fleet.test.ts)
+   904→- [x] OpenTelemetry tracing for all operations
+   905→
+   906→### Phase 2.3: Service Demand Service (2026-01-19)
+   907→- [x] ServiceDemandService class for fleet availability management (src/services/service-demand.ts)
+   908→- [x] getDemand() - retrieves demand config for fleet/date with day type calculation
+   909→- [x] validateAvailability() - CRITICAL method checking fleet against service demand (HARD constraint)
+   910→- [x] findViolations() - batch validation for optimizer proposed PM schedules
+   911→- [x] Default demand calculation (85% of fleet when no config exists)
+   912→- [x] Day type detection (WEEKDAY, SATURDAY, SUNDAY, HOLIDAY)
+   913→- [x] Peak period support (AM, midday, PM, evening requirements)
+   914→- [x] CRUD operations for demand configuration records
+   915→- [x] Fleet availability summary for dashboard
+   916→- [x] Unit tests with 46 passing tests (src/services/service-demand.test.ts)
+   917→- [x] OpenTelemetry tracing for all operations
+   918→
+   919→### Phase 2.4: Route Utilization Service (2026-01-19)
+   920→- [x] RouteUtilizationService class for mileage projection accuracy (src/services/route-utilization.ts)
+   921→- [x] getProfile() - retrieves route utilization profile with effective date lookup
+   922→- [x] calculateDailyRate() - CRITICAL method with fallback hierarchy:
+   923→  - Route-specific profile (HIGH confidence)
+   924→  - Fleet-wide average from 30-day mileage readings (MEDIUM/LOW confidence)
+   925→  - System default 250 km/day (ESTIMATED confidence)
+   926→- [x] calculateRouteRate() - route-level rate without train context
+   927→- [x] projectMileage() - cumulative mileage projection over time horizon
+   928→- [x] projectDateForMileage() - find date when train reaches target mileage (PM scheduling)
+   929→- [x] getFleetAverage() - calculate fleet-wide average from mileage readings
+   930→- [x] CRUD operations for route utilization profiles
+   931→- [x] Day type handling (WEEKDAY, SATURDAY, SUNDAY, HOLIDAY)
+   932→- [x] Peak season detection and multiplier application (CNY, school holidays)
+   933→- [x] Confidence scoring based on data source quality
+   934→- [x] Unit tests with 56 passing tests (src/services/route-utilization.test.ts)
+   935→- [x] OpenTelemetry tracing for all operations
+   936→
+   937→---
+   938→
+   939→## Summary Statistics
+   940→
+   941→| Phase | P1 Items | P2 Items | P3 Items | Total |
+   942→|-------|----------|----------|----------|-------|
+   943→| 1. Foundation | ~75 | 0 | 0 | ~75 |
+   944→| 2. Core Domain | ~45 | ~15 | 0 | ~60 |
+   945→| 3. Optimizers | ~25 | ~20 | 0 | ~45 |
+   946→| 4. Supporting Services | 0 | ~40 | 0 | ~40 |
+   947→| 5. API Layer | 0 | ~60 | 0 | ~60 |
+   948→| 6. Integration | 0 | ~20 | ~10 | ~30 |
+   949→| 7. UI | 0 | ~20 | ~40 | ~60 |
+   950→| 8. Operations | 0 | 0 | ~35 | ~35 |
+   951→| 9. Demo | 0 | 0 | ~15 | ~15 |
+   952→| **TOTAL** | **~145** | **~175** | **~100** | **~420** |
+   953→
+   954→---
+   955→
+   956→## Critical Dependencies
+   957→
+   958→| Dependency | Source | Required For | Fallback |
+   959→|-----------|--------|--------------|----------|
+   960→| Corrective maintenance status | Maximo webhook | PM scheduling validity | Manual status UI |
+   961→| Inventory positions | ERP/Maximo | Material constraint validation | Assume unlimited (warning flag) |
+   962→| Service demand | Operations input | Run assignment optimization | Default 85% fleet |
+   963→| Route utilization profiles | Operations input | Mileage projections | Fleet-wide average (warning flag) |
+   964→
+   965→---
+   966→
+   967→## Notes
+   968→
+   969→1. **Non-negotiable dependencies**: Corrective maintenance visibility and service demand are prerequisites for valid schedules
+   970→2. **Dual-solver architecture**: Strategic (GA) and tactical (OR-Tools CP-SAT) must share constraint envelope
+   971→3. **Explainability**: Every optimizer decision must include factor-based explanation traces
+   972→4. **Baseline/drift**: Long-term plans stabilize via published baselines; drift thresholds prevent jitter
+   973→5. **Material constraints**: PM scheduling without parts availability is operationally useless
+   974→6. **Cold-start risk**: Historical PM data will be incomplete - explicit confidence scoring required
+   975→7. **Audit compliance**: 12-year government contract mandates immutable audit trail with full attribution
+   976→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,215 @@
+     1→/**
+     2→ * MMS REST API
+     3→ *
+     4→ * Main Hono application setup with middleware and route registration.
+     5→ * Provides RESTful endpoints for the Metro Fleet Mileage Management System.
+     6→ *
+     7→ * Base URL: /api/v1
+     8→ * Authentication: Bearer JWT (when implemented)
+     9→ * Rate Limiting: 100 requests/minute per user (when implemented)
+    10→ *
+    11→ * @see specs/005-api.md
+    12→ */
+    13→
+    14→import { Hono } from 'hono';
+    15→import { cors } from 'hono/cors';
+    16→import { logger as honoLogger } from 'hono/logger';
+    17→import { secureHeaders } from 'hono/secure-headers';
+    18→import { timing } from 'hono/timing';
+    19→import {
+    20→  requestContext,
+    21→  createErrorHandler,
+    22→  notFoundHandler,
+    23→  tracingMiddleware,
+    24→} from './middleware';
+    25→import { authRoutes, fleetRoutes, pmScheduleRoutes, mileageRoutes, optimizerRoutes, baselineRoutes, driftRoutes, manhourRoutes, canvasRoutes, costingRoutes, materialRoutes, scenarioRoutes, exportRoutes } from './routes';
+    26→import { success, type AppVariables } from './types';
+    27→import { logger } from '../lib/logging/logger';
+    28→
+    29→/**
+    30→ * Create the main Hono application
+    31→ */
+    32→export function createApp(): Hono<{ Variables: AppVariables }> {
+    33→  const app = new Hono<{ Variables: AppVariables }>();
+    34→
+    35→  // ==========================================================================
+    36→  // Global Middleware
+    37→  // ==========================================================================
+    38→
+    39→  // Security headers
+    40→  app.use('*', secureHeaders());
+    41→
+    42→  // CORS configuration
+    43→  app.use(
+    44→    '*',
+    45→    cors({
+    46→      origin: (origin) => {
+    47→        // Allow localhost for development
+    48→        if (!origin) return '';
+    49→        if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+    50→          return origin;
+    51→        }
+    52→        // Add production origins here
+    53→        return '';
+    54→      },
+    55→      allowMethods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+    56→      allowHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+    57→      exposeHeaders: ['X-Request-ID', 'X-Response-Time'],
+    58→      maxAge: 3600,
+    59→      credentials: true,
+    60→    })
+    61→  );
+    62→
+    63→  // Request ID and timing
+    64→  app.use('*', requestContext());
+    65→
+    66→  // Server timing headers
+    67→  app.use('*', timing());
+    68→
+    69→  // Request logging (development)
+    70→  if (process.env.NODE_ENV !== 'production') {
+    71→    app.use('*', honoLogger());
+    72→  }
+    73→
+    74→  // OpenTelemetry tracing
+    75→  app.use('*', tracingMiddleware());
+    76→
+    77→  // ==========================================================================
+    78→  // Health Endpoints (outside /api/v1)
+    79→  // ==========================================================================
+    80→
+    81→  /**
+    82→   * GET /health
+    83→   *
+    84→   * Liveness probe - returns 200 if process is running.
+    85→   */
+    86→  app.get('/health', (c) => {
+    87→    return c.json({ status: 'healthy', timestamp: new Date().toISOString() });
+    88→  });
+    89→
+    90→  /**
+    91→   * GET /ready
+    92→   *
+    93→   * Readiness probe - returns 200 if service is ready to accept traffic.
+    94→   * Should check database, Redis, and external service connections.
+    95→   */
+    96→  app.get('/ready', async (c) => {
+    97→    // TODO: Add actual health checks (DB, Redis, etc.)
+    98→    const checks = {
+    99→      database: 'healthy',
+   100→      redis: 'healthy',
+   101→      timestamp: new Date().toISOString(),
+   102→    };
+   103→
+   104→    return c.json({ status: 'ready', checks });
+   105→  });
+   106→
+   107→  // ==========================================================================
+   108→  // API v1 Routes
+   109→  // ==========================================================================
+   110→
+   111→  const api = new Hono<{ Variables: AppVariables }>();
+   112→
+   113→  /**
+   114→   * GET /api/v1
+   115→   *
+   116→   * API information endpoint.
+   117→   */
+   118→  api.get('/', (c) => {
+   119→    return c.json(
+   120→      success({
+   121→        name: 'MMS API',
+   122→        version: '1.0.0',
+   123→        description: 'Metro Fleet Mileage Management System API',
+   124→        documentation: '/api/v1/docs',
+   125→      })
+   126→    );
+   127→  });
+   128→
+   129→  // Authentication Routes
+   130→  api.route('/', authRoutes);
+   131→
+   132→  // Fleet Management Routes
+   133→  api.route('/', fleetRoutes);
+   134→
+   135→  // PM Schedule Management Routes
+   136→  api.route('/', pmScheduleRoutes);
+   137→
+   138→  // Mileage Management Routes
+   139→  api.route('/', mileageRoutes);
+   140→
+   141→  // Optimizer Routes
+   142→  api.route('/', optimizerRoutes);
+   143→
+   144→  // Baseline Management Routes
+   145→  api.route('/', baselineRoutes);
+   146→
+   147→  // Drift Analysis Routes
+   148→  api.route('/', driftRoutes);
+   149→
+   150→  // Man-hour Management Routes
+   151→  api.route('/', manhourRoutes);
+   152→
+   153→  // Canvas Data Routes
+   154→  api.route('/', canvasRoutes);
+   155→
+   156→  // Costing Routes
+   157→  api.route('/', costingRoutes);
+   158→
+   159→  // Material Management Routes
+   160→  api.route('/', materialRoutes);
+   161→
+   162→  // Scenario Management Routes
+   163→  api.route('/', scenarioRoutes);
+   164→
+   165→  // Export Routes
+   166→  api.route('/', exportRoutes);
+   167→
+   168→  // Mount API at /api/v1
+   169→  app.route('/api/v1', api);
+   170→
+   171→  // ==========================================================================
+   172→  // Error Handling
+   173→  // ==========================================================================
+   174→
+   175→  // Not found handler for unmatched routes
+   176→  app.notFound(notFoundHandler());
+   177→
+   178→  // Global error handler
+   179→  app.onError(createErrorHandler());
+   180→
+   181→  return app;
+   182→}
+   183→
+   184→/**
+   185→ * Singleton app instance
+   186→ */
+   187→let appInstance: Hono<{ Variables: AppVariables }> | null = null;
+   188→
+   189→/**
+   190→ * Get the Hono app instance (creates if not exists)
+   191→ */
+   192→export function getApp(): Hono<{ Variables: AppVariables }> {
+   193→  if (!appInstance) {
+   194→    appInstance = createApp();
+   195→    logger.info('MMS API initialized');
+   196→  }
+   197→  return appInstance;
+   198→}
+   199→
+   200→/**
+   201→ * Export types for external use
+   202→ */
+   203→export type {
+   204→  SuccessResponse,
+   205→  ErrorResponse,
+   206→  PaginationMeta,
+   207→  AppVariables,
+   208→  AuthUser,
+   209→} from './types';
+   210→export { success, paginatedSuccess, error, ErrorCodes } from './types';
+   211→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

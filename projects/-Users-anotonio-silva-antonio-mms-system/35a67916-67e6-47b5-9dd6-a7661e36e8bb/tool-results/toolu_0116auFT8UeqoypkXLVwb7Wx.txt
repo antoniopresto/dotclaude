@@ -1,0 +1,434 @@
+     1→/**
+     2→ * Fleet Management Routes
+     3→ *
+     4→ * REST endpoints for fleet, train, depot, and route management.
+     5→ * Wraps FleetService with HTTP interface per spec 005.3.
+     6→ *
+     7→ * @see specs/005-api.md Section 5.3
+     8→ */
+     9→
+    10→import { Hono } from 'hono';
+    11→import {
+    12→  success,
+    13→  paginatedSuccess,
+    14→  error,
+    15→  parsePaginationQuery,
+    16→  ErrorCodes,
+    17→  type AppVariables,
+    18→} from '../types';
+    19→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    20→import { getFleetService, type TrainListFilters, type FleetListFilters } from '../../services';
+    21→import { isValidUuid } from '../../lib/schemas';
+    22→
+    23→// Singleton service instance
+    24→let fleetService: ReturnType<typeof getFleetService> | null = null;
+    25→
+    26→function getService(): ReturnType<typeof getFleetService> {
+    27→  if (!fleetService) {
+    28→    fleetService = getFleetService();
+    29→  }
+    30→  return fleetService;
+    31→}
+    32→
+    33→export const fleetRoutes = new Hono<{ Variables: AppVariables }>();
+    34→
+    35→/**
+    36→ * GET /fleets
+    37→ *
+    38→ * List all fleet types with train counts.
+    39→ */
+    40→fleetRoutes.get('/fleets', async (c) => {
+    41→  const service = getService();
+    42→
+    43→  // Parse query filters
+    44→  const filters: FleetListFilters = {};
+    45→  const baseDepotId = c.req.query('baseDepotId');
+    46→  const manufacturer = c.req.query('manufacturer');
+    47→  const active = c.req.query('active');
+    48→
+    49→  if (baseDepotId && isValidUuid(baseDepotId)) {
+    50→    filters.baseDepotId = baseDepotId;
+    51→  }
+    52→  if (manufacturer) {
+    53→    filters.manufacturer = manufacturer;
+    54→  }
+    55→  if (active !== undefined) {
+    56→    filters.active = active === 'true';
+    57→  }
+    58→
+    59→  const fleets = await service.listFleets(filters);
+    60→
+    61→  // Enrich with train counts using fleet statistics
+    62→  const enrichedFleets = await Promise.all(
+    63→    fleets.map(async (fleet) => {
+    64→      try {
+    65→        const stats = await service.getFleetStatistics(fleet.id);
+    66→        return {
+    67→          id: fleet.id,
+    68→          code: fleet.code,
+    69→          name: fleet.name,
+    70→          manufacturer: fleet.manufacturer,
+    71→          model: fleet.model,
+    72→          carsPerTrain: fleet.carsPerTrain,
+    73→          trainCount: stats.totalTrains,
+    74→          activeTrainCount: stats.activeTrains,
+    75→        };
+    76→      } catch {
+    77→        // If statistics fail, return basic fleet data
+    78→        return {
+    79→          id: fleet.id,
+    80→          code: fleet.code,
+    81→          name: fleet.name,
+    82→          manufacturer: fleet.manufacturer,
+    83→          model: fleet.model,
+    84→          carsPerTrain: fleet.carsPerTrain,
+    85→          trainCount: 0,
+    86→          activeTrainCount: 0,
+    87→        };
+    88→      }
+    89→    })
+    90→  );
+    91→
+    92→  return c.json(
+    93→    success(enrichedFleets, {
+    94→      timing: { durationMs: getRequestDuration(c) },
+    95→    })
+    96→  );
+    97→});
+    98→
+    99→/**
+   100→ * GET /fleets/:id
+   101→ *
+   102→ * Get fleet details by ID.
+   103→ */
+   104→fleetRoutes.get('/fleets/:id', async (c) => {
+   105→  const requestId = getRequestId(c);
+   106→  const fleetId = c.req.param('id');
+   107→
+   108→  if (!isValidUuid(fleetId)) {
+   109→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid fleet ID format', requestId), 400);
+   110→  }
+   111→
+   112→  const service = getService();
+   113→  const fleet = await service.getFleetById(fleetId);
+   114→  const stats = await service.getFleetStatistics(fleetId);
+   115→
+   116→  return c.json(
+   117→    success({
+   118→      id: fleet.id,
+   119→      code: fleet.code,
+   120→      name: fleet.name,
+   121→      manufacturer: fleet.manufacturer,
+   122→      model: fleet.model,
+   123→      carsPerTrain: fleet.carsPerTrain,
+   124→      trainCount: stats.totalTrains,
+   125→      activeTrainCount: stats.activeTrains,
+   126→      fitTrains: stats.fitTrains,
+   127→      restrictedTrains: stats.restrictedTrains,
+   128→      groundedTrains: stats.groundedTrains,
+   129→      statistics: {
+   130→        totalMileageKm: stats.totalMileageKm,
+   131→        averageMileageKm: stats.averageMileageKm,
+   132→        minMileageKm: stats.minMileageKm,
+   133→        maxMileageKm: stats.maxMileageKm,
+   134→      },
+   135→    })
+   136→  );
+   137→});
+   138→
+   139→/**
+   140→ * GET /trains
+   141→ *
+   142→ * List trains with filtering and pagination.
+   143→ */
+   144→fleetRoutes.get('/trains', async (c) => {
+   145→  const service = getService();
+   146→
+   147→  // Parse query filters
+   148→  const filters: TrainListFilters = {};
+   149→  const fleetId = c.req.query('fleetId');
+   150→  const depotId = c.req.query('depotId');
+   151→  const fitnessStatus = c.req.query('fitnessStatus');
+   152→  const active = c.req.query('active');
+   153→
+   154→  if (fleetId && isValidUuid(fleetId)) {
+   155→    filters.fleetId = fleetId;
+   156→  }
+   157→  if (depotId && isValidUuid(depotId)) {
+   158→    filters.depotId = depotId;
+   159→  }
+   160→  if (fitnessStatus) {
+   161→    const validStatuses = ['FIT', 'RESTRICTED', 'GROUNDED'] as const;
+   162→    if (validStatuses.includes(fitnessStatus as (typeof validStatuses)[number])) {
+   163→      filters.fitnessStatus = fitnessStatus as 'FIT' | 'RESTRICTED' | 'GROUNDED';
+   164→    }
+   165→  }
+   166→  if (active !== undefined) {
+   167→    filters.active = active === 'true';
+   168→  }
+   169→
+   170→  // Parse pagination
+   171→  const pagination = parsePaginationQuery({
+   172→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   173→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   174→    sort: c.req.query('sort'),
+   175→  });
+   176→
+   177→  const result = await service.listTrains(filters, {
+   178→    page: pagination.page,
+   179→    pageSize: pagination.pageSize,
+   180→    sortBy: pagination.sort?.field,
+   181→    sortOrder: pagination.sort?.direction,
+   182→  });
+   183→
+   184→  // Map to API response format
+   185→  // Calculate mileage variance as current - target
+   186→  const trains = result.data.map((train) => ({
+   187→    id: train.id,
+   188→    trainNumber: train.trainNumber,
+   189→    fleetId: train.fleetId,
+   190→    currentMileageKm: train.currentMileageKm,
+   191→    targetMileageKm: train.targetMileageKm,
+   192→    mileageVarianceKm: train.targetMileageKm
+   193→      ? train.currentMileageKm - train.targetMileageKm
+   194→      : null,
+   195→    fitnessStatus: train.fitnessStatus,
+   196→    currentDepotId: train.currentDepotId,
+   197→    homeDepotId: train.homeDepotId,
+   198→    commissioningDate: train.commissioningDate,
+   199→    isActive: train.active,
+   200→  }));
+   201→
+   202→  return c.json(
+   203→    paginatedSuccess(
+   204→      trains,
+   205→      {
+   206→        page: result.page,
+   207→        pageSize: result.pageSize,
+   208→        totalItems: result.total,
+   209→      },
+   210→      { durationMs: getRequestDuration(c) }
+   211→    )
+   212→  );
+   213→});
+   214→
+   215→/**
+   216→ * GET /trains/:id
+   217→ *
+   218→ * Get detailed train information.
+   219→ */
+   220→fleetRoutes.get('/trains/:id', async (c) => {
+   221→  const requestId = getRequestId(c);
+   222→  const trainId = c.req.param('id');
+   223→
+   224→  if (!isValidUuid(trainId)) {
+   225→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid train ID format', requestId), 400);
+   226→  }
+   227→
+   228→  const service = getService();
+   229→  const trainWithDetails = await service.getTrainWithDetails(trainId);
+   230→
+   231→  // Calculate mileage variance
+   232→  const mileageVarianceKm = trainWithDetails.targetMileageKm
+   233→    ? trainWithDetails.currentMileageKm - trainWithDetails.targetMileageKm
+   234→    : null;
+   235→
+   236→  return c.json(
+   237→    success({
+   238→      id: trainWithDetails.id,
+   239→      trainNumber: trainWithDetails.trainNumber,
+   240→      fleet: trainWithDetails.fleet
+   241→        ? {
+   242→            id: trainWithDetails.fleet.id,
+   243→            code: trainWithDetails.fleet.code,
+   244→            name: trainWithDetails.fleet.name,
+   245→          }
+   246→        : null,
+   247→      currentMileageKm: trainWithDetails.currentMileageKm,
+   248→      targetMileageKm: trainWithDetails.targetMileageKm,
+   249→      mileageVarianceKm,
+   250→      fitnessStatus: trainWithDetails.fitnessStatus,
+   251→      fitnessNotes: trainWithDetails.fitnessNotes,
+   252→      currentDepot: trainWithDetails.currentDepot
+   253→        ? {
+   254→            id: trainWithDetails.currentDepot.id,
+   255→            code: trainWithDetails.currentDepot.code,
+   256→            name: trainWithDetails.currentDepot.name,
+   257→          }
+   258→        : null,
+   259→      homeDepot: trainWithDetails.homeDepot
+   260→        ? {
+   261→            id: trainWithDetails.homeDepot.id,
+   262→            code: trainWithDetails.homeDepot.code,
+   263→            name: trainWithDetails.homeDepot.name,
+   264→          }
+   265→        : null,
+   266→      commissioningDate: trainWithDetails.commissioningDate,
+   267→      isActive: trainWithDetails.active,
+   268→    })
+   269→  );
+   270→});
+   271→
+   272→/**
+   273→ * PATCH /trains/:id
+   274→ *
+   275→ * Update train properties (fitness status, notes).
+   276→ */
+   277→fleetRoutes.patch('/trains/:id', async (c) => {
+   278→  const requestId = getRequestId(c);
+   279→  const trainId = c.req.param('id');
+   280→
+   281→  if (!isValidUuid(trainId)) {
+   282→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid train ID format', requestId), 400);
+   283→  }
+   284→
+   285→  const body = await c.req.json();
+   286→  const service = getService();
+   287→
+   288→  // Handle fitness status change
+   289→  if (body.fitnessStatus) {
+   290→    const validStatuses = ['FIT', 'RESTRICTED', 'GROUNDED'];
+   291→    if (!validStatuses.includes(body.fitnessStatus)) {
+   292→      return c.json(
+   293→        error(
+   294→          ErrorCodes.VALIDATION_ERROR,
+   295→          `Invalid fitness status. Must be one of: ${validStatuses.join(', ')}`,
+   296→          requestId
+   297→        ),
+   298→        400
+   299→      );
+   300→    }
+   301→
+   302→    await service.updateFitnessStatus({
+   303→      trainId,
+   304→      newStatus: body.fitnessStatus,
+   305→      notes: body.fitnessNotes,
+   306→      changedBy: c.get('user')?.id,
+   307→    });
+   308→  }
+   309→
+   310→  // Get updated train
+   311→  const updatedTrain = await service.getTrainById(trainId);
+   312→
+   313→  return c.json(
+   314→    success({
+   315→      id: updatedTrain.id,
+   316→      fitnessStatus: updatedTrain.fitnessStatus,
+   317→      fitnessNotes: updatedTrain.fitnessNotes,
+   318→      updatedAt: updatedTrain.updatedAt,
+   319→    })
+   320→  );
+   321→});
+   322→
+   323→/**
+   324→ * GET /depots
+   325→ *
+   326→ * List all depots.
+   327→ */
+   328→fleetRoutes.get('/depots', async (c) => {
+   329→  const service = getService();
+   330→  const depots = await service.listDepots();
+   331→
+   332→  return c.json(
+   333→    success(
+   334→      depots.map((depot) => ({
+   335→        id: depot.id,
+   336→        code: depot.code,
+   337→        name: depot.name,
+   338→        location: depot.location,
+   339→        timezone: depot.timezone,
+   340→        isActive: depot.active,
+   341→      }))
+   342→    )
+   343→  );
+   344→});
+   345→
+   346→/**
+   347→ * GET /depots/:id
+   348→ *
+   349→ * Get depot details by ID.
+   350→ */
+   351→fleetRoutes.get('/depots/:id', async (c) => {
+   352→  const requestId = getRequestId(c);
+   353→  const depotId = c.req.param('id');
+   354→
+   355→  if (!isValidUuid(depotId)) {
+   356→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid depot ID format', requestId), 400);
+   357→  }
+   358→
+   359→  const service = getService();
+   360→  const depot = await service.getDepotById(depotId);
+   361→
+   362→  return c.json(
+   363→    success({
+   364→      id: depot.id,
+   365→      code: depot.code,
+   366→      name: depot.name,
+   367→      location: depot.location,
+   368→      timezone: depot.timezone,
+   369→      isActive: depot.active,
+   370→    })
+   371→  );
+   372→});
+   373→
+   374→/**
+   375→ * GET /routes
+   376→ *
+   377→ * List all routes.
+   378→ */
+   379→fleetRoutes.get('/routes', async (c) => {
+   380→  const service = getService();
+   381→  const routes = await service.listRoutes();
+   382→
+   383→  return c.json(
+   384→    success(
+   385→      routes.map((route) => ({
+   386→        id: route.id,
+   387→        code: route.routeCode,
+   388→        name: route.routeName,
+   389→        expectedKmPerDay: route.expectedKmPerDay,
+   390→        requiredTrains: route.requiredTrains,
+   391→        allowedFleetIds: route.allowedFleetIds,
+   392→        signalingSystem: route.signalingSystem,
+   393→        powerSystem: route.powerSystem,
+   394→        isActive: route.active,
+   395→      }))
+   396→    )
+   397→  );
+   398→});
+   399→
+   400→/**
+   401→ * GET /routes/:id
+   402→ *
+   403→ * Get route details by ID.
+   404→ */
+   405→fleetRoutes.get('/routes/:id', async (c) => {
+   406→  const requestId = getRequestId(c);
+   407→  const routeId = c.req.param('id');
+   408→
+   409→  if (!isValidUuid(routeId)) {
+   410→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid route ID format', requestId), 400);
+   411→  }
+   412→
+   413→  const service = getService();
+   414→  const route = await service.getRouteById(routeId);
+   415→
+   416→  return c.json(
+   417→    success({
+   418→      id: route.id,
+   419→      code: route.routeCode,
+   420→      name: route.routeName,
+   421→      expectedKmPerDay: route.expectedKmPerDay,
+   422→      requiredTrains: route.requiredTrains,
+   423→      allowedFleetIds: route.allowedFleetIds,
+   424→      signalingSystem: route.signalingSystem,
+   425→      powerSystem: route.powerSystem,
+   426→      isActive: route.active,
+   427→    })
+   428→  );
+   429→});
+   430→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,478 @@
+     1→/**
+     2→ * Overlay Data Slice
+     3→ *
+     4→ * State management for canvas overlay panels: man-hours and drift analysis.
+     5→ * These overlays provide actionable insights on top of the PM schedule canvas.
+     6→ *
+     7→ * @see specs/006-user-interface.md Section 6.4.3
+     8→ */
+     9→
+    10→import { createSlice } from '@belt/tools';
+    11→
+    12→// =============================================================================
+    13→// Man-Hour Overlay Types
+    14→// =============================================================================
+    15→
+    16→export type ManhourStatus = 'OVERLOADED' | 'OPTIMAL' | 'UNDERUTILIZED';
+    17→
+    18→export interface ManhourAdjustment {
+    19→  type: string;
+    20→  hours: number;
+    21→  status: string;
+    22→}
+    23→
+    24→export interface DepotManhourData {
+    25→  depotId: string;
+    26→  depotCode: string;
+    27→  requiredHours: number;
+    28→  availableHours: number;
+    29→  utilizationPct: number;
+    30→  status: ManhourStatus;
+    31→  adjustments: ManhourAdjustment[];
+    32→}
+    33→
+    34→export interface ManhourWeekData {
+    35→  weekStart: string;
+    36→  depots: DepotManhourData[];
+    37→}
+    38→
+    39→export interface ManhourOverlayData {
+    40→  weeks: ManhourWeekData[];
+    41→}
+    42→
+    43→// =============================================================================
+    44→// Drift Overlay Types
+    45→// =============================================================================
+    46→
+    47→export type DriftSeverity = 'GREEN' | 'YELLOW' | 'RED';
+    48→
+    49→export interface PmDrift {
+    50→  pmId: string;
+    51→  driftDays: number;
+    52→}
+    53→
+    54→export interface TrainDriftData {
+    55→  trainId: string;
+    56→  trainNumber: string;
+    57→  driftSeverity: DriftSeverity;
+    58→  mileageDriftPct: number;
+    59→  pmDrifts: PmDrift[];
+    60→}
+    61→
+    62→export interface DriftOverlayData {
+    63→  baselineId: string;
+    64→  baselineName: string;
+    65→  trains: TrainDriftData[];
+    66→}
+    67→
+    68→export interface DriftRecommendation {
+    69→  trainId: string;
+    70→  trainNumber: string;
+    71→  recommendation: 'REPLAN' | 'MONITOR' | 'OK';
+    72→  reason: string;
+    73→  priority: 'HIGH' | 'MEDIUM' | 'LOW';
+    74→}
+    75→
+    76→// =============================================================================
+    77→// Overlay State
+    78→// =============================================================================
+    79→
+    80→export interface OverlaySliceState {
+    81→  // Man-hour overlay
+    82→  manhourData: ManhourOverlayData | null;
+    83→  manhourLoading: boolean;
+    84→  manhourError: string | null;
+    85→  manhourLastFetch: number | null;
+    86→  manhourWeeks: number;
+    87→  manhourDepotFilter: string | null;
+    88→  manhourExpandedWeeks: string[];
+    89→
+    90→  // Drift overlay
+    91→  driftData: DriftOverlayData | null;
+    92→  driftLoading: boolean;
+    93→  driftError: string | null;
+    94→  driftLastFetch: number | null;
+    95→  driftBaselineId: string | null;
+    96→  driftSeverityFilter: DriftSeverity | null;
+    97→  driftExpandedTrains: string[];
+    98→  driftRecommendations: DriftRecommendation[];
+    99→
+   100→  // Panel state
+   101→  manhourPanelExpanded: boolean;
+   102→  driftPanelExpanded: boolean;
+   103→
+   104→  [key: string]: unknown;
+   105→}
+   106→
+   107→const initialOverlayState: OverlaySliceState = {
+   108→  // Man-hour overlay
+   109→  manhourData: null,
+   110→  manhourLoading: false,
+   111→  manhourError: null,
+   112→  manhourLastFetch: null,
+   113→  manhourWeeks: 12,
+   114→  manhourDepotFilter: null,
+   115→  manhourExpandedWeeks: [],
+   116→
+   117→  // Drift overlay
+   118→  driftData: null,
+   119→  driftLoading: false,
+   120→  driftError: null,
+   121→  driftLastFetch: null,
+   122→  driftBaselineId: null,
+   123→  driftSeverityFilter: null,
+   124→  driftExpandedTrains: [],
+   125→  driftRecommendations: [],
+   126→
+   127→  // Panel state
+   128→  manhourPanelExpanded: true,
+   129→  driftPanelExpanded: true,
+   130→};
+   131→
+   132→export const overlaySlice = createSlice({
+   133→  id: 'overlay',
+   134→  initial: initialOverlayState,
+   135→  cache: { policy: 'session' },
+   136→  reducers: {
+   137→    // ==========================================================================
+   138→    // Man-hour Overlay Reducers
+   139→    // ==========================================================================
+   140→
+   141→    setManhourLoading: (s, loading: boolean) => {
+   142→      const state = s as OverlaySliceState;
+   143→      state.manhourLoading = loading;
+   144→    },
+   145→
+   146→    setManhourData: (s, data: ManhourOverlayData) => {
+   147→      const state = s as OverlaySliceState;
+   148→      state.manhourData = data;
+   149→      state.manhourLoading = false;
+   150→      state.manhourError = null;
+   151→      state.manhourLastFetch = Date.now();
+   152→    },
+   153→
+   154→    setManhourError: (s, error: string) => {
+   155→      const state = s as OverlaySliceState;
+   156→      state.manhourError = error;
+   157→      state.manhourLoading = false;
+   158→    },
+   159→
+   160→    clearManhourData: (s) => {
+   161→      const state = s as OverlaySliceState;
+   162→      state.manhourData = null;
+   163→      state.manhourError = null;
+   164→      state.manhourLastFetch = null;
+   165→    },
+   166→
+   167→    setManhourWeeks: (s, weeks: number) => {
+   168→      const state = s as OverlaySliceState;
+   169→      state.manhourWeeks = weeks;
+   170→    },
+   171→
+   172→    setManhourDepotFilter: (s, depotId: string | null) => {
+   173→      const state = s as OverlaySliceState;
+   174→      state.manhourDepotFilter = depotId;
+   175→    },
+   176→
+   177→    expandManhourWeek: (s, weekStart: string) => {
+   178→      const state = s as OverlaySliceState;
+   179→      if (!state.manhourExpandedWeeks.includes(weekStart)) {
+   180→        state.manhourExpandedWeeks.push(weekStart);
+   181→      }
+   182→    },
+   183→
+   184→    collapseManhourWeek: (s, weekStart: string) => {
+   185→      const state = s as OverlaySliceState;
+   186→      state.manhourExpandedWeeks = state.manhourExpandedWeeks.filter(w => w !== weekStart);
+   187→    },
+   188→
+   189→    toggleManhourWeek: (s, weekStart: string) => {
+   190→      const state = s as OverlaySliceState;
+   191→      if (state.manhourExpandedWeeks.includes(weekStart)) {
+   192→        state.manhourExpandedWeeks = state.manhourExpandedWeeks.filter(w => w !== weekStart);
+   193→      } else {
+   194→        state.manhourExpandedWeeks.push(weekStart);
+   195→      }
+   196→    },
+   197→
+   198→    toggleManhourPanel: (s) => {
+   199→      const state = s as OverlaySliceState;
+   200→      state.manhourPanelExpanded = !state.manhourPanelExpanded;
+   201→    },
+   202→
+   203→    // ==========================================================================
+   204→    // Drift Overlay Reducers
+   205→    // ==========================================================================
+   206→
+   207→    setDriftLoading: (s, loading: boolean) => {
+   208→      const state = s as OverlaySliceState;
+   209→      state.driftLoading = loading;
+   210→    },
+   211→
+   212→    setDriftData: (s, data: DriftOverlayData) => {
+   213→      const state = s as OverlaySliceState;
+   214→      state.driftData = data;
+   215→      state.driftLoading = false;
+   216→      state.driftError = null;
+   217→      state.driftLastFetch = Date.now();
+   218→
+   219→      // Generate recommendations based on drift data
+   220→      state.driftRecommendations = data.trains
+   221→        .filter(t => t.driftSeverity !== 'GREEN')
+   222→        .map(train => ({
+   223→          trainId: train.trainId,
+   224→          trainNumber: train.trainNumber,
+   225→          recommendation: train.driftSeverity === 'RED' ? 'REPLAN' as const : 'MONITOR' as const,
+   226→          reason: train.driftSeverity === 'RED'
+   227→            ? `Mileage drift of ${Math.abs(train.mileageDriftPct).toFixed(1)}% exceeds threshold`
+   228→            : `Mileage drift approaching threshold at ${Math.abs(train.mileageDriftPct).toFixed(1)}%`,
+   229→          priority: train.driftSeverity === 'RED' ? 'HIGH' as const : 'MEDIUM' as const,
+   230→        }));
+   231→    },
+   232→
+   233→    setDriftError: (s, error: string) => {
+   234→      const state = s as OverlaySliceState;
+   235→      state.driftError = error;
+   236→      state.driftLoading = false;
+   237→    },
+   238→
+   239→    clearDriftData: (s) => {
+   240→      const state = s as OverlaySliceState;
+   241→      state.driftData = null;
+   242→      state.driftError = null;
+   243→      state.driftLastFetch = null;
+   244→      state.driftRecommendations = [];
+   245→    },
+   246→
+   247→    setDriftBaselineId: (s, baselineId: string | null) => {
+   248→      const state = s as OverlaySliceState;
+   249→      state.driftBaselineId = baselineId;
+   250→    },
+   251→
+   252→    setDriftSeverityFilter: (s, severity: DriftSeverity | null) => {
+   253→      const state = s as OverlaySliceState;
+   254→      state.driftSeverityFilter = severity;
+   255→    },
+   256→
+   257→    expandDriftTrain: (s, trainId: string) => {
+   258→      const state = s as OverlaySliceState;
+   259→      if (!state.driftExpandedTrains.includes(trainId)) {
+   260→        state.driftExpandedTrains.push(trainId);
+   261→      }
+   262→    },
+   263→
+   264→    collapseDriftTrain: (s, trainId: string) => {
+   265→      const state = s as OverlaySliceState;
+   266→      state.driftExpandedTrains = state.driftExpandedTrains.filter(t => t !== trainId);
+   267→    },
+   268→
+   269→    toggleDriftTrain: (s, trainId: string) => {
+   270→      const state = s as OverlaySliceState;
+   271→      if (state.driftExpandedTrains.includes(trainId)) {
+   272→        state.driftExpandedTrains = state.driftExpandedTrains.filter(t => t !== trainId);
+   273→      } else {
+   274→        state.driftExpandedTrains.push(trainId);
+   275→      }
+   276→    },
+   277→
+   278→    toggleDriftPanel: (s) => {
+   279→      const state = s as OverlaySliceState;
+   280→      state.driftPanelExpanded = !state.driftPanelExpanded;
+   281→    },
+   282→
+   283→    // ==========================================================================
+   284→    // General Reducers
+   285→    // ==========================================================================
+   286→
+   287→    reset: (s) => {
+   288→      const state = s as OverlaySliceState;
+   289→      Object.assign(state, initialOverlayState);
+   290→    },
+   291→  },
+   292→});
+   293→
+   294→// =============================================================================
+   295→// Data Loading Functions
+   296→// =============================================================================
+   297→
+   298→/**
+   299→ * Load man-hour overlay data from API
+   300→ */
+   301→export async function loadManhourOverlayData(
+   302→  dispatch: {
+   303→    setManhourLoading: (loading: boolean) => void;
+   304→    setManhourData: (data: ManhourOverlayData) => void;
+   305→    setManhourError: (error: string) => void;
+   306→  },
+   307→  options: { baseUrl?: string; weeks?: number; depotId?: string } = {}
+   308→): Promise<void> {
+   309→  const { baseUrl = '/api/v1', weeks = 12, depotId } = options;
+   310→
+   311→  dispatch.setManhourLoading(true);
+   312→
+   313→  const params = new URLSearchParams();
+   314→  params.set('weeks', String(weeks));
+   315→  if (depotId) {
+   316→    params.set('depotId', depotId);
+   317→  }
+   318→
+   319→  try {
+   320→    const response = await fetch(`${baseUrl}/canvas/manhour-overlay?${params}`);
+   321→
+   322→    if (!response.ok) {
+   323→      throw new Error(`Failed to fetch man-hour overlay: ${response.status}`);
+   324→    }
+   325→
+   326→    const json = await response.json() as { data: ManhourOverlayData };
+   327→    dispatch.setManhourData(json.data);
+   328→  } catch (error) {
+   329→    const message = error instanceof Error ? error.message : 'Unknown error';
+   330→    dispatch.setManhourError(message);
+   331→  }
+   332→}
+   333→
+   334→/**
+   335→ * Load drift overlay data from API
+   336→ */
+   337→export async function loadDriftOverlayData(
+   338→  dispatch: {
+   339→    setDriftLoading: (loading: boolean) => void;
+   340→    setDriftData: (data: DriftOverlayData) => void;
+   341→    setDriftError: (error: string) => void;
+   342→  },
+   343→  options: { baseUrl?: string; baselineId?: string } = {}
+   344→): Promise<void> {
+   345→  const { baseUrl = '/api/v1', baselineId } = options;
+   346→
+   347→  dispatch.setDriftLoading(true);
+   348→
+   349→  const params = new URLSearchParams();
+   350→  if (baselineId) {
+   351→    params.set('baselineId', baselineId);
+   352→  }
+   353→
+   354→  try {
+   355→    const response = await fetch(`${baseUrl}/canvas/drift-overlay?${params}`);
+   356→
+   357→    if (!response.ok) {
+   358→      throw new Error(`Failed to fetch drift overlay: ${response.status}`);
+   359→    }
+   360→
+   361→    const json = await response.json() as { data: DriftOverlayData };
+   362→    dispatch.setDriftData(json.data);
+   363→  } catch (error) {
+   364→    const message = error instanceof Error ? error.message : 'Unknown error';
+   365→    dispatch.setDriftError(message);
+   366→  }
+   367→}
+   368→
+   369→// =============================================================================
+   370→// Selectors
+   371→// =============================================================================
+   372→
+   373→/**
+   374→ * Get filtered man-hour weeks based on depot filter
+   375→ */
+   376→export function selectFilteredManhourWeeks(state: OverlaySliceState): ManhourWeekData[] {
+   377→  if (!state.manhourData) return [];
+   378→
+   379→  if (!state.manhourDepotFilter) {
+   380→    return state.manhourData.weeks;
+   381→  }
+   382→
+   383→  return state.manhourData.weeks.map(week => ({
+   384→    ...week,
+   385→    depots: week.depots.filter(d => d.depotId === state.manhourDepotFilter),
+   386→  }));
+   387→}
+   388→
+   389→/**
+   390→ * Get weeks with overloaded status
+   391→ */
+   392→export function selectOverloadedWeeks(state: OverlaySliceState): ManhourWeekData[] {
+   393→  if (!state.manhourData) return [];
+   394→
+   395→  return state.manhourData.weeks.filter(week =>
+   396→    week.depots.some(d => d.status === 'OVERLOADED')
+   397→  );
+   398→}
+   399→
+   400→/**
+   401→ * Get total overloaded hours across all weeks
+   402→ */
+   403→export function selectTotalOverloadedHours(state: OverlaySliceState): number {
+   404→  if (!state.manhourData) return 0;
+   405→
+   406→  return state.manhourData.weeks.reduce((total, week) => {
+   407→    return total + week.depots.reduce((weekTotal, depot) => {
+   408→      if (depot.status === 'OVERLOADED') {
+   409→        return weekTotal + (depot.requiredHours - depot.availableHours);
+   410→      }
+   411→      return weekTotal;
+   412→    }, 0);
+   413→  }, 0);
+   414→}
+   415→
+   416→/**
+   417→ * Get filtered trains based on drift severity filter
+   418→ */
+   419→export function selectFilteredDriftTrains(state: OverlaySliceState): TrainDriftData[] {
+   420→  if (!state.driftData) return [];
+   421→
+   422→  if (!state.driftSeverityFilter) {
+   423→    return state.driftData.trains;
+   424→  }
+   425→
+   426→  return state.driftData.trains.filter(t => t.driftSeverity === state.driftSeverityFilter);
+   427→}
+   428→
+   429→/**
+   430→ * Get trains requiring replan (RED severity)
+   431→ */
+   432→export function selectTrainsRequiringReplan(state: OverlaySliceState): TrainDriftData[] {
+   433→  if (!state.driftData) return [];
+   434→  return state.driftData.trains.filter(t => t.driftSeverity === 'RED');
+   435→}
+   436→
+   437→/**
+   438→ * Get drift summary statistics
+   439→ */
+   440→export function selectDriftSummaryStats(state: OverlaySliceState): {
+   441→  totalTrains: number;
+   442→  greenCount: number;
+   443→  yellowCount: number;
+   444→  redCount: number;
+   445→} {
+   446→  if (!state.driftData) {
+   447→    return { totalTrains: 0, greenCount: 0, yellowCount: 0, redCount: 0 };
+   448→  }
+   449→
+   450→  const trains = state.driftData.trains;
+   451→  return {
+   452→    totalTrains: trains.length,
+   453→    greenCount: trains.filter(t => t.driftSeverity === 'GREEN').length,
+   454→    yellowCount: trains.filter(t => t.driftSeverity === 'YELLOW').length,
+   455→    redCount: trains.filter(t => t.driftSeverity === 'RED').length,
+   456→  };
+   457→}
+   458→
+   459→/**
+   460→ * Check if man-hour data is stale (>5 minutes)
+   461→ */
+   462→export function isManhourDataStale(state: OverlaySliceState): boolean {
+   463→  if (!state.manhourLastFetch) return true;
+   464→  return Date.now() - state.manhourLastFetch > 5 * 60 * 1000;
+   465→}
+   466→
+   467→/**
+   468→ * Check if drift data is stale (>5 minutes)
+   469→ */
+   470→export function isDriftDataStale(state: OverlaySliceState): boolean {
+   471→  if (!state.driftLastFetch) return true;
+   472→  return Date.now() - state.driftLastFetch > 5 * 60 * 1000;
+   473→}
+   474→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

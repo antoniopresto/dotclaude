@@ -1,0 +1,528 @@
+     1→/**
+     2→ * Tactical Wide Layer
+     3→ *
+     4→ * deck.gl WebGL layer for the 1-year tactical-wide PM view.
+     5→ * Renders compressed Gantt blocks at monthly granularity:
+     6→ * - Rows = trains
+     7→ * - Columns = months
+     8→ * - Blocks = PM events compressed by month
+     9→ *
+    10→ * Used at zoom levels 4-8 (TACTICAL_WIDE).
+    11→ * Bridges the gap between strategic heatmap and tactical Gantt.
+    12→ *
+    13→ * @see specs/006-user-interface.md Section 6.3
+    14→ */
+    15→
+    16→import { PolygonLayer, TextLayer } from '@deck.gl/layers';
+    17→import DeckGL from '@deck.gl/react';
+    18→import { OrthographicView } from '@deck.gl/core';
+    19→
+    20→import type { TacticalWideCanvasData } from './types';
+    21→
+    22→// =============================================================================
+    23→// Constants
+    24→// =============================================================================
+    25→
+    26→const MONTH_WIDTH = 100;
+    27→const ROW_HEIGHT = 36;
+    28→const BLOCK_HEIGHT = 24;
+    29→const BLOCK_MARGIN = 2;
+    30→const LABEL_WIDTH = 120;
+    31→const HEADER_HEIGHT = 50;
+    32→
+    33→/** PM status colors (RGBA) matching spec 006.3.4 */
+    34→const PM_STATUS_COLORS: Record<string, [number, number, number, number]> = {
+    35→  SCHEDULED: [59, 130, 246, 255],    // Blue-500
+    36→  IN_PROGRESS: [245, 158, 11, 255],  // Amber-500
+    37→  COMPLETED: [34, 197, 94, 255],     // Green-500
+    38→  CANCELLED: [148, 163, 184, 255],   // Slate-400
+    39→  DEFERRED: [168, 85, 247, 255],     // Purple-500
+    40→  OVERDUE: [239, 68, 68, 255],       // Red-500
+    41→};
+    42→
+    43→/** Fleet colors */
+    44→const FLEET_COLORS: Record<string, [number, number, number, number]> = {
+    45→  KS: [14, 165, 233, 255],
+    46→  ALSTOM: [139, 92, 246, 255],
+    47→  DEFAULT: [100, 116, 139, 255],
+    48→};
+    49→
+    50→/** Month names for labels */
+    51→const MONTH_NAMES = [
+    52→  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    53→  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    54→];
+    55→
+    56→// =============================================================================
+    57→// Helper Types
+    58→// =============================================================================
+    59→
+    60→interface CompressedBlock {
+    61→  pmId: string;
+    62→  trainId: string;
+    63→  trainNumber: string;
+    64→  trainIndex: number;
+    65→  monthIndex: number;
+    66→  pmCode: string;
+    67→  targetDate: string;
+    68→  status: string;
+    69→  isLocked: boolean;
+    70→  weekOfMonth: number;
+    71→  durationWeeks: number;
+    72→  displayColor: string;
+    73→  polygon: [number, number][];
+    74→}
+    75→
+    76→interface MonthLabel {
+    77→  text: string;
+    78→  month: number;
+    79→  year: number;
+    80→  position: [number, number];
+    81→}
+    82→
+    83→interface TrainLabel {
+    84→  text: string;
+    85→  trainId: string;
+    86→  fleetCode: string;
+    87→  position: [number, number];
+    88→}
+    89→
+    90→// =============================================================================
+    91→// Helper Functions
+    92→// =============================================================================
+    93→
+    94→/**
+    95→ * Get the week of the month for a date (1-5)
+    96→ */
+    97→function getWeekOfMonth(dateStr: string): number {
+    98→  const date = new Date(dateStr);
+    99→  const day = date.getDate();
+   100→  return Math.ceil(day / 7);
+   101→}
+   102→
+   103→/**
+   104→ * Generate months between two dates
+   105→ */
+   106→function generateMonths(fromDate: Date, toDate: Date): Array<{ month: number; year: number }> {
+   107→  const months: Array<{ month: number; year: number }> = [];
+   108→  const current = new Date(fromDate.getFullYear(), fromDate.getMonth(), 1);
+   109→  const end = new Date(toDate.getFullYear(), toDate.getMonth(), 1);
+   110→
+   111→  while (current <= end) {
+   112→    months.push({ month: current.getMonth(), year: current.getFullYear() });
+   113→    current.setMonth(current.getMonth() + 1);
+   114→  }
+   115→
+   116→  return months;
+   117→}
+   118→
+   119→/**
+   120→ * Get month index from date string
+   121→ */
+   122→function getMonthIndex(dateStr: string, fromDate: Date): number {
+   123→  const date = new Date(dateStr);
+   124→  const yearDiff = date.getFullYear() - fromDate.getFullYear();
+   125→  const monthDiff = date.getMonth() - fromDate.getMonth();
+   126→  return yearDiff * 12 + monthDiff;
+   127→}
+   128→
+   129→/**
+   130→ * Calculate weeks duration from days
+   131→ */
+   132→function daysToWeeks(days: number): number {
+   133→  return Math.max(1, Math.ceil(days / 7));
+   134→}
+   135→
+   136→/**
+   137→ * Get color for PM status
+   138→ */
+   139→function getStatusColor(status: string): [number, number, number, number] {
+   140→  return PM_STATUS_COLORS[status] || PM_STATUS_COLORS.SCHEDULED;
+   141→}
+   142→
+   143→/**
+   144→ * Create polygon vertices for a compressed block
+   145→ */
+   146→function createBlockPolygon(
+   147→  monthIndex: number,
+   148→  trainIndex: number,
+   149→  weekOfMonth: number,
+   150→  durationWeeks: number
+   151→): [number, number][] {
+   152→  const weekWidth = MONTH_WIDTH / 5; // 5 weeks max per month
+   153→  const x = LABEL_WIDTH + monthIndex * MONTH_WIDTH + (weekOfMonth - 1) * weekWidth + BLOCK_MARGIN;
+   154→  const y = HEADER_HEIGHT + trainIndex * ROW_HEIGHT + (ROW_HEIGHT - BLOCK_HEIGHT) / 2;
+   155→  const width = Math.min(durationWeeks * weekWidth - BLOCK_MARGIN * 2, MONTH_WIDTH - BLOCK_MARGIN * 2);
+   156→  const height = BLOCK_HEIGHT;
+   157→
+   158→  return [
+   159→    [x, y],
+   160→    [x + width, y],
+   161→    [x + width, y + height],
+   162→    [x, y + height],
+   163→  ];
+   164→}
+   165→
+   166→/**
+   167→ * Transform API data into compressed blocks
+   168→ */
+   169→function transformToCompressedBlocks(
+   170→  data: TacticalWideCanvasData,
+   171→  fromDate: Date
+   172→): CompressedBlock[] {
+   173→  const blocks: CompressedBlock[] = [];
+   174→  const trainIndexMap = new Map<string, number>();
+   175→
+   176→  // Build train index map
+   177→  data.trains.forEach((train, index) => {
+   178→    trainIndexMap.set(train.trainId, index);
+   179→  });
+   180→
+   181→  // Create compressed blocks
+   182→  data.pmBlocks.forEach((pm) => {
+   183→    const trainIndex = trainIndexMap.get(pm.trainId);
+   184→    if (trainIndex === undefined) return;
+   185→
+   186→    const train = data.trains.find((t) => t.trainId === pm.trainId);
+   187→    if (!train) return;
+   188→
+   189→    const monthIndex = getMonthIndex(pm.targetDate, fromDate);
+   190→    const weekOfMonth = getWeekOfMonth(pm.targetDate);
+   191→    const durationWeeks = daysToWeeks(pm.durationDays);
+   192→
+   193→    blocks.push({
+   194→      pmId: pm.pmId,
+   195→      trainId: pm.trainId,
+   196→      trainNumber: train.trainNumber,
+   197→      trainIndex,
+   198→      monthIndex,
+   199→      pmCode: pm.pmCode,
+   200→      targetDate: pm.targetDate,
+   201→      status: pm.status,
+   202→      isLocked: pm.isLocked,
+   203→      weekOfMonth,
+   204→      durationWeeks,
+   205→      displayColor: pm.displayColor,
+   206→      polygon: createBlockPolygon(monthIndex, trainIndex, weekOfMonth, durationWeeks),
+   207→    });
+   208→  });
+   209→
+   210→  return blocks;
+   211→}
+   212→
+   213→// =============================================================================
+   214→// Component Props
+   215→// =============================================================================
+   216→
+   217→export interface TacticalWideLayerProps {
+   218→  data: TacticalWideCanvasData | null;
+   219→  fromDate: Date;
+   220→  toDate: Date;
+   221→  width: number | string;
+   222→  height: number | string;
+   223→  selectedPmIds?: string[];
+   224→  onBlockHover?: (block: CompressedBlock | null) => void;
+   225→  onBlockClick?: (block: CompressedBlock) => void;
+   226→  onMonthClick?: (month: number, year: number) => void;
+   227→}
+   228→
+   229→// =============================================================================
+   230→// Component
+   231→// =============================================================================
+   232→
+   233→/**
+   234→ * Tactical Wide View
+   235→ *
+   236→ * Renders compressed PM blocks at monthly granularity using deck.gl.
+   237→ * Optimized for 60fps rendering when viewing a full year of data.
+   238→ */
+   239→export function TacticalWideLayer({
+   240→  data,
+   241→  fromDate,
+   242→  toDate,
+   243→  width,
+   244→  height,
+   245→  selectedPmIds = [],
+   246→  onBlockHover,
+   247→  onBlockClick,
+   248→  onMonthClick,
+   249→}: TacticalWideLayerProps) {
+   250→  if (!data || data.trains.length === 0) {
+   251→    return (
+   252→      <div
+   253→        style={{
+   254→          width,
+   255→          height,
+   256→          display: 'flex',
+   257→          alignItems: 'center',
+   258→          justifyContent: 'center',
+   259→          color: 'var(--pt-text-muted)',
+   260→        }}
+   261→      >
+   262→        No tactical-wide data available
+   263→      </div>
+   264→    );
+   265→  }
+   266→
+   267→  const months = generateMonths(fromDate, toDate);
+   268→  const blocks = transformToCompressedBlocks(data, fromDate);
+   269→  const trainCount = data.trains.length;
+   270→
+   271→  const canvasWidth = LABEL_WIDTH + months.length * MONTH_WIDTH + 40;
+   272→  const canvasHeight = HEADER_HEIGHT + trainCount * ROW_HEIGHT + 40;
+   273→
+   274→  // Generate month labels
+   275→  const monthLabels: MonthLabel[] = months.map((m, index) => ({
+   276→    text: `${MONTH_NAMES[m.month]} ${m.year}`,
+   277→    month: m.month,
+   278→    year: m.year,
+   279→    position: [
+   280→      LABEL_WIDTH + index * MONTH_WIDTH + MONTH_WIDTH / 2,
+   281→      HEADER_HEIGHT / 2,
+   282→    ] as [number, number],
+   283→  }));
+   284→
+   285→  // Generate train labels
+   286→  const trainLabels: TrainLabel[] = data.trains.map((train, index) => ({
+   287→    text: train.trainNumber,
+   288→    trainId: train.trainId,
+   289→    fleetCode: train.fleetCode,
+   290→    position: [
+   291→      LABEL_WIDTH / 2,
+   292→      HEADER_HEIGHT + index * ROW_HEIGHT + ROW_HEIGHT / 2,
+   293→    ] as [number, number],
+   294→  }));
+   295→
+   296→  // Create grid lines for months
+   297→  const gridLines: Array<{ polygon: [number, number][] }> = months.map((_, index) => {
+   298→    const x = LABEL_WIDTH + index * MONTH_WIDTH;
+   299→    return {
+   300→      polygon: [
+   301→        [x, HEADER_HEIGHT],
+   302→        [x + 1, HEADER_HEIGHT],
+   303→        [x + 1, HEADER_HEIGHT + trainCount * ROW_HEIGHT],
+   304→        [x, HEADER_HEIGHT + trainCount * ROW_HEIGHT],
+   305→      ] as [number, number][],
+   306→    };
+   307→  });
+   308→
+   309→  // Create row lines for trains
+   310→  const rowLines: Array<{ polygon: [number, number][] }> = data.trains.map((_, index) => {
+   311→    const y = HEADER_HEIGHT + index * ROW_HEIGHT;
+   312→    return {
+   313→      polygon: [
+   314→        [LABEL_WIDTH, y],
+   315→        [LABEL_WIDTH + months.length * MONTH_WIDTH, y],
+   316→        [LABEL_WIDTH + months.length * MONTH_WIDTH, y + 1],
+   317→        [LABEL_WIDTH, y + 1],
+   318→      ] as [number, number][],
+   319→    };
+   320→  });
+   321→
+   322→  const layers = [
+   323→    // Grid lines - months
+   324→    new PolygonLayer<{ polygon: [number, number][] }>({
+   325→      id: 'month-grid',
+   326→      data: gridLines,
+   327→      pickable: false,
+   328→      filled: true,
+   329→      getPolygon: (d) => d.polygon,
+   330→      getFillColor: [226, 232, 240, 255], // Slate-200
+   331→    }),
+   332→
+   333→    // Grid lines - rows
+   334→    new PolygonLayer<{ polygon: [number, number][] }>({
+   335→      id: 'row-grid',
+   336→      data: rowLines,
+   337→      pickable: false,
+   338→      filled: true,
+   339→      getPolygon: (d) => d.polygon,
+   340→      getFillColor: [241, 245, 249, 255], // Slate-100
+   341→    }),
+   342→
+   343→    // PM Blocks
+   344→    new PolygonLayer<CompressedBlock>({
+   345→      id: 'pm-blocks',
+   346→      data: blocks,
+   347→      pickable: true,
+   348→      filled: true,
+   349→      stroked: true,
+   350→      extruded: false,
+   351→      getPolygon: (d) => d.polygon,
+   352→      getFillColor: (d) => {
+   353→        const color = getStatusColor(d.status);
+   354→        // Highlight selected blocks
+   355→        if (selectedPmIds.includes(d.pmId)) {
+   356→          return [color[0], color[1], color[2], 255] as [number, number, number, number];
+   357→        }
+   358→        return [color[0], color[1], color[2], 200] as [number, number, number, number];
+   359→      },
+   360→      getLineColor: (d) => {
+   361→        if (selectedPmIds.includes(d.pmId)) {
+   362→          return [30, 58, 138, 255]; // Blue-900 for selected
+   363→        }
+   364→        if (d.isLocked) {
+   365→          return [245, 158, 11, 255]; // Amber-500 for locked
+   366→        }
+   367→        return [100, 116, 139, 255]; // Slate-500
+   368→      },
+   369→      getLineWidth: (d) => (selectedPmIds.includes(d.pmId) ? 2 : 1),
+   370→      lineWidthMinPixels: 1,
+   371→      onHover: (info) => {
+   372→        if (onBlockHover) {
+   373→          onBlockHover(info.object ?? null);
+   374→        }
+   375→      },
+   376→      onClick: (info) => {
+   377→        if (info.object && onBlockClick) {
+   378→          onBlockClick(info.object);
+   379→        }
+   380→      },
+   381→      updateTriggers: {
+   382→        getFillColor: [selectedPmIds, data],
+   383→        getLineColor: [selectedPmIds],
+   384→        getLineWidth: [selectedPmIds],
+   385→      },
+   386→    }),
+   387→
+   388→    // PM Code Labels (on blocks)
+   389→    new TextLayer<CompressedBlock>({
+   390→      id: 'pm-labels',
+   391→      data: blocks.filter((b) => b.durationWeeks >= 2), // Only show labels on larger blocks
+   392→      pickable: false,
+   393→      getPosition: (d) => {
+   394→        const x = (d.polygon[0][0] + d.polygon[1][0]) / 2;
+   395→        const y = (d.polygon[0][1] + d.polygon[2][1]) / 2;
+   396→        return [x, y, 0] as [number, number, number];
+   397→      },
+   398→      getText: (d) => d.pmCode,
+   399→      getSize: 10,
+   400→      getAngle: 0,
+   401→      getTextAnchor: 'middle',
+   402→      getAlignmentBaseline: 'center',
+   403→      getColor: [255, 255, 255, 255],
+   404→      fontFamily: 'Inter, system-ui, sans-serif',
+   405→      fontWeight: 600,
+   406→    }),
+   407→
+   408→    // Train labels
+   409→    new TextLayer<TrainLabel>({
+   410→      id: 'train-labels',
+   411→      data: trainLabels,
+   412→      pickable: false,
+   413→      getPosition: (d) => [...d.position, 0] as [number, number, number],
+   414→      getText: (d) => d.text,
+   415→      getSize: 12,
+   416→      getAngle: 0,
+   417→      getTextAnchor: 'middle',
+   418→      getAlignmentBaseline: 'center',
+   419→      getColor: (d) => FLEET_COLORS[d.fleetCode] || FLEET_COLORS.DEFAULT,
+   420→      fontFamily: 'Inter, system-ui, sans-serif',
+   421→      fontWeight: 600,
+   422→    }),
+   423→
+   424→    // Month labels
+   425→    new TextLayer<MonthLabel>({
+   426→      id: 'month-labels',
+   427→      data: monthLabels,
+   428→      pickable: true,
+   429→      getPosition: (d) => [...d.position, 0] as [number, number, number],
+   430→      getText: (d) => d.text,
+   431→      getSize: 12,
+   432→      getAngle: 0,
+   433→      getTextAnchor: 'middle',
+   434→      getAlignmentBaseline: 'center',
+   435→      getColor: [30, 41, 59, 255], // Slate-800
+   436→      fontFamily: 'Inter, system-ui, sans-serif',
+   437→      fontWeight: 700,
+   438→      onClick: (info) => {
+   439→        if (info.object && onMonthClick) {
+   440→          onMonthClick(info.object.month, info.object.year);
+   441→        }
+   442→      },
+   443→    }),
+   444→  ];
+   445→
+   446→  const initialViewState = {
+   447→    target: [canvasWidth / 2, canvasHeight / 2, 0] as [number, number, number],
+   448→    zoom: 0,
+   449→    minZoom: -2,
+   450→    maxZoom: 4,
+   451→  };
+   452→
+   453→  return (
+   454→    <DeckGL
+   455→      width={width}
+   456→      height={height}
+   457→      views={new OrthographicView({ id: 'main' })}
+   458→      initialViewState={initialViewState}
+   459→      controller={{
+   460→        scrollZoom: true,
+   461→        dragPan: true,
+   462→        dragRotate: false,
+   463→        doubleClickZoom: true,
+   464→        touchZoom: true,
+   465→        touchRotate: false,
+   466→        keyboard: true,
+   467→      }}
+   468→      layers={layers}
+   469→      getCursor={({ isHovering }) => (isHovering ? 'pointer' : 'grab')}
+   470→      style={{ position: 'absolute', top: '0', left: '0' }}
+   471→    />
+   472→  );
+   473→}
+   474→
+   475→// =============================================================================
+   476→// Tooltip Component
+   477→// =============================================================================
+   478→
+   479→export interface TacticalWideTooltipProps {
+   480→  block: CompressedBlock | null;
+   481→  x: number;
+   482→  y: number;
+   483→}
+   484→
+   485→/**
+   486→ * Tooltip for PM block hover
+   487→ */
+   488→export function TacticalWideTooltip({ block, x, y }: TacticalWideTooltipProps) {
+   489→  if (!block) return null;
+   490→
+   491→  return (
+   492→    <div
+   493→      style={{
+   494→        position: 'absolute',
+   495→        left: x + 10,
+   496→        top: y + 10,
+   497→        backgroundColor: 'white',
+   498→        border: '1px solid #e2e8f0',
+   499→        borderRadius: '6px',
+   500→        padding: '8px 12px',
+   501→        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   502→        pointerEvents: 'none',
+   503→        zIndex: 100,
+   504→        fontSize: '12px',
+   505→        lineHeight: 1.5,
+   506→      }}
+   507→    >
+   508→      <div style={{ fontWeight: 600, marginBottom: '4px' }}>
+   509→        {block.pmCode} - Train {block.trainNumber}
+   510→      </div>
+   511→      <div style={{ color: '#64748b' }}>
+   512→        <div>Target Date: <strong>{block.targetDate}</strong></div>
+   513→        <div>Status: <strong>{block.status}</strong></div>
+   514→        <div>Duration: <strong>~{block.durationWeeks} week(s)</strong></div>
+   515→        {block.isLocked && (
+   516→          <div style={{ color: '#d97706' }}>🔒 Locked</div>
+   517→        )}
+   518→      </div>
+   519→    </div>
+   520→  );
+   521→}
+   522→
+   523→export default TacticalWideLayer;
+   524→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

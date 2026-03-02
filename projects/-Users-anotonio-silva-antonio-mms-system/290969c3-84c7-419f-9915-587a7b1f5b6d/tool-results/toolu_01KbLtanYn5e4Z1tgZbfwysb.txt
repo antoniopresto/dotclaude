@@ -1,0 +1,315 @@
+     1→/**
+     2→ * Authentication Routes
+     3→ *
+     4→ * REST endpoints for user authentication and session management.
+     5→ * Implements JWT-based authentication per spec 005.2.
+     6→ *
+     7→ * Endpoints:
+     8→ * - POST /auth/login - Authenticate user and obtain tokens
+     9→ * - POST /auth/refresh - Refresh access token
+    10→ * - POST /auth/logout - Invalidate session
+    11→ *
+    12→ * @see specs/005-api.md Section 5.2
+    13→ */
+    14→
+    15→import { Hono } from 'hono';
+    16→import {
+    17→  success,
+    18→  error,
+    19→  ErrorCodes,
+    20→  type AppVariables,
+    21→} from '../types';
+    22→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    23→import {
+    24→  getAuthService,
+    25→  type LoginRequest,
+    26→  type RefreshRequest,
+    27→} from '../../services/auth';
+    28→import { validateLoginRequest } from '../../lib/schemas';
+    29→import {
+    30→  AuthenticationError,
+    31→  TokenExpiredError,
+    32→  InvalidTokenError,
+    33→  isMmsError,
+    34→} from '../../lib/errors';
+    35→
+    36→// Singleton service instance
+    37→let authService: ReturnType<typeof getAuthService> | null = null;
+    38→
+    39→function getService(): ReturnType<typeof getAuthService> {
+    40→  if (!authService) {
+    41→    authService = getAuthService();
+    42→  }
+    43→  return authService;
+    44→}
+    45→
+    46→export const authRoutes = new Hono<{ Variables: AppVariables }>();
+    47→
+    48→/**
+    49→ * POST /auth/login
+    50→ *
+    51→ * Authenticate user with email and password.
+    52→ * Returns access token, refresh token, and user information.
+    53→ */
+    54→authRoutes.post('/auth/login', async (c) => {
+    55→  const service = getService();
+    56→  const requestId = getRequestId(c);
+    57→
+    58→  try {
+    59→    // Parse request body
+    60→    const body = await c.req.json();
+    61→
+    62→    // Validate login request
+    63→    const validation = validateLoginRequest(body);
+    64→    if (!validation.valid) {
+    65→      return c.json(
+    66→        error(
+    67→          ErrorCodes.VALIDATION_ERROR,
+    68→          'Invalid login request',
+    69→          requestId,
+    70→          { errors: validation.errors }
+    71→        ),
+    72→        400 as const
+    73→      );
+    74→    }
+    75→
+    76→    // Get client info for session tracking
+    77→    const ipAddress = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+    78→                      c.req.header('x-real-ip') ||
+    79→                      'unknown';
+    80→    const userAgent = c.req.header('user-agent') || 'unknown';
+    81→
+    82→    // Perform login
+    83→    const loginRequest: LoginRequest = {
+    84→      email: body.email,
+    85→      password: body.password,
+    86→      ipAddress,
+    87→      userAgent,
+    88→    };
+    89→
+    90→    const result = await service.login(loginRequest);
+    91→
+    92→    return c.json(
+    93→      success(result, {
+    94→        timing: { durationMs: getRequestDuration(c) },
+    95→      })
+    96→    );
+    97→  } catch (err) {
+    98→    if (err instanceof AuthenticationError) {
+    99→      return c.json(
+   100→        error(ErrorCodes.UNAUTHORIZED, err.message, requestId),
+   101→        401 as const
+   102→      );
+   103→    }
+   104→
+   105→    if (isMmsError(err)) {
+   106→      return c.json(
+   107→        error(err.code, err.message, requestId),
+   108→        err.statusCode as 400 | 401 | 403 | 404 | 409 | 422 | 500 | 502 | 503 | 504
+   109→      );
+   110→    }
+   111→
+   112→    throw err;
+   113→  }
+   114→});
+   115→
+   116→/**
+   117→ * POST /auth/refresh
+   118→ *
+   119→ * Refresh access token using refresh token.
+   120→ * Implements token rotation for security.
+   121→ */
+   122→authRoutes.post('/auth/refresh', async (c) => {
+   123→  const service = getService();
+   124→  const requestId = getRequestId(c);
+   125→
+   126→  try {
+   127→    // Parse request body
+   128→    const body = await c.req.json();
+   129→
+   130→    // Validate refresh token is provided
+   131→    if (!body.refreshToken || typeof body.refreshToken !== 'string') {
+   132→      return c.json(
+   133→        error(
+   134→          ErrorCodes.VALIDATION_ERROR,
+   135→          'Refresh token is required',
+   136→          requestId
+   137→        ),
+   138→        400 as const
+   139→      );
+   140→    }
+   141→
+   142→    // Get client info
+   143→    const ipAddress = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+   144→                      c.req.header('x-real-ip') ||
+   145→                      'unknown';
+   146→    const userAgent = c.req.header('user-agent') || 'unknown';
+   147→
+   148→    // Perform token refresh
+   149→    const refreshRequest: RefreshRequest = {
+   150→      refreshToken: body.refreshToken,
+   151→      ipAddress,
+   152→      userAgent,
+   153→    };
+   154→
+   155→    const result = await service.refreshToken(refreshRequest);
+   156→
+   157→    return c.json(
+   158→      success(result, {
+   159→        timing: { durationMs: getRequestDuration(c) },
+   160→      })
+   161→    );
+   162→  } catch (err) {
+   163→    if (err instanceof TokenExpiredError) {
+   164→      return c.json(
+   165→        error(ErrorCodes.UNAUTHORIZED, 'Refresh token has expired', requestId),
+   166→        401 as const
+   167→      );
+   168→    }
+   169→
+   170→    if (err instanceof InvalidTokenError) {
+   171→      return c.json(
+   172→        error(ErrorCodes.UNAUTHORIZED, err.message, requestId),
+   173→        401 as const
+   174→      );
+   175→    }
+   176→
+   177→    if (isMmsError(err)) {
+   178→      return c.json(
+   179→        error(err.code, err.message, requestId),
+   180→        err.statusCode as 400 | 401 | 403 | 404 | 409 | 422 | 500 | 502 | 503 | 504
+   181→      );
+   182→    }
+   183→
+   184→    throw err;
+   185→  }
+   186→});
+   187→
+   188→/**
+   189→ * POST /auth/logout
+   190→ *
+   191→ * Invalidate current session.
+   192→ * Requires Authorization header with Bearer token.
+   193→ */
+   194→authRoutes.post('/auth/logout', async (c) => {
+   195→  const service = getService();
+   196→  const requestId = getRequestId(c);
+   197→
+   198→  try {
+   199→    // Extract token from Authorization header
+   200→    const authHeader = c.req.header('authorization');
+   201→    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   202→      return c.json(
+   203→        error(
+   204→          ErrorCodes.UNAUTHORIZED,
+   205→          'Authorization header with Bearer token is required',
+   206→          requestId
+   207→        ),
+   208→        401 as const
+   209→      );
+   210→    }
+   211→
+   212→    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+   213→
+   214→    // Perform logout
+   215→    await service.logout(token);
+   216→
+   217→    return c.json(
+   218→      success({ message: 'Logged out successfully' }, {
+   219→        timing: { durationMs: getRequestDuration(c) },
+   220→      })
+   221→    );
+   222→  } catch (err) {
+   223→    if (err instanceof InvalidTokenError) {
+   224→      return c.json(
+   225→        error(ErrorCodes.UNAUTHORIZED, err.message, requestId),
+   226→        401 as const
+   227→      );
+   228→    }
+   229→
+   230→    if (isMmsError(err)) {
+   231→      return c.json(
+   232→        error(err.code, err.message, requestId),
+   233→        err.statusCode as 400 | 401 | 403 | 404 | 409 | 422 | 500 | 502 | 503 | 504
+   234→      );
+   235→    }
+   236→
+   237→    throw err;
+   238→  }
+   239→});
+   240→
+   241→/**
+   242→ * GET /auth/me
+   243→ *
+   244→ * Get current authenticated user information.
+   245→ * Requires Authorization header with Bearer token.
+   246→ * Note: This is a convenience endpoint not in the original spec.
+   247→ */
+   248→authRoutes.get('/auth/me', async (c) => {
+   249→  const service = getService();
+   250→  const requestId = getRequestId(c);
+   251→
+   252→  try {
+   253→    // Extract token from Authorization header
+   254→    const authHeader = c.req.header('authorization');
+   255→    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   256→      return c.json(
+   257→        error(
+   258→          ErrorCodes.UNAUTHORIZED,
+   259→          'Authorization header with Bearer token is required',
+   260→          requestId
+   261→        ),
+   262→        401 as const
+   263→      );
+   264→    }
+   265→
+   266→    const token = authHeader.substring(7);
+   267→
+   268→    // Verify token and get session data
+   269→    const session = await service.verifyAccessToken(token);
+   270→
+   271→    // Get full user data
+   272→    const user = await service.getUserById(session.userId);
+   273→
+   274→    if (!user) {
+   275→      return c.json(
+   276→        error(ErrorCodes.NOT_FOUND, 'User not found', requestId),
+   277→        404 as const
+   278→      );
+   279→    }
+   280→
+   281→    return c.json(
+   282→      success(user, {
+   283→        timing: { durationMs: getRequestDuration(c) },
+   284→      })
+   285→    );
+   286→  } catch (err) {
+   287→    if (err instanceof TokenExpiredError) {
+   288→      return c.json(
+   289→        error(ErrorCodes.UNAUTHORIZED, 'Access token has expired', requestId),
+   290→        401 as const
+   291→      );
+   292→    }
+   293→
+   294→    if (err instanceof InvalidTokenError) {
+   295→      return c.json(
+   296→        error(ErrorCodes.UNAUTHORIZED, err.message, requestId),
+   297→        401 as const
+   298→      );
+   299→    }
+   300→
+   301→    if (isMmsError(err)) {
+   302→      return c.json(
+   303→        error(err.code, err.message, requestId),
+   304→        err.statusCode as 400 | 401 | 403 | 404 | 409 | 422 | 500 | 502 | 503 | 504
+   305→      );
+   306→    }
+   307→
+   308→    throw err;
+   309→  }
+   310→});
+   311→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

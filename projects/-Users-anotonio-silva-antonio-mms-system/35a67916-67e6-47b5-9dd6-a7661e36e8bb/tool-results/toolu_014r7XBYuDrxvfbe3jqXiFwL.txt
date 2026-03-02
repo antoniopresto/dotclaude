@@ -1,0 +1,504 @@
+  2000→      throw new PMEditBlockedError(
+  2001→        editValidation.reason,
+  2002→        editValidation.message,
+  2003→        {
+  2004→          maximoStatus: editValidation.maximoStatus,
+  2005→          maximoWonum: editValidation.maximoWonum,
+  2006→          suggestion: editValidation.suggestion
+  2007→        }
+  2008→      );
+  2009→    }
+  2010→    
+  2011→    // 2. Load PM with all relationships
+  2012→    const pm = await this.db.query.pmSchedule.findFirst({
+  2013→      where: eq(pmSchedule.id, pmId),
+  2014→      with: {
+  2015→        pmType: true,
+  2016→        train: true,
+  2017→        assignedTrack: true
+  2018→      }
+  2019→    });
+  2020→    
+  2021→    if (!pm) {
+  2022→      throw new NotFoundError('PM not found');
+  2023→    }
+  2024→    
+  2025→    // 3. Validate compliance window
+  2026→    if (newTargetDate < pm.constraintStart || newTargetDate > pm.constraintEnd) {
+  2027→      throw new ComplianceWindowError(
+  2028→        `Target date ${newTargetDate.toISOString().split('T')[0]} is outside compliance window`,
+  2029→        {
+  2030→          constraintStart: pm.constraintStart,
+  2031→          constraintEnd: pm.constraintEnd,
+  2032→          requestedDate: newTargetDate
+  2033→        }
+  2034→      );
+  2035→    }
+  2036→    
+  2037→    // 4. Validate track availability (if track specified)
+  2038→    if (newTrackId) {
+  2039→      const conflict = await this.checkTrackConflict(
+  2040→        newTrackId,
+  2041→        newTargetDate,
+  2042→        pm.pmType.minTrackDays,
+  2043→        pmId  // Exclude self from conflict check
+  2044→      );
+  2045→      
+  2046→      if (conflict) {
+  2047→        throw new TrackConflictError(
+  2048→          `Track ${conflict.trackNumber} is occupied by ${conflict.conflictingPMCode}`,
+  2049→          conflict
+  2050→        );
+  2051→      }
+  2052→    }
+  2053→    
+  2054→    // 5. Capture old state for audit
+  2055→    const oldState = {
+  2056→      targetDate: pm.targetDate,
+  2057→      assignedTrackId: pm.assignedTrackId
+  2058→    };
+  2059→    
+  2060→    // 6. Update PM schedule
+  2061→    const updatedPM = await this.db.transaction(async (tx) => {
+  2062→      // Update main record
+  2063→      const [updated] = await tx.update(pmSchedule)
+  2064→        .set({
+  2065→          targetDate: newTargetDate,
+  2066→          assignedTrackId: newTrackId ?? pm.assignedTrackId,
+  2067→          updatedAt: new Date()
+  2068→        })
+  2069→        .where(eq(pmSchedule.id, pmId))
+  2070→        .returning();
+  2071→      
+  2072→      // Record in history table
+  2073→      await tx.insert(pmScheduleHistory).values({
+  2074→        pmScheduleId: pmId,
+  2075→        changeType: 'RESCHEDULE',
+  2076→        fieldName: 'targetDate',
+  2077→        oldValue: oldState.targetDate.toISOString(),
+  2078→        newValue: newTargetDate.toISOString(),
+  2079→        changedBy: userId,
+  2080→        reason: 'Manual reschedule via canvas'
+  2081→      });
+  2082→      
+  2083→      if (newTrackId && newTrackId !== pm.assignedTrackId) {
+  2084→        await tx.insert(pmScheduleHistory).values({
+  2085→          pmScheduleId: pmId,
+  2086→          changeType: 'TRACK_REASSIGNMENT',
+  2087→          fieldName: 'assignedTrackId',
+  2088→          oldValue: oldState.assignedTrackId,
+  2089→          newValue: newTrackId,
+  2090→          changedBy: userId,
+  2091→          reason: 'Track reassignment via canvas'
+  2092→        });
+  2093→      }
+  2094→      
+  2095→      return updated;
+  2096→    });
+  2097→    
+  2098→    // 7. Update shadow record for Maximo sync
+  2099→    await this.updateShadowRecord(pmId, {
+  2100→      syncStatus: 'PENDING',
+  2101→      pendingChanges: {
+  2102→        targetDate: newTargetDate.toISOString(),
+  2103→        trackId: newTrackId
+  2104→      }
+  2105→    });
+  2106→    
+  2107→    // 8. Audit log
+  2108→    await this.auditLogger.log({
+  2109→      action: 'PM_RESCHEDULED',
+  2110→      entityType: 'PM_SCHEDULE',
+  2111→      entityId: pmId,
+  2112→      userId,
+  2113→      changes: {
+  2114→        targetDate: { old: oldState.targetDate, new: newTargetDate },
+  2115→        assignedTrackId: { old: oldState.assignedTrackId, new: newTrackId }
+  2116→      }
+  2117→    });
+  2118→    
+  2119→    return updatedPM;
+  2120→  }
+  2121→  
+  2122→  /**
+  2123→   * Get PM with all relationships for canvas display.
+  2124→   */
+  2125→  async getPM(pmId: string): Promise<PMScheduleWithRelations> {
+  2126→    const pm = await this.db.query.pmSchedule.findFirst({
+  2127→      where: eq(pmSchedule.id, pmId),
+  2128→      with: {
+  2129→        pmType: true,
+  2130→        train: true,
+  2131→        assignedTrack: true,
+  2132→        assignedDepot: true
+  2133→      }
+  2134→    });
+  2135→    
+  2136→    if (!pm) {
+  2137→      throw new NotFoundError('PM not found');
+  2138→    }
+  2139→    
+  2140→    return pm;
+  2141→  }
+  2142→  
+  2143→  /**
+  2144→   * Check if a track has conflicts for the given date range.
+  2145→   */
+  2146→  private async checkTrackConflict(
+  2147→    trackId: string,
+  2148→    startDate: Date,
+  2149→    durationDays: number,
+  2150→    excludePmId?: string
+  2151→  ): Promise<TrackConflict | null> {
+  2152→    const endDate = addDays(startDate, durationDays);
+  2153→    
+  2154→    const conflictingPM = await this.db.query.pmSchedule.findFirst({
+  2155→      where: and(
+  2156→        eq(pmSchedule.assignedTrackId, trackId),
+  2157→        excludePmId ? ne(pmSchedule.id, excludePmId) : undefined,
+  2158→        or(
+  2159→          // New PM overlaps existing PM's start
+  2160→          and(
+  2161→            lte(pmSchedule.targetDate, startDate),
+  2162→            gte(sql`${pmSchedule.targetDate} + ${durationDays} * interval '1 day'`, startDate)
+  2163→          ),
+  2164→          // New PM overlaps existing PM's end
+  2165→          and(
+  2166→            lte(pmSchedule.targetDate, endDate),
+  2167→            gte(sql`${pmSchedule.targetDate} + ${durationDays} * interval '1 day'`, startDate)
+  2168→          )
+  2169→        ),
+  2170→        inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS'])
+  2171→      ),
+  2172→      with: {
+  2173→        pmType: true,
+  2174→        train: true,
+  2175→        assignedTrack: true
+  2176→      }
+  2177→    });
+  2178→    
+  2179→    if (conflictingPM) {
+  2180→      return {
+  2181→        trackId,
+  2182→        trackNumber: conflictingPM.assignedTrack.trackNumber,
+  2183→        conflictingPMId: conflictingPM.id,
+  2184→        conflictingPMCode: conflictingPM.pmType.pmCode,
+  2185→        conflictingTrainNumber: conflictingPM.train.trainNumber,
+  2186→        conflictingDateRange: {
+  2187→          start: conflictingPM.targetDate,
+  2188→          end: addDays(conflictingPM.targetDate, conflictingPM.pmType.minTrackDays)
+  2189→        }
+  2190→      };
+  2191→    }
+  2192→    
+  2193→    return null;
+  2194→  }
+  2195→}
+  2196→
+  2197→/**
+  2198→ * Custom error for PM edit blocks.
+  2199→ */
+  2200→class PMEditBlockedError extends Error {
+  2201→  constructor(
+  2202→    public reason: string,
+  2203→    message: string,
+  2204→    public details: {
+  2205→      maximoStatus?: string;
+  2206→      maximoWonum?: string;
+  2207→      suggestion?: string;
+  2208→    }
+  2209→  ) {
+  2210→    super(message);
+  2211→    this.name = 'PMEditBlockedError';
+  2212→  }
+  2213→}
+  2214→
+  2215→class ComplianceWindowError extends Error {
+  2216→  constructor(
+  2217→    message: string,
+  2218→    public details: {
+  2219→      constraintStart: Date;
+  2220→      constraintEnd: Date;
+  2221→      requestedDate: Date;
+  2222→    }
+  2223→  ) {
+  2224→    super(message);
+  2225→    this.name = 'ComplianceWindowError';
+  2226→  }
+  2227→}
+  2228→
+  2229→class TrackConflictError extends Error {
+  2230→  constructor(
+  2231→    message: string,
+  2232→    public conflict: TrackConflict
+  2233→  ) {
+  2234→    super(message);
+  2235→    this.name = 'TrackConflictError';
+  2236→  }
+  2237→}
+  2238→
+  2239→interface TrackConflict {
+  2240→  trackId: string;
+  2241→  trackNumber: string;
+  2242→  conflictingPMId: string;
+  2243→  conflictingPMCode: string;
+  2244→  conflictingTrainNumber: string;
+  2245→  conflictingDateRange: {
+  2246→    start: Date;
+  2247→    end: Date;
+  2248→  };
+  2249→}
+  2250→```
+  2251→
+  2252→---
+  2253→
+  2254→## 4.5 Strategic Planner
+  2255→
+  2256→### 4.5.1 Purpose
+  2257→
+  2258→Generate and maintain the 1-10 year strategic plan using genetic algorithms, constrained by capacity envelopes from the tactical model.
+  2259→
+  2260→### 4.5.2 Implementation
+  2261→
+  2262→```typescript
+  2263→interface StrategicPlannerConfig {
+  2264→  horizonYears: number;          // 10
+  2265→  granularity: 'MONTHLY' | 'QUARTERLY';
+  2266→  populationSize: number;        // 100
+  2267→  generations: number;           // 500
+  2268→  mutationRate: number;          // 0.1
+  2269→  eliteCount: number;            // 10
+  2270→}
+  2271→
+  2272→interface StrategicAllocation {
+  2273→  trainId: string;
+  2274→  pmTypeId: string;
+  2275→  targetQuarter: string;  // e.g., '2028-Q2'
+  2276→  estimatedHours: number;
+  2277→  estimatedCost: number;
+  2278→}
+  2279→
+  2280→class StrategicPlanner {
+  2281→  private constraintAggregation: ConstraintAggregationService;
+  2282→  
+  2283→  async generatePlan(
+  2284→    fromBaseline: string | null
+  2285→  ): Promise<StrategicPlanResult> {
+  2286→    // 1. Load current fleet state
+  2287→    const fleetState = await this.getFleetState();
+  2288→    
+  2289→    // 2. Project PM requirements for each train
+  2290→    const pmRequirements = await this.projectPMRequirements(
+  2291→      fleetState,
+  2292→      this.config.horizonYears
+  2293→    );
+  2294→    
+  2295→    // 3. Generate constraint envelopes for each quarter
+  2296→    const envelopes = await this.generateEnvelopes();
+  2297→    
+  2298→    // 4. Run genetic algorithm
+  2299→    const bestPlan = await this.runGeneticAlgorithm(
+  2300→      pmRequirements,
+  2301→      envelopes
+  2302→    );
+  2303→    
+  2304→    // 5. Validate against constraint envelopes
+  2305→    const validation = await this.validatePlan(bestPlan, envelopes);
+  2306→    
+  2307→    if (!validation.valid) {
+  2308→      // Attempt repair
+  2309→      const repairedPlan = await this.repairPlan(bestPlan, validation);
+  2310→      return {
+  2311→        plan: repairedPlan,
+  2312→        validation: await this.validatePlan(repairedPlan, envelopes),
+  2313→        metrics: this.calculateMetrics(repairedPlan)
+  2314→      };
+  2315→    }
+  2316→    
+  2317→    return {
+  2318→      plan: bestPlan,
+  2319→      validation,
+  2320→      metrics: this.calculateMetrics(bestPlan)
+  2321→    };
+  2322→  }
+  2323→  
+  2324→  /**
+  2325→   * Project PM requirements for all trains over the planning horizon.
+  2326→   * 
+  2327→   * CRITICAL: This implementation correctly handles:
+  2328→   * 1. PM hierarchy (C4 satisfies C1/C2/C3 - resets their counters)
+  2329→   * 2. Dual triggers (mileage OR time, whichever comes first)
+  2330→   * 3. Recent velocity calculation for accurate projections
+  2331→   * 4. Cascading projections (each PM feeds into next cycle)
+  2332→   */
+  2333→  private async projectPMRequirements(
+  2334→    fleetState: FleetState,
+  2335→    horizonYears: number
+  2336→  ): Promise<PMRequirement[]> {
+  2337→    const requirements: PMRequirement[] = [];
+  2338→    const horizonEnd = addYears(new Date(), horizonYears);
+  2339→    
+  2340→    for (const train of fleetState.trains) {
+  2341→      const trainRules = await this.getPMRulesForFleet(train.fleetId);
+  2342→      const trainHistory = await this.getPMHistoryForTrain(train.id);
+  2343→      
+  2344→      // Calculate daily utilization for this train
+  2345→      const dailyKm = this.calculateDailyUtilization(train, trainHistory);
+  2346→      
+  2347→      // Project all PM types for this train
+  2348→      const trainProjections = await this.projectTrainPMs(
+  2349→        train,
+  2350→        trainRules,
+  2351→        trainHistory,
+  2352→        horizonEnd,
+  2353→        dailyKm
+  2354→      );
+  2355→      
+  2356→      requirements.push(...trainProjections);
+  2357→    }
+  2358→    
+  2359→    return requirements;
+  2360→  }
+  2361→  
+  2362→  /**
+  2363→   * Project all PM events for a single train over the horizon.
+  2364→   */
+  2365→  private async projectTrainPMs(
+  2366→    train: Train,
+  2367→    pmRules: PMType[],
+  2368→    pmHistory: PMHistory[],
+  2369→    horizonEnd: Date,
+  2370→    dailyKm: number
+  2371→  ): Promise<PMRequirement[]> {
+  2372→    const projections: PMRequirement[] = [];
+  2373→    
+  2374→    // Create working state (mutable copy of history + projections)
+  2375→    let workingHistory = [...pmHistory];
+  2376→    let currentMileage = train.currentMileageKm;
+  2377→    let currentDate = new Date();
+  2378→    
+  2379→    // Project until we exceed horizon
+  2380→    while (currentDate < horizonEnd) {
+  2381→      // Find next PM due across all PM types
+  2382→      let nextPM: { 
+  2383→        rule: PMType; 
+  2384→        date: Date; 
+  2385→        mileage: number; 
+  2386→        trigger: 'MILEAGE' | 'TIME' 
+  2387→      } | null = null;
+  2388→      
+  2389→      for (const rule of pmRules) {
+  2390→        const projection = this.calculateNextPMDue(
+  2391→          train,
+  2392→          rule,
+  2393→          pmRules,
+  2394→          workingHistory,
+  2395→          currentMileage,
+  2396→          currentDate,
+  2397→          dailyKm
+  2398→        );
+  2399→        
+  2400→        if (!nextPM || projection.date < nextPM.date) {
+  2401→          nextPM = {
+  2402→            rule,
+  2403→            date: projection.date,
+  2404→            mileage: projection.mileage,
+  2405→            trigger: projection.trigger
+  2406→          };
+  2407→        }
+  2408→      }
+  2409→      
+  2410→      if (!nextPM || nextPM.date > horizonEnd) break;
+  2411→      
+  2412→      // Create requirement
+  2413→      const requirement: PMRequirement = {
+  2414→        id: generateUUID(),
+  2415→        trainId: train.id,
+  2416→        trainNumber: train.trainNumber,
+  2417→        pmTypeId: nextPM.rule.id,
+  2418→        pmCode: nextPM.rule.pmCode,
+  2419→        projectedDate: nextPM.date,
+  2420→        projectedMileageKm: nextPM.mileage,
+  2421→        triggerType: nextPM.trigger,
+  2422→        confidence: workingHistory.length > 0 ? 'HISTORICAL' : 'ESTIMATED',
+  2423→        estimatedHours: nextPM.rule.estimatedHours,
+  2424→        trackType: nextPM.rule.trackType,
+  2425→        durationDays: nextPM.rule.minTrackDays,
+  2426→        // Compliance window (Ã‚Â±10% of interval by default)
+  2427→        constraintStart: addDays(nextPM.date, -Math.round(nextPM.rule.intervalKm * 0.1 / dailyKm)),
+  2428→        constraintEnd: addDays(nextPM.date, Math.round(nextPM.rule.intervalKm * 0.1 / dailyKm))
+  2429→      };
+  2430→      
+  2431→      projections.push(requirement);
+  2432→      
+  2433→      // Add to working history for cascading projection
+  2434→      workingHistory.push({
+  2435→        id: requirement.id,
+  2436→        trainId: train.id,
+  2437→        pmTypeId: nextPM.rule.id,
+  2438→        pmCode: nextPM.rule.pmCode,
+  2439→        completionDate: nextPM.date,
+  2440→        mileageAtCompletion: nextPM.mileage
+  2441→      });
+  2442→      
+  2443→      // Advance state past this PM
+  2444→      currentDate = addDays(nextPM.date, nextPM.rule.minTrackDays);
+  2445→      currentMileage = nextPM.mileage + (nextPM.rule.minTrackDays * dailyKm * 0.1);
+  2446→    }
+  2447→    
+  2448→    return projections;
+  2449→  }
+  2450→  
+  2451→  /**
+  2452→   * Calculate when the next instance of a specific PM type is due.
+  2453→   * 
+  2454→   * CRITICAL: Accounts for PM hierarchy - a C4 satisfies C1/C2/C3 requirements,
+  2455→   * so the mileage counter resets from the C4 completion point.
+  2456→   * 
+  2457→   * CRITICAL: Handles "Cold Start" case where train has no PM history.
+  2458→   * Without this fix, trains with high mileage and no history would show
+  2459→   * ALL PMs as overdue immediately.
+  2460→   */
+  2461→  private calculateNextPMDue(
+  2462→    train: Train,
+  2463→    targetRule: PMType,
+  2464→    allRules: PMType[],
+  2465→    history: PMHistory[],
+  2466→    currentMileage: number,
+  2467→    currentDate: Date,
+  2468→    dailyKm: number
+  2469→  ): { date: Date; mileage: number; trigger: 'MILEAGE' | 'TIME' } {
+  2470→    
+  2471→    // 1. Find all PM types that SATISFY the target PM
+  2472→    // (the target itself + any higher-level PM that includes target in satisfiesCodes)
+  2473→    const satisfyingCodes = this.getSatisfyingCodes(targetRule.pmCode, allRules);
+  2474→    
+  2475→    // 2. Find the most recent PM that satisfies this requirement
+  2476→    const lastSatisfying = history
+  2477→      .filter(h => satisfyingCodes.includes(h.pmCode))
+  2478→      .sort((a, b) => b.mileageAtCompletion - a.mileageAtCompletion)[0];
+  2479→    
+  2480→    // 3. Handle "Cold Start" - no PM history exists
+  2481→    //    Assume train has been maintained on schedule since commissioning.
+  2482→    //    Calculate which cycle we're currently in and when it started.
+  2483→    let lastMileage: number;
+  2484→    let lastDate: Date;
+  2485→    
+  2486→    if (lastSatisfying) {
+  2487→      // Normal case: use actual history
+  2488→      lastMileage = lastSatisfying.mileageAtCompletion;
+  2489→      lastDate = new Date(lastSatisfying.completionDate);
+  2490→    } else {
+  2491→      // COLD START FIX: Create "virtual" last PM
+  2492→      // Calculate how many complete cycles since commissioning
+  2493→      const cyclesCompleted = Math.floor(currentMileage / targetRule.intervalKm);
+  2494→      
+  2495→      if (cyclesCompleted > 0) {
+  2496→        // Assume last PM occurred at start of current cycle
+  2497→        lastMileage = cyclesCompleted * targetRule.intervalKm;
+  2498→        // Estimate when that mileage was reached
+  2499→        const daysAgo = (currentMileage - lastMileage) / dailyKm;
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

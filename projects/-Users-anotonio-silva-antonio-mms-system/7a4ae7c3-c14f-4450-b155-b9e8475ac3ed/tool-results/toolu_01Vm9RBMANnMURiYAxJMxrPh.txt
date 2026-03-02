@@ -1,0 +1,600 @@
+     1→/**
+     2→ * MMS Maximo REST Client
+     3→ *
+     4→ * HTTP client for Maximo OSLC REST API integration.
+     5→ * Handles authentication, request/response serialization, and error handling.
+     6→ *
+     7→ * Configuration is loaded from `maximo_integration_config` table.
+     8→ * Password should be provided via environment variable `MAXIMO_API_PASSWORD`
+     9→ * or a secrets manager (not stored in database).
+    10→ *
+    11→ * @see specs/007-integration.md Section 7.4.3
+    12→ */
+    13→
+    14→import { eq, and, isNull } from 'drizzle-orm';
+    15→import { addDays, format } from 'date-fns';
+    16→import { db } from '../lib/db/connection';
+    17→import { maximoIntegrationConfig } from '../lib/db/schema';
+    18→import { MaximoConnectionError } from '../lib/errors';
+    19→import logger from '../lib/logging/logger';
+    20→import { withSpan } from '../lib/tracing';
+    21→
+    22→// =============================================================================
+    23→// Types
+    24→// =============================================================================
+    25→
+    26→/** Maximo API configuration loaded from database */
+    27→export interface MaximoConfig {
+    28→  baseUrl: string;
+    29→  siteId: string;
+    30→  username: string;
+    31→  password: string;
+    32→  timeoutMs: number;
+    33→  maxRetries: number;
+    34→}
+    35→
+    36→/** Maximo work order status values */
+    37→export type MaximoWoStatus = 'WAPPR' | 'APPR' | 'INPRG' | 'COMP' | 'CLOSE' | 'CAN';
+    38→
+    39→/** Maximo work order create payload */
+    40→export interface MaximoWorkOrderCreatePayload {
+    41→  siteid: string;
+    42→  woclass: string;
+    43→  worktype: string;
+    44→  assetnum: string;
+    45→  description: string;
+    46→  schedstart: string;
+    47→  schedfinish: string;
+    48→  location?: string;
+    49→  estlabhrs?: number;
+    50→  pmnum?: string;
+    51→  mms_schedule_id: string;
+    52→  mms_constraint_start: string;
+    53→  mms_constraint_end: string;
+    54→}
+    55→
+    56→/** Maximo work order update payload */
+    57→export interface MaximoWorkOrderUpdatePayload {
+    58→  schedstart?: string;
+    59→  schedfinish?: string;
+    60→  location?: string;
+    61→  estlabhrs?: number;
+    62→  description?: string;
+    63→}
+    64→
+    65→/** Maximo work order response */
+    66→export interface MaximoWorkOrder {
+    67→  wonum: string;
+    68→  status: MaximoWoStatus;
+    69→  schedstart?: string;
+    70→  schedfinish?: string;
+    71→  actstart?: string;
+    72→  actfinish?: string;
+    73→  actlabhrs?: number;
+    74→  changedate?: string;
+    75→  description?: string;
+    76→  assetnum?: string;
+    77→  location?: string;
+    78→}
+    79→
+    80→/** Maximo API error response */
+    81→export interface MaximoErrorResponse {
+    82→  Error?: {
+    83→    message?: string;
+    84→    reasonCode?: string;
+    85→    statusCode?: number;
+    86→  };
+    87→  oslc?: {
+    88→    Error?: {
+    89→      'spi:message'?: string;
+    90→      'spi:reasonCode'?: string;
+    91→    };
+    92→  };
+    93→}
+    94→
+    95→// =============================================================================
+    96→// Logger
+    97→// =============================================================================
+    98→
+    99→const log = logger.child({ service: 'MaximoClient' });
+   100→
+   101→// =============================================================================
+   102→// MaximoClient Implementation
+   103→// =============================================================================
+   104→
+   105→/**
+   106→ * HTTP client for Maximo OSLC REST API
+   107→ *
+   108→ * Implements the Maximo REST API calls defined in spec 007.4.3:
+   109→ * - GET /os/mxwo/{wonum} - Fetch WO details
+   110→ * - POST /os/mxwo - Create new WO
+   111→ * - POST /os/mxwo/{wonum} - Update WO
+   112→ *
+   113→ * @example
+   114→ * ```typescript
+   115→ * const client = new MaximoClient();
+   116→ * await client.initialize();
+   117→ *
+   118→ * // Create work order
+   119→ * const woNum = await client.createWorkOrder({
+   120→ *   siteid: 'METRO',
+   121→ *   woclass: 'WORKORDER',
+   122→ *   worktype: 'PM',
+   123→ *   assetnum: '1001',
+   124→ *   description: 'C2 - Brake Inspection',
+   125→ *   schedstart: '2026-02-15T08:00:00Z',
+   126→ *   schedfinish: '2026-02-15T17:00:00Z',
+   127→ *   mms_schedule_id: 'uuid-123',
+   128→ *   mms_constraint_start: '2026-02-10T00:00:00Z',
+   129→ *   mms_constraint_end: '2026-02-20T23:59:59Z',
+   130→ * });
+   131→ *
+   132→ * // Fetch work order
+   133→ * const wo = await client.getWorkOrder(woNum);
+   134→ *
+   135→ * // Update work order
+   136→ * await client.updateWorkOrder(woNum, { schedstart: '2026-02-16T08:00:00Z' });
+   137→ * ```
+   138→ */
+   139→export class MaximoClient {
+   140→  private config: MaximoConfig | null = null;
+   141→  private initialized = false;
+   142→
+   143→  /**
+   144→   * Initialize the client by loading configuration from database
+   145→   *
+   146→   * @param depotId Optional depot ID for depot-specific config
+   147→   */
+   148→  async initialize(depotId?: string): Promise<void> {
+   149→    return withSpan('MaximoClient.initialize', async (span) => {
+   150→      if (depotId) {
+   151→        span.setAttribute('depot.id', depotId);
+   152→      }
+   153→
+   154→      // db is imported from connection
+   155→
+   156→      // Try to load depot-specific config first, then fall back to global
+   157→      let configRecord = depotId
+   158→        ? await db.query.maximoIntegrationConfig.findFirst({
+   159→            where: and(
+   160→              eq(maximoIntegrationConfig.depotId, depotId),
+   161→              eq(maximoIntegrationConfig.active, true)
+   162→            ),
+   163→          })
+   164→        : null;
+   165→
+   166→      // Fall back to global config (depotId = NULL)
+   167→      if (!configRecord) {
+   168→        configRecord = await db.query.maximoIntegrationConfig.findFirst({
+   169→          where: and(
+   170→            isNull(maximoIntegrationConfig.depotId),
+   171→            eq(maximoIntegrationConfig.active, true)
+   172→          ),
+   173→        });
+   174→      }
+   175→
+   176→      if (!configRecord) {
+   177→        log.warn({ depotId }, 'No Maximo integration config found, client will operate in simulation mode');
+   178→        this.initialized = true;
+   179→        return;
+   180→      }
+   181→
+   182→      // Get password from environment variable
+   183→      const password = process.env['MAXIMO_API_PASSWORD'];
+   184→      if (!password) {
+   185→        log.warn('MAXIMO_API_PASSWORD not set, client will operate in simulation mode');
+   186→        this.initialized = true;
+   187→        return;
+   188→      }
+   189→
+   190→      this.config = {
+   191→        baseUrl: configRecord.baseUrl,
+   192→        siteId: configRecord.siteId,
+   193→        username: configRecord.username,
+   194→        password,
+   195→        timeoutMs: (configRecord.circuitBreakerTimeout ?? 60000),
+   196→        maxRetries: configRecord.maxRetries ?? 5,
+   197→      };
+   198→
+   199→      span.setAttribute('maximo.base_url', this.config.baseUrl);
+   200→      span.setAttribute('maximo.site_id', this.config.siteId);
+   201→
+   202→      log.info(
+   203→        { baseUrl: this.config.baseUrl, siteId: this.config.siteId },
+   204→        'Maximo client initialized'
+   205→      );
+   206→
+   207→      this.initialized = true;
+   208→    });
+   209→  }
+   210→
+   211→  /**
+   212→   * Check if the client is configured for real API calls
+   213→   */
+   214→  isConfigured(): boolean {
+   215→    return this.config !== null;
+   216→  }
+   217→
+   218→  /**
+   219→   * Create a work order in Maximo
+   220→   *
+   221→   * @param payload Work order create payload
+   222→   * @returns Created work order number
+   223→   * @throws MaximoConnectionError if API call fails
+   224→   */
+   225→  async createWorkOrder(payload: MaximoWorkOrderCreatePayload): Promise<string> {
+   226→    return withSpan('MaximoClient.createWorkOrder', async (span) => {
+   227→      span.setAttribute('maximo.asset', payload.assetnum);
+   228→      span.setAttribute('maximo.work_type', payload.worktype);
+   229→      span.setAttribute('mms.schedule_id', payload.mms_schedule_id);
+   230→
+   231→      // Simulation mode
+   232→      if (!this.config) {
+   233→        const woNum = `WO-${format(new Date(), 'yyyy')}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+   234→        log.info({ woNum, payload }, 'Created Maximo work order (simulated)');
+   235→        await new Promise((resolve) => setTimeout(resolve, 100));
+   236→        return woNum;
+   237→      }
+   238→
+   239→      const url = `${this.config.baseUrl}/os/mxwo`;
+   240→
+   241→      try {
+   242→        const response = await fetch(url, {
+   243→          method: 'POST',
+   244→          headers: this.buildHeaders(),
+   245→          body: JSON.stringify(payload),
+   246→          signal: AbortSignal.timeout(this.config.timeoutMs),
+   247→        });
+   248→
+   249→        if (!response.ok) {
+   250→          const errorBody = await this.parseErrorResponse(response);
+   251→          throw new MaximoConnectionError(
+   252→            `Failed to create work order: ${errorBody}`,
+   253→            { statusCode: response.status, url }
+   254→          );
+   255→        }
+   256→
+   257→        const data = await response.json();
+   258→        const woNum = data.wonum || data._wonum || data['spi:wonum'];
+   259→
+   260→        if (!woNum) {
+   261→          throw new MaximoConnectionError(
+   262→            'Work order created but wonum not returned',
+   263→            { response: data }
+   264→          );
+   265→        }
+   266→
+   267→        span.setAttribute('maximo.wo_num', woNum);
+   268→        log.info({ woNum, assetnum: payload.assetnum }, 'Created Maximo work order');
+   269→
+   270→        return woNum;
+   271→      } catch (error) {
+   272→        if (error instanceof MaximoConnectionError) {
+   273→          throw error;
+   274→        }
+   275→        throw new MaximoConnectionError(
+   276→          `Failed to create work order: ${error instanceof Error ? error.message : String(error)}`,
+   277→          { cause: error }
+   278→        );
+   279→      }
+   280→    });
+   281→  }
+   282→
+   283→  /**
+   284→   * Fetch a work order from Maximo
+   285→   *
+   286→   * @param woNum Work order number
+   287→   * @returns Work order data or null if not found
+   288→   * @throws MaximoConnectionError if API call fails (except 404)
+   289→   */
+   290→  async getWorkOrder(woNum: string): Promise<MaximoWorkOrder | null> {
+   291→    return withSpan('MaximoClient.getWorkOrder', async (span) => {
+   292→      span.setAttribute('maximo.wo_num', woNum);
+   293→
+   294→      // Simulation mode
+   295→      if (!this.config) {
+   296→        log.debug({ woNum }, 'Fetching Maximo work order (simulated)');
+   297→        await new Promise((resolve) => setTimeout(resolve, 50));
+   298→        return {
+   299→          wonum: woNum,
+   300→          status: 'APPR' as MaximoWoStatus,
+   301→          schedstart: new Date().toISOString(),
+   302→          schedfinish: addDays(new Date(), 1).toISOString(),
+   303→          changedate: new Date().toISOString(),
+   304→        };
+   305→      }
+   306→
+   307→      const url = `${this.config.baseUrl}/os/mxwo/${encodeURIComponent(woNum)}`;
+   308→
+   309→      try {
+   310→        const response = await fetch(url, {
+   311→          method: 'GET',
+   312→          headers: this.buildHeaders(),
+   313→          signal: AbortSignal.timeout(this.config.timeoutMs),
+   314→        });
+   315→
+   316→        if (response.status === 404) {
+   317→          return null;
+   318→        }
+   319→
+   320→        if (!response.ok) {
+   321→          const errorBody = await this.parseErrorResponse(response);
+   322→          throw new MaximoConnectionError(
+   323→            `Failed to fetch work order: ${errorBody}`,
+   324→            { statusCode: response.status, url, woNum }
+   325→          );
+   326→        }
+   327→
+   328→        const data = await response.json();
+   329→
+   330→        return this.parseWorkOrderResponse(data);
+   331→      } catch (error) {
+   332→        if (error instanceof MaximoConnectionError) {
+   333→          throw error;
+   334→        }
+   335→        throw new MaximoConnectionError(
+   336→          `Failed to fetch work order: ${error instanceof Error ? error.message : String(error)}`,
+   337→          { cause: error, woNum }
+   338→        );
+   339→      }
+   340→    });
+   341→  }
+   342→
+   343→  /**
+   344→   * Update a work order in Maximo
+   345→   *
+   346→   * @param woNum Work order number
+   347→   * @param payload Update payload
+   348→   * @param options.force Force update even if Maximo has changes (conflict resolution)
+   349→   * @throws MaximoConnectionError if API call fails
+   350→   */
+   351→  async updateWorkOrder(
+   352→    woNum: string,
+   353→    payload: MaximoWorkOrderUpdatePayload,
+   354→    options?: { force?: boolean }
+   355→  ): Promise<void> {
+   356→    return withSpan('MaximoClient.updateWorkOrder', async (span) => {
+   357→      span.setAttribute('maximo.wo_num', woNum);
+   358→      span.setAttribute('force', options?.force ?? false);
+   359→
+   360→      // Simulation mode
+   361→      if (!this.config) {
+   362→        log.info({ woNum, payload, force: options?.force }, 'Updated Maximo work order (simulated)');
+   363→        await new Promise((resolve) => setTimeout(resolve, 100));
+   364→        return;
+   365→      }
+   366→
+   367→      const url = `${this.config.baseUrl}/os/mxwo/${encodeURIComponent(woNum)}`;
+   368→
+   369→      try {
+   370→        const headers = this.buildHeaders();
+   371→
+   372→        // Use PATCH method for partial updates, or POST with _action=Change
+   373→        // Maximo OSLC supports both patterns
+   374→        const response = await fetch(url, {
+   375→          method: 'POST',
+   376→          headers: {
+   377→            ...headers,
+   378→            'x-method-override': 'PATCH',
+   379→            ...(options?.force ? { 'x-maximo-override': 'true' } : {}),
+   380→          },
+   381→          body: JSON.stringify(payload),
+   382→          signal: AbortSignal.timeout(this.config.timeoutMs),
+   383→        });
+   384→
+   385→        if (!response.ok) {
+   386→          const errorBody = await this.parseErrorResponse(response);
+   387→          throw new MaximoConnectionError(
+   388→            `Failed to update work order: ${errorBody}`,
+   389→            { statusCode: response.status, url, woNum }
+   390→          );
+   391→        }
+   392→
+   393→        log.info({ woNum, payload }, 'Updated Maximo work order');
+   394→      } catch (error) {
+   395→        if (error instanceof MaximoConnectionError) {
+   396→          throw error;
+   397→        }
+   398→        throw new MaximoConnectionError(
+   399→          `Failed to update work order: ${error instanceof Error ? error.message : String(error)}`,
+   400→          { cause: error, woNum }
+   401→        );
+   402→      }
+   403→    });
+   404→  }
+   405→
+   406→  /**
+   407→   * Query work orders modified since a given timestamp
+   408→   *
+   409→   * Used by pull sync to fetch status updates.
+   410→   *
+   411→   * @param since Fetch work orders modified after this time
+   412→   * @param options.limit Maximum number of records to return
+   413→   * @returns Array of work orders
+   414→   */
+   415→  async queryModifiedWorkOrders(
+   416→    since: Date,
+   417→    options?: { limit?: number }
+   418→  ): Promise<MaximoWorkOrder[]> {
+   419→    return withSpan('MaximoClient.queryModifiedWorkOrders', async (span) => {
+   420→      const sinceStr = since.toISOString();
+   421→      span.setAttribute('since', sinceStr);
+   422→      span.setAttribute('limit', options?.limit ?? 100);
+   423→
+   424→      // Simulation mode
+   425→      if (!this.config) {
+   426→        log.debug({ since: sinceStr }, 'Querying modified work orders (simulated)');
+   427→        await new Promise((resolve) => setTimeout(resolve, 50));
+   428→        return [];
+   429→      }
+   430→
+   431→      // Build OSLC query
+   432→      // oslc.where=changedate>="2026-01-20T00:00:00Z"
+   433→      const whereClause = encodeURIComponent(`changedate>="${sinceStr}"`);
+   434→      const limit = options?.limit ?? 100;
+   435→      const url = `${this.config.baseUrl}/os/mxwo?oslc.where=${whereClause}&oslc.pageSize=${limit}&oslc.select=wonum,status,schedstart,schedfinish,actstart,actfinish,actlabhrs,changedate`;
+   436→
+   437→      try {
+   438→        const response = await fetch(url, {
+   439→          method: 'GET',
+   440→          headers: this.buildHeaders(),
+   441→          signal: AbortSignal.timeout(this.config.timeoutMs),
+   442→        });
+   443→
+   444→        if (!response.ok) {
+   445→          const errorBody = await this.parseErrorResponse(response);
+   446→          throw new MaximoConnectionError(
+   447→            `Failed to query work orders: ${errorBody}`,
+   448→            { statusCode: response.status, url }
+   449→          );
+   450→        }
+   451→
+   452→        const data = await response.json();
+   453→
+   454→        // Parse OSLC collection response
+   455→        const members = data.member || data['rdfs:member'] || [];
+   456→
+   457→        return members.map((item: Record<string, unknown>) => this.parseWorkOrderResponse(item));
+   458→      } catch (error) {
+   459→        if (error instanceof MaximoConnectionError) {
+   460→          throw error;
+   461→        }
+   462→        throw new MaximoConnectionError(
+   463→          `Failed to query work orders: ${error instanceof Error ? error.message : String(error)}`,
+   464→          { cause: error }
+   465→        );
+   466→      }
+   467→    });
+   468→  }
+   469→
+   470→  /**
+   471→   * Test connection to Maximo API
+   472→   *
+   473→   * @returns true if connection successful
+   474→   * @throws MaximoConnectionError if connection fails
+   475→   */
+   476→  async testConnection(): Promise<boolean> {
+   477→    return withSpan('MaximoClient.testConnection', async (span) => {
+   478→      if (!this.config) {
+   479→        span.setAttribute('mode', 'simulation');
+   480→        return true;
+   481→      }
+   482→
+   483→      // Try to query a single work order to verify connectivity
+   484→      const url = `${this.config.baseUrl}/os/mxwo?oslc.pageSize=1`;
+   485→
+   486→      try {
+   487→        const response = await fetch(url, {
+   488→          method: 'GET',
+   489→          headers: this.buildHeaders(),
+   490→          signal: AbortSignal.timeout(5000), // 5 second timeout for health check
+   491→        });
+   492→
+   493→        if (!response.ok) {
+   494→          throw new MaximoConnectionError(
+   495→            `Connection test failed: HTTP ${response.status}`,
+   496→            { statusCode: response.status }
+   497→          );
+   498→        }
+   499→
+   500→        span.setAttribute('status', 'connected');
+   501→        return true;
+   502→      } catch (error) {
+   503→        span.setAttribute('status', 'failed');
+   504→        span.setAttribute('error', error instanceof Error ? error.message : String(error));
+   505→        throw new MaximoConnectionError(
+   506→          `Connection test failed: ${error instanceof Error ? error.message : String(error)}`,
+   507→          { cause: error }
+   508→        );
+   509→      }
+   510→    });
+   511→  }
+   512→
+   513→  // ===========================================================================
+   514→  // Private Helper Methods
+   515→  // ===========================================================================
+   516→
+   517→  private buildHeaders(): Record<string, string> {
+   518→    if (!this.config) {
+   519→      return { 'Content-Type': 'application/json' };
+   520→    }
+   521→
+   522→    // Basic auth for Maximo OSLC API
+   523→    const credentials = Buffer.from(`${this.config.username}:${this.config.password}`).toString('base64');
+   524→
+   525→    return {
+   526→      'Content-Type': 'application/json',
+   527→      'Accept': 'application/json',
+   528→      'Authorization': `Basic ${credentials}`,
+   529→      'x-public-uri': this.config.baseUrl,
+   530→    };
+   531→  }
+   532→
+   533→  private async parseErrorResponse(response: Response): Promise<string> {
+   534→    try {
+   535→      const text = await response.text();
+   536→
+   537→      // Try to parse as JSON
+   538→      try {
+   539→        const json = JSON.parse(text) as MaximoErrorResponse;
+   540→        const message =
+   541→          json.Error?.message ||
+   542→          json.oslc?.Error?.['spi:message'] ||
+   543→          `HTTP ${response.status}`;
+   544→        return message;
+   545→      } catch {
+   546→        // Return raw text if not JSON
+   547→        return text.substring(0, 500);
+   548→      }
+   549→    } catch {
+   550→      return `HTTP ${response.status} ${response.statusText}`;
+   551→    }
+   552→  }
+   553→
+   554→  private parseWorkOrderResponse(data: Record<string, unknown>): MaximoWorkOrder {
+   555→    // Handle both direct properties and spi: prefixed properties (Maximo OSLC format)
+   556→    return {
+   557→      wonum: (data.wonum || data['spi:wonum']) as string,
+   558→      status: (data.status || data['spi:status'] || 'WAPPR') as MaximoWoStatus,
+   559→      schedstart: (data.schedstart || data['spi:schedstart']) as string | undefined,
+   560→      schedfinish: (data.schedfinish || data['spi:schedfinish']) as string | undefined,
+   561→      actstart: (data.actstart || data['spi:actstart']) as string | undefined,
+   562→      actfinish: (data.actfinish || data['spi:actfinish']) as string | undefined,
+   563→      actlabhrs: (data.actlabhrs || data['spi:actlabhrs']) as number | undefined,
+   564→      changedate: (data.changedate || data['spi:changedate']) as string | undefined,
+   565→      description: (data.description || data['spi:description']) as string | undefined,
+   566→      assetnum: (data.assetnum || data['spi:assetnum']) as string | undefined,
+   567→      location: (data.location || data['spi:location']) as string | undefined,
+   568→    };
+   569→  }
+   570→}
+   571→
+   572→// =============================================================================
+   573→// Singleton Instance
+   574→// =============================================================================
+   575→
+   576→let clientInstance: MaximoClient | null = null;
+   577→
+   578→/**
+   579→ * Get the singleton MaximoClient instance
+   580→ *
+   581→ * Call initialize() before using other methods.
+   582→ */
+   583→export function getMaximoClient(): MaximoClient {
+   584→  if (!clientInstance) {
+   585→    clientInstance = new MaximoClient();
+   586→  }
+   587→  return clientInstance;
+   588→}
+   589→
+   590→/**
+   591→ * Reset the client instance (for testing)
+   592→ */
+   593→export function resetMaximoClient(): void {
+   594→  clientInstance = null;
+   595→}
+   596→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,614 @@
+     1→/**
+     2→ * MMS Run Assignment Optimizer
+     3→ *
+     4→ * Main optimizer service that orchestrates between C++ OR-Tools solver
+     5→ * and TypeScript fallback. Provides IPC with the C++ binary via
+     6→ * NDJSON streams on stdin/stdout.
+     7→ *
+     8→ * Architecture:
+     9→ * - Primary: C++ OR-Tools CP-SAT solver for optimal solutions
+    10→ * - Fallback: TypeScript greedy algorithm when C++ unavailable/timeout
+    11→ * - Heartbeat monitoring to detect hung processes
+    12→ * - Explanation traces for every assignment decision
+    13→ *
+    14→ * @see specs/002-architecture.md Section 2.4
+    15→ * @see specs/004-domain-services.md Section 4.3
+    16→ */
+    17→
+    18→import { spawn, type Subprocess } from 'bun';
+    19→import { logger } from '../lib/logging/logger';
+    20→import { withSpan, recordSpanError } from '../lib/tracing';
+    21→import { OptimizerError } from '../lib/errors';
+    22→import { optimizerMetrics } from '../lib/metrics';
+    23→import { FallbackOptimizer, fallbackOptimizer } from './fallback';
+    24→import {
+    25→  type OptimizerFullInput,
+    26→  type OptimizerFullResult,
+    27→  type OptimizerMessage,
+    28→  type OptimizerProgressMessage,
+    29→  DEFAULT_OPTIMIZER_CONFIG,
+    30→} from './types';
+    31→
+    32→// Re-export types
+    33→export * from './types';
+    34→export { FallbackOptimizer, fallbackOptimizer } from './fallback';
+    35→
+    36→// =============================================================================
+    37→// Configuration
+    38→// =============================================================================
+    39→
+    40→export interface RunAssignmentOptimizerConfig {
+    41→  binaryPath: string;
+    42→  maxSolveTimeSeconds: number;
+    43→  timeoutMs: number;
+    44→  fallbackEnabled: boolean;
+    45→  heartbeatIntervalMs: number;
+    46→  heartbeatTimeoutMs: number;
+    47→}
+    48→
+    49→const DEFAULT_CONFIG: RunAssignmentOptimizerConfig = {
+    50→  binaryPath: process.env['MMS_OPTIMIZER_BINARY'] || './mms-optimizer',
+    51→  maxSolveTimeSeconds: 30,
+    52→  timeoutMs: 60000,
+    53→  fallbackEnabled: true,
+    54→  heartbeatIntervalMs: 5000,
+    55→  heartbeatTimeoutMs: 15000, // 3 missed heartbeats
+    56→};
+    57→
+    58→// =============================================================================
+    59→// Progress Callback
+    60→// =============================================================================
+    61→
+    62→export type ProgressCallback = (progress: OptimizerProgressMessage) => void;
+    63→
+    64→// =============================================================================
+    65→// Main Optimizer Service
+    66→// =============================================================================
+    67→
+    68→/**
+    69→ * Run Assignment Optimizer Service
+    70→ *
+    71→ * Manages the optimization process, handling both C++ binary
+    72→ * execution and TypeScript fallback scenarios.
+    73→ */
+    74→export class RunAssignmentOptimizer {
+    75→  private readonly config: RunAssignmentOptimizerConfig;
+    76→  private readonly log = logger.child({ service: 'RunAssignmentOptimizer' });
+    77→  private readonly fallback: FallbackOptimizer;
+    78→  private process: Subprocess | null = null;
+    79→  private heartbeatTimer: Timer | null = null;
+    80→  private lastHeartbeat: number = 0;
+    81→
+    82→  constructor(config: Partial<RunAssignmentOptimizerConfig> = {}) {
+    83→    this.config = { ...DEFAULT_CONFIG, ...config };
+    84→    this.fallback = fallbackOptimizer;
+    85→  }
+    86→
+    87→  /**
+    88→   * Run optimization for train-to-route assignment
+    89→   *
+    90→   * @param input - Optimization input with trains, routes, and constraints
+    91→   * @param onProgress - Optional callback for progress updates
+    92→   * @returns Optimization result with assignments and explanations
+    93→   */
+    94→  async optimize(
+    95→    input: OptimizerFullInput,
+    96→    onProgress?: ProgressCallback
+    97→  ): Promise<OptimizerFullResult> {
+    98→    return withSpan('optimizer.optimize', async (span) => {
+    99→      const startTime = Date.now();
+   100→
+   101→      span.setAttribute('requestId', input.requestId);
+   102→      span.setAttribute('trainCount', input.trains.length);
+   103→      span.setAttribute('routeCount', input.routes.length);
+   104→      span.setAttribute('fallbackEnabled', this.config.fallbackEnabled);
+   105→
+   106→      // Merge default config with input config
+   107→      const mergedInput: OptimizerFullInput = {
+   108→        ...input,
+   109→        config: { ...DEFAULT_OPTIMIZER_CONFIG, ...input.config },
+   110→      };
+   111→
+   112→      this.log.info(
+   113→        {
+   114→          requestId: input.requestId,
+   115→          trainCount: input.trains.length,
+   116→          routeCount: input.routes.length,
+   117→          assignmentDate: input.assignmentDate,
+   118→        },
+   119→        'Starting optimization'
+   120→      );
+   121→
+   122→      try {
+   123→        // Try C++ optimizer first
+   124→        const result = await this.runCppOptimizer(mergedInput, onProgress);
+   125→
+   126→        // Check if C++ returned INFEASIBLE and fallback is enabled
+   127→        if (result.status === 'INFEASIBLE' && this.config.fallbackEnabled) {
+   128→          this.log.warn(
+   129→            { requestId: input.requestId },
+   130→            'C++ optimizer returned INFEASIBLE, using fallback'
+   131→          );
+   132→          return await this.runWithFallback(mergedInput, startTime);
+   133→        }
+   134→
+   135→        optimizerMetrics.optimizerSolveSeconds
+   136→          .labels('cpp', result.status)
+   137→          .observe(result.solveTimeMs / 1000);
+   138→
+   139→        return result;
+   140→      } catch (error) {
+   141→        recordSpanError(span, error);
+   142→
+   143→        this.log.error(
+   144→          { requestId: input.requestId, error },
+   145→          'C++ optimizer failed'
+   146→        );
+   147→
+   148→        if (this.config.fallbackEnabled) {
+   149→          return await this.runWithFallback(mergedInput, startTime);
+   150→        }
+   151→
+   152→        throw error;
+   153→      }
+   154→    });
+   155→  }
+   156→
+   157→  /**
+   158→   * Run only the TypeScript fallback optimizer
+   159→   *
+   160→   * Useful for testing or when C++ binary is not available.
+   161→   */
+   162→  async optimizeWithFallback(
+   163→    input: OptimizerFullInput
+   164→  ): Promise<OptimizerFullResult> {
+   165→    const mergedInput: OptimizerFullInput = {
+   166→      ...input,
+   167→      config: { ...DEFAULT_OPTIMIZER_CONFIG, ...input.config },
+   168→    };
+   169→    return this.fallback.optimize(mergedInput);
+   170→  }
+   171→
+   172→  /**
+   173→   * Check if C++ optimizer binary is available
+   174→   */
+   175→  async isCppOptimizerAvailable(): Promise<boolean> {
+   176→    try {
+   177→      const proc = spawn(['test', '-x', this.config.binaryPath], {
+   178→        stdout: 'pipe',
+   179→        stderr: 'pipe',
+   180→      });
+   181→      const code = await proc.exited;
+   182→      return code === 0;
+   183→    } catch {
+   184→      return false;
+   185→    }
+   186→  }
+   187→
+   188→  /**
+   189→   * Run C++ optimizer binary
+   190→   */
+   191→  private async runCppOptimizer(
+   192→    input: OptimizerFullInput,
+   193→    onProgress?: ProgressCallback
+   194→  ): Promise<OptimizerFullResult> {
+   195→    return new Promise((resolve, reject) => {
+   196→      const timeout = setTimeout(() => {
+   197→        this.cleanup();
+   198→        reject(
+   199→          new OptimizerError(`Optimizer timeout after ${this.config.timeoutMs}ms`, {
+   200→            requestId: input.requestId,
+   201→            errorCode: 'TIMEOUT',
+   202→          })
+   203→        );
+   204→      }, this.config.timeoutMs);
+   205→
+   206→      // Check if binary exists
+   207→      const binaryCheck = spawn(['test', '-x', this.config.binaryPath], {
+   208→        stdout: 'pipe',
+   209→        stderr: 'pipe',
+   210→      });
+   211→
+   212→      binaryCheck.exited.then((code) => {
+   213→        if (code !== 0) {
+   214→          clearTimeout(timeout);
+   215→          reject(
+   216→            new OptimizerError('C++ optimizer binary not found or not executable', {
+   217→              requestId: input.requestId,
+   218→              errorCode: 'BINARY_NOT_FOUND',
+   219→              context: { binaryPath: this.config.binaryPath },
+   220→            })
+   221→          );
+   222→          return;
+   223→        }
+   224→
+   225→        // Spawn optimizer process
+   226→        this.process = spawn([this.config.binaryPath], {
+   227→          stdin: 'pipe',
+   228→          stdout: 'pipe',
+   229→          stderr: 'pipe',
+   230→        });
+   231→
+   232→        // Start heartbeat monitor
+   233→        this.startHeartbeatMonitor(input.requestId, () => {
+   234→          clearTimeout(timeout);
+   235→          this.cleanup();
+   236→          reject(
+   237→            new OptimizerError('Optimizer heartbeat timeout - process may be stuck', {
+   238→              requestId: input.requestId,
+   239→              errorCode: 'HEARTBEAT_TIMEOUT',
+   240→            })
+   241→          );
+   242→        });
+   243→
+   244→        // Write input to stdin
+   245→        const inputJson = JSON.stringify(this.transformInputForCpp(input)) + '\n';
+   246→        const stdin = this.process.stdin;
+   247→        if (stdin && typeof stdin === 'object' && 'getWriter' in stdin) {
+   248→          const writer = (stdin as unknown as WritableStream<Uint8Array>).getWriter();
+   249→          writer.write(new TextEncoder().encode(inputJson));
+   250→          writer.close();
+   251→        }
+   252→
+   253→        // Read stdout
+   254→        const stdout = this.process.stdout;
+   255→        if (stdout && typeof stdout === 'object' && 'getReader' in stdout) {
+   256→          this.readOutputStream(
+   257→            stdout as ReadableStream<Uint8Array>,
+   258→            input.requestId,
+   259→            onProgress,
+   260→            (result) => {
+   261→              clearTimeout(timeout);
+   262→              this.cleanup();
+   263→              resolve(result);
+   264→            },
+   265→            (error) => {
+   266→              clearTimeout(timeout);
+   267→              this.cleanup();
+   268→              reject(error);
+   269→            }
+   270→          );
+   271→        }
+   272→
+   273→        // Read stderr for logs
+   274→        const stderr = this.process.stderr;
+   275→        if (stderr && typeof stderr === 'object' && 'getReader' in stderr) {
+   276→          this.readErrorStream(stderr as ReadableStream<Uint8Array>);
+   277→        }
+   278→
+   279→        // Handle process exit
+   280→        this.process.exited.then((code) => {
+   281→          if (code !== 0) {
+   282→            const signal = (this.process as unknown as { signalCode?: string })?.signalCode;
+   283→            clearTimeout(timeout);
+   284→            this.cleanup();
+   285→            reject(
+   286→              new OptimizerError(`Optimizer exited with code ${code}`, {
+   287→                requestId: input.requestId,
+   288→                errorCode: signal === 'SIGSEGV' ? 'SEGFAULT' : 'INTERNAL_ERROR',
+   289→                context: { exitCode: code },
+   290→              })
+   291→            );
+   292→          }
+   293→        });
+   294→      });
+   295→    });
+   296→  }
+   297→
+   298→  /**
+   299→   * Transform input for C++ binary (snake_case)
+   300→   */
+   301→  private transformInputForCpp(input: OptimizerFullInput): Record<string, unknown> {
+   302→    return {
+   303→      type: 'SOLVE_REQUEST',
+   304→      request_id: input.requestId,
+   305→      assignment_date: input.assignmentDate,
+   306→      config: {
+   307→        max_solve_time_seconds: input.config.maxSolveTimeSeconds,
+   308→        num_workers: input.config.numWorkers,
+   309→        soft_constraint_penalties: {
+   310→          mileage_imbalance: input.config.softConstraintPenalties.mileageImbalance,
+   311→          preference_violation: input.config.softConstraintPenalties.preferenceViolation,
+   312→          overtime_hours: input.config.softConstraintPenalties.overtimeHours,
+   313→        },
+   314→        explanation_verbosity: input.config.explanationVerbosity,
+   315→      },
+   316→      trains: input.trains.map((t) => ({
+   317→        id: t.id,
+   318→        train_number: t.trainNumber,
+   319→        fleet_id: t.fleetId,
+   320→        current_mileage: t.currentMileageKm,
+   321→        target_mileage: t.targetMileageKm,
+   322→        fitness_status: t.fitnessStatus,
+   323→        restrictions: t.restrictions,
+   324→        home_depot_id: t.homeDepotId,
+   325→        current_depot_id: t.currentDepotId,
+   326→      })),
+   327→      routes: input.routes.map((r) => ({
+   328→        id: r.id,
+   329→        route_code: r.routeCode,
+   330→        expected_km: r.expectedKmPerDay,
+   331→        required_trains: r.requiredTrains,
+   332→        allowed_fleets: r.allowedFleetIds,
+   333→        restrictions: r.restrictions,
+   334→      })),
+   335→      hard_constraints: input.hardConstraints.map((c) => ({
+   336→        type: c.type,
+   337→        train_id: c.trainId,
+   338→        route_id: c.routeId,
+   339→        description: c.description,
+   340→      })),
+   341→      soft_constraints: input.softConstraints.map((c) => ({
+   342→        type: c.type,
+   343→        train_id: c.trainId,
+   344→        penalty_weight: c.penaltyWeight,
+   345→        description: c.description,
+   346→      })),
+   347→      unavailability_events: input.unavailabilityEvents?.map((e) => ({
+   348→        train_id: e.trainId,
+   349→        event_type: e.eventType,
+   350→        status: e.status,
+   351→        blocks_run_assignment: e.blocksRunAssignment,
+   352→        description: e.description,
+   353→        external_reference: e.externalReference,
+   354→      })),
+   355→      route_compatibility: input.routeCompatibility?.map((c) => ({
+   356→        train_id: c.trainId,
+   357→        fleet_id: c.fleetId,
+   358→        route_id: c.routeId,
+   359→        is_compatible: c.isCompatible,
+   360→        constraint_type: c.constraintType,
+   361→        restriction_reason: c.restrictionReason,
+   362→      })),
+   363→      material_positions: input.materialPositions?.map((p) => ({
+   364→        depot_id: p.depotId,
+   365→        part_number: p.partNumber,
+   366→        quantity_available: p.quantityAvailable,
+   367→        next_delivery_date: p.nextDeliveryDate,
+   368→      })),
+   369→      pending_pms: input.pendingPms?.map((pm) => ({
+   370→        pm_id: pm.pmId,
+   371→        train_id: pm.trainId,
+   372→        pm_type: pm.pmType,
+   373→        target_date: pm.targetDate,
+   374→        required_materials: pm.requiredMaterials.map((m) => ({
+   375→          part_number: m.partNumber,
+   376→          quantity: m.quantity,
+   377→          criticality: m.criticality,
+   378→        })),
+   379→      })),
+   380→      service_demand: input.serviceDemand?.map((d) => ({
+   381→        fleet_id: d.fleetId,
+   382→        min_trains_required: d.minTrainsRequired,
+   383→        day_type: d.dayType,
+   384→      })),
+   385→    };
+   386→  }
+   387→
+   388→  /**
+   389→   * Read and parse output stream
+   390→   */
+   391→  private async readOutputStream(
+   392→    stream: ReadableStream<Uint8Array>,
+   393→    requestId: string,
+   394→    onProgress: ProgressCallback | undefined,
+   395→    onResult: (result: OptimizerFullResult) => void,
+   396→    onError: (error: Error) => void
+   397→  ): Promise<void> {
+   398→    const reader = stream.getReader();
+   399→    const decoder = new TextDecoder();
+   400→    let buffer = '';
+   401→
+   402→    try {
+   403→      while (true) {
+   404→        const { done, value } = await reader.read();
+   405→        if (done) break;
+   406→
+   407→        buffer += decoder.decode(value, { stream: true });
+   408→        const lines = buffer.split('\n');
+   409→        buffer = lines.pop() || '';
+   410→
+   411→        for (const line of lines) {
+   412→          if (!line.trim()) continue;
+   413→
+   414→          try {
+   415→            const msg = JSON.parse(line) as OptimizerMessage;
+   416→            this.handleMessage(msg, requestId, onProgress, onResult, onError);
+   417→          } catch (parseError) {
+   418→            this.log.warn({ line, parseError }, 'Failed to parse optimizer output');
+   419→          }
+   420→        }
+   421→      }
+   422→    } catch (error) {
+   423→      this.log.error({ error }, 'Error reading optimizer output stream');
+   424→      onError(error instanceof Error ? error : new Error(String(error)));
+   425→    }
+   426→  }
+   427→
+   428→  /**
+   429→   * Handle parsed optimizer message
+   430→   */
+   431→  private handleMessage(
+   432→    msg: OptimizerMessage,
+   433→    requestId: string,
+   434→    onProgress: ProgressCallback | undefined,
+   435→    onResult: (result: OptimizerFullResult) => void,
+   436→    onError: (error: Error) => void
+   437→  ): void {
+   438→    switch (msg.type) {
+   439→      case 'HEARTBEAT':
+   440→        this.lastHeartbeat = Date.now();
+   441→        break;
+   442→
+   443→      case 'PROGRESS':
+   444→        this.lastHeartbeat = Date.now();
+   445→        if (onProgress) {
+   446→          onProgress(msg);
+   447→        }
+   448→        break;
+   449→
+   450→      case 'ERROR':
+   451→        onError(
+   452→          new OptimizerError(msg.errorMessage, {
+   453→            requestId,
+   454→            errorCode: msg.errorCode,
+   455→            recoverySuggestion: msg.recoverySuggestion,
+   456→          })
+   457→        );
+   458→        break;
+   459→
+   460→      case 'RESULT':
+   461→        onResult(this.transformResultFromCpp(msg as unknown as Record<string, unknown>));
+   462→        break;
+   463→    }
+   464→  }
+   465→
+   466→  /**
+   467→   * Transform result from C++ (snake_case to camelCase)
+   468→   */
+   469→  private transformResultFromCpp(msg: Record<string, unknown>): OptimizerFullResult {
+   470→    const assignments = (msg['assignments'] as Record<string, unknown>[])?.map((a) => ({
+   471→      trainId: a['train_id'] as string,
+   472→      routeId: a['route_id'] as string,
+   473→      score: a['score'] as number,
+   474→      explanation: (a['explanation'] as Record<string, unknown>[])?.map((e) => ({
+   475→        constraintType: e['constraint_type'] as 'HARD' | 'SOFT',
+   476→        constraintName: e['constraint_name'] as string,
+   477→        impact: e['impact'] as number,
+   478→        description: e['description'] as string,
+   479→      })) || [],
+   480→    })) || [];
+   481→
+   482→    const unassigned = (msg['unassigned'] as Record<string, unknown>[])?.map((u) => ({
+   483→      trainId: u['train_id'] as string | undefined,
+   484→      routeId: u['route_id'] as string | undefined,
+   485→      shortfall: u['shortfall'] as number | undefined,
+   486→      reason: u['reason'] as string,
+   487→      blockingConstraints: (u['blocking_constraints'] as string[]) || [],
+   488→    })) || [];
+   489→
+   490→    const materialWarnings = (msg['material_warnings'] as Record<string, unknown>[])?.map((w) => ({
+   491→      pmId: w['pm_id'] as string,
+   492→      trainId: w['train_id'] as string,
+   493→      partNumber: w['part_number'] as string,
+   494→      status: w['status'] as 'UNAVAILABLE' | 'LOW_STOCK' | 'ARRIVING_LATE',
+   495→      description: w['description'] as string,
+   496→    })) || [];
+   497→
+   498→    const summary = msg['summary'] as Record<string, unknown>;
+   499→
+   500→    return {
+   501→      type: 'RESULT',
+   502→      requestId: msg['request_id'] as string,
+   503→      status: msg['status'] as 'OPTIMAL' | 'FEASIBLE' | 'FALLBACK' | 'INFEASIBLE',
+   504→      solveTimeMs: msg['solve_time_ms'] as number,
+   505→      assignments,
+   506→      unassigned,
+   507→      materialWarnings,
+   508→      summary: {
+   509→        totalPenalty: summary?.['total_penalty'] as number || 0,
+   510→        trainsAssigned: summary?.['trains_assigned'] as number || assignments.length,
+   511→        trainsUnassigned: summary?.['trains_unassigned'] as number || unassigned.length,
+   512→        softConstraintBreakdown: (summary?.['soft_constraint_breakdown'] as Record<string, number>) || {},
+   513→        materialBlocks: summary?.['material_blocks'] as number || 0,
+   514→      },
+   515→    };
+   516→  }
+   517→
+   518→  /**
+   519→   * Read stderr for logs/metrics
+   520→   */
+   521→  private async readErrorStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+   522→    const reader = stream.getReader();
+   523→    const decoder = new TextDecoder();
+   524→
+   525→    try {
+   526→      while (true) {
+   527→        const { done, value } = await reader.read();
+   528→        if (done) break;
+   529→
+   530→        const text = decoder.decode(value, { stream: true });
+   531→        for (const line of text.split('\n')) {
+   532→          if (line.trim()) {
+   533→            this.log.debug({ stderr: line }, 'Optimizer stderr');
+   534→          }
+   535→        }
+   536→      }
+   537→    } catch {
+   538→      // Ignore stderr errors
+   539→    }
+   540→  }
+   541→
+   542→  /**
+   543→   * Start heartbeat monitoring
+   544→   */
+   545→  private startHeartbeatMonitor(
+   546→    requestId: string,
+   547→    onTimeout: () => void
+   548→  ): void {
+   549→    this.lastHeartbeat = Date.now();
+   550→
+   551→    this.heartbeatTimer = setInterval(() => {
+   552→      const elapsed = Date.now() - this.lastHeartbeat;
+   553→
+   554→      if (elapsed > this.config.heartbeatTimeoutMs) {
+   555→        this.log.error(
+   556→          { requestId, elapsedMs: elapsed },
+   557→          'Heartbeat timeout - killing optimizer process'
+   558→        );
+   559→
+   560→        // Kill hung process
+   561→        if (this.process) {
+   562→          this.process.kill('SIGKILL');
+   563→        }
+   564→
+   565→        onTimeout();
+   566→      }
+   567→    }, this.config.heartbeatIntervalMs);
+   568→  }
+   569→
+   570→  /**
+   571→   * Run fallback optimizer
+   572→   */
+   573→  private async runWithFallback(
+   574→    input: OptimizerFullInput,
+   575→    startTime: number
+   576→  ): Promise<OptimizerFullResult> {
+   577→    this.log.info({ requestId: input.requestId }, 'Running fallback optimizer');
+   578→
+   579→    const result = await this.fallback.optimize(input);
+   580→
+   581→    optimizerMetrics.optimizerSolveSeconds
+   582→      .labels('fallback', result.status)
+   583→      .observe((Date.now() - startTime) / 1000);
+   584→
+   585→    return result;
+   586→  }
+   587→
+   588→  /**
+   589→   * Cleanup resources
+   590→   */
+   591→  private cleanup(): void {
+   592→    if (this.heartbeatTimer) {
+   593→      clearInterval(this.heartbeatTimer);
+   594→      this.heartbeatTimer = null;
+   595→    }
+   596→
+   597→    if (this.process) {
+   598→      try {
+   599→        this.process.kill();
+   600→      } catch {
+   601→        // Ignore kill errors
+   602→      }
+   603→      this.process = null;
+   604→    }
+   605→  }
+   606→}
+   607→
+   608→// Export singleton instance
+   609→export const runAssignmentOptimizer = new RunAssignmentOptimizer();
+   610→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

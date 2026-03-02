@@ -1,0 +1,813 @@
+     1→/**
+     2→ * MMS Infinite Canvas
+     3→ *
+     4→ * The main canvas component that renders PM schedule data at different zoom levels.
+     5→ * Uses deck.gl for strategic view (WebGL) and Konva for tactical/operational views (Canvas 2D).
+     6→ *
+     7→ * Zoom Level Rendering:
+     8→ * - STRATEGIC (0-4): deck.gl WebGL heatmap
+     9→ * - TACTICAL_WIDE (4-8): deck.gl WebGL compressed blocks
+    10→ * - TACTICAL (8-12): Konva HTML5 Canvas Gantt
+    11→ * - OPERATIONAL (12-16): Konva HTML5 Canvas detailed cards
+    12→ * - DETAIL (16+): React DOM overlay
+    13→ *
+    14→ * Based on specs/006-user-interface.md Section 6.3.
+    15→ */
+    16→
+    17→import { useRef } from 'react';
+    18→import { Card, NonIdealState, Spinner, Tag, Button, ButtonGroup } from '@blueprintjs/core';
+    19→
+    20→import { useCanvas, useCanvasData, useFleet, loadStrategicData, loadTacticalData, loadTacticalWideData, loadOperationalData, loadDetailData } from '../../store';
+    21→import type { CanvasSliceState } from '../../store/slices/canvas';
+    22→import type { CanvasDataState } from '../../store/slices/canvas';
+    23→import type { FleetSliceState } from '../../store/slices/fleet';
+    24→import { StrategicHeatmapLayer, TacticalWideLayer, TacticalGanttLayer, OperationalDetailLayer, DetailCardOverlay, type HeatmapCell, type PmBlock, type OperationalPmBlock } from './layers';
+    25→
+    26→/** Default canvas dimensions when container size is not available */
+    27→const DEFAULT_CANVAS_WIDTH = 1200;
+    28→const DEFAULT_CANVAS_HEIGHT = 800;
+    29→
+    30→export function InfiniteCanvas() {
+    31→  const { state: canvasStateRaw, actions: canvasActions } = useCanvas();
+    32→  const { state: canvasDataStateRaw, actions: canvasDataActions } = useCanvasData();
+    33→  const { state: fleetStateRaw } = useFleet();
+    34→
+    35→  const canvasState = canvasStateRaw as unknown as CanvasSliceState;
+    36→  const canvasDataState = canvasDataStateRaw as unknown as CanvasDataState;
+    37→  const fleetState = fleetStateRaw as unknown as FleetSliceState;
+    38→
+    39→  const { zoom, zoomLevel, viewport, isPanning, layers } = canvasState;
+    40→  const {
+    41→    strategicData, strategicLoading, strategicError, fromYear, toYear,
+    42→    tacticalWideData, tacticalWideLoading, tacticalWideError, tacticalWideFromDate, tacticalWideToDate,
+    43→    tacticalData, tacticalLoading, tacticalError, tacticalFromDate, tacticalToDate,
+    44→    operationalData, operationalLoading, operationalError, operationalFromDate, operationalToDate,
+    45→    detailData, detailLoading, detailError, detailFromDate, detailToDate, detailExpandedPmIds
+    46→  } = canvasDataState;
+    47→  const isLoading = fleetState.trains.length === 0;
+    48→
+    49→  const tooltipPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+    50→  const tooltipRef = useRef<HTMLDivElement>(null);
+    51→
+    52→  const handleWheel = (event: React.WheelEvent) => {
+    53→    event.preventDefault();
+    54→    const delta = event.deltaY > 0 ? -0.5 : 0.5;
+    55→    const newZoom = Math.max(0, Math.min(20, zoom + delta));
+    56→    canvasActions.setZoom(newZoom);
+    57→  };
+    58→
+    59→  const handleMouseDown = (event: React.MouseEvent) => {
+    60→    if (event.button === 0) {
+    61→      canvasActions.startPanning();
+    62→    }
+    63→  };
+    64→
+    65→  const handleMouseUp = () => {
+    66→    canvasActions.stopPanning();
+    67→  };
+    68→
+    69→  const handleMouseMove = (event: React.MouseEvent) => {
+    70→    if (isPanning) {
+    71→      canvasActions.pan({
+    72→        dx: -event.movementX,
+    73→        dy: -event.movementY,
+    74→      });
+    75→    }
+    76→    tooltipPosRef.current = { x: event.clientX, y: event.clientY };
+    77→  };
+    78→
+    79→  const handleLoadStrategicData = () => {
+    80→    loadStrategicData(canvasDataActions, {
+    81→      fromYear,
+    82→      toYear,
+    83→    });
+    84→  };
+    85→
+    86→  const handleLoadTacticalWideData = () => {
+    87→    loadTacticalWideData(canvasDataActions, {
+    88→      fromDate: tacticalWideFromDate,
+    89→      toDate: tacticalWideToDate,
+    90→    });
+    91→  };
+    92→
+    93→  const handleLoadTacticalData = () => {
+    94→    loadTacticalData(canvasDataActions, {
+    95→      fromWeek: tacticalFromDate,
+    96→      toWeek: tacticalToDate,
+    97→    });
+    98→  };
+    99→
+   100→  const handleLoadOperationalData = () => {
+   101→    loadOperationalData(canvasDataActions, {
+   102→      fromDate: operationalFromDate,
+   103→      toDate: operationalToDate,
+   104→    });
+   105→  };
+   106→
+   107→  const handleLoadDetailData = () => {
+   108→    loadDetailData(canvasDataActions, {
+   109→      fromDate: detailFromDate,
+   110→      toDate: detailToDate,
+   111→    });
+   112→  };
+   113→
+   114→  const handleDetailPmSelect = (pmId: string) => {
+   115→    canvasActions.selectPm(pmId);
+   116→  };
+   117→
+   118→  const handleDetailPmExpand = (pmId: string) => {
+   119→    canvasDataActions.expandDetailPm(pmId);
+   120→  };
+   121→
+   122→  const handleDetailPmCollapse = (pmId: string) => {
+   123→    canvasDataActions.collapseDetailPm(pmId);
+   124→  };
+   125→
+   126→  const handleDetailPmEdit = (pmId: string, field: string) => {
+   127→    // In production, this would dispatch an edit action to the PM service
+   128→    console.log(`Edit PM ${pmId} field ${field}`);
+   129→  };
+   130→
+   131→  const handleDetailPmLock = (pmId: string) => {
+   132→    // In production, this would dispatch a lock action
+   133→    console.log(`Lock PM ${pmId}`);
+   134→  };
+   135→
+   136→  const handleDetailPmUnlock = (pmId: string) => {
+   137→    // In production, this would dispatch an unlock action
+   138→    console.log(`Unlock PM ${pmId}`);
+   139→  };
+   140→
+   141→  const handleDetailViewHistory = (pmId: string) => {
+   142→    // In production, this would open a history panel
+   143→    console.log(`View history for PM ${pmId}`);
+   144→  };
+   145→
+   146→  const handlePmBlockHover = (pm: PmBlock | null) => {
+   147→    if (tooltipRef.current) {
+   148→      if (pm) {
+   149→        tooltipRef.current.style.display = 'block';
+   150→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   151→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   152→        tooltipRef.current.innerHTML = `
+   153→          <div style="font-weight: 600; margin-bottom: 4px;">
+   154→            ${pm.pmCode} - ${pm.trainNumber}
+   155→          </div>
+   156→          <div style="color: #64748b;">
+   157→            <div>Date: <strong>${pm.targetDate}</strong></div>
+   158→            <div>Duration: <strong>${pm.durationDays} day${pm.durationDays > 1 ? 's' : ''}</strong></div>
+   159→            <div>Status: <strong>${pm.status}</strong></div>
+   160→            ${pm.depotCode ? `<div>Depot: <strong>${pm.depotCode}</strong></div>` : ''}
+   161→            ${pm.trackNumber ? `<div>Track: <strong>${pm.trackNumber}</strong></div>` : ''}
+   162→            ${pm.estimatedHours ? `<div>Hours: <strong>${pm.estimatedHours}h</strong></div>` : ''}
+   163→            ${pm.isLocked ? '<div style="color: #d97706;">🔒 Locked</div>' : ''}
+   164→          </div>
+   165→        `;
+   166→      } else {
+   167→        tooltipRef.current.style.display = 'none';
+   168→      }
+   169→    }
+   170→  };
+   171→
+   172→  const handlePmBlockClick = (pmId: string) => {
+   173→    canvasActions.selectPm(pmId);
+   174→  };
+   175→
+   176→  // Tactical-Wide block handlers
+   177→  const handleTacticalWideBlockHover = (block: { pmId: string; trainNumber: string; pmCode: string; targetDate: string; status: string; durationWeeks: number; isLocked: boolean } | null) => {
+   178→    if (tooltipRef.current) {
+   179→      if (block) {
+   180→        tooltipRef.current.style.display = 'block';
+   181→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   182→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   183→        tooltipRef.current.innerHTML = `
+   184→          <div style="font-weight: 600; margin-bottom: 4px;">
+   185→            ${block.pmCode} - ${block.trainNumber}
+   186→          </div>
+   187→          <div style="color: #64748b;">
+   188→            <div>Date: <strong>${block.targetDate}</strong></div>
+   189→            <div>Status: <strong>${block.status}</strong></div>
+   190→            <div>Duration: <strong>~${block.durationWeeks} week(s)</strong></div>
+   191→            ${block.isLocked ? '<div style="color: #d97706;">🔒 Locked</div>' : ''}
+   192→          </div>
+   193→        `;
+   194→      } else {
+   195→        tooltipRef.current.style.display = 'none';
+   196→      }
+   197→    }
+   198→  };
+   199→
+   200→  const handleTacticalWideBlockClick = (block: { pmId: string }) => {
+   201→    canvasActions.selectPm(block.pmId);
+   202→  };
+   203→
+   204→  const handleMonthClick = (month: number, year: number) => {
+   205→    // Zoom into tactical view for the clicked month
+   206→    canvasActions.setZoom(10); // Move to TACTICAL zoom level
+   207→    const startDate = new Date(year, month, 1);
+   208→    const endDate = new Date(year, month + 3, 0); // 3 months view
+   209→    canvasActions.setViewport({
+   210→      startDate: startDate.toISOString().split('T')[0],
+   211→      endDate: endDate.toISOString().split('T')[0],
+   212→    });
+   213→  };
+   214→
+   215→  const handleCellHover = (cell: HeatmapCell | null) => {
+   216→    if (tooltipRef.current) {
+   217→      if (cell) {
+   218→        tooltipRef.current.style.display = 'block';
+   219→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   220→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   221→        tooltipRef.current.innerHTML = `
+   222→          <div style="font-weight: 600; margin-bottom: 4px;">
+   223→            Train ${cell.trainNumber} - ${cell.year}
+   224→          </div>
+   225→          <div style="color: #64748b;">
+   226→            <div>PM Count: <strong>${cell.pmCount}</strong></div>
+   227→            <div>Total Hours: <strong>${cell.totalHours.toFixed(1)}h</strong></div>
+   228→            ${cell.completedCount > 0 ? `<div>Completed: <strong>${cell.completedCount}</strong></div>` : ''}
+   229→            ${cell.lockedCount > 0 ? `<div>Locked: <strong>${cell.lockedCount}</strong></div>` : ''}
+   230→          </div>
+   231→        `;
+   232→      } else {
+   233→        tooltipRef.current.style.display = 'none';
+   234→      }
+   235→    }
+   236→  };
+   237→
+   238→  const handleCellClick = (cell: HeatmapCell) => {
+   239→    canvasActions.setZoom(6);
+   240→    canvasActions.setViewport({
+   241→      startDate: `${cell.year}-01-01`,
+   242→      endDate: `${cell.year}-12-31`,
+   243→      trainIds: [cell.trainId],
+   244→    });
+   245→  };
+   246→
+   247→  const handleYearClick = (year: number) => {
+   248→    canvasActions.setZoom(6);
+   249→    canvasActions.setViewport({
+   250→      startDate: `${year}-01-01`,
+   251→      endDate: `${year}-12-31`,
+   252→    });
+   253→  };
+   254→
+   255→  const handleOperationalPmHover = (pm: OperationalPmBlock | null) => {
+   256→    if (tooltipRef.current) {
+   257→      if (pm) {
+   258→        tooltipRef.current.style.display = 'block';
+   259→        tooltipRef.current.style.left = `${tooltipPosRef.current.x + 10}px`;
+   260→        tooltipRef.current.style.top = `${tooltipPosRef.current.y + 10}px`;
+   261→        const materialInfo = pm.materials.length > 0
+   262→          ? pm.materials.map(m => `${m.status === 'AVAILABLE' ? '✓' : '⚠'} ${m.materialName}`).slice(0, 3).join('<br/>')
+   263→          : '<span style="color: #94a3b8; font-style: italic;">No materials required</span>';
+   264→        tooltipRef.current.innerHTML = `
+   265→          <div style="font-weight: 600; margin-bottom: 8px;">
+   266→            ${pm.pmCode} - ${pm.trainNumber}
+   267→          </div>
+   268→          <div style="color: #64748b;">
+   269→            <div><strong>${pm.pmDescription}</strong></div>
+   270→            <div style="margin-top: 4px;">Date: <strong>${pm.targetDate} - ${pm.endDate}</strong></div>
+   271→            <div>Duration: <strong>${pm.durationDays} day${pm.durationDays > 1 ? 's' : ''}</strong></div>
+   272→            <div>Status: <strong>${pm.status}</strong></div>
+   273→            ${pm.depotCode ? `<div>Depot: <strong>${pm.depotCode}</strong></div>` : ''}
+   274→            ${pm.trackNumber ? `<div>Track: <strong>${pm.trackNumber}</strong></div>` : ''}
+   275→            ${pm.estimatedHours ? `<div>Hours: <strong>${pm.estimatedHours}h</strong></div>` : ''}
+   276→            ${pm.assignedShift ? `<div>Shift: <strong>${pm.assignedShift}</strong></div>` : ''}
+   277→            ${pm.isLocked ? '<div style="color: #d97706; margin-top: 4px;">🔒 Locked in Maximo</div>' : ''}
+   278→            <div style="margin-top: 8px; border-top: 1px solid #e2e8f0; padding-top: 8px;">
+   279→              <strong>Materials:</strong><br/>
+   280→              ${materialInfo}
+   281→            </div>
+   282→          </div>
+   283→        `;
+   284→      } else {
+   285→        tooltipRef.current.style.display = 'none';
+   286→      }
+   287→    }
+   288→  };
+   289→
+   290→  const renderContent = () => {
+   291→    if (isLoading) {
+   292→      return (
+   293→        <NonIdealState
+   294→          icon={<Spinner size={48} />}
+   295→          title="Loading fleet data..."
+   296→          description="Fetching trains and PM schedule"
+   297→        />
+   298→      );
+   299→    }
+   300→
+   301→    if (fleetState.trains.length === 0) {
+   302→      return (
+   303→        <NonIdealState
+   304→          icon="train"
+   305→          title="No trains found"
+   306→          description="No trains match the current filters"
+   307→        />
+   308→      );
+   309→    }
+   310→
+   311→    if (zoomLevel === 'STRATEGIC') {
+   312→      if (strategicLoading) {
+   313→        return (
+   314→          <NonIdealState
+   315→            icon={<Spinner size={48} />}
+   316→            title="Loading strategic view..."
+   317→            description="Fetching PM density data"
+   318→          />
+   319→        );
+   320→      }
+   321→
+   322→      if (strategicError) {
+   323→        return (
+   324→          <NonIdealState
+   325→            icon="error"
+   326→            title="Error loading strategic view"
+   327→            description={strategicError}
+   328→            action={
+   329→              <Button intent="primary" onClick={handleLoadStrategicData}>
+   330→                Retry
+   331→              </Button>
+   332→            }
+   333→          />
+   334→        );
+   335→      }
+   336→
+   337→      if (!strategicData) {
+   338→        return (
+   339→          <NonIdealState
+   340→            icon="heat-grid"
+   341→            title="Strategic View"
+   342→            description="Load PM density heatmap for multi-year planning"
+   343→            action={
+   344→              <ButtonGroup>
+   345→                <Button intent="primary" onClick={handleLoadStrategicData}>
+   346→                  Load Strategic Data
+   347→                </Button>
+   348→              </ButtonGroup>
+   349→            }
+   350→          >
+   351→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   352→              <p>Shows 10-year PM density across {fleetState.trains.length} trains</p>
+   353→            </div>
+   354→          </NonIdealState>
+   355→        );
+   356→      }
+   357→
+   358→      return (
+   359→        <>
+   360→          <StrategicHeatmapLayer
+   361→            data={strategicData}
+   362→            fromYear={fromYear}
+   363→            toYear={toYear}
+   364→            width="100%"
+   365→            height="100%"
+   366→            onCellHover={handleCellHover}
+   367→            onCellClick={handleCellClick}
+   368→            onYearClick={handleYearClick}
+   369→          />
+   370→          <div
+   371→            ref={tooltipRef}
+   372→            style={{
+   373→              display: 'none',
+   374→              position: 'fixed',
+   375→              backgroundColor: 'white',
+   376→              border: '1px solid #e2e8f0',
+   377→              borderRadius: '6px',
+   378→              padding: '8px 12px',
+   379→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   380→              pointerEvents: 'none',
+   381→              zIndex: 100,
+   382→              fontSize: '12px',
+   383→              lineHeight: 1.5,
+   384→            }}
+   385→          />
+   386→        </>
+   387→      );
+   388→    }
+   389→
+   390→    if (zoomLevel === 'TACTICAL_WIDE') {
+   391→      if (tacticalWideLoading) {
+   392→        return (
+   393→          <NonIdealState
+   394→            icon={<Spinner size={48} />}
+   395→            title="Loading tactical-wide view..."
+   396→            description="Fetching yearly PM schedule data"
+   397→          />
+   398→        );
+   399→      }
+   400→
+   401→      if (tacticalWideError) {
+   402→        return (
+   403→          <NonIdealState
+   404→            icon="error"
+   405→            title="Error loading tactical-wide view"
+   406→            description={tacticalWideError}
+   407→            action={
+   408→              <Button intent="primary" onClick={handleLoadTacticalWideData}>
+   409→                Retry
+   410→              </Button>
+   411→            }
+   412→          />
+   413→        );
+   414→      }
+   415→
+   416→      if (!tacticalWideData) {
+   417→        return (
+   418→          <NonIdealState
+   419→            icon="calendar"
+   420→            title="Tactical Wide View"
+   421→            description="Load 1-year PM schedule with monthly granularity"
+   422→            action={
+   423→              <ButtonGroup>
+   424→                <Button intent="primary" onClick={handleLoadTacticalWideData}>
+   425→                  Load Tactical Wide Data
+   426→                </Button>
+   427→              </ButtonGroup>
+   428→            }
+   429→          >
+   430→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   431→              <p>Shows PM schedule from {tacticalWideFromDate} to {tacticalWideToDate}</p>
+   432→              <p>Monthly granularity with compressed Gantt blocks</p>
+   433→            </div>
+   434→          </NonIdealState>
+   435→        );
+   436→      }
+   437→
+   438→      return (
+   439→        <>
+   440→          <TacticalWideLayer
+   441→            data={tacticalWideData}
+   442→            fromDate={new Date(tacticalWideFromDate)}
+   443→            toDate={new Date(tacticalWideToDate)}
+   444→            width="100%"
+   445→            height="100%"
+   446→            selectedPmIds={canvasState.selection.selectedPmIds}
+   447→            onBlockHover={handleTacticalWideBlockHover}
+   448→            onBlockClick={handleTacticalWideBlockClick}
+   449→            onMonthClick={handleMonthClick}
+   450→          />
+   451→          <div
+   452→            ref={tooltipRef}
+   453→            style={{
+   454→              display: 'none',
+   455→              position: 'fixed',
+   456→              backgroundColor: 'white',
+   457→              border: '1px solid #e2e8f0',
+   458→              borderRadius: '6px',
+   459→              padding: '8px 12px',
+   460→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   461→              pointerEvents: 'none',
+   462→              zIndex: 100,
+   463→              fontSize: '12px',
+   464→              lineHeight: 1.5,
+   465→            }}
+   466→          />
+   467→        </>
+   468→      );
+   469→    }
+   470→
+   471→    if (zoomLevel === 'TACTICAL') {
+   472→      if (tacticalLoading) {
+   473→        return (
+   474→          <NonIdealState
+   475→            icon={<Spinner size={48} />}
+   476→            title="Loading tactical view..."
+   477→            description="Fetching PM schedule data"
+   478→          />
+   479→        );
+   480→      }
+   481→
+   482→      if (tacticalError) {
+   483→        return (
+   484→          <NonIdealState
+   485→            icon="error"
+   486→            title="Error loading tactical view"
+   487→            description={tacticalError}
+   488→            action={
+   489→              <Button intent="primary" onClick={handleLoadTacticalData}>
+   490→                Retry
+   491→              </Button>
+   492→            }
+   493→          />
+   494→        );
+   495→      }
+   496→
+   497→      if (!tacticalData) {
+   498→        return (
+   499→          <NonIdealState
+   500→            icon="gantt-chart"
+   501→            title="Tactical View"
+   502→            description="Load 12-week PM schedule Gantt chart"
+   503→            action={
+   504→              <ButtonGroup>
+   505→                <Button intent="primary" onClick={handleLoadTacticalData}>
+   506→                  Load Tactical Data
+   507→                </Button>
+   508→              </ButtonGroup>
+   509→            }
+   510→          >
+   511→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   512→              <p>Shows PM schedule from {tacticalFromDate} to {tacticalToDate}</p>
+   513→            </div>
+   514→          </NonIdealState>
+   515→        );
+   516→      }
+   517→
+   518→      // Build train order from tactical data
+   519→      const trainIds = Array.from(new Set(tacticalData.pmBlocks.map(pm => pm.trainId)));
+   520→      const containerWidth = DEFAULT_CANVAS_WIDTH;
+   521→      const containerHeight = DEFAULT_CANVAS_HEIGHT;
+   522→
+   523→      return (
+   524→        <>
+   525→          <TacticalGanttLayer
+   526→            data={tacticalData}
+   527→            trainOrder={trainIds}
+   528→            fromDate={new Date(tacticalFromDate)}
+   529→            toDate={new Date(tacticalToDate)}
+   530→            width={containerWidth}
+   531→            height={containerHeight}
+   532→            selectedPmIds={canvasState.selection.selectedPmIds}
+   533→            onPmClick={handlePmBlockClick}
+   534→            onPmHover={handlePmBlockHover}
+   535→            showConstraintWalls={layers.complianceWindows}
+   536→            showGrid={true}
+   537→          />
+   538→          <div
+   539→            ref={tooltipRef}
+   540→            style={{
+   541→              display: 'none',
+   542→              position: 'fixed',
+   543→              backgroundColor: 'white',
+   544→              border: '1px solid #e2e8f0',
+   545→              borderRadius: '6px',
+   546→              padding: '8px 12px',
+   547→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   548→              pointerEvents: 'none',
+   549→              zIndex: 100,
+   550→              fontSize: '12px',
+   551→              lineHeight: 1.5,
+   552→            }}
+   553→          />
+   554→        </>
+   555→      );
+   556→    }
+   557→
+   558→    // OPERATIONAL and DETAIL zoom levels
+   559→    if (zoomLevel === 'OPERATIONAL') {
+   560→      if (operationalLoading) {
+   561→        return (
+   562→          <NonIdealState
+   563→            icon={<Spinner size={48} />}
+   564→            title="Loading operational view..."
+   565→            description="Fetching detailed PM schedule data"
+   566→          />
+   567→        );
+   568→      }
+   569→
+   570→      if (operationalError) {
+   571→        return (
+   572→          <NonIdealState
+   573→            icon="error"
+   574→            title="Error loading operational view"
+   575→            description={operationalError}
+   576→            action={
+   577→              <Button intent="primary" onClick={handleLoadOperationalData}>
+   578→                Retry
+   579→              </Button>
+   580→            }
+   581→          />
+   582→        );
+   583→      }
+   584→
+   585→      if (!operationalData) {
+   586→        return (
+   587→          <NonIdealState
+   588→            icon="id-number"
+   589→            title="Operational View"
+   590→            description="Load 4-week detailed PM cards with material status"
+   591→            action={
+   592→              <ButtonGroup>
+   593→                <Button intent="primary" onClick={handleLoadOperationalData}>
+   594→                  Load Operational Data
+   595→                </Button>
+   596→              </ButtonGroup>
+   597→            }
+   598→          >
+   599→            <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   600→              <p>Shows PM schedule from {operationalFromDate} to {operationalToDate}</p>
+   601→              <p>Daily granularity with detailed PM cards</p>
+   602→            </div>
+   603→          </NonIdealState>
+   604→        );
+   605→      }
+   606→
+   607→      const containerWidth = DEFAULT_CANVAS_WIDTH;
+   608→      const containerHeight = DEFAULT_CANVAS_HEIGHT;
+   609→
+   610→      return (
+   611→        <>
+   612→          <OperationalDetailLayer
+   613→            data={operationalData}
+   614→            fromDate={new Date(operationalFromDate)}
+   615→            toDate={new Date(operationalToDate)}
+   616→            width={containerWidth}
+   617→            height={containerHeight}
+   618→            selectedPmIds={canvasState.selection.selectedPmIds}
+   619→            onPmClick={handlePmBlockClick}
+   620→            onPmHover={handleOperationalPmHover}
+   621→            showGrid={true}
+   622→          />
+   623→          <div
+   624→            ref={tooltipRef}
+   625→            style={{
+   626→              display: 'none',
+   627→              position: 'fixed',
+   628→              backgroundColor: 'white',
+   629→              border: '1px solid #e2e8f0',
+   630→              borderRadius: '6px',
+   631→              padding: '12px 16px',
+   632→              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+   633→              pointerEvents: 'none',
+   634→              zIndex: 100,
+   635→              fontSize: '12px',
+   636→              lineHeight: 1.6,
+   637→              maxWidth: '350px',
+   638→            }}
+   639→          />
+   640→        </>
+   641→      );
+   642→    }
+   643→
+   644→    // DETAIL view (zoom 16+) - React DOM overlay with full PM editing
+   645→    if (detailLoading) {
+   646→      return (
+   647→        <NonIdealState
+   648→          icon={<Spinner size={48} />}
+   649→          title="Loading detail view..."
+   650→          description="Fetching detailed PM data with history"
+   651→        />
+   652→      );
+   653→    }
+   654→
+   655→    if (detailError) {
+   656→      return (
+   657→        <NonIdealState
+   658→          icon="error"
+   659→          title="Error loading detail view"
+   660→          description={detailError}
+   661→          action={
+   662→            <Button intent="primary" onClick={handleLoadDetailData}>
+   663→              Retry
+   664→            </Button>
+   665→          }
+   666→        />
+   667→      );
+   668→    }
+   669→
+   670→    if (!detailData) {
+   671→      return (
+   672→        <NonIdealState
+   673→          icon="document"
+   674→          title="Detail View"
+   675→          description="Load 1-week PM schedule with full editing capabilities"
+   676→          action={
+   677→            <ButtonGroup>
+   678→              <Button intent="primary" onClick={handleLoadDetailData}>
+   679→                Load Detail Data
+   680→              </Button>
+   681→            </ButtonGroup>
+   682→          }
+   683→        >
+   684→          <div style={{ marginTop: '16px', fontSize: '12px', color: 'var(--pt-text-muted)' }}>
+   685→            <p>Shows PM schedule from {detailFromDate} to {detailToDate}</p>
+   686→            <ul style={{ textAlign: 'left', maxWidth: '300px', margin: '8px auto' }}>
+   687→              <li>Full PM editing interface</li>
+   688→              <li>Constraint validation feedback</li>
+   689→              <li>Material availability status</li>
+   690→              <li>Change history timeline</li>
+   691→            </ul>
+   692→          </div>
+   693→        </NonIdealState>
+   694→      );
+   695→    }
+   696→
+   697→    return (
+   698→      <DetailCardOverlay
+   699→        data={detailData}
+   700→        fromDate={new Date(detailFromDate)}
+   701→        toDate={new Date(detailToDate)}
+   702→        width={DEFAULT_CANVAS_WIDTH}
+   703→        height={DEFAULT_CANVAS_HEIGHT}
+   704→        selectedPmIds={canvasState.selection.selectedPmIds}
+   705→        expandedPmIds={detailExpandedPmIds}
+   706→        onPmSelect={handleDetailPmSelect}
+   707→        onPmExpand={handleDetailPmExpand}
+   708→        onPmCollapse={handleDetailPmCollapse}
+   709→        onPmEdit={handleDetailPmEdit}
+   710→        onPmLock={handleDetailPmLock}
+   711→        onPmUnlock={handleDetailPmUnlock}
+   712→        onViewHistory={handleDetailViewHistory}
+   713→      />
+   714→    );
+   715→  };
+   716→
+   717→  return (
+   718→    <div
+   719→      className="mms-canvas"
+   720→      style={{
+   721→        flex: 1,
+   722→        position: 'relative',
+   723→        overflow: 'hidden',
+   724→        backgroundColor: 'var(--pt-app-background-color, #f5f8fa)',
+   725→        cursor: isPanning ? 'grabbing' : 'grab',
+   726→      }}
+   727→      onWheel={handleWheel}
+   728→      onMouseDown={handleMouseDown}
+   729→      onMouseUp={handleMouseUp}
+   730→      onMouseLeave={handleMouseUp}
+   731→      onMouseMove={handleMouseMove}
+   732→    >
+   733→      <div
+   734→        style={{
+   735→          position: 'absolute',
+   736→          top: 0,
+   737→          left: 0,
+   738→          right: 0,
+   739→          bottom: 0,
+   740→          transform: `translate(${-canvasState.panX}px, ${-canvasState.panY}px)`,
+   741→          transition: isPanning ? 'none' : 'transform 0.1s ease-out',
+   742→        }}
+   743→      >
+   744→        {renderContent()}
+   745→      </div>
+   746→
+   747→      <div style={{
+   748→        position: 'absolute',
+   749→        top: '12px',
+   750→        right: '12px',
+   751→        zIndex: 10,
+   752→      }}>
+   753→        <Card elevation={1} style={{ padding: '8px 12px' }}>
+   754→          <div style={{ fontSize: '11px', color: 'var(--pt-text-muted)', marginBottom: '4px' }}>
+   755→            Zoom Level
+   756→          </div>
+   757→          <div style={{ fontSize: '14px', fontWeight: 600 }}>
+   758→            {zoomLevel.replace('_', ' ')}
+   759→          </div>
+   760→          <div style={{ fontSize: '11px', fontFamily: 'monospace' }}>
+   761→            {zoom.toFixed(1)} / 20
+   762→          </div>
+   763→        </Card>
+   764→      </div>
+   765→
+   766→      <div style={{
+   767→        position: 'absolute',
+   768→        bottom: '12px',
+   769→        left: '12px',
+   770→        zIndex: 10,
+   771→      }}>
+   772→        <Card elevation={1} style={{ padding: '8px 12px' }}>
+   773→          <div style={{ fontSize: '11px' }}>
+   774→            <span style={{ color: 'var(--pt-text-muted)' }}>Viewport: </span>
+   775→            <span style={{ fontFamily: 'monospace' }}>
+   776→              {viewport.startDate} to {viewport.endDate}
+   777→            </span>
+   778→          </div>
+   779→          <div style={{ fontSize: '11px' }}>
+   780→            <span style={{ color: 'var(--pt-text-muted)' }}>Trains: </span>
+   781→            <span>{viewport.trainIds.length || 'All'}</span>
+   782→          </div>
+   783→        </Card>
+   784→      </div>
+   785→
+   786→      {(canvasState.layers.manhourOverlay || canvasState.layers.driftOverlay || canvasState.layers.baselineShadow) && (
+   787→        <div style={{
+   788→          position: 'absolute',
+   789→          top: '12px',
+   790→          left: '12px',
+   791→          zIndex: 10,
+   792→          display: 'flex',
+   793→          gap: '4px',
+   794→        }}>
+   795→          {canvasState.layers.manhourOverlay && (
+   796→            <Tag intent="primary" icon="chart">Man-hours</Tag>
+   797→          )}
+   798→          {canvasState.layers.driftOverlay && (
+   799→            <Tag intent="warning" icon="delta">Drift</Tag>
+   800→          )}
+   801→          {canvasState.layers.baselineShadow && (
+   802→            <Tag minimal icon="git-commit">Baseline</Tag>
+   803→          )}
+   804→        </div>
+   805→      )}
+   806→    </div>
+   807→  );
+   808→}
+   809→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

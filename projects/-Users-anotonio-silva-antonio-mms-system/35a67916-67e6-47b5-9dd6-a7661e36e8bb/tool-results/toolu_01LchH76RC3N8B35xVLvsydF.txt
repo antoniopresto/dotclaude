@@ -1,0 +1,1080 @@
+     1→/**
+     2→ * MMS Date/Time Utilities Unit Tests
+     3→ *
+     4→ * Tests for date utilities covering:
+     5→ * - Timezone conversions
+     6→ * - Compliance window calculations (±10% tolerance)
+     7→ * - PM hierarchy logic (C4 satisfies C1/C2/C3)
+     8→ * - Mileage projection accuracy
+     9→ * - Day type detection
+    10→ * - Week/period boundaries
+    11→ *
+    12→ * These tests are CRITICAL as compliance window calculations
+    13→ * are foundational for PM scheduling across the 12-year contract.
+    14→ *
+    15→ * @see src/lib/utils/date.ts
+    16→ * @see specs/004-domain-services.md Section 4.4 (PM Scheduler)
+    17→ */
+    18→
+    19→import { describe, test, expect } from 'bun:test';
+    20→import {
+    21→  // Constants
+    22→  DEFAULT_TIMEZONE,
+    23→  COMPLIANCE_TOLERANCE_PCT,
+    24→  PM_HIERARCHY,
+    25→  // Timezone utilities
+    26→  toLocalTime,
+    27→  toUtc,
+    28→  formatInTimezone,
+    29→  getTodayInTimezone,
+    30→  // Compliance window utilities
+    31→  calculateComplianceWindow,
+    32→  isWithinComplianceWindow,
+    33→  isPmOverdue,
+    34→  isPmUpcoming,
+    35→  getDaysToDeadline,
+    36→  // PM hierarchy utilities
+    37→  getSatisfiedPmCodes,
+    38→  pmSatisfies,
+    39→  // Mileage projection utilities
+    40→  projectMileage,
+    41→  projectDateForMileage,
+    42→  // Week/period utilities
+    43→  getWeekBoundaries,
+    44→  getDayType,
+    45→  generateDateRange,
+    46→  generateWeeklyPeriods,
+    47→  // Parsing utilities
+    48→  parseDateString,
+    49→  formatDisplayDate,
+    50→  formatIsoDate,
+    51→  // Performance utilities
+    52→  measureDuration,
+    53→  createStopwatch,
+    54→  // Types
+    55→  type ComplianceWindow,
+    56→} from './date';
+    57→import { addDays, addMonths } from 'date-fns';
+    58→
+    59→// =============================================================================
+    60→// Test Constants
+    61→// =============================================================================
+    62→
+    63→describe('Date Utility Constants', () => {
+    64→  test('DEFAULT_TIMEZONE should be Asia/Hong_Kong', () => {
+    65→    expect(DEFAULT_TIMEZONE).toBe('Asia/Hong_Kong');
+    66→  });
+    67→
+    68→  test('COMPLIANCE_TOLERANCE_PCT should be 10%', () => {
+    69→    expect(COMPLIANCE_TOLERANCE_PCT).toBe(0.10);
+    70→  });
+    71→
+    72→  test('PM_HIERARCHY should define correct hierarchy', () => {
+    73→    expect(PM_HIERARCHY).toHaveProperty('OVERHAUL');
+    74→    expect(PM_HIERARCHY).toHaveProperty('C4');
+    75→    expect(PM_HIERARCHY).toHaveProperty('C3');
+    76→    expect(PM_HIERARCHY).toHaveProperty('C2');
+    77→    expect(PM_HIERARCHY).toHaveProperty('C1');
+    78→
+    79→    // OVERHAUL satisfies all
+    80→    expect(PM_HIERARCHY['OVERHAUL']).toContain('C4');
+    81→    expect(PM_HIERARCHY['OVERHAUL']).toContain('C3');
+    82→    expect(PM_HIERARCHY['OVERHAUL']).toContain('C2');
+    83→    expect(PM_HIERARCHY['OVERHAUL']).toContain('C1');
+    84→
+    85→    // C4 satisfies C3, C2, C1
+    86→    expect(PM_HIERARCHY['C4']).toContain('C3');
+    87→    expect(PM_HIERARCHY['C4']).toContain('C2');
+    88→    expect(PM_HIERARCHY['C4']).toContain('C1');
+    89→
+    90→    // C1 satisfies nothing
+    91→    expect(PM_HIERARCHY['C1']).toHaveLength(0);
+    92→  });
+    93→});
+    94→
+    95→// =============================================================================
+    96→// Timezone Utilities Tests
+    97→// =============================================================================
+    98→
+    99→describe('Timezone Utilities', () => {
+   100→  describe('toLocalTime', () => {
+   101→    test('should convert UTC to local timezone', () => {
+   102→      const utcDate = new Date('2026-01-15T00:00:00.000Z');
+   103→      const localDate = toLocalTime(utcDate);
+   104→
+   105→      // Hong Kong is UTC+8
+   106→      expect(localDate).toBeDefined();
+   107→      expect(localDate instanceof Date).toBe(true);
+   108→    });
+   109→
+   110→    test('should use default timezone when not specified', () => {
+   111→      const utcDate = new Date('2026-06-15T12:00:00.000Z');
+   112→      const localDate = toLocalTime(utcDate);
+   113→
+   114→      expect(localDate).toBeDefined();
+   115→    });
+   116→
+   117→    test('should accept custom timezone', () => {
+   118→      const utcDate = new Date('2026-01-15T00:00:00.000Z');
+   119→      const tokyoDate = toLocalTime(utcDate, 'Asia/Tokyo');
+   120→
+   121→      expect(tokyoDate).toBeDefined();
+   122→      expect(tokyoDate instanceof Date).toBe(true);
+   123→    });
+   124→  });
+   125→
+   126→  describe('toUtc', () => {
+   127→    test('should convert local timezone to UTC', () => {
+   128→      const localDate = new Date('2026-01-15T08:00:00.000');
+   129→      const utcDate = toUtc(localDate);
+   130→
+   131→      expect(utcDate).toBeDefined();
+   132→      expect(utcDate instanceof Date).toBe(true);
+   133→    });
+   134→
+   135→    test('should accept custom timezone', () => {
+   136→      const localDate = new Date('2026-01-15T09:00:00.000');
+   137→      const utcDate = toUtc(localDate, 'Asia/Tokyo');
+   138→
+   139→      expect(utcDate).toBeDefined();
+   140→    });
+   141→  });
+   142→
+   143→  describe('formatInTimezone', () => {
+   144→    test('should format date in specified timezone', () => {
+   145→      const date = new Date('2026-01-15T00:00:00.000Z');
+   146→      const formatted = formatInTimezone(date, 'yyyy-MM-dd HH:mm');
+   147→
+   148→      expect(typeof formatted).toBe('string');
+   149→      expect(formatted).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+   150→    });
+   151→
+   152→    test('should use default timezone when not specified', () => {
+   153→      const date = new Date('2026-06-15T12:00:00.000Z');
+   154→      const formatted = formatInTimezone(date, 'yyyy-MM-dd');
+   155→
+   156→      expect(formatted).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+   157→    });
+   158→  });
+   159→
+   160→  describe('getTodayInTimezone', () => {
+   161→    test('should return start of day in timezone', () => {
+   162→      const today = getTodayInTimezone();
+   163→
+   164→      expect(today).toBeDefined();
+   165→      expect(today instanceof Date).toBe(true);
+   166→      expect(today.getHours()).toBe(0);
+   167→      expect(today.getMinutes()).toBe(0);
+   168→      expect(today.getSeconds()).toBe(0);
+   169→    });
+   170→
+   171→    test('should accept custom timezone', () => {
+   172→      const today = getTodayInTimezone('America/New_York');
+   173→
+   174→      expect(today).toBeDefined();
+   175→      expect(today instanceof Date).toBe(true);
+   176→    });
+   177→  });
+   178→});
+   179→
+   180→// =============================================================================
+   181→// Compliance Window Utilities Tests (CRITICAL for PM Scheduling)
+   182→// =============================================================================
+   183→
+   184→describe('Compliance Window Utilities', () => {
+   185→  describe('calculateComplianceWindow', () => {
+   186→    describe('Time-based trigger', () => {
+   187→      test('should calculate window for 12-month interval', () => {
+   188→        const lastPmDate = new Date('2025-01-15');
+   189→        const window = calculateComplianceWindow({
+   190→          lastPmDate,
+   191→          intervalMonths: 12,
+   192→        });
+   193→
+   194→        expect(window.isValid).toBe(true);
+   195→
+   196→        // Target date should be 12 months after last PM
+   197→        const expectedTarget = addMonths(lastPmDate, 12);
+   198→        expect(window.targetDate.getTime()).toBe(expectedTarget.getTime());
+   199→
+   200→        // Window should be ±10% of 12 months (±36 days)
+   201→        const toleranceDays = Math.floor(12 * 30 * COMPLIANCE_TOLERANCE_PCT);
+   202→        expect(toleranceDays).toBe(36);
+   203→
+   204→        const expectedStart = addDays(expectedTarget, -toleranceDays);
+   205→        const expectedEnd = addDays(expectedTarget, toleranceDays);
+   206→        expect(window.start.getTime()).toBe(expectedStart.getTime());
+   207→        expect(window.end.getTime()).toBe(expectedEnd.getTime());
+   208→      });
+   209→
+   210→      test('should calculate window for 6-month interval', () => {
+   211→        const lastPmDate = new Date('2025-06-01');
+   212→        const window = calculateComplianceWindow({
+   213→          lastPmDate,
+   214→          intervalMonths: 6,
+   215→        });
+   216→
+   217→        expect(window.isValid).toBe(true);
+   218→
+   219→        // Target date should be 6 months after last PM
+   220→        const expectedTarget = addMonths(lastPmDate, 6);
+   221→        expect(window.targetDate.getTime()).toBe(expectedTarget.getTime());
+   222→
+   223→        // Window should be ±10% of 6 months (±18 days)
+   224→        const toleranceDays = Math.floor(6 * 30 * COMPLIANCE_TOLERANCE_PCT);
+   225→        expect(toleranceDays).toBe(18);
+   226→      });
+   227→
+   228→      test('should calculate window for 3-month interval (C1)', () => {
+   229→        const lastPmDate = new Date('2026-01-01');
+   230→        const window = calculateComplianceWindow({
+   231→          lastPmDate,
+   232→          intervalMonths: 3,
+   233→        });
+   234→
+   235→        expect(window.isValid).toBe(true);
+   236→
+   237→        // Target date should be 3 months after last PM
+   238→        const expectedTarget = addMonths(lastPmDate, 3);
+   239→        expect(window.targetDate.getTime()).toBe(expectedTarget.getTime());
+   240→
+   241→        // Window should be ±10% of 3 months (±9 days)
+   242→        const toleranceDays = Math.floor(3 * 30 * COMPLIANCE_TOLERANCE_PCT);
+   243→        expect(toleranceDays).toBe(9);
+   244→      });
+   245→
+   246→      test('should calculate window for 24-month interval (C4)', () => {
+   247→        const lastPmDate = new Date('2024-01-15');
+   248→        const window = calculateComplianceWindow({
+   249→          lastPmDate,
+   250→          intervalMonths: 24,
+   251→        });
+   252→
+   253→        expect(window.isValid).toBe(true);
+   254→
+   255→        // Target date should be 24 months after last PM
+   256→        const expectedTarget = addMonths(lastPmDate, 24);
+   257→        expect(window.targetDate.getTime()).toBe(expectedTarget.getTime());
+   258→
+   259→        // Window should be ±10% of 24 months (±72 days)
+   260→        const toleranceDays = Math.floor(24 * 30 * COMPLIANCE_TOLERANCE_PCT);
+   261→        expect(toleranceDays).toBe(72);
+   262→      });
+   263→    });
+   264→
+   265→    describe('Mileage-based trigger', () => {
+   266→      test('should calculate window based on mileage interval', () => {
+   267→        const lastPmDate = new Date('2025-01-01');
+   268→        const window = calculateComplianceWindow({
+   269→          lastPmDate,
+   270→          intervalKm: 60000,
+   271→          currentMileageKm: 150000,
+   272→          lastPmMileageKm: 120000,
+   273→          dailyKmRate: 300,
+   274→        });
+   275→
+   276→        expect(window.isValid).toBe(true);
+   277→
+   278→        // Target mileage = 120000 + 60000 = 180000
+   279→        // Remaining = 180000 - 150000 = 30000 km
+   280→        // Days to target = 30000 / 300 = 100 days
+   281→        const expectedTargetDays = 100;
+   282→        const expectedTarget = addDays(new Date(), expectedTargetDays);
+   283→
+   284→        // Should be within a day due to timing
+   285→        const daysDiff = Math.abs(
+   286→          (window.targetDate.getTime() - expectedTarget.getTime()) / (1000 * 60 * 60 * 24)
+   287→        );
+   288→        expect(daysDiff).toBeLessThan(2);
+   289→      });
+   290→
+   291→      test('should use default daily rate when not specified', () => {
+   292→        const lastPmDate = new Date('2025-01-01');
+   293→        const window = calculateComplianceWindow({
+   294→          lastPmDate,
+   295→          intervalKm: 60000,
+   296→          currentMileageKm: 50000,
+   297→          lastPmMileageKm: 0,
+   298→        });
+   299→
+   300→        expect(window.isValid).toBe(true);
+   301→        expect(window.targetDate).toBeDefined();
+   302→      });
+   303→
+   304→      test('should handle case where mileage target already passed', () => {
+   305→        const lastPmDate = new Date('2025-01-01');
+   306→        const window = calculateComplianceWindow({
+   307→          lastPmDate,
+   308→          intervalKm: 60000,
+   309→          currentMileageKm: 200000,
+   310→          lastPmMileageKm: 120000,
+   311→          dailyKmRate: 300,
+   312→        });
+   313→
+   314→        expect(window.isValid).toBe(true);
+   315→        // Target already passed, days to target would be negative
+   316→        // So target date would be in the past relative to now
+   317→      });
+   318→    });
+   319→
+   320→    describe('Fallback behavior', () => {
+   321→      test('should use 12-month fallback when no interval specified', () => {
+   322→        const lastPmDate = new Date('2025-06-01');
+   323→        const window = calculateComplianceWindow({
+   324→          lastPmDate,
+   325→        });
+   326→
+   327→        expect(window.isValid).toBe(true);
+   328→
+   329→        // Fallback is 12 months with ±1 month tolerance
+   330→        const expectedTarget = addMonths(lastPmDate, 12);
+   331→        expect(window.targetDate.getTime()).toBe(expectedTarget.getTime());
+   332→
+   333→        const expectedStart = addMonths(expectedTarget, -1);
+   334→        const expectedEnd = addMonths(expectedTarget, 1);
+   335→        expect(window.start.getTime()).toBe(expectedStart.getTime());
+   336→        expect(window.end.getTime()).toBe(expectedEnd.getTime());
+   337→      });
+   338→    });
+   339→  });
+   340→
+   341→  describe('isWithinComplianceWindow', () => {
+   342→    test('should return true for date within window', () => {
+   343→      const window: ComplianceWindow = {
+   344→        start: new Date('2026-01-01'),
+   345→        end: new Date('2026-02-28'),
+   346→        targetDate: new Date('2026-02-01'),
+   347→        isValid: true,
+   348→      };
+   349→
+   350→      expect(isWithinComplianceWindow(new Date('2026-01-15'), window)).toBe(true);
+   351→      expect(isWithinComplianceWindow(new Date('2026-02-01'), window)).toBe(true);
+   352→      expect(isWithinComplianceWindow(new Date('2026-02-14'), window)).toBe(true);
+   353→    });
+   354→
+   355→    test('should return true for date on window boundaries', () => {
+   356→      const window: ComplianceWindow = {
+   357→        start: new Date('2026-01-01'),
+   358→        end: new Date('2026-02-28'),
+   359→        targetDate: new Date('2026-02-01'),
+   360→        isValid: true,
+   361→      };
+   362→
+   363→      expect(isWithinComplianceWindow(new Date('2026-01-01'), window)).toBe(true);
+   364→      expect(isWithinComplianceWindow(new Date('2026-02-28'), window)).toBe(true);
+   365→    });
+   366→
+   367→    test('should return false for date before window', () => {
+   368→      const window: ComplianceWindow = {
+   369→        start: new Date('2026-01-01'),
+   370→        end: new Date('2026-02-28'),
+   371→        targetDate: new Date('2026-02-01'),
+   372→        isValid: true,
+   373→      };
+   374→
+   375→      expect(isWithinComplianceWindow(new Date('2025-12-31'), window)).toBe(false);
+   376→      expect(isWithinComplianceWindow(new Date('2025-06-15'), window)).toBe(false);
+   377→    });
+   378→
+   379→    test('should return false for date after window', () => {
+   380→      const window: ComplianceWindow = {
+   381→        start: new Date('2026-01-01'),
+   382→        end: new Date('2026-02-28'),
+   383→        targetDate: new Date('2026-02-01'),
+   384→        isValid: true,
+   385→      };
+   386→
+   387→      expect(isWithinComplianceWindow(new Date('2026-03-01'), window)).toBe(false);
+   388→      expect(isWithinComplianceWindow(new Date('2026-12-31'), window)).toBe(false);
+   389→    });
+   390→  });
+   391→
+   392→  describe('isPmOverdue', () => {
+   393→    test('should return true when current date is after window end', () => {
+   394→      const window: ComplianceWindow = {
+   395→        start: new Date('2026-01-01'),
+   396→        end: new Date('2026-02-28'),
+   397→        targetDate: new Date('2026-02-01'),
+   398→        isValid: true,
+   399→      };
+   400→
+   401→      expect(isPmOverdue(window, new Date('2026-03-01'))).toBe(true);
+   402→      expect(isPmOverdue(window, new Date('2026-06-15'))).toBe(true);
+   403→    });
+   404→
+   405→    test('should return false when current date is within or before window', () => {
+   406→      const window: ComplianceWindow = {
+   407→        start: new Date('2026-01-01'),
+   408→        end: new Date('2026-02-28'),
+   409→        targetDate: new Date('2026-02-01'),
+   410→        isValid: true,
+   411→      };
+   412→
+   413→      expect(isPmOverdue(window, new Date('2026-02-15'))).toBe(false);
+   414→      expect(isPmOverdue(window, new Date('2025-12-15'))).toBe(false);
+   415→    });
+   416→
+   417→    test('should use current date when not specified', () => {
+   418→      const futureWindow: ComplianceWindow = {
+   419→        start: new Date('2030-01-01'),
+   420→        end: new Date('2030-02-28'),
+   421→        targetDate: new Date('2030-02-01'),
+   422→        isValid: true,
+   423→      };
+   424→
+   425→      expect(isPmOverdue(futureWindow)).toBe(false);
+   426→    });
+   427→  });
+   428→
+   429→  describe('isPmUpcoming', () => {
+   430→    test('should return true when current date is before window start', () => {
+   431→      const window: ComplianceWindow = {
+   432→        start: new Date('2027-01-01'),
+   433→        end: new Date('2027-02-28'),
+   434→        targetDate: new Date('2027-02-01'),
+   435→        isValid: true,
+   436→      };
+   437→
+   438→      expect(isPmUpcoming(window, new Date('2026-12-31'))).toBe(true);
+   439→      expect(isPmUpcoming(window, new Date('2026-06-15'))).toBe(true);
+   440→    });
+   441→
+   442→    test('should return false when current date is within or after window', () => {
+   443→      const window: ComplianceWindow = {
+   444→        start: new Date('2026-01-01'),
+   445→        end: new Date('2026-02-28'),
+   446→        targetDate: new Date('2026-02-01'),
+   447→        isValid: true,
+   448→      };
+   449→
+   450→      expect(isPmUpcoming(window, new Date('2026-01-15'))).toBe(false);
+   451→      expect(isPmUpcoming(window, new Date('2026-03-15'))).toBe(false);
+   452→    });
+   453→  });
+   454→
+   455→  describe('getDaysToDeadline', () => {
+   456→    test('should return positive days when window end is in future', () => {
+   457→      const window: ComplianceWindow = {
+   458→        start: new Date('2026-01-01'),
+   459→        end: new Date('2026-03-01'),
+   460→        targetDate: new Date('2026-02-01'),
+   461→        isValid: true,
+   462→      };
+   463→
+   464→      const days = getDaysToDeadline(window, new Date('2026-01-15'));
+   465→      expect(days).toBe(45);
+   466→    });
+   467→
+   468→    test('should return negative days when window end is in past', () => {
+   469→      const window: ComplianceWindow = {
+   470→        start: new Date('2026-01-01'),
+   471→        end: new Date('2026-02-01'),
+   472→        targetDate: new Date('2026-01-15'),
+   473→        isValid: true,
+   474→      };
+   475→
+   476→      const days = getDaysToDeadline(window, new Date('2026-02-15'));
+   477→      expect(days).toBe(-14);
+   478→    });
+   479→
+   480→    test('should return 0 on exact deadline date', () => {
+   481→      const window: ComplianceWindow = {
+   482→        start: new Date('2026-01-01'),
+   483→        end: new Date('2026-02-01'),
+   484→        targetDate: new Date('2026-01-15'),
+   485→        isValid: true,
+   486→      };
+   487→
+   488→      const days = getDaysToDeadline(window, new Date('2026-02-01'));
+   489→      expect(days).toBe(0);
+   490→    });
+   491→  });
+   492→});
+   493→
+   494→// =============================================================================
+   495→// PM Hierarchy Utilities Tests
+   496→// =============================================================================
+   497→
+   498→describe('PM Hierarchy Utilities', () => {
+   499→  describe('getSatisfiedPmCodes', () => {
+   500→    test('OVERHAUL should satisfy C4, C3, C2, C1', () => {
+   501→      const satisfied = getSatisfiedPmCodes('OVERHAUL');
+   502→      expect(satisfied).toContain('C4');
+   503→      expect(satisfied).toContain('C3');
+   504→      expect(satisfied).toContain('C2');
+   505→      expect(satisfied).toContain('C1');
+   506→      expect(satisfied).toHaveLength(4);
+   507→    });
+   508→
+   509→    test('C4 should satisfy C3, C2, C1', () => {
+   510→      const satisfied = getSatisfiedPmCodes('C4');
+   511→      expect(satisfied).toContain('C3');
+   512→      expect(satisfied).toContain('C2');
+   513→      expect(satisfied).toContain('C1');
+   514→      expect(satisfied).toHaveLength(3);
+   515→    });
+   516→
+   517→    test('C3 should satisfy C2, C1', () => {
+   518→      const satisfied = getSatisfiedPmCodes('C3');
+   519→      expect(satisfied).toContain('C2');
+   520→      expect(satisfied).toContain('C1');
+   521→      expect(satisfied).toHaveLength(2);
+   522→    });
+   523→
+   524→    test('C2 should satisfy C1', () => {
+   525→      const satisfied = getSatisfiedPmCodes('C2');
+   526→      expect(satisfied).toContain('C1');
+   527→      expect(satisfied).toHaveLength(1);
+   528→    });
+   529→
+   530→    test('C1 should satisfy nothing', () => {
+   531→      const satisfied = getSatisfiedPmCodes('C1');
+   532→      expect(satisfied).toHaveLength(0);
+   533→    });
+   534→
+   535→    test('unknown PM code should return empty array', () => {
+   536→      const satisfied = getSatisfiedPmCodes('UNKNOWN');
+   537→      expect(satisfied).toEqual([]);
+   538→    });
+   539→  });
+   540→
+   541→  describe('pmSatisfies', () => {
+   542→    test('C4 should satisfy C3', () => {
+   543→      expect(pmSatisfies('C4', 'C3')).toBe(true);
+   544→    });
+   545→
+   546→    test('C4 should satisfy C2', () => {
+   547→      expect(pmSatisfies('C4', 'C2')).toBe(true);
+   548→    });
+   549→
+   550→    test('C4 should satisfy C1', () => {
+   551→      expect(pmSatisfies('C4', 'C1')).toBe(true);
+   552→    });
+   553→
+   554→    test('C3 should satisfy C2', () => {
+   555→      expect(pmSatisfies('C3', 'C2')).toBe(true);
+   556→    });
+   557→
+   558→    test('C3 should satisfy C1', () => {
+   559→      expect(pmSatisfies('C3', 'C1')).toBe(true);
+   560→    });
+   561→
+   562→    test('C2 should satisfy C1', () => {
+   563→      expect(pmSatisfies('C2', 'C1')).toBe(true);
+   564→    });
+   565→
+   566→    test('C1 should NOT satisfy C2', () => {
+   567→      expect(pmSatisfies('C1', 'C2')).toBe(false);
+   568→    });
+   569→
+   570→    test('C2 should NOT satisfy C3', () => {
+   571→      expect(pmSatisfies('C2', 'C3')).toBe(false);
+   572→    });
+   573→
+   574→    test('C3 should NOT satisfy C4', () => {
+   575→      expect(pmSatisfies('C3', 'C4')).toBe(false);
+   576→    });
+   577→
+   578→    test('same PM code should NOT satisfy itself', () => {
+   579→      expect(pmSatisfies('C1', 'C1')).toBe(false);
+   580→      expect(pmSatisfies('C2', 'C2')).toBe(false);
+   581→      expect(pmSatisfies('C4', 'C4')).toBe(false);
+   582→    });
+   583→
+   584→    test('OVERHAUL should satisfy all C-level PMs', () => {
+   585→      expect(pmSatisfies('OVERHAUL', 'C4')).toBe(true);
+   586→      expect(pmSatisfies('OVERHAUL', 'C3')).toBe(true);
+   587→      expect(pmSatisfies('OVERHAUL', 'C2')).toBe(true);
+   588→      expect(pmSatisfies('OVERHAUL', 'C1')).toBe(true);
+   589→    });
+   590→
+   591→    test('unknown PM codes should return false', () => {
+   592→      expect(pmSatisfies('UNKNOWN', 'C1')).toBe(false);
+   593→      expect(pmSatisfies('C1', 'UNKNOWN')).toBe(false);
+   594→    });
+   595→  });
+   596→});
+   597→
+   598→// =============================================================================
+   599→// Mileage Projection Utilities Tests
+   600→// =============================================================================
+   601→
+   602→describe('Mileage Projection Utilities', () => {
+   603→  describe('projectMileage', () => {
+   604→    test('should project mileage for future date', () => {
+   605→      const currentMileage = 100000;
+   606→      const dailyRate = 300;
+   607→      const currentDate = new Date('2026-01-01');
+   608→      const targetDate = new Date('2026-01-31'); // 30 days later
+   609→
+   610→      const projection = projectMileage(currentMileage, targetDate, dailyRate, currentDate);
+   611→
+   612→      expect(projection.projectedMileageKm).toBe(100000 + 30 * 300);
+   613→      expect(projection.dailyRateKm).toBe(300);
+   614→      expect(projection.date).toEqual(targetDate);
+   615→    });
+   616→
+   617→    test('should assign HIGH confidence for projections ≤30 days', () => {
+   618→      const currentDate = new Date('2026-01-01');
+   619→      const targetDate = new Date('2026-01-15'); // 14 days
+   620→
+   621→      const projection = projectMileage(100000, targetDate, 300, currentDate);
+   622→      expect(projection.confidence).toBe('HIGH');
+   623→
+   624→      const projection30 = projectMileage(100000, addDays(currentDate, 30), 300, currentDate);
+   625→      expect(projection30.confidence).toBe('HIGH');
+   626→    });
+   627→
+   628→    test('should assign MEDIUM confidence for projections 31-90 days', () => {
+   629→      const currentDate = new Date('2026-01-01');
+   630→
+   631→      const projection31 = projectMileage(100000, addDays(currentDate, 31), 300, currentDate);
+   632→      expect(projection31.confidence).toBe('MEDIUM');
+   633→
+   634→      const projection60 = projectMileage(100000, addDays(currentDate, 60), 300, currentDate);
+   635→      expect(projection60.confidence).toBe('MEDIUM');
+   636→
+   637→      const projection90 = projectMileage(100000, addDays(currentDate, 90), 300, currentDate);
+   638→      expect(projection90.confidence).toBe('MEDIUM');
+   639→    });
+   640→
+   641→    test('should assign LOW confidence for projections 91-365 days', () => {
+   642→      const currentDate = new Date('2026-01-01');
+   643→
+   644→      const projection91 = projectMileage(100000, addDays(currentDate, 91), 300, currentDate);
+   645→      expect(projection91.confidence).toBe('LOW');
+   646→
+   647→      const projection180 = projectMileage(100000, addDays(currentDate, 180), 300, currentDate);
+   648→      expect(projection180.confidence).toBe('LOW');
+   649→
+   650→      const projection365 = projectMileage(100000, addDays(currentDate, 365), 300, currentDate);
+   651→      expect(projection365.confidence).toBe('LOW');
+   652→    });
+   653→
+   654→    test('should assign ESTIMATED confidence for projections >365 days', () => {
+   655→      const currentDate = new Date('2026-01-01');
+   656→
+   657→      const projection366 = projectMileage(100000, addDays(currentDate, 366), 300, currentDate);
+   658→      expect(projection366.confidence).toBe('ESTIMATED');
+   659→
+   660→      const projection730 = projectMileage(100000, addDays(currentDate, 730), 300, currentDate);
+   661→      expect(projection730.confidence).toBe('ESTIMATED');
+   662→    });
+   663→
+   664→    test('should use default daily rate of 280 km/day when not specified', () => {
+   665→      const currentDate = new Date('2026-01-01');
+   666→      const targetDate = new Date('2026-01-11'); // 10 days
+   667→
+   668→      const projection = projectMileage(100000, targetDate, undefined, currentDate);
+   669→      expect(projection.projectedMileageKm).toBe(100000 + 10 * 280);
+   670→    });
+   671→
+   672→    test('should round projected mileage', () => {
+   673→      const currentDate = new Date('2026-01-01');
+   674→      const targetDate = new Date('2026-01-02'); // 1 day
+   675→
+   676→      const projection = projectMileage(100000, targetDate, 277.5, currentDate);
+   677→      expect(Number.isInteger(projection.projectedMileageKm)).toBe(true);
+   678→    });
+   679→
+   680→    test('should handle past dates (negative projection)', () => {
+   681→      const currentDate = new Date('2026-01-15');
+   682→      const targetDate = new Date('2026-01-01'); // 14 days ago
+   683→
+   684→      const projection = projectMileage(100000, targetDate, 300, currentDate);
+   685→      expect(projection.projectedMileageKm).toBe(100000 - 14 * 300);
+   686→    });
+   687→  });
+   688→
+   689→  describe('projectDateForMileage', () => {
+   690→    test('should calculate date when target mileage will be reached', () => {
+   691→      const currentDate = new Date('2026-01-01');
+   692→      const currentMileage = 100000;
+   693→      const targetMileage = 109000; // 9000 km ahead
+   694→      const dailyRate = 300; // 30 days to reach
+   695→
+   696→      const projectedDate = projectDateForMileage(
+   697→        currentMileage,
+   698→        targetMileage,
+   699→        dailyRate,
+   700→        currentDate
+   701→      );
+   702→
+   703→      expect(projectedDate.getTime()).toBe(addDays(currentDate, 30).getTime());
+   704→    });
+   705→
+   706→    test('should use default daily rate of 280 km/day when not specified', () => {
+   707→      const currentDate = new Date('2026-01-01');
+   708→      const currentMileage = 100000;
+   709→      const targetMileage = 102800; // 2800 km ahead = 10 days at 280 km/day
+   710→
+   711→      const projectedDate = projectDateForMileage(
+   712→        currentMileage,
+   713→        targetMileage,
+   714→        undefined,
+   715→        currentDate
+   716→      );
+   717→
+   718→      expect(projectedDate.getTime()).toBe(addDays(currentDate, 10).getTime());
+   719→    });
+   720→
+   721→    test('should return past date if target already passed', () => {
+   722→      const currentDate = new Date('2026-01-15');
+   723→      const currentMileage = 110000;
+   724→      const targetMileage = 100000; // Already passed
+   725→
+   726→      const projectedDate = projectDateForMileage(currentMileage, targetMileage, 300, currentDate);
+   727→
+   728→      // Remaining km is negative, so days to target is negative
+   729→      const expectedDays = Math.ceil((100000 - 110000) / 300);
+   730→      expect(projectedDate.getTime()).toBe(addDays(currentDate, expectedDays).getTime());
+   731→    });
+   732→
+   733→    test('should handle exact mileage match', () => {
+   734→      const currentDate = new Date('2026-01-01');
+   735→      const currentMileage = 100000;
+   736→      const targetMileage = 100000; // Same
+   737→
+   738→      const projectedDate = projectDateForMileage(currentMileage, targetMileage, 300, currentDate);
+   739→
+   740→      expect(projectedDate.getTime()).toBe(currentDate.getTime());
+   741→    });
+   742→  });
+   743→});
+   744→
+   745→// =============================================================================
+   746→// Week/Period Utilities Tests
+   747→// =============================================================================
+   748→
+   749→describe('Week/Period Utilities', () => {
+   750→  describe('getWeekBoundaries', () => {
+   751→    test('should return Monday as start of week', () => {
+   752→      // Wednesday 2026-01-15
+   753→      const date = new Date('2026-01-15');
+   754→      const { start, end } = getWeekBoundaries(date);
+   755→
+   756→      // Monday 2026-01-12
+   757→      expect(start.getDay()).toBe(1); // Monday
+   758→      expect(start.getDate()).toBe(12);
+   759→
+   760→      // Sunday 2026-01-18
+   761→      expect(end.getDay()).toBe(0); // Sunday
+   762→      expect(end.getDate()).toBe(18);
+   763→    });
+   764→
+   765→    test('should handle date on Monday', () => {
+   766→      // Monday 2026-01-12
+   767→      const date = new Date('2026-01-12');
+   768→      const { start } = getWeekBoundaries(date);
+   769→
+   770→      expect(start.getDate()).toBe(12);
+   771→    });
+   772→
+   773→    test('should handle date on Sunday', () => {
+   774→      // Sunday 2026-01-18
+   775→      const date = new Date('2026-01-18');
+   776→      const { end } = getWeekBoundaries(date);
+   777→
+   778→      expect(end.getDate()).toBe(18);
+   779→    });
+   780→  });
+   781→
+   782→  describe('getDayType', () => {
+   783→    test('should return WEEKDAY for Monday-Friday', () => {
+   784→      expect(getDayType(new Date('2026-01-12'))).toBe('WEEKDAY'); // Monday
+   785→      expect(getDayType(new Date('2026-01-13'))).toBe('WEEKDAY'); // Tuesday
+   786→      expect(getDayType(new Date('2026-01-14'))).toBe('WEEKDAY'); // Wednesday
+   787→      expect(getDayType(new Date('2026-01-15'))).toBe('WEEKDAY'); // Thursday
+   788→      expect(getDayType(new Date('2026-01-16'))).toBe('WEEKDAY'); // Friday
+   789→    });
+   790→
+   791→    test('should return SATURDAY for Saturday', () => {
+   792→      expect(getDayType(new Date('2026-01-17'))).toBe('SATURDAY');
+   793→      expect(getDayType(new Date('2026-01-24'))).toBe('SATURDAY');
+   794→    });
+   795→
+   796→    test('should return SUNDAY for Sunday', () => {
+   797→      expect(getDayType(new Date('2026-01-18'))).toBe('SUNDAY');
+   798→      expect(getDayType(new Date('2026-01-25'))).toBe('SUNDAY');
+   799→    });
+   800→  });
+   801→
+   802→  describe('generateDateRange', () => {
+   803→    test('should generate array of dates between start and end', () => {
+   804→      const start = new Date('2026-01-01');
+   805→      const end = new Date('2026-01-05');
+   806→
+   807→      const dates = generateDateRange(start, end);
+   808→
+   809→      expect(dates).toHaveLength(5);
+   810→      expect(dates[0].getDate()).toBe(1);
+   811→      expect(dates[4].getDate()).toBe(5);
+   812→    });
+   813→
+   814→    test('should return single date for same start and end', () => {
+   815→      const date = new Date('2026-01-15');
+   816→
+   817→      const dates = generateDateRange(date, date);
+   818→
+   819→      expect(dates).toHaveLength(1);
+   820→      expect(dates[0].getDate()).toBe(15);
+   821→    });
+   822→
+   823→    test('should handle month boundaries', () => {
+   824→      const start = new Date('2026-01-30');
+   825→      const end = new Date('2026-02-02');
+   826→
+   827→      const dates = generateDateRange(start, end);
+   828→
+   829→      expect(dates).toHaveLength(4);
+   830→      expect(dates[0].getMonth()).toBe(0); // January
+   831→      expect(dates[3].getMonth()).toBe(1); // February
+   832→    });
+   833→  });
+   834→
+   835→  describe('generateWeeklyPeriods', () => {
+   836→    test('should generate weekly periods for date range', () => {
+   837→      const start = new Date('2026-01-01');
+   838→      const end = new Date('2026-01-21'); // 3 weeks
+   839→
+   840→      const periods = generateWeeklyPeriods(start, end);
+   841→
+   842→      expect(periods.length).toBeGreaterThanOrEqual(3);
+   843→
+   844→      // Each period should have start on Monday
+   845→      periods.forEach((period) => {
+   846→        expect(period.start.getDay()).toBe(1); // Monday
+   847→      });
+   848→    });
+   849→
+   850→    test('should handle partial week at start', () => {
+   851→      // Start on Wednesday
+   852→      const start = new Date('2026-01-14');
+   853→      const end = new Date('2026-01-28');
+   854→
+   855→      const periods = generateWeeklyPeriods(start, end);
+   856→
+   857→      // First period should start on Monday before the start date
+   858→      expect(periods[0].start.getDate()).toBe(12); // Monday 2026-01-12
+   859→    });
+   860→  });
+   861→});
+   862→
+   863→// =============================================================================
+   864→// Parsing Utilities Tests
+   865→// =============================================================================
+   866→
+   867→describe('Parsing Utilities', () => {
+   868→  describe('parseDateString', () => {
+   869→    test('should parse valid YYYY-MM-DD format', () => {
+   870→      const date = parseDateString('2026-01-15');
+   871→      expect(date).not.toBeNull();
+   872→      expect(date!.getFullYear()).toBe(2026);
+   873→      expect(date!.getMonth()).toBe(0); // January
+   874→      expect(date!.getDate()).toBe(15);
+   875→    });
+   876→
+   877→    test('should parse ISO 8601 format', () => {
+   878→      const date = parseDateString('2026-01-15T12:30:00.000Z');
+   879→      expect(date).not.toBeNull();
+   880→      expect(date!.getFullYear()).toBe(2026);
+   881→    });
+   882→
+   883→    test('should return null for invalid date string', () => {
+   884→      expect(parseDateString('invalid')).toBeNull();
+   885→      expect(parseDateString('')).toBeNull();
+   886→      expect(parseDateString('2026-13-45')).toBeNull(); // Invalid month/day
+   887→    });
+   888→
+   889→    test('should return null for malformed date strings', () => {
+   890→      expect(parseDateString('01/15/2026')).toBeNull(); // US format not supported
+   891→      expect(parseDateString('15-01-2026')).toBeNull(); // DD-MM-YYYY not supported
+   892→    });
+   893→  });
+   894→
+   895→  describe('formatDisplayDate', () => {
+   896→    test('should format date with default format', () => {
+   897→      const date = new Date('2026-01-15');
+   898→      const formatted = formatDisplayDate(date);
+   899→      expect(formatted).toBe('2026-01-15');
+   900→    });
+   901→
+   902→    test('should format date with custom format', () => {
+   903→      const date = new Date('2026-01-15');
+   904→
+   905→      expect(formatDisplayDate(date, 'dd/MM/yyyy')).toBe('15/01/2026');
+   906→      expect(formatDisplayDate(date, 'MMM dd, yyyy')).toBe('Jan 15, 2026');
+   907→      expect(formatDisplayDate(date, 'EEEE, MMMM do, yyyy')).toMatch(/Thursday, January 15th, 2026/);
+   908→    });
+   909→  });
+   910→
+   911→  describe('formatIsoDate', () => {
+   912→    test('should format date as ISO string', () => {
+   913→      const date = new Date('2026-01-15T12:30:00.000Z');
+   914→      const formatted = formatIsoDate(date);
+   915→
+   916→      expect(formatted).toBe(date.toISOString());
+   917→      expect(formatted).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+   918→    });
+   919→  });
+   920→});
+   921→
+   922→// =============================================================================
+   923→// Performance Utilities Tests
+   924→// =============================================================================
+   925→
+   926→describe('Performance Utilities', () => {
+   927→  describe('measureDuration', () => {
+   928→    test('should measure async operation duration', async () => {
+   929→      const { result, durationMs } = await measureDuration(async () => {
+   930→        await new Promise((resolve) => setTimeout(resolve, 50));
+   931→        return 'completed';
+   932→      });
+   933→
+   934→      expect(result).toBe('completed');
+   935→      expect(durationMs).toBeGreaterThanOrEqual(40); // Allow some tolerance
+   936→      expect(durationMs).toBeLessThan(200);
+   937→    });
+   938→
+   939→    test('should return result correctly', async () => {
+   940→      const { result } = await measureDuration(async () => {
+   941→        return { foo: 'bar', count: 42 };
+   942→      });
+   943→
+   944→      expect(result).toEqual({ foo: 'bar', count: 42 });
+   945→    });
+   946→  });
+   947→
+   948→  describe('createStopwatch', () => {
+   949→    test('should measure elapsed time', async () => {
+   950→      const stopwatch = createStopwatch();
+   951→
+   952→      stopwatch.start();
+   953→      await new Promise((resolve) => setTimeout(resolve, 50));
+   954→      const elapsed = stopwatch.stop();
+   955→
+   956→      expect(elapsed).toBeGreaterThanOrEqual(40);
+   957→      expect(elapsed).toBeLessThan(200);
+   958→    });
+   959→
+   960→    test('should return 0 if stopped without start', () => {
+   961→      const stopwatch = createStopwatch();
+   962→      expect(stopwatch.stop()).toBe(0);
+   963→    });
+   964→
+   965→    test('should return 0 for elapsed if not started', () => {
+   966→      const stopwatch = createStopwatch();
+   967→      expect(stopwatch.elapsed()).toBe(0);
+   968→    });
+   969→
+   970→    test('elapsed should work while running', async () => {
+   971→      const stopwatch = createStopwatch();
+   972→
+   973→      stopwatch.start();
+   974→      await new Promise((resolve) => setTimeout(resolve, 30));
+   975→      const elapsed1 = stopwatch.elapsed();
+   976→      await new Promise((resolve) => setTimeout(resolve, 30));
+   977→      const elapsed2 = stopwatch.elapsed();
+   978→
+   979→      expect(elapsed2).toBeGreaterThan(elapsed1);
+   980→    });
+   981→
+   982→    test('elapsed should return same value after stop', async () => {
+   983→      const stopwatch = createStopwatch();
+   984→
+   985→      stopwatch.start();
+   986→      await new Promise((resolve) => setTimeout(resolve, 30));
+   987→      stopwatch.stop();
+   988→
+   989→      const elapsed1 = stopwatch.elapsed();
+   990→      await new Promise((resolve) => setTimeout(resolve, 30));
+   991→      const elapsed2 = stopwatch.elapsed();
+   992→
+   993→      expect(elapsed1).toBe(elapsed2);
+   994→    });
+   995→  });
+   996→});
+   997→
+   998→// =============================================================================
+   999→// Integration Tests - Full PM Scheduling Workflow
+  1000→// =============================================================================
+  1001→
+  1002→describe('Integration: PM Scheduling Workflow', () => {
+  1003→  test('should correctly calculate next C1 PM window based on mileage', () => {
+  1004→    const lastPmDate = new Date('2025-06-01');
+  1005→    const lastPmMileage = 50000;
+  1006→    const currentMileage = 95000;
+  1007→    const c1IntervalKm = 60000;
+  1008→    const dailyKmRate = 300;
+  1009→
+  1010→    // Calculate compliance window
+  1011→    const window = calculateComplianceWindow({
+  1012→      lastPmDate,
+  1013→      intervalKm: c1IntervalKm,
+  1014→      currentMileageKm: currentMileage,
+  1015→      lastPmMileageKm: lastPmMileage,
+  1016→      dailyKmRate,
+  1017→    });
+  1018→
+  1019→    // Target mileage = 50000 + 60000 = 110000
+  1020→    // Remaining = 110000 - 95000 = 15000 km
+  1021→    // Days to target = 15000 / 300 = 50 days
+  1022→    expect(window.isValid).toBe(true);
+  1023→
+  1024→    // Project what mileage will be at window end
+  1025→    const mileageAtWindowEnd = projectMileage(
+  1026→      currentMileage,
+  1027→      window.end,
+  1028→      dailyKmRate,
+  1029→      new Date()
+  1030→    );
+  1031→
+  1032→    // Should be within range (allowing for date calculations)
+  1033→    expect(mileageAtWindowEnd.projectedMileageKm).toBeGreaterThan(100000);
+  1034→  });
+  1035→
+  1036→  test('should properly handle PM hierarchy in scheduling', () => {
+  1037→    // Scenario: C4 completes, should reset C1/C2/C3 counters
+  1038→
+  1039→    // C4 satisfies C3
+  1040→    expect(pmSatisfies('C4', 'C3')).toBe(true);
+  1041→
+  1042→    // Get all PMs that C4 satisfies
+  1043→    const satisfied = getSatisfiedPmCodes('C4');
+  1044→    expect(satisfied).toContain('C1');
+  1045→    expect(satisfied).toContain('C2');
+  1046→    expect(satisfied).toContain('C3');
+  1047→
+  1048→    // Verify hierarchy is correctly defined for 12-year contract
+  1049→    expect(PM_HIERARCHY['OVERHAUL']).toHaveLength(4);
+  1050→    expect(PM_HIERARCHY['C4']).toHaveLength(3);
+  1051→    expect(PM_HIERARCHY['C3']).toHaveLength(2);
+  1052→    expect(PM_HIERARCHY['C2']).toHaveLength(1);
+  1053→    expect(PM_HIERARCHY['C1']).toHaveLength(0);
+  1054→  });
+  1055→
+  1056→  test('should detect when PM is within compliance window for scheduling', () => {
+  1057→    const lastPmDate = new Date('2025-01-01');
+  1058→    const window = calculateComplianceWindow({
+  1059→      lastPmDate,
+  1060→      intervalMonths: 12,
+  1061→    });
+  1062→
+  1063→    // Should be schedulable within window
+  1064→    const targetDate = addMonths(lastPmDate, 12);
+  1065→    expect(isWithinComplianceWindow(targetDate, window)).toBe(true);
+  1066→
+  1067→    // Should detect overdue if past window
+  1068→    const overdueDate = addDays(window.end, 30);
+  1069→    expect(isPmOverdue(window, overdueDate)).toBe(true);
+  1070→
+  1071→    // Should detect upcoming if before window
+  1072→    const upcomingDate = addDays(window.start, -30);
+  1073→    expect(isPmUpcoming(window, upcomingDate)).toBe(true);
+  1074→  });
+  1075→});
+  1076→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

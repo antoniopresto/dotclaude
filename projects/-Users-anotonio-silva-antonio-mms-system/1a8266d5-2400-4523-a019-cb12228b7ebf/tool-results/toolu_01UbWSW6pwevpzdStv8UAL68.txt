@@ -1,0 +1,568 @@
+     1→/**
+     2→ * UI Slice
+     3→ *
+     4→ * State management for global UI state: toasts, modals, loading, errors.
+     5→ *
+     6→ * @see specs/006-user-interface.md Section 6.8
+     7→ */
+     8→
+     9→import { createSlice } from '@belt/tools';
+    10→import type { Toast, ModalState, LoadingState, ErrorState, OptimizerJob } from '../types';
+    11→
+    12→// =============================================================================
+    13→// UI Slice State
+    14→// =============================================================================
+    15→
+    16→// =============================================================================
+    17→// Accessibility State Types
+    18→// =============================================================================
+    19→
+    20→export interface AccessibilityState {
+    21→  /** User prefers reduced motion (respects OS setting) */
+    22→  reducedMotion: boolean;
+    23→  /** User prefers high contrast (respects OS setting) */
+    24→  highContrast: boolean;
+    25→  /** Whether focus ring should be visible (keyboard navigation active) */
+    26→  focusVisible: boolean;
+    27→  /** Screen reader announcements enabled */
+    28→  announcementsEnabled: boolean;
+    29→  /** Current focus location for canvas keyboard navigation */
+    30→  focusedPmId: string | null;
+    31→  /** Last announced message (for debugging) */
+    32→  lastAnnouncement: string | null;
+    33→}
+    34→
+    35→export interface UiSliceState {
+    36→  // Toast notifications
+    37→  toasts: Toast[];
+    38→  maxToasts: number;
+    39→
+    40→  // Modal state
+    41→  modal: ModalState;
+    42→
+    43→  // Loading indicators
+    44→  loading: LoadingState;
+    45→
+    46→  // Global error state
+    47→  error: ErrorState;
+    48→
+    49→  // Sidebar collapsed
+    50→  sidebarCollapsed: boolean;
+    51→
+    52→  // Help panel open
+    53→  helpPanelOpen: boolean;
+    54→
+    55→  // Keyboard shortcuts dialog visible
+    56→  keyboardShortcutsDialogOpen: boolean;
+    57→
+    58→  // Keyboard shortcuts enabled
+    59→  shortcutsEnabled: boolean;
+    60→
+    61→  // Theme
+    62→  theme: 'light' | 'dark' | 'system';
+    63→
+    64→  // Optimizer jobs tracking
+    65→  optimizerJobs: OptimizerJob[];
+    66→  activeJobId: string | null;
+    67→
+    68→  // Connection status
+    69→  isOnline: boolean;
+    70→  websocketConnected: boolean;
+    71→
+    72→  // Sync status
+    73→  lastSyncAt: number | null;
+    74→  syncInProgress: boolean;
+    75→
+    76→  // Accessibility (WCAG 2.1 AA compliance)
+    77→  accessibility: AccessibilityState;
+    78→
+    79→  // Index signature for MachineState compatibility
+    80→  [key: string]: unknown;
+    81→}
+    82→
+    83→const initialUiState: UiSliceState = {
+    84→  toasts: [],
+    85→  maxToasts: 5,
+    86→  modal: {
+    87→    isOpen: false,
+    88→    type: null,
+    89→    data: null,
+    90→  },
+    91→  loading: {
+    92→    trains: false,
+    93→    pmSchedule: false,
+    94→    canvas: false,
+    95→    optimizer: false,
+    96→  },
+    97→  error: {
+    98→    message: null,
+    99→    code: null,
+   100→    details: null,
+   101→    timestamp: null,
+   102→  },
+   103→  sidebarCollapsed: false,
+   104→  helpPanelOpen: false,
+   105→  keyboardShortcutsDialogOpen: false,
+   106→  shortcutsEnabled: true,
+   107→  theme: 'system',
+   108→  optimizerJobs: [],
+   109→  activeJobId: null,
+   110→  isOnline: true,
+   111→  websocketConnected: false,
+   112→  lastSyncAt: null,
+   113→  syncInProgress: false,
+   114→  // Accessibility defaults (WCAG 2.1 AA)
+   115→  accessibility: {
+   116→    reducedMotion: false, // Will be synced from OS preference
+   117→    highContrast: false, // Will be synced from OS preference
+   118→    focusVisible: false, // Shows when keyboard navigation active
+   119→    announcementsEnabled: true,
+   120→    focusedPmId: null,
+   121→    lastAnnouncement: null,
+   122→  },
+   123→};
+   124→
+   125→let toastIdCounter = 0;
+   126→
+   127→export const uiSlice = createSlice({
+   128→  id: 'ui',
+   129→  initial: initialUiState,
+   130→  cache: { policy: 'session' },
+   131→  reducers: {
+   132→    // ==========================================================================
+   133→    // Toast Notifications
+   134→    // ==========================================================================
+   135→
+   136→    addToast: (
+   137→      s,
+   138→      toast: Omit<Toast, 'id' | 'createdAt'> & { id?: string }
+   139→    ) => {
+   140→      const state = s as UiSliceState;
+   141→      const newToast: Toast = {
+   142→        id: toast.id ?? `toast-${++toastIdCounter}`,
+   143→        type: toast.type,
+   144→        title: toast.title,
+   145→        message: toast.message,
+   146→        duration: toast.duration ?? 5000,
+   147→        dismissible: toast.dismissible ?? true,
+   148→        createdAt: Date.now(),
+   149→      };
+   150→
+   151→      state.toasts.push(newToast);
+   152→
+   153→      // Trim to max toasts
+   154→      if (state.toasts.length > state.maxToasts) {
+   155→        state.toasts.shift();
+   156→      }
+   157→    },
+   158→
+   159→    removeToast: (s, toastId: string) => {
+   160→      const state = s as UiSliceState;
+   161→      state.toasts = state.toasts.filter((t) => t.id !== toastId);
+   162→    },
+   163→
+   164→    clearToasts: (s) => {
+   165→      const state = s as UiSliceState;
+   166→      state.toasts = [];
+   167→    },
+   168→
+   169→    // Convenience toast creators
+   170→    showSuccess: (s, payload: { title: string; message: string }) => {
+   171→      const state = s as UiSliceState;
+   172→      state.toasts.push({
+   173→        id: `toast-${++toastIdCounter}`,
+   174→        type: 'success',
+   175→        title: payload.title,
+   176→        message: payload.message,
+   177→        duration: 3000,
+   178→        dismissible: true,
+   179→        createdAt: Date.now(),
+   180→      });
+   181→    },
+   182→
+   183→    showError: (s, payload: { title: string; message: string }) => {
+   184→      const state = s as UiSliceState;
+   185→      state.toasts.push({
+   186→        id: `toast-${++toastIdCounter}`,
+   187→        type: 'error',
+   188→        title: payload.title,
+   189→        message: payload.message,
+   190→        duration: 8000,
+   191→        dismissible: true,
+   192→        createdAt: Date.now(),
+   193→      });
+   194→    },
+   195→
+   196→    showWarning: (s, payload: { title: string; message: string }) => {
+   197→      const state = s as UiSliceState;
+   198→      state.toasts.push({
+   199→        id: `toast-${++toastIdCounter}`,
+   200→        type: 'warning',
+   201→        title: payload.title,
+   202→        message: payload.message,
+   203→        duration: 6000,
+   204→        dismissible: true,
+   205→        createdAt: Date.now(),
+   206→      });
+   207→    },
+   208→
+   209→    showInfo: (s, payload: { title: string; message: string }) => {
+   210→      const state = s as UiSliceState;
+   211→      state.toasts.push({
+   212→        id: `toast-${++toastIdCounter}`,
+   213→        type: 'info',
+   214→        title: payload.title,
+   215→        message: payload.message,
+   216→        duration: 5000,
+   217→        dismissible: true,
+   218→        createdAt: Date.now(),
+   219→      });
+   220→    },
+   221→
+   222→    // ==========================================================================
+   223→    // Modal
+   224→    // ==========================================================================
+   225→
+   226→    openModal: (s, payload: { type: string; data?: Record<string, unknown> }) => {
+   227→      const state = s as UiSliceState;
+   228→      state.modal = {
+   229→        isOpen: true,
+   230→        type: payload.type,
+   231→        data: payload.data ?? null,
+   232→      };
+   233→    },
+   234→
+   235→    closeModal: (s) => {
+   236→      const state = s as UiSliceState;
+   237→      state.modal = {
+   238→        isOpen: false,
+   239→        type: null,
+   240→        data: null,
+   241→      };
+   242→    },
+   243→
+   244→    updateModalData: (s, data: Record<string, unknown>) => {
+   245→      const state = s as UiSliceState;
+   246→      if (state.modal.isOpen) {
+   247→        state.modal.data = { ...state.modal.data, ...data };
+   248→      }
+   249→    },
+   250→
+   251→    // ==========================================================================
+   252→    // Loading
+   253→    // ==========================================================================
+   254→
+   255→    setLoading: (s, payload: Partial<LoadingState>) => {
+   256→      const state = s as UiSliceState;
+   257→      state.loading = { ...state.loading, ...payload };
+   258→    },
+   259→
+   260→    startLoading: (s, key: keyof LoadingState) => {
+   261→      const state = s as UiSliceState;
+   262→      state.loading[key] = true;
+   263→    },
+   264→
+   265→    stopLoading: (s, key: keyof LoadingState) => {
+   266→      const state = s as UiSliceState;
+   267→      state.loading[key] = false;
+   268→    },
+   269→
+   270→    clearLoading: (s) => {
+   271→      const state = s as UiSliceState;
+   272→      state.loading = {
+   273→        trains: false,
+   274→        pmSchedule: false,
+   275→        canvas: false,
+   276→        optimizer: false,
+   277→      };
+   278→    },
+   279→
+   280→    // ==========================================================================
+   281→    // Error
+   282→    // ==========================================================================
+   283→
+   284→    setError: (
+   285→      s,
+   286→      payload: { message: string; code?: string; details?: Record<string, unknown> }
+   287→    ) => {
+   288→      const state = s as UiSliceState;
+   289→      state.error = {
+   290→        message: payload.message,
+   291→        code: payload.code ?? null,
+   292→        details: payload.details ?? null,
+   293→        timestamp: Date.now(),
+   294→      };
+   295→    },
+   296→
+   297→    clearError: (s) => {
+   298→      const state = s as UiSliceState;
+   299→      state.error = {
+   300→        message: null,
+   301→        code: null,
+   302→        details: null,
+   303→        timestamp: null,
+   304→      };
+   305→    },
+   306→
+   307→    // ==========================================================================
+   308→    // Layout
+   309→    // ==========================================================================
+   310→
+   311→    toggleSidebar: (s) => {
+   312→      const state = s as UiSliceState;
+   313→      state.sidebarCollapsed = !state.sidebarCollapsed;
+   314→    },
+   315→
+   316→    setSidebarCollapsed: (s, collapsed: boolean) => {
+   317→      const state = s as UiSliceState;
+   318→      state.sidebarCollapsed = collapsed;
+   319→    },
+   320→
+   321→    toggleHelpPanel: (s) => {
+   322→      const state = s as UiSliceState;
+   323→      state.helpPanelOpen = !state.helpPanelOpen;
+   324→    },
+   325→
+   326→    setHelpPanelOpen: (s, open: boolean) => {
+   327→      const state = s as UiSliceState;
+   328→      state.helpPanelOpen = open;
+   329→    },
+   330→
+   331→    toggleKeyboardShortcutsDialog: (s) => {
+   332→      const state = s as UiSliceState;
+   333→      state.keyboardShortcutsDialogOpen = !state.keyboardShortcutsDialogOpen;
+   334→    },
+   335→
+   336→    showKeyboardShortcutsDialog: (s) => {
+   337→      const state = s as UiSliceState;
+   338→      state.keyboardShortcutsDialogOpen = true;
+   339→    },
+   340→
+   341→    hideKeyboardShortcutsDialog: (s) => {
+   342→      const state = s as UiSliceState;
+   343→      state.keyboardShortcutsDialogOpen = false;
+   344→    },
+   345→
+   346→    // ==========================================================================
+   347→    // Preferences
+   348→    // ==========================================================================
+   349→
+   350→    setShortcutsEnabled: (s, enabled: boolean) => {
+   351→      const state = s as UiSliceState;
+   352→      state.shortcutsEnabled = enabled;
+   353→    },
+   354→
+   355→    setTheme: (s, theme: 'light' | 'dark' | 'system') => {
+   356→      const state = s as UiSliceState;
+   357→      state.theme = theme;
+   358→    },
+   359→
+   360→    // ==========================================================================
+   361→    // Optimizer Jobs
+   362→    // ==========================================================================
+   363→
+   364→    addOptimizerJob: (s, job: OptimizerJob) => {
+   365→      const state = s as UiSliceState;
+   366→      state.optimizerJobs.push(job);
+   367→      state.activeJobId = job.id;
+   368→    },
+   369→
+   370→    updateOptimizerJob: (s, job: Partial<OptimizerJob> & { id: string }) => {
+   371→      const state = s as UiSliceState;
+   372→      const index = state.optimizerJobs.findIndex((j) => j.id === job.id);
+   373→      if (index !== -1) {
+   374→        state.optimizerJobs[index] = { ...state.optimizerJobs[index], ...job };
+   375→      }
+   376→    },
+   377→
+   378→    removeOptimizerJob: (s, jobId: string) => {
+   379→      const state = s as UiSliceState;
+   380→      state.optimizerJobs = state.optimizerJobs.filter((j) => j.id !== jobId);
+   381→      if (state.activeJobId === jobId) {
+   382→        state.activeJobId = state.optimizerJobs[0]?.id ?? null;
+   383→      }
+   384→    },
+   385→
+   386→    setActiveJob: (s, jobId: string | null) => {
+   387→      const state = s as UiSliceState;
+   388→      state.activeJobId = jobId;
+   389→    },
+   390→
+   391→    clearCompletedJobs: (s) => {
+   392→      const state = s as UiSliceState;
+   393→      state.optimizerJobs = state.optimizerJobs.filter(
+   394→        (j) => j.status !== 'COMPLETED' && j.status !== 'FAILED'
+   395→      );
+   396→    },
+   397→
+   398→    // ==========================================================================
+   399→    // Connection Status
+   400→    // ==========================================================================
+   401→
+   402→    setOnlineStatus: (s, isOnline: boolean) => {
+   403→      const state = s as UiSliceState;
+   404→      state.isOnline = isOnline;
+   405→    },
+   406→
+   407→    setWebsocketConnected: (s, connected: boolean) => {
+   408→      const state = s as UiSliceState;
+   409→      state.websocketConnected = connected;
+   410→    },
+   411→
+   412→    // ==========================================================================
+   413→    // Sync Status
+   414→    // ==========================================================================
+   415→
+   416→    startSync: (s) => {
+   417→      const state = s as UiSliceState;
+   418→      state.syncInProgress = true;
+   419→    },
+   420→
+   421→    finishSync: (s) => {
+   422→      const state = s as UiSliceState;
+   423→      state.syncInProgress = false;
+   424→      state.lastSyncAt = Date.now();
+   425→    },
+   426→
+   427→    // ==========================================================================
+   428→    // Accessibility (WCAG 2.1 AA)
+   429→    // ==========================================================================
+   430→
+   431→    /** Set reduced motion preference (from OS or user override) */
+   432→    setReducedMotion: (s, enabled: boolean) => {
+   433→      const state = s as UiSliceState;
+   434→      state.accessibility.reducedMotion = enabled;
+   435→    },
+   436→
+   437→    /** Set high contrast preference (from OS or user override) */
+   438→    setHighContrast: (s, enabled: boolean) => {
+   439→      const state = s as UiSliceState;
+   440→      state.accessibility.highContrast = enabled;
+   441→    },
+   442→
+   443→    /** Set focus visible state (keyboard navigation detected) */
+   444→    setFocusVisible: (s, visible: boolean) => {
+   445→      const state = s as UiSliceState;
+   446→      state.accessibility.focusVisible = visible;
+   447→    },
+   448→
+   449→    /** Enable/disable screen reader announcements */
+   450→    setAnnouncementsEnabled: (s, enabled: boolean) => {
+   451→      const state = s as UiSliceState;
+   452→      state.accessibility.announcementsEnabled = enabled;
+   453→    },
+   454→
+   455→    /** Set currently focused PM for keyboard navigation */
+   456→    setFocusedPm: (s, pmId: string | null) => {
+   457→      const state = s as UiSliceState;
+   458→      state.accessibility.focusedPmId = pmId;
+   459→      // Keyboard navigation detected when focusing via keyboard
+   460→      if (pmId !== null) {
+   461→        state.accessibility.focusVisible = true;
+   462→      }
+   463→    },
+   464→
+   465→    /** Clear PM focus */
+   466→    clearFocusedPm: (s) => {
+   467→      const state = s as UiSliceState;
+   468→      state.accessibility.focusedPmId = null;
+   469→    },
+   470→
+   471→    /** Record last announcement (for debugging) */
+   472→    recordAnnouncement: (s, message: string) => {
+   473→      const state = s as UiSliceState;
+   474→      state.accessibility.lastAnnouncement = message;
+   475→    },
+   476→
+   477→    /** Update multiple accessibility settings at once */
+   478→    updateAccessibility: (s, settings: Partial<AccessibilityState>) => {
+   479→      const state = s as UiSliceState;
+   480→      state.accessibility = { ...state.accessibility, ...settings };
+   481→    },
+   482→
+   483→    // ==========================================================================
+   484→    // Reset
+   485→    // ==========================================================================
+   486→
+   487→    reset: (s) => {
+   488→      const state = s as UiSliceState;
+   489→      Object.assign(state, initialUiState);
+   490→    },
+   491→  },
+   492→});
+   493→
+   494→// =============================================================================
+   495→// Selectors
+   496→// =============================================================================
+   497→
+   498→/** Check if any loading is in progress */
+   499→export function isAnyLoading(state: UiSliceState): boolean {
+   500→  return Object.values(state.loading).some(Boolean);
+   501→}
+   502→
+   503→/** Get active optimizer job */
+   504→export function selectActiveJob(state: UiSliceState): OptimizerJob | undefined {
+   505→  return state.activeJobId
+   506→    ? state.optimizerJobs.find((j) => j.id === state.activeJobId)
+   507→    : undefined;
+   508→}
+   509→
+   510→/** Get running optimizer jobs */
+   511→export function selectRunningJobs(state: UiSliceState): OptimizerJob[] {
+   512→  return state.optimizerJobs.filter((j) => j.status === 'RUNNING' || j.status === 'PENDING');
+   513→}
+   514→
+   515→/** Check if there's an error */
+   516→export function hasError(state: UiSliceState): boolean {
+   517→  return state.error.message !== null;
+   518→}
+   519→
+   520→/** Get visible toasts */
+   521→export function selectVisibleToasts(state: UiSliceState): Toast[] {
+   522→  const now = Date.now();
+   523→  return state.toasts.filter((t) => now - t.createdAt < t.duration);
+   524→}
+   525→
+   526→/** Check connection status */
+   527→export function isFullyConnected(state: UiSliceState): boolean {
+   528→  return state.isOnline && state.websocketConnected;
+   529→}
+   530→
+   531→// =============================================================================
+   532→// Accessibility Selectors
+   533→// =============================================================================
+   534→
+   535→/** Check if reduced motion is preferred */
+   536→export function selectReducedMotion(state: UiSliceState): boolean {
+   537→  return state.accessibility.reducedMotion;
+   538→}
+   539→
+   540→/** Check if high contrast is preferred */
+   541→export function selectHighContrast(state: UiSliceState): boolean {
+   542→  return state.accessibility.highContrast;
+   543→}
+   544→
+   545→/** Check if focus ring should be visible */
+   546→export function selectFocusVisible(state: UiSliceState): boolean {
+   547→  return state.accessibility.focusVisible;
+   548→}
+   549→
+   550→/** Get currently focused PM ID */
+   551→export function selectFocusedPmId(state: UiSliceState): string | null {
+   552→  return state.accessibility.focusedPmId;
+   553→}
+   554→
+   555→/** Check if announcements are enabled */
+   556→export function selectAnnouncementsEnabled(state: UiSliceState): boolean {
+   557→  return state.accessibility.announcementsEnabled;
+   558→}
+   559→
+   560→/** Get full accessibility state */
+   561→export function selectAccessibility(state: UiSliceState): AccessibilityState {
+   562→  return state.accessibility;
+   563→}
+   564→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

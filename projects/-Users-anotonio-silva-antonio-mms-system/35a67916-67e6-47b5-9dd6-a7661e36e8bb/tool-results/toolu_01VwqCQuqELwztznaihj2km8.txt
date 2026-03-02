@@ -1,0 +1,504 @@
+  1000→  
+  1001→  /**
+  1002→   * Project mileage for a train over a time horizon
+  1003→   */
+  1004→  async projectMileage(
+  1005→    trainId: string,
+  1006→    startDate: Date,
+  1007→    horizonDays: number
+  1008→  ): Promise<{ date: Date; projectedKm: number; cumulativeKm: number }[]> {
+  1009→    const train = await this.db
+  1010→      .select()
+  1011→      .from(trains)
+  1012→      .where(eq(trains.id, trainId))
+  1013→      .limit(1);
+  1014→    
+  1015→    if (!train[0]) {
+  1016→      throw new NotFoundError(`Train ${trainId} not found`);
+  1017→    }
+  1018→    
+  1019→    let cumulativeKm = train[0].currentMileageKm;
+  1020→    const projections: { date: Date; projectedKm: number; cumulativeKm: number }[] = [];
+  1021→    
+  1022→    for (let day = 0; day < horizonDays; day++) {
+  1023→      const targetDate = addDays(startDate, day);
+  1024→      const { dailyKm } = await this.calculateDailyRate(trainId, targetDate);
+  1025→      
+  1026→      cumulativeKm += dailyKm;
+  1027→      projections.push({
+  1028→        date: targetDate,
+  1029→        projectedKm: dailyKm,
+  1030→        cumulativeKm
+  1031→      });
+  1032→    }
+  1033→    
+  1034→    return projections;
+  1035→  }
+  1036→  
+  1037→  private async getTypicalRouteAssignment(trainId: string): Promise<{ routeId: string } | null> {
+  1038→    // Look at recent run assignments to determine typical route
+  1039→    const recentAssignments = await this.db
+  1040→      .select({ routeId: runAssignments.routeId, count: count() })
+  1041→      .from(runAssignments)
+  1042→      .where(and(
+  1043→        eq(runAssignments.trainId, trainId),
+  1044→        gte(runAssignments.assignmentDate, addDays(new Date(), -30))
+  1045→      ))
+  1046→      .groupBy(runAssignments.routeId)
+  1047→      .orderBy(desc(count()))
+  1048→      .limit(1);
+  1049→    
+  1050→    return recentAssignments[0] || null;
+  1051→  }
+  1052→  
+  1053→  private async getFleetAverage(fleetId: string): Promise<number> {
+  1054→    // Calculate from recent mileage readings
+  1055→    const result = await this.db
+  1056→      .select({ avgDaily: avg(mileageReadings.dailyKm) })
+  1057→      .from(mileageReadings)
+  1058→      .innerJoin(trains, eq(mileageReadings.trainId, trains.id))
+  1059→      .where(and(
+  1060→        eq(trains.fleetId, fleetId),
+  1061→        gte(mileageReadings.readingDate, addDays(new Date(), -30)),
+  1062→        eq(mileageReadings.validationStatus, 'VALID')
+  1063→      ));
+  1064→    
+  1065→    return Math.round(result[0]?.avgDaily || 250);
+  1066→  }
+  1067→  
+  1068→  private getKmForDayType(profile: RouteUtilizationProfile, dayType: string): number {
+  1069→    switch (dayType) {
+  1070→      case 'SATURDAY': return profile.saturdayKm || profile.weekdayKm * 0.8;
+  1071→      case 'SUNDAY': return profile.sundayKm || profile.weekdayKm * 0.7;
+  1072→      case 'HOLIDAY': return profile.holidayKm || profile.weekdayKm * 0.6;
+  1073→      default: return profile.weekdayKm;
+  1074→    }
+  1075→  }
+  1076→  
+  1077→  private getSeasonalMultiplier(profile: RouteUtilizationProfile, date: Date): number {
+  1078→    // TODO: Integrate with season calendar
+  1079→    const month = date.getMonth();
+  1080→    // Peak season: CNY (Jan-Feb), School holidays (Jun, Nov-Dec)
+  1081→    const peakMonths = [0, 1, 5, 10, 11];
+  1082→    return peakMonths.includes(month) ? profile.peakSeasonMultiplier : profile.offPeakMultiplier;
+  1083→  }
+  1084→  
+  1085→  private getDayType(date: Date): string {
+  1086→    const dayOfWeek = date.getDay();
+  1087→    if (dayOfWeek === 0) return 'SUNDAY';
+  1088→    if (dayOfWeek === 6) return 'SATURDAY';
+  1089→    return 'WEEKDAY';
+  1090→  }
+  1091→}
+  1092→```
+  1093→
+  1094→---
+  1095→
+  1096→## 4.3 Run Assignment Optimizer
+  1097→
+  1098→### 4.3.1 Purpose
+  1099→
+  1100→Optimize daily train-to-route assignments for mileage balancing while respecting hard constraints (fitness, PM due, **unavailability**, **service demand**) and minimizing soft constraint penalties.
+  1101→
+  1102→### 4.3.2 Optimizer Service (TypeScript Wrapper)
+  1103→
+  1104→```typescript
+  1105→interface OptimizerConfig {
+  1106→  binaryPath: string;          // ./mms-optimizer
+  1107→  maxSolveTimeSeconds: number; // 30
+  1108→  numWorkers: number;          // 4
+  1109→  timeoutMs: number;           // 60000
+  1110→  fallbackEnabled: boolean;    // true
+  1111→}
+  1112→
+  1113→class RunAssignmentOptimizer {
+  1114→  private process: Subprocess | null = null;
+  1115→  
+  1116→  async optimize(input: OptimizerInput): Promise<OptimizerResult> {
+  1117→    const startTime = Date.now();
+  1118→    
+  1119→    try {
+  1120→      // Try C++ optimizer first
+  1121→      const result = await this.runCppOptimizer(input);
+  1122→      
+  1123→      // Validate result
+  1124→      if (result.status === 'INFEASIBLE' && this.config.fallbackEnabled) {
+  1125→        this.logger.warn('C++ optimizer returned INFEASIBLE, using fallback');
+  1126→        return await this.runFallbackOptimizer(input);
+  1127→      }
+  1128→      
+  1129→      return result;
+  1130→      
+  1131→    } catch (error) {
+  1132→      this.logger.error({ error }, 'C++ optimizer failed, using fallback');
+  1133→      
+  1134→      if (this.config.fallbackEnabled) {
+  1135→        return await this.runFallbackOptimizer(input);
+  1136→      }
+  1137→      
+  1138→      throw error;
+  1139→    }
+  1140→  }
+  1141→  
+  1142→  private async runCppOptimizer(input: OptimizerInput): Promise<OptimizerResult> {
+  1143→    return new Promise((resolve, reject) => {
+  1144→      const timeout = setTimeout(() => {
+  1145→        this.process?.kill();
+  1146→        reject(new Error('Optimizer timeout'));
+  1147→      }, this.config.timeoutMs);
+  1148→      
+  1149→      this.process = Bun.spawn([this.config.binaryPath], {
+  1150→        stdin: 'pipe',
+  1151→        stdout: 'pipe',
+  1152→        stderr: 'pipe'
+  1153→      });
+  1154→      
+  1155→      // Write input
+  1156→      const writer = this.process.stdin.getWriter();
+  1157→      writer.write(new TextEncoder().encode(JSON.stringify(input) + '\n'));
+  1158→      writer.close();
+  1159→      
+  1160→      // Read stdout (results)
+  1161→      const results: any[] = [];
+  1162→      const reader = this.process.stdout.getReader();
+  1163→      const decoder = new TextDecoder();
+  1164→      let buffer = '';
+  1165→      
+  1166→      const readStream = async () => {
+  1167→        while (true) {
+  1168→          const { done, value } = await reader.read();
+  1169→          if (done) break;
+  1170→          
+  1171→          buffer += decoder.decode(value, { stream: true });
+  1172→          const lines = buffer.split('\n');
+  1173→          buffer = lines.pop() || '';
+  1174→          
+  1175→          for (const line of lines) {
+  1176→            if (!line.trim()) continue;
+  1177→            
+  1178→            try {
+  1179→              const msg = JSON.parse(line);
+  1180→              
+  1181→              if (msg.type === 'PROGRESS') {
+  1182→                this.emitProgress(msg);
+  1183→              } else if (msg.type === 'RESULT') {
+  1184→                clearTimeout(timeout);
+  1185→                resolve(this.mapResult(msg));
+  1186→                return;
+  1187→              }
+  1188→            } catch (e) {
+  1189→              this.logger.warn({ line }, 'Failed to parse optimizer output');
+  1190→            }
+  1191→          }
+  1192→        }
+  1193→      };
+  1194→      
+  1195→      // Read stderr (metrics/logs)
+  1196→      this.readStderr(this.process.stderr);
+  1197→      
+  1198→      readStream().catch(reject);
+  1199→      
+  1200→      this.process.exited.then((code) => {
+  1201→        clearTimeout(timeout);
+  1202→        if (code !== 0 && results.length === 0) {
+  1203→          reject(new Error(`Optimizer exited with code ${code}`));
+  1204→        }
+  1205→      });
+  1206→    });
+  1207→  }
+  1208→  
+  1209→  private async runFallbackOptimizer(input: OptimizerInput): Promise<OptimizerResult> {
+  1210→    // TypeScript greedy fallback
+  1211→    const assignments: Assignment[] = [];
+  1212→    const unassigned: UnassignedTrain[] = [];
+  1213→    const assignedTrainIds = new Set<string>();
+  1214→    
+  1215→    // Sort routes by priority (required trains desc)
+  1216→    const sortedRoutes = [...input.routes].sort(
+  1217→      (a, b) => b.required_trains - a.required_trains
+  1218→    );
+  1219→    
+  1220→    // Sort trains by fitness and mileage balance
+  1221→    const sortedTrains = [...input.trains]
+  1222→      .filter(t => t.fitness_status === 'FIT')
+  1223→      .sort((a, b) => {
+  1224→        // Prioritize under-utilized trains
+  1225→        const aBalance = a.current_mileage - a.target_mileage;
+  1226→        const bBalance = b.current_mileage - b.target_mileage;
+  1227→        return aBalance - bBalance;
+  1228→      });
+  1229→    
+  1230→    for (const route of sortedRoutes) {
+  1231→      let assigned = 0;
+  1232→      
+  1233→      for (const train of sortedTrains) {
+  1234→        if (assigned >= route.required_trains) break;
+  1235→        if (assignedTrainIds.has(train.id)) continue;
+  1236→        
+  1237→        // Check hard constraints
+  1238→        const hardViolation = this.checkHardConstraints(train, route, input);
+  1239→        if (hardViolation) {
+  1240→          continue;
+  1241→        }
+  1242→        
+  1243→        // Check fleet compatibility
+  1244→        if (route.allowed_fleets.length > 0 && 
+  1245→            !route.allowed_fleets.includes(train.fleet_id)) {
+  1246→          continue;
+  1247→        }
+  1248→        
+  1249→        // Assign
+  1250→        assignments.push({
+  1251→          train_id: train.id,
+  1252→          route_id: route.id,
+  1253→          score: this.calculateScore(train, route),
+  1254→          explanation: [
+  1255→            {
+  1256→              constraint_type: 'SOFT',
+  1257→              constraint_name: 'MILEAGE_BALANCE',
+  1258→              impact: train.current_mileage - train.target_mileage,
+  1259→              description: `Train is ${Math.abs(train.current_mileage - train.target_mileage)}km ${
+  1260→                train.current_mileage < train.target_mileage ? 'under' : 'over'
+  1261→              } target`
+  1262→            }
+  1263→          ]
+  1264→        });
+  1265→        
+  1266→        assignedTrainIds.add(train.id);
+  1267→        assigned++;
+  1268→      }
+  1269→      
+  1270→      // Record shortfall
+  1271→      if (assigned < route.required_trains) {
+  1272→        unassigned.push({
+  1273→          route_id: route.id,
+  1274→          shortfall: route.required_trains - assigned,
+  1275→          reason: 'Insufficient fit trains available'
+  1276→        });
+  1277→      }
+  1278→    }
+  1279→    
+  1280→    // Record unassigned trains with reasons
+  1281→    for (const train of input.trains) {
+  1282→      if (assignedTrainIds.has(train.id)) continue;
+  1283→      
+  1284→      const reason = train.fitness_status !== 'FIT' 
+  1285→        ? `Train is ${train.fitness_status}`
+  1286→        : this.findBlockingConstraint(train, input);
+  1287→      
+  1288→      unassigned.push({
+  1289→        train_id: train.id,
+  1290→        reason,
+  1291→        blocking_constraints: this.getBlockingConstraints(train, input)
+  1292→      });
+  1293→    }
+  1294→    
+  1295→    return {
+  1296→      type: 'RESULT',
+  1297→      request_id: input.request_id,
+  1298→      status: 'FALLBACK',
+  1299→      solve_time_ms: 0,
+  1300→      assignments,
+  1301→      unassigned,
+  1302→      material_warnings: [],
+  1303→      summary: {
+  1304→        total_penalty: 1e6,  // High penalty for fallback
+  1305→        trains_assigned: assignments.length,
+  1306→        trains_unassigned: unassigned.length,
+  1307→        soft_constraint_breakdown: {},
+  1308→        material_blocks: 0
+  1309→      }
+  1310→    };
+  1311→  }
+  1312→  
+  1313→  private checkHardConstraints(
+  1314→    train: Train,
+  1315→    route: Route,
+  1316→    input: OptimizerInput
+  1317→  ): string | null {
+  1318→    // NEW v2.1: Check unavailability events first
+  1319→    if (input.unavailability_events) {
+  1320→      for (const event of input.unavailability_events) {
+  1321→        if (event.train_id === train.id && 
+  1322→            event.status === 'ACTIVE' && 
+  1323→            event.blocks_run_assignment) {
+  1324→          return `Train unavailable: ${event.event_type} - ${event.description || event.external_reference || 'No details'}`;
+  1325→        }
+  1326→      }
+  1327→    }
+  1328→    
+  1329→    // Check explicit hard constraints
+  1330→    for (const constraint of input.hard_constraints) {
+  1331→      if (constraint.train_id === train.id) {
+  1332→        return constraint.description;
+  1333→      }
+  1334→    }
+  1335→    
+  1336→    // NEW v2.1: Check route compatibility
+  1337→    if (input.route_compatibility) {
+  1338→      const incompatible = input.route_compatibility.find(
+  1339→        c => c.train_id === train.id && 
+  1340→             c.route_id === route.id && 
+  1341→             !c.is_compatible
+  1342→      );
+  1343→      if (incompatible) {
+  1344→        return `Route incompatible: ${incompatible.constraint_type} - ${incompatible.restriction_reason || 'Technical restriction'}`;
+  1345→      }
+  1346→    }
+  1347→    
+  1348→    // Check pending PMs that block assignment
+  1349→    for (const pm of input.pending_pms) {
+  1350→      if (pm.train_id === train.id && 
+  1351→          pm.target_date <= new Date().toISOString().split('T')[0]) {
+  1352→        // Check if materials are available
+  1353→        const blocked = pm.required_materials.some(mat => {
+  1354→          if (mat.criticality !== 'BLOCKING') return false;
+  1355→          
+  1356→          const position = input.material_positions.find(
+  1357→            p => p.part_number === mat.part_number && 
+  1358→                 p.depot_id === train.home_depot_id
+  1359→          );
+  1360→          
+  1361→          return !position || position.quantity_available < mat.quantity;
+  1362→        });
+  1363→        
+  1364→        if (!blocked) {
+  1365→          return `PM ${pm.pm_type} due today`;
+  1366→        }
+  1367→      }
+  1368→    }
+  1369→    
+  1370→    return null;
+  1371→  }
+  1372→}
+  1373→
+  1374→// NEW v2.1: Extended optimizer input interface
+  1375→interface OptimizerInput {
+  1376→  request_id: string;
+  1377→  assignment_date: string;
+  1378→  
+  1379→  trains: {
+  1380→    id: string;
+  1381→    train_number: string;
+  1382→    fleet_id: string;
+  1383→    current_mileage: number;
+  1384→    target_mileage: number;
+  1385→    fitness_status: 'FIT' | 'RESTRICTED' | 'GROUNDED';
+  1386→    home_depot_id: string;
+  1387→  }[];
+  1388→  
+  1389→  routes: {
+  1390→    id: string;
+  1391→    route_code: string;
+  1392→    expected_km: number;
+  1393→    required_trains: number;
+  1394→    allowed_fleets: string[];
+  1395→  }[];
+  1396→  
+  1397→  hard_constraints: {
+  1398→    train_id: string;
+  1399→    type: string;
+  1400→    description: string;
+  1401→  }[];
+  1402→  
+  1403→  pending_pms: {
+  1404→    train_id: string;
+  1405→    pm_type: string;
+  1406→    target_date: string;
+  1407→    required_materials: {
+  1408→      part_number: string;
+  1409→      quantity: number;
+  1410→      criticality: 'BLOCKING' | 'DEFERRABLE' | 'CONSUMABLE';
+  1411→    }[];
+  1412→  }[];
+  1413→  
+  1414→  material_positions: {
+  1415→    depot_id: string;
+  1416→    part_number: string;
+  1417→    quantity_available: number;
+  1418→  }[];
+  1419→  
+  1420→  // NEW v2.1: Unavailability events
+  1421→  unavailability_events?: {
+  1422→    train_id: string;
+  1423→    event_type: string;
+  1424→    status: 'ACTIVE' | 'RESOLVED';
+  1425→    blocks_run_assignment: boolean;
+  1426→    description?: string;
+  1427→    external_reference?: string;
+  1428→    estimated_return_date?: string;
+  1429→  }[];
+  1430→  
+  1431→  // NEW v2.1: Route compatibility constraints
+  1432→  route_compatibility?: {
+  1433→    train_id: string;
+  1434→    route_id: string;
+  1435→    is_compatible: boolean;
+  1436→    constraint_type?: string;
+  1437→    restriction_reason?: string;
+  1438→  }[];
+  1439→  
+  1440→  // NEW v2.1: Service demand for validation
+  1441→  service_demand?: {
+  1442→    min_trains_required: number;
+  1443→    standby_buffer: number;
+  1444→  };
+  1445→  
+  1446→  config: {
+  1447→    max_solve_time_seconds: number;
+  1448→    num_workers: number;
+  1449→    soft_constraint_penalties: {
+  1450→      mileage_imbalance: number;
+  1451→      route_preference: number;
+  1452→    };
+  1453→  };
+  1454→}
+  1455→```
+  1456→
+  1457→### 4.3.3 C++ Optimizer Core
+  1458→
+  1459→```cpp
+  1460→// mms-optimizer/src/solver.cpp
+  1461→
+  1462→#include <ortools/sat/cp_model.h>
+  1463→#include <nlohmann/json.hpp>
+  1464→#include <vector>
+  1465→#include <unordered_map>
+  1466→
+  1467→using namespace operations_research::sat;
+  1468→using json = nlohmann::json;
+  1469→
+  1470→struct ExplanationFactor {
+  1471→    std::string constraint_type;  // "HARD" or "SOFT"
+  1472→    std::string constraint_name;
+  1473→    double impact;
+  1474→    std::string description;
+  1475→};
+  1476→
+  1477→class MmsSolver {
+  1478→public:
+  1479→    json solve(const json& input) {
+  1480→        CpModelBuilder model;
+  1481→        std::string request_id = input["request_id"];
+  1482→        
+  1483→        auto trains = input["trains"];
+  1484→        auto routes = input["routes"];
+  1485→        auto config = input["config"];
+  1486→        
+  1487→        // Decision variables: assign[t][r] = 1 if train t assigned to route r
+  1488→        std::vector<std::vector<BoolVar>> assign;
+  1489→        assign.resize(trains.size());
+  1490→        
+  1491→        for (size_t t = 0; t < trains.size(); t++) {
+  1492→            assign[t].resize(routes.size());
+  1493→            for (size_t r = 0; r < routes.size(); r++) {
+  1494→                assign[t][r] = model.NewBoolVar();
+  1495→            }
+  1496→        }
+  1497→        
+  1498→        // Hard constraint: Each train assigned to at most one route
+  1499→        for (size_t t = 0; t < trains.size(); t++) {
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

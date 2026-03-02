@@ -1,0 +1,200 @@
+     1→/**
+     2→ * MMS Track Capabilities Tables (v2.1)
+     3→ *
+     4→ * Track equipment/features and PM requirements for constraint-based scheduling.
+     5→ * Also includes PM baseline assumptions for cold start data migration.
+     6→ *
+     7→ * @see specs/003-database-schema.md Sections 3.2.5 - 3.2.6
+     8→ */
+     9→
+    10→import { relations } from 'drizzle-orm';
+    11→import {
+    12→  boolean,
+    13→  date,
+    14→  index,
+    15→  integer,
+    16→  jsonb,
+    17→  pgTable,
+    18→  text,
+    19→  timestamp,
+    20→  uniqueIndex,
+    21→  uuid,
+    22→} from 'drizzle-orm/pg-core';
+    23→import { tracks, trains } from './core-fleet';
+    24→import {
+    25→  assumptionTypeEnum,
+    26→  confidenceLevelEnum,
+    27→  trackCapabilityEnum,
+    28→} from './enums';
+    29→import { pmTypes } from './pm-management';
+    30→import { users } from './users';
+    31→
+    32→/**
+    33→ * Track Capabilities - Equipment and features per track
+    34→ *
+    35→ * Defines specific equipment available on each maintenance track.
+    36→ * Used to match PM requirements to capable tracks.
+    37→ *
+    38→ * Examples:
+    39→ * - Track T1 at Bishan has: PIT, CRANE, LIFTING_JACKS
+    40→ * - Track T5 at Changi has: WHEEL_LATHE, DROP_TABLE
+    41→ */
+    42→export const trackCapabilities = pgTable(
+    43→  'track_capabilities',
+    44→  {
+    45→    id: uuid('id').primaryKey().defaultRandom(),
+    46→    trackId: uuid('track_id')
+    47→      .notNull()
+    48→      .references(() => tracks.id),
+    49→    capability: trackCapabilityEnum('capability').notNull(),
+    50→
+    51→    // Capacity limits for this capability (e.g., max lift weight)
+    52→    capacityLimit: jsonb('capacity_limit'), // {"max_axle_load_tonnes": 17, "max_lift_tonnes": 25}
+    53→
+    54→    // Availability
+    55→    isOperational: boolean('is_operational').default(true),
+    56→    maintenanceSchedule: text('maintenance_schedule'), // "Unavailable Tuesdays 06:00-10:00"
+    57→
+    58→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    59→  },
+    60→  (table) => [
+    61→    uniqueIndex('idx_track_cap_unique').on(table.trackId, table.capability),
+    62→    index('idx_track_cap_track').on(table.trackId),
+    63→    index('idx_track_cap_type').on(table.capability),
+    64→  ]
+    65→);
+    66→
+    67→/**
+    68→ * PM Capability Requirements - What capabilities each PM type needs
+    69→ *
+    70→ * Links PM types to required track capabilities.
+    71→ * Mandatory vs. preferred:
+    72→ * - is_mandatory=true: PM cannot proceed without this capability
+    73→ * - is_mandatory=false: Preferred but can use alternative
+    74→ *
+    75→ * Example: C4 overhaul requires PIT (mandatory), LIFTING_JACKS (mandatory), CRANE (preferred)
+    76→ */
+    77→export const pmCapabilityRequirements = pgTable(
+    78→  'pm_capability_requirements',
+    79→  {
+    80→    id: uuid('id').primaryKey().defaultRandom(),
+    81→    pmTypeId: uuid('pm_type_id')
+    82→      .notNull()
+    83→      .references(() => pmTypes.id),
+    84→    capability: trackCapabilityEnum('capability').notNull(),
+    85→    isMandatory: boolean('is_mandatory').default(true),
+    86→
+    87→    notes: text('notes'), // Why this capability is needed
+    88→
+    89→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    90→  },
+    91→  (table) => [
+    92→    uniqueIndex('idx_pm_cap_req_unique').on(table.pmTypeId, table.capability),
+    93→    index('idx_pm_cap_req_pm').on(table.pmTypeId),
+    94→    index('idx_pm_cap_req_cap').on(table.capability),
+    95→  ]
+    96→);
+    97→
+    98→/**
+    99→ * PM Baseline Assumptions - Cold start data migration
+   100→ *
+   101→ * Handles scenarios where PM history is incomplete during data migration.
+   102→ * Tracks how PM dates/mileage were inferred with confidence levels.
+   103→ *
+   104→ * Inference rules (implemented in application logic):
+   105→ * 1. INFERRED_FROM_COMMISSIONING: If train commissioned 2020-01-01 and C1 interval
+   106→ *    is 6 months, assume first PM at 2020-07-01
+   107→ * 2. INFERRED_FROM_HIGHER_PM: If C4 completed 2024-06-15, C1/C2/C3 counters reset
+   108→ *    from that date
+   109→ * 3. NO_HISTORY: No data, use commissioning date with requires_review=true
+   110→ *
+   111→ * Records with LOW/ESTIMATED confidence should have requires_review=true
+   112→ * for manual verification by operators.
+   113→ */
+   114→export const pmBaselineAssumptions = pgTable(
+   115→  'pm_baseline_assumptions',
+   116→  {
+   117→    id: uuid('id').primaryKey().defaultRandom(),
+   118→    trainId: uuid('train_id')
+   119→      .notNull()
+   120→      .references(() => trains.id),
+   121→    pmTypeId: uuid('pm_type_id')
+   122→      .notNull()
+   123→      .references(() => pmTypes.id),
+   124→
+   125→    // Assumption details
+   126→    assumptionType: assumptionTypeEnum('assumption_type').notNull(),
+   127→
+   128→    // Assumed baseline values
+   129→    assumedLastPmDate: date('assumed_last_pm_date'),
+   130→    assumedLastPmMileage: integer('assumed_last_pm_mileage'),
+   131→    confidenceLevel: confidenceLevelEnum('confidence_level').notNull(),
+   132→
+   133→    // Inference source documentation
+   134→    inferenceSource: text('inference_source'), // How assumption was derived
+   135→    inferenceData: jsonb('inference_data'), // Supporting data
+   136→
+   137→    // Review workflow
+   138→    requiresReview: boolean('requires_review').default(false),
+   139→    reviewedBy: uuid('reviewed_by').references(() => users.id),
+   140→    reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+   141→    reviewNotes: text('review_notes'),
+   142→
+   143→    // When applied to the system
+   144→    appliedAt: timestamp('applied_at', { withTimezone: true }),
+   145→    appliedBy: uuid('applied_by').references(() => users.id),
+   146→
+   147→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   148→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+   149→  },
+   150→  (table) => [
+   151→    uniqueIndex('idx_assumptions_unique').on(table.trainId, table.pmTypeId),
+   152→    index('idx_assumptions_train').on(table.trainId),
+   153→    index('idx_assumptions_review').on(table.requiresReview),
+   154→    index('idx_assumptions_confidence').on(table.confidenceLevel),
+   155→  ]
+   156→);
+   157→
+   158→// ============================================================================
+   159→// Relations
+   160→// ============================================================================
+   161→
+   162→export const trackCapabilitiesRelations = relations(trackCapabilities, ({ one }) => ({
+   163→  track: one(tracks, {
+   164→    fields: [trackCapabilities.trackId],
+   165→    references: [tracks.id],
+   166→  }),
+   167→}));
+   168→
+   169→export const pmCapabilityRequirementsRelations = relations(pmCapabilityRequirements, ({ one }) => ({
+   170→  pmType: one(pmTypes, {
+   171→    fields: [pmCapabilityRequirements.pmTypeId],
+   172→    references: [pmTypes.id],
+   173→  }),
+   174→}));
+   175→
+   176→export const pmBaselineAssumptionsRelations = relations(pmBaselineAssumptions, ({ one }) => ({
+   177→  train: one(trains, {
+   178→    fields: [pmBaselineAssumptions.trainId],
+   179→    references: [trains.id],
+   180→  }),
+   181→  pmType: one(pmTypes, {
+   182→    fields: [pmBaselineAssumptions.pmTypeId],
+   183→    references: [pmTypes.id],
+   184→  }),
+   185→  reviewedByUser: one(users, {
+   186→    fields: [pmBaselineAssumptions.reviewedBy],
+   187→    references: [users.id],
+   188→    relationName: 'reviewedBy',
+   189→  }),
+   190→  appliedByUser: one(users, {
+   191→    fields: [pmBaselineAssumptions.appliedBy],
+   192→    references: [users.id],
+   193→    relationName: 'appliedBy',
+   194→  }),
+   195→}));
+   196→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

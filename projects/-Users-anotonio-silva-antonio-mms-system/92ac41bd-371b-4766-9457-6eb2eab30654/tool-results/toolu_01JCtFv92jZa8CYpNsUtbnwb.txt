@@ -1,0 +1,703 @@
+     1→# MMS
+     2→
+     3→**Metro Fleet Mileage Management System**
+     4→
+     5→Constraint-based fleet management platform for train deployments and preventive maintenance scheduling over a 12-year government contract period.
+     6→
+     7→## Architecture
+     8→
+     9→```
+    10→┌─────────────────────────────────────────────────────────────────────────────┐
+    11→│                              Frontend (Vite + React 18)                     │
+    12→│   deck.gl Canvas │ BlueprintJS Components │ @belt/tools State Machines     │
+    13→└────────────────────────────────┬────────────────────────────────────────────┘
+    14→                                 │ /api/*
+    15→                                 ▼
+    16→┌─────────────────────────────────────────────────────────────────────────────┐
+    17→│                           API Server (Bun + Hono)                           │
+    18→│              REST Endpoints │ OpenAPI Spec │ OpenTelemetry Traces           │
+    19→└───────┬────────────────────────────┬───────────────────────────┬────────────┘
+    20→        │                            │                           │
+    21→        ▼                            ▼                           ▼
+    22→┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
+    23→│  PostgreSQL   │          │      Redis      │          │     Workers     │
+    24→│  + TimescaleDB│          │  Queues + Cache │          │     (BullMQ)    │
+    25→└───────────────┘          └─────────────────┘          └────────┬────────┘
+    26→                                                                 │
+    27→                                                                 ▼
+    28→                                                        ┌─────────────────┐
+    29→                                                        │  C++ Optimizer  │
+    30→                                                        │   (OR-Tools)    │
+    31→                                                        └─────────────────┘
+    32→```
+    33→
+    34→**Stack:**
+    35→- **Runtime**: Bun 1.x
+    36→- **Database**: PostgreSQL 16 + TimescaleDB (time-series)
+    37→- **Queue**: BullMQ (Redis-backed job processing)
+    38→- **API**: Hono framework with OpenAPI/Zod validation
+    39→- **Frontend**: React 18 + deck.gl (WebGL) + BlueprintJS v6
+    40→- **State**: @belt/tools machines (NOT React hooks/zustand)
+    41→- **Optimizer**: C++ with OR-Tools CP-SAT solver
+    42→
+    43→## Quick Start
+    44→
+    45→### Prerequisites
+    46→
+    47→- [Bun](https://bun.sh) (latest)
+    48→- [Docker](https://docker.com) (for database/redis)
+    49→
+    50→### Development Setup
+    51→
+    52→```bash
+    53→# 1. Clone and install dependencies
+    54→git clone <repo-url>
+    55→cd mms/system
+    56→bun install
+    57→
+    58→# 2. Start database services
+    59→docker compose up -d postgres redis
+    60→
+    61→# 3. Setup environment
+    62→cp .env.example .env
+    63→
+    64→# 4. Run database migrations
+    65→bun run db:push
+    66→
+    67→# 5. Start development server (API + Frontend)
+    68→bun run dev
+    69→```
+    70→
+    71→This starts:
+    72→- **API Server** at `http://localhost:3000`
+    73→- **Frontend** at `http://localhost:5173` (proxies `/api` to backend)
+    74→
+    75→### Development Commands
+    76→
+    77→| Command | Description |
+    78→|---------|-------------|
+    79→| `bun run dev` | Start API + Frontend (recommended) |
+    80→| `bun run dev:api` | Start API server only |
+    81→| `bun run dev:frontend` | Start Vite frontend only |
+    82→| `bun run dev:workers` | Start background workers only |
+    83→| `WORKERS=all bun run dev` | Start everything including workers |
+    84→
+    85→### Validation Commands
+    86→
+    87→Run in order before committing:
+    88→
+    89→```bash
+    90→bun test <path>       # Unit tests for changed files
+    91→bun run typecheck     # TypeScript strict mode
+    92→bun run lint          # ESLint
+    93→bun run build         # Full build
+    94→```
+    95→
+    96→### Testing
+    97→
+    98→```bash
+    99→bun run test          # All unit tests
+   100→bun run test:unit     # Unit tests only
+   101→bun run test:integration  # Integration tests (needs DB/Redis)
+   102→bun run test:e2e      # End-to-end tests (Playwright)
+   103→```
+   104→
+   105→For integration tests, use random ports to avoid conflicts:
+   106→```bash
+   107→PORT=0 bun run test:integration
+   108→```
+   109→
+   110→## Project Structure
+   111→
+   112→```
+   113→src/
+   114→├── api/              # Hono REST endpoints
+   115→│   ├── server.ts     # API entry point
+   116→│   ├── routes/       # Route definitions
+   117→│   └── middleware/   # Auth, validation, logging
+   118→├── services/         # Domain business logic
+   119→│   ├── fleet/        # Fleet management
+   120→│   ├── scheduling/   # PM scheduling
+   121→│   └── optimizer/    # Constraint solver interface
+   122→├── workers/          # BullMQ background jobs
+   123→│   ├── runner.ts     # Worker entry point
+   124→│   └── handlers/     # Job processors
+   125→├── lib/              # Shared utilities
+   126→│   ├── db/           # Drizzle ORM connection
+   127→│   ├── redis/        # Redis client
+   128→│   ├── logging/      # Pino + OpenTelemetry
+   129→│   └── schemas/      # Shared Zod schemas
+   130→├── engine/           # PM projection algorithm
+   131→├── canvas/           # deck.gl infinite canvas
+   132→├── components/       # React UI components
+   133→└── store/            # @belt/tools state machines
+   134→
+   135→specs/                # Source of truth (9 spec documents)
+   136→ralph/                # Ralph Wiggum task orchestration
+   137→scripts/              # Development utilities
+   138→docker/               # Container configurations
+   139→mms-optimizer/        # C++ OR-Tools binary
+   140→```
+   141→
+   142→## Environment Variables
+   143→
+   144→Key variables (see `.env.example` for full list):
+   145→
+   146→| Variable | Default | Description |
+   147→|----------|---------|-------------|
+   148→| `PORT` | `3000` | API server port |
+   149→| `VITE_PORT` | `5173` | Frontend dev server port |
+   150→| `DATABASE_URL` | `postgresql://mms:mms_dev_password@localhost:5432/mms` | PostgreSQL connection |
+   151→| `REDIS_HOST` | `localhost` | Redis hostname |
+   152→| `REDIS_PORT` | `6379` | Redis port |
+   153→| `JWT_SECRET` | (dev default) | Auth token signing |
+   154→| `WORKERS` | (all) | Comma-separated worker list |
+   155→| `LOG_LEVEL` | `debug` | Logging verbosity |
+   156→
+   157→## Docker Compose
+   158→
+   159→For full containerized development:
+   160→
+   161→```bash
+   162→# Start all services
+   163→docker compose up -d
+   164→
+   165→# Start with development tools (pgAdmin, Redis Commander)
+   166→docker compose --profile tools up -d
+   167→
+   168→# View logs
+   169→docker compose logs -f backend
+   170→
+   171→# Stop and clean
+   172→docker compose down -v
+   173→```
+   174→
+   175→Services:
+   176→- `postgres` - PostgreSQL 16 + TimescaleDB (:5432)
+   177→- `redis` - Redis 7 (:6379)
+   178→- `backend` - API server (:3000)
+   179→- `worker` - Background workers
+   180→- `frontend` - Vite dev server (:5173)
+   181→- `optimizer` - C++ OR-Tools binary
+   182→
+   183→Tools (with `--profile tools`):
+   184→- `redis-commander` - Redis web UI (:8081)
+   185→- `pgadmin` - PostgreSQL web UI (:8082)
+   186→
+   187→## API Endpoints
+   188→
+   189→| Endpoint | Description |
+   190→|----------|-------------|
+   191→| `GET /health` | Liveness probe |
+   192→| `GET /ready` | Readiness probe (checks DB + Redis) |
+   193→| `GET /metrics` | Prometheus metrics |
+   194→| `GET /api/fleet` | List fleet trains |
+   195→| `GET /api/schedule` | Get schedule data |
+   196→| `POST /api/schedule/optimize` | Trigger optimization |
+   197→
+   198→## Domain Concepts
+   199→
+   200→- **PM (Preventive Maintenance)**: C1, C2, C3, C4, Overhaul cycles
+   201→- **Run Assignment**: Daily train-to-route allocation
+   202→- **Compliance Window**: Valid date range for PM scheduling
+   203→- **Bow Wave**: Accumulation of deferred maintenance (risk indicator)
+   204→- **TCO**: Total Cost of Ownership (12-year projection)
+   205→
+   206→**Constraint Hierarchy:**
+   207→1. **Hard constraints**: Safety, physical limits - NEVER violate
+   208→2. **Soft constraints**: Compliance windows, preferences - violate with penalty
+   209→3. **Material constraints**: Check inventory before scheduling PM
+   210→4. **Track constraints**: Validate track capability for PM type
+   211→
+   212→---
+   213→
+   214→## @belt/tools Utilities Reference
+   215→
+   216→The `@belt/tools` package provides comprehensive utilities for state management, runtime validation, and common operations. All utilities are already available in this project.
+   217→
+   218→### State Machine
+   219→
+   220→Immer-based reactive state management with React hooks and automatic cache management.
+   221→
+   222→#### Creating Slices
+   223→
+   224→```typescript
+   225→import { createSlice, createAsyncSlice, createMachine } from '@belt/tools';
+   226→
+   227→// Synchronous slice for local state
+   228→const fleetSlice = createSlice({
+   229→  id: 'fleet',
+   230→  initial: {
+   231→    trains: [],
+   232→    pmHistory: [],
+   233→    selectedTrain: null as string | null,
+   234→  },
+   235→  cache: { policy: 'session' }, // or 'public', 'private'
+   236→  reducers: {
+   237→    importFleet: (state, payload: Train[]) => {
+   238→      state.trains = payload; // Immer allows direct mutations
+   239→    },
+   240→    selectTrain: (state, trainId: string) => {
+   241→      state.selectedTrain = trainId;
+   242→    },
+   243→    clearSelection: (state) => {
+   244→      state.selectedTrain = null;
+   245→    },
+   246→  },
+   247→});
+   248→
+   249→// Async slice for data fetching
+   250→const analyticsSlice = createAsyncSlice({
+   251→  id: 'analytics',
+   252→  cache: {
+   253→    policy: 'public',
+   254→    ttl: '5m', // Time-to-live using ms() format
+   255→    swr: true, // Stale-while-revalidate
+   256→  },
+   257→  context: {},
+   258→  load: async () => {
+   259→    const response = await fetch('/api/analytics');
+   260→    return response.json();
+   261→  },
+   262→});
+   263→```
+   264→
+   265→#### Creating Machines
+   266→
+   267→```tsx
+   268→import { createMachine } from '@belt/tools';
+   269→
+   270→const appMachine = createMachine({
+   271→  id: 'mms',
+   272→  slices: {
+   273→    fleet: fleetSlice,
+   274→    analytics: analyticsSlice,
+   275→  },
+   276→  context: { userId: null }, // Global context
+   277→});
+   278→
+   279→// Use in React components
+   280→function FleetView() {
+   281→  const { state, actions } = appMachine.useMachine('fleet');
+   282→
+   283→  return (
+   284→    <div>
+   285→      <button onClick={() => actions.importFleet(trains)}>
+   286→        Import Fleet
+   287→      </button>
+   288→      <div>{state.trains.length} trains loaded</div>
+   289→    </div>
+   290→  );
+   291→}
+   292→```
+   293→
+   294→**Cache Policies:**
+   295→- `public` - Shared cache, TTL-based invalidation
+   296→- `private` - User-specific cache, invalidated on user change
+   297→- `session` - Session-specific cache, invalidated on app restart
+   298→
+   299→---
+   300→
+   301→### Runtime Schema Validation
+   302→
+   303→Type-safe runtime validation using TypeBox with concise syntax.
+   304→
+   305→#### Basic Types
+   306→
+   307→```typescript
+   308→import { createType, createSchema, isType, invariantType, InferType } from '@belt/tools';
+   309→
+   310→// Primitive types
+   311→const StringType = createType('string');
+   312→const NumberType = createType('number');
+   313→const BooleanType = createType('boolean');
+   314→const DateType = createType('date');
+   315→
+   316→// Optional types (append ?)
+   317→const OptionalString = createType('string?');
+   318→const OptionalNumber = createType('number?');
+   319→
+   320→// Array types (append [])
+   321→const StringArray = createType('string[]');
+   322→const NumberArray = createType('number[]');
+   323→
+   324→// Type guards
+   325→if (isType(value, 'string')) {
+   326→  console.log(value.toUpperCase()); // TypeScript knows it's string
+   327→}
+   328→
+   329→if (isType(value, 'date')) {
+   330→  console.log(value.toISOString()); // TypeScript knows it's Date
+   331→}
+   332→```
+   333→
+   334→#### Object Schemas
+   335→
+   336→```typescript
+   337→import { createSchema, InferType } from '@belt/tools';
+   338→
+   339→// Define schema
+   340→const TrainModel = createSchema({
+   341→  id: 'string',
+   342→  name: 'string',
+   343→  mileage: 'number',
+   344→  lastPM: 'date',
+   345→  tags: 'string[]',
+   346→  metadata: 'object?', // Optional generic object
+   347→});
+   348→
+   349→// Infer TypeScript type
+   350→type Train = InferType<typeof TrainModel>;
+   351→
+   352→// Parse and validate
+   353→const train = TrainModel.parse({
+   354→  id: 'T001',
+   355→  name: 'Red Line',
+   356→  mileage: 50000,
+   357→  lastPM: new Date('2025-01-01'),
+   358→  tags: ['metro', 'active'],
+   359→});
+   360→
+   361→// Validate without parsing
+   362→if (TrainModel.isValid(data)) {
+   363→  // TypeScript knows data is Train
+   364→}
+   365→
+   366→// Assert type (throws if invalid)
+   367→invariantType(TrainModel, data);
+   368→```
+   369→
+   370→#### Complex Types
+   371→
+   372→```typescript
+   373→import { createType } from '@belt/tools';
+   374→
+   375→// Nested objects
+   376→const PMEventType = createType({
+   377→  properties: {
+   378→    trainId: 'string',
+   379→    scheduledDate: 'date',
+   380→    location: {
+   381→      properties: {
+   382→        facility: 'string',
+   383→        bay: 'number',
+   384→      },
+   385→    },
+   386→    tasks: {
+   387→      items: { // Array of objects
+   388→        properties: {
+   389→          code: 'string',
+   390→          duration: 'number',
+   391→          completed: 'boolean?',
+   392→        },
+   393→      },
+   394→    },
+   395→  },
+   396→});
+   397→
+   398→// Enums
+   399→const StatusEnum = createType({
+   400→  enum: ['pending', 'in-progress', 'completed', 'cancelled'],
+   401→});
+   402→
+   403→// Unions
+   404→const IDType = createType({
+   405→  union: ['string', 'number'],
+   406→});
+   407→
+   408→// Records (key-value maps)
+   409→const ConfigType = createType({
+   410→  record: 'string', // Record<string, string>
+   411→});
+   412→```
+   413→
+   414→#### List Parsing
+   415→
+   416→```typescript
+   417→// Parse array of items
+   418→const trainList = TrainModel.list().parse([
+   419→  { id: 'T001', name: 'Red Line', mileage: 50000, lastPM: new Date(), tags: [] },
+   420→  { id: 'T002', name: 'Blue Line', mileage: 30000, lastPM: new Date(), tags: [] },
+   421→]);
+   422→
+   423→// Parse array from nested path
+   424→const events = PMEventType.parseList(response, 'data.events');
+   425→```
+   426→
+   427→---
+   428→
+   429→### Date Utilities
+   430→
+   431→Date manipulation and formatting using date-fns.
+   432→
+   433→```typescript
+   434→import { formatDate, setDefaultDateLocale, ms } from '@belt/tools';
+   435→import { ptBR } from 'date-fns/locale';
+   436→
+   437→// Format dates
+   438→formatDate(new Date(), 'yyyy-MM-dd'); // '2026-01-14'
+   439→formatDate(new Date(), 'MMM dd, yyyy'); // 'Jan 14, 2026'
+   440→formatDate('2026-01-14', 'dd/MM/yyyy'); // '14/01/2026'
+   441→
+   442→// Set global locale
+   443→setDefaultDateLocale(ptBR);
+   444→formatDate(new Date(), 'MMMM'); // 'janeiro'
+   445→
+   446→// Override locale for single call
+   447→import { enUS } from 'date-fns/locale';
+   448→formatDate(new Date(), 'MMMM', { locale: enUS }); // 'January'
+   449→
+   450→// Time string conversion
+   451→ms('1s');       // 1000
+   452→ms('5m');       // 300000
+   453→ms('1h');       // 3600000
+   454→ms('2d');       // 172800000
+   455→ms('1w');       // 604800000
+   456→ms('1mo');      // ~2629800000
+   457→ms('1y');       // ~31557600000
+   458→ms('500ms');    // 500
+   459→
+   460→// Use in configs
+   461→const CACHE_TTL = ms('5m');
+   462→const DEBOUNCE = ms('300ms');
+   463→const POLL_INTERVAL = ms('30s');
+   464→```
+   465→
+   466→**Supported time units:** `ms`, `s`, `m`/`min`, `h`, `d`, `w`, `mo`/`mon`/`months`, `y`
+   467→
+   468→---
+   469→
+   470→### Object Utilities
+   471→
+   472→Type-safe object manipulation with deep path access.
+   473→
+   474→```typescript
+   475→import {
+   476→  getProperty,
+   477→  setProperty,
+   478→  objectKeys,
+   479→  objectEntries,
+   480→  objectValues,
+   481→  keyBy,
+   482→  isObject,
+   483→  assertObject,
+   484→  requireAll,
+   485→  deepFreeze,
+   486→} from '@belt/tools';
+   487→
+   488→// Deep property access (type-safe)
+   489→const street = getProperty(user, 'address.street');
+   490→const city = getProperty(user, 'address.city', true); // Allow falsy values
+   491→
+   492→// Set nested properties
+   493→setProperty(train, 'metadata.lastInspection', new Date());
+   494→
+   495→// Object manipulation
+   496→const keys = objectKeys(train); // Type-safe keys
+   497→const entries = objectEntries(train); // Typed entries
+   498→const values = objectValues(train); // Typed values
+   499→
+   500→// Array to object by key
+   501→const trainsById = keyBy(trains, 'id');
+   502→// Or with function
+   503→const trainsByName = keyBy(trains, (t) => t.name);
+   504→
+   505→// Type guards
+   506→if (isObject(value)) {
+   507→  // value is UnknownRecord
+   508→}
+   509→
+   510→// Assert object with no falsy values
+   511→const validated = requireAll({
+   512→  id: train.id,
+   513→  name: train.name,
+   514→  mileage: train.mileage,
+   515→});
+   516→
+   517→// Deep freeze (immutability)
+   518→const frozen = deepFreeze(config);
+   519→```
+   520→
+   521→**Path Examples:**
+   522→```typescript
+   523→type User = {
+   524→  id: string;
+   525→  profile: {
+   526→    address: {
+   527→      street: string;
+   528→      city: string;
+   529→    };
+   530→  };
+   531→};
+   532→
+   533→// All paths are type-checked
+   534→getProperty(user, 'id');                    // ✓ string
+   535→getProperty(user, 'profile.address.city');  // ✓ string
+   536→getProperty(user, 'profile.invalid');       // ✗ Type error
+   537→```
+   538→
+   539→---
+   540→
+   541→### String Utilities
+   542→
+   543→String manipulation with type inference.
+   544→
+   545→```typescript
+   546→import { capitalize, isString, assertString } from '@belt/tools';
+   547→
+   548→// Capitalize
+   549→capitalize('hello'); // 'Hello' (type: 'Hello')
+   550→
+   551→// Type guards
+   552→if (isString(value)) {
+   553→  console.log(value.toUpperCase());
+   554→}
+   555→
+   556→// Assertions
+   557→assertString(value);
+   558→assertString(value, { notEmpty: true });
+   559→assertString(value, { message: 'Name is required', notEmpty: true });
+   560→```
+   561→
+   562→---
+   563→
+   564→### Error Handling
+   565→
+   566→Comprehensive error utilities with stack trace management.
+   567→
+   568→```typescript
+   569→import {
+   570→  invariant,
+   571→  tryCatch,
+   572→  InvariantError,
+   573→  createErrorList,
+   574→} from '@belt/tools';
+   575→
+   576→// Assertions
+   577→invariant(user.id, 'User ID is required');
+   578→invariant(trains.length > 0, 'No trains found');
+   579→
+   580→// Safe error handling
+   581→const [error, result] = tryCatch(() => JSON.parse(data));
+   582→if (error) {
+   583→  console.error('Parse failed:', error.message);
+   584→} else {
+   585→  console.log('Success:', result);
+   586→}
+   587→
+   588→// Collect multiple errors
+   589→const errors = createErrorList('Validation failed: ');
+   590→if (!train.id) errors.add('Missing ID');
+   591→if (!train.name) errors.add('Missing name');
+   592→if (train.mileage < 0) errors.add('Invalid mileage');
+   593→errors.check(); // Throws if any errors
+   594→```
+   595→
+   596→---
+   597→
+   598→### Type Utilities
+   599→
+   600→Advanced TypeScript type helpers.
+   601→
+   602→```typescript
+   603→import type {
+   604→  Paths,          // All dot-notation paths of object
+   605→  PathType,       // Type at specific path
+   606→  Compute,        // Flatten intersection types
+   607→  Writable,       // Remove readonly modifiers
+   608→  Falsy,          // Union of falsy values
+   609→  InferType,      // Infer type from schema
+   610→  UnknownRecord,  // { [key: string]: unknown }
+   611→  AnyRecord,      // { [key: string]: any }
+   612→  MaybePromise,   // T | Promise<T>
+   613→  MaybeArray,     // T | T[]
+   614→  PromiseValue,   // Extract Promise<T> → T
+   615→  Simplify,       // Flatten complex types
+   616→  Merge,          // Deep merge two types
+   617→  PartialFields,  // Make specific fields optional
+   618→  NullableToPartial, // Convert nullable to optional
+   619→  UnionToIntersection, // Union → Intersection
+   620→  CastUnknown,    // Cast if unknown
+   621→  SerializableOnly, // Only serializable fields
+   622→} from '@belt/tools';
+   623→
+   624→// Example: Paths
+   625→type User = {
+   626→  id: string;
+   627→  profile: {
+   628→    address: {
+   629→      street: string;
+   630→    };
+   631→  };
+   632→};
+   633→
+   634→type UserPaths = Paths<User>;
+   635→// 'id' | 'profile' | 'profile.address' | 'profile.address.street'
+   636→
+   637→type StreetType = PathType<User, 'profile.address.street'>;
+   638→// string
+   639→
+   640→// Example: Compute (flatten intersections)
+   641→type A = { a: number };
+   642→type B = { b: string };
+   643→type Flat = Compute<A & B>; // { a: number; b: string }
+   644→
+   645→// Example: Writable
+   646→type ReadOnly = { readonly id: string; readonly name: string };
+   647→type Mutable = Writable<ReadOnly>; // { id: string; name: string }
+   648→
+   649→// Example: PartialFields
+   650→type Train = { id: string; name: string; metadata: object };
+   651→type Optional = PartialFields<Train, ['metadata']>;
+   652→// { id: string; name: string; metadata?: object }
+   653→```
+   654→
+   655→**Type Guards:**
+   656→```typescript
+   657→import { isFalsy } from '@belt/tools';
+   658→import type { Falsy } from '@belt/tools';
+   659→
+   660→// All falsy values
+   661→const falsyValues: Falsy = false | '' | null | undefined | 0 | 0n | NaN;
+   662→
+   663→if (isFalsy(value)) {
+   664→  // value is one of the falsy values
+   665→}
+   666→```
+   667→
+   668→---
+   669→
+   670→### Other Utilities
+   671→
+   672→```typescript
+   673→import { delay, maskData, getTypeOf, createProxy } from '@belt/tools';
+   674→
+   675→// Async delay
+   676→await delay(500); // Wait 500ms
+   677→await delay();    // Default 500ms
+   678→
+   679→// Mask sensitive data for logging
+   680→const masked = maskData({
+   681→  password: 'secret123',
+   682→  email: 'user@example.com',
+   683→  nested: { token: 'abc123' },
+   684→});
+   685→// { password: 'String', email: 'String', nested: { token: 'String' } }
+   686→
+   687→// Get type name
+   688→getTypeOf(null);           // 'Null'
+   689→getTypeOf(undefined);      // 'Undefined'
+   690→getTypeOf(new Date());     // 'Date'
+   691→getTypeOf({});             // 'Object'
+   692→getTypeOf([]);             // 'Array'
+   693→getTypeOf(NaN);            // 'NaN'
+   694→
+   695→// Lazy initialization
+   696→const lazyConfig = createProxy(() => loadConfig());
+   697→// Config is only loaded on first access
+   698→```
+   699→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

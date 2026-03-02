@@ -1,0 +1,335 @@
+     1→/**
+     2→ * Man-hour Management Routes
+     3→ *
+     4→ * REST endpoints for man-hour projections and adjustment workflows.
+     5→ * Wraps ManHourLevelingService with HTTP interface per spec 005.7.
+     6→ *
+     7→ * Endpoints:
+     8→ * - GET /manhours/projections - List projections with filtering
+     9→ * - GET /manhours/adjustments - List proposed adjustments
+    10→ * - POST /manhours/adjustments/:id/approve - Approve an adjustment
+    11→ * - POST /manhours/adjustments/:id/reject - Reject an adjustment
+    12→ *
+    13→ * @see specs/005-api.md Section 5.7
+    14→ */
+    15→
+    16→import { Hono } from 'hono';
+    17→import { parseISO } from 'date-fns';
+    18→import {
+    19→  success,
+    20→  paginatedSuccess,
+    21→  error,
+    22→  parsePaginationQuery,
+    23→  ErrorCodes,
+    24→  type AppVariables,
+    25→} from '../types';
+    26→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    27→import {
+    28→  getManHourLevelingService,
+    29→  type ProjectionFilters,
+    30→  type AdjustmentFilters,
+    31→  type AdjustmentStatus,
+    32→  type AdjustmentType,
+    33→} from '../../services';
+    34→import { isValidUuid } from '../../lib/schemas';
+    35→
+    36→let manhourService: ReturnType<typeof getManHourLevelingService> | null = null;
+    37→
+    38→function getService(): ReturnType<typeof getManHourLevelingService> {
+    39→  if (!manhourService) {
+    40→    manhourService = getManHourLevelingService();
+    41→  }
+    42→  return manhourService;
+    43→}
+    44→
+    45→export const manhourRoutes = new Hono<{ Variables: AppVariables }>();
+    46→
+    47→/**
+    48→ * GET /manhours/projections
+    49→ *
+    50→ * Get man-hour projections with filtering.
+    51→ *
+    52→ * Query Parameters:
+    53→ * - depotId: Filter by depot
+    54→ * - fromDate: Period start (inclusive)
+    55→ * - toDate: Period end (inclusive)
+    56→ * - granularity: WEEKLY or MONTHLY
+    57→ * - projectionRunId: Filter by specific projection run
+    58→ */
+    59→manhourRoutes.get('/manhours/projections', async (c) => {
+    60→  const requestId = getRequestId(c);
+    61→
+    62→  // Parse query filters
+    63→  const depotId = c.req.query('depotId');
+    64→  const fromDate = c.req.query('fromDate');
+    65→  const toDate = c.req.query('toDate');
+    66→  const projectionRunId = c.req.query('projectionRunId');
+    67→
+    68→  // Validate UUIDs if provided
+    69→  if (depotId && !isValidUuid(depotId)) {
+    70→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'depotId must be a valid UUID', requestId), 400);
+    71→  }
+    72→  if (projectionRunId && !isValidUuid(projectionRunId)) {
+    73→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'projectionRunId must be a valid UUID', requestId), 400);
+    74→  }
+    75→
+    76→  // Validate date formats
+    77→  if (fromDate && !/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+    78→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'fromDate must be in YYYY-MM-DD format', requestId), 400);
+    79→  }
+    80→  if (toDate && !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+    81→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'toDate must be in YYYY-MM-DD format', requestId), 400);
+    82→  }
+    83→
+    84→  // Build filter object
+    85→  const filters: ProjectionFilters = {};
+    86→  if (depotId) filters.depotId = depotId;
+    87→  if (fromDate) filters.fromDate = parseISO(fromDate);
+    88→  if (toDate) filters.toDate = parseISO(toDate);
+    89→  if (projectionRunId) filters.projectionRunId = projectionRunId;
+    90→
+    91→  // Parse pagination
+    92→  const pagination = parsePaginationQuery({
+    93→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+    94→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+    95→    sort: c.req.query('sort'),
+    96→  });
+    97→
+    98→  const service = getService();
+    99→  const result = await service.getProjections(filters, pagination.page, pagination.pageSize);
+   100→
+   101→  // Map to API response format per spec 005.7
+   102→  const data = result.data.map((projection) => {
+   103→    const requiredTotal = parseFloat(projection.requiredTotalHours ?? '0');
+   104→    const availableTotal = parseFloat(projection.availableTotalHours ?? '0');
+   105→    const varianceHours = availableTotal - requiredTotal;
+   106→    const utilizationPct = availableTotal > 0 ? (requiredTotal / availableTotal) * 100 : 0;
+   107→
+   108→    return {
+   109→      depotId: projection.depotId,
+   110→      periodStart: projection.periodStart,
+   111→      periodEnd: projection.periodEnd,
+   112→      required: {
+   113→        pm: parseFloat(projection.requiredPmHours ?? '0'),
+   114→        corrective: parseFloat(projection.requiredCorrectiveHours ?? '0'),
+   115→        overhaul: parseFloat(projection.requiredOverhaulHours ?? '0'),
+   116→        total: requiredTotal,
+   117→      },
+   118→      available: {
+   119→        regular: parseFloat(projection.availableRegularHours ?? '0'),
+   120→        overtime: parseFloat(projection.availableOvertimeHours ?? '0'),
+   121→        total: availableTotal,
+   122→      },
+   123→      varianceHours,
+   124→      utilizationPct: Math.round(utilizationPct * 10) / 10,
+   125→      isOverloaded: requiredTotal > availableTotal,
+   126→      isUnderutilized: requiredTotal < availableTotal * 0.7,
+   127→      pendingAdjustments: 0, // TODO: Count adjustments when relation is loaded
+   128→    };
+   129→  });
+   130→
+   131→  return c.json(
+   132→    paginatedSuccess(
+   133→      data,
+   134→      {
+   135→        page: result.page,
+   136→        pageSize: result.pageSize,
+   137→        totalItems: result.total,
+   138→      },
+   139→      { durationMs: getRequestDuration(c) }
+   140→    )
+   141→  );
+   142→});
+   143→
+   144→/**
+   145→ * GET /manhours/adjustments
+   146→ *
+   147→ * Get proposed man-hour adjustments with filtering.
+   148→ *
+   149→ * Query Parameters:
+   150→ * - status: Filter by status (PROPOSED, APPROVED, REJECTED, APPLIED)
+   151→ * - type: Filter by adjustment type (ADVANCE_PM, DEFER_PM, ADD_OVERTIME, etc.)
+   152→ * - fromDate: Source period start (inclusive)
+   153→ * - toDate: Source period end (inclusive)
+   154→ */
+   155→manhourRoutes.get('/manhours/adjustments', async (c) => {
+   156→  const requestId = getRequestId(c);
+   157→
+   158→  // Parse query filters
+   159→  const status = c.req.query('status');
+   160→  const type = c.req.query('type');
+   161→  const fromDate = c.req.query('fromDate');
+   162→  const toDate = c.req.query('toDate');
+   163→
+   164→  // Validate status if provided
+   165→  const validStatuses: AdjustmentStatus[] = ['PROPOSED', 'APPROVED', 'REJECTED', 'APPLIED'];
+   166→  if (status && !validStatuses.includes(status as AdjustmentStatus)) {
+   167→    return c.json(
+   168→      error(
+   169→        ErrorCodes.VALIDATION_ERROR,
+   170→        `status must be one of: ${validStatuses.join(', ')}`,
+   171→        requestId
+   172→      ),
+   173→      400
+   174→    );
+   175→  }
+   176→
+   177→  // Validate type if provided
+   178→  const validTypes: AdjustmentType[] = [
+   179→    'ADVANCE_PM',
+   180→    'DEFER_PM',
+   181→    'ADD_OVERTIME',
+   182→    'CROSS_DEPOT',
+   183→    'ADD_CONTRACTOR',
+   184→    'MANUAL_REVIEW',
+   185→  ];
+   186→  if (type && !validTypes.includes(type as AdjustmentType)) {
+   187→    return c.json(
+   188→      error(ErrorCodes.VALIDATION_ERROR, `type must be one of: ${validTypes.join(', ')}`, requestId),
+   189→      400
+   190→    );
+   191→  }
+   192→
+   193→  // Validate date formats
+   194→  if (fromDate && !/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+   195→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'fromDate must be in YYYY-MM-DD format', requestId), 400);
+   196→  }
+   197→  if (toDate && !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+   198→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'toDate must be in YYYY-MM-DD format', requestId), 400);
+   199→  }
+   200→
+   201→  // Build filter object
+   202→  const filters: AdjustmentFilters = {};
+   203→  if (status) filters.status = status as AdjustmentStatus;
+   204→  if (type) filters.type = type as AdjustmentType;
+   205→  if (fromDate) filters.fromDate = parseISO(fromDate);
+   206→  if (toDate) filters.toDate = parseISO(toDate);
+   207→
+   208→  // Parse pagination
+   209→  const pagination = parsePaginationQuery({
+   210→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+   211→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+   212→    sort: c.req.query('sort'),
+   213→  });
+   214→
+   215→  const service = getService();
+   216→  const result = await service.getAdjustments(filters, pagination.page, pagination.pageSize);
+   217→
+   218→  // Map to API response format per spec 005.7
+   219→  const data = result.data.map((adjustment) => ({
+   220→    id: adjustment.id,
+   221→    projectionId: adjustment.projectionId,
+   222→    type: adjustment.adjustmentType,
+   223→    sourcePeriod: {
+   224→      start: adjustment.sourcePeriodStart,
+   225→      end: adjustment.sourcePeriodEnd,
+   226→    },
+   227→    targetPeriod: adjustment.targetPeriodStart
+   228→      ? {
+   229→          start: adjustment.targetPeriodStart,
+   230→          end: adjustment.targetPeriodEnd,
+   231→        }
+   232→      : null,
+   233→    hoursAdjusted: parseFloat(adjustment.hoursAdjusted ?? '0'),
+   234→    affectedPMs: adjustment.affectedPmIds ?? [],
+   235→    costImpact: adjustment.costImpact ? parseFloat(adjustment.costImpact) : null,
+   236→    riskLevel: adjustment.riskImpact,
+   237→    reason: adjustment.reason,
+   238→    status: adjustment.status,
+   239→    proposedAt: adjustment.proposedAt,
+   240→  }));
+   241→
+   242→  return c.json(
+   243→    paginatedSuccess(
+   244→      data,
+   245→      {
+   246→        page: result.page,
+   247→        pageSize: result.pageSize,
+   248→        totalItems: result.total,
+   249→      },
+   250→      { durationMs: getRequestDuration(c) }
+   251→    )
+   252→  );
+   253→});
+   254→
+   255→/**
+   256→ * POST /manhours/adjustments/:id/approve
+   257→ *
+   258→ * Approve a man-hour adjustment.
+   259→ *
+   260→ * Request body:
+   261→ * - comment?: Optional approval comment
+   262→ */
+   263→manhourRoutes.post('/manhours/adjustments/:id/approve', async (c) => {
+   264→  const requestId = getRequestId(c);
+   265→  const adjustmentId = c.req.param('id');
+   266→
+   267→  if (!isValidUuid(adjustmentId)) {
+   268→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid adjustment ID format', requestId), 400);
+   269→  }
+   270→
+   271→  const body = await c.req.json().catch(() => ({}));
+   272→  const user = c.get('user');
+   273→  const userId = user?.id ?? 'system';
+   274→
+   275→  const service = getService();
+   276→  const updated = await service.approveAdjustment(adjustmentId, userId);
+   277→
+   278→  return c.json(
+   279→    success({
+   280→      id: updated.id,
+   281→      status: updated.status,
+   282→      approvedBy: updated.approvedBy,
+   283→      approvedAt: updated.approvedAt,
+   284→      comment: body.comment ?? null,
+   285→    })
+   286→  );
+   287→});
+   288→
+   289→/**
+   290→ * POST /manhours/adjustments/:id/reject
+   291→ *
+   292→ * Reject a man-hour adjustment.
+   293→ *
+   294→ * Request body:
+   295→ * - reason: Reason for rejection (required)
+   296→ */
+   297→manhourRoutes.post('/manhours/adjustments/:id/reject', async (c) => {
+   298→  const requestId = getRequestId(c);
+   299→  const adjustmentId = c.req.param('id');
+   300→
+   301→  if (!isValidUuid(adjustmentId)) {
+   302→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid adjustment ID format', requestId), 400);
+   303→  }
+   304→
+   305→  const body = await c.req.json();
+   306→
+   307→  // Validate reason is provided
+   308→  if (!body.reason || typeof body.reason !== 'string' || body.reason.trim().length === 0) {
+   309→    return c.json(
+   310→      error(ErrorCodes.VALIDATION_ERROR, 'reason is required for rejection', requestId),
+   311→      400
+   312→    );
+   313→  }
+   314→
+   315→  const user = c.get('user');
+   316→  const userId = user?.id ?? 'system';
+   317→
+   318→  const service = getService();
+   319→  const updated = await service.rejectAdjustment(adjustmentId, userId, body.reason);
+   320→
+   321→  return c.json(
+   322→    success({
+   323→      id: updated.id,
+   324→      status: updated.status,
+   325→      rejectedBy: updated.approvedBy, // Same field used for rejections
+   326→      rejectedAt: updated.approvedAt,
+   327→      rejectionReason: updated.rejectionReason,
+   328→    })
+   329→  );
+   330→});
+   331→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

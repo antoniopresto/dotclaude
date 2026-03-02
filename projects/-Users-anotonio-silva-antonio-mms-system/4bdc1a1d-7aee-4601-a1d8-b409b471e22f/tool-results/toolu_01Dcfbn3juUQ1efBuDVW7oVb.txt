@@ -1,0 +1,317 @@
+     1→/**
+     2→ * MMS Base Service
+     3→ *
+     4→ * Abstract base class for all domain services in the MMS system.
+     5→ * Provides consistent patterns for:
+     6→ * - OpenTelemetry distributed tracing
+     7→ * - Structured logging with Pino
+     8→ * - Database transaction management
+     9→ * - Error handling and propagation
+    10→ *
+    11→ * All domain services (Ingestion, Fleet, PM Scheduler, etc.) extend this base.
+    12→ *
+    13→ * @see specs/004-domain-services.md
+    14→ */
+    15→
+    16→import type { Logger } from 'pino';
+    17→import type { Span, Attributes } from '@opentelemetry/api';
+    18→import { createChildLogger, logError as pinoLogError } from '../logging/logger';
+    19→import { db, withTransaction, type Transaction, type Database } from '../db/connection';
+    20→import {
+    21→  withSpan,
+    22→  withSpanSync,
+    23→  getTracer,
+    24→  getTraceContext,
+    25→  recordSpanError,
+    26→  addSpanEvent,
+    27→  MmsAttributes,
+    28→  SpanKind,
+    29→  type Tracer,
+    30→} from '../tracing';
+    31→import { MmsError, toMmsError } from '../errors';
+    32→
+    33→/**
+    34→ * Service configuration options
+    35→ */
+    36→export interface ServiceConfig {
+    37→  /** Service name for tracing and logging */
+    38→  name: string;
+    39→  /** Service version */
+    40→  version?: string;
+    41→  /** Additional context for all logs and spans */
+    42→  context?: Record<string, unknown>;
+    43→}
+    44→
+    45→/**
+    46→ * Operation result wrapper for consistent return types
+    47→ */
+    48→export interface OperationResult<T> {
+    49→  success: boolean;
+    50→  data?: T;
+    51→  error?: MmsError;
+    52→  durationMs: number;
+    53→}
+    54→
+    55→/**
+    56→ * Base service class for all MMS domain services
+    57→ *
+    58→ * @example
+    59→ * ```typescript
+    60→ * class FleetService extends BaseService {
+    61→ *   constructor() {
+    62→ *     super({ name: 'fleet-service' });
+    63→ *   }
+    64→ *
+    65→ *   async getTrains(fleetId: string): Promise<Train[]> {
+    66→ *     return this.traced('getTrains', async (span) => {
+    67→ *       span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+    68→ *       return this.db.query.trains.findMany({
+    69→ *         where: eq(trains.fleetId, fleetId)
+    70→ *       });
+    71→ *     });
+    72→ *   }
+    73→ * }
+    74→ * ```
+    75→ */
+    76→export abstract class BaseService {
+    77→  protected readonly serviceName: string;
+    78→  protected readonly log: Logger;
+    79→  protected readonly tracer: Tracer;
+    80→  protected readonly db: Database;
+    81→
+    82→  constructor(config: ServiceConfig) {
+    83→    this.serviceName = config.name;
+    84→    this.log = createChildLogger({
+    85→      service: config.name,
+    86→      version: config.version ?? '0.1.0',
+    87→      ...config.context,
+    88→    });
+    89→    this.tracer = getTracer(config.name);
+    90→    this.db = db;
+    91→  }
+    92→
+    93→  /**
+    94→   * Execute an async operation with tracing
+    95→   *
+    96→   * Automatically creates a span, records errors, and measures duration.
+    97→   * Propagates trace context for distributed tracing.
+    98→   *
+    99→   * @param operationName - Name of the operation (becomes span name)
+   100→   * @param fn - Async function to execute
+   101→   * @param attributes - Optional span attributes
+   102→   */
+   103→  protected async traced<T>(
+   104→    operationName: string,
+   105→    fn: (span: Span) => Promise<T>,
+   106→    attributes?: Attributes
+   107→  ): Promise<T> {
+   108→    const spanName = `${this.serviceName}.${operationName}`;
+   109→
+   110→    return withSpan(
+   111→      spanName,
+   112→      async (span) => {
+   113→        // Add operation start log
+   114→        this.log.debug(
+   115→          { operation: operationName, ...getTraceContext() },
+   116→          `Starting ${operationName}`
+   117→        );
+   118→
+   119→        const startTime = Date.now();
+   120→
+   121→        try {
+   122→          const result = await fn(span);
+   123→
+   124→          // Add operation complete log
+   125→          const durationMs = Date.now() - startTime;
+   126→          this.log.info(
+   127→            { operation: operationName, durationMs, ...getTraceContext() },
+   128→            `Completed ${operationName} in ${durationMs}ms`
+   129→          );
+   130→
+   131→          return result;
+   132→        } catch (error) {
+   133→          const durationMs = Date.now() - startTime;
+   134→          const mmsError = toMmsError(error);
+   135→
+   136→          this.log.error(
+   137→            {
+   138→              operation: operationName,
+   139→              durationMs,
+   140→              error: mmsError.toJSON(),
+   141→              ...getTraceContext(),
+   142→            },
+   143→            `Failed ${operationName}: ${mmsError.message}`
+   144→          );
+   145→
+   146→          throw mmsError;
+   147→        }
+   148→      },
+   149→      {
+   150→        kind: SpanKind.INTERNAL,
+   151→        tracer: this.tracer,
+   152→        attributes: {
+   153→          'service.name': this.serviceName,
+   154→          'operation.name': operationName,
+   155→          ...attributes,
+   156→        },
+   157→      }
+   158→    );
+   159→  }
+   160→
+   161→  /**
+   162→   * Execute a sync operation with tracing
+   163→   */
+   164→  protected tracedSync<T>(
+   165→    operationName: string,
+   166→    fn: (span: Span) => T,
+   167→    attributes?: Attributes
+   168→  ): T {
+   169→    const spanName = `${this.serviceName}.${operationName}`;
+   170→
+   171→    return withSpanSync(
+   172→      spanName,
+   173→      (span) => {
+   174→        const startTime = Date.now();
+   175→
+   176→        try {
+   177→          const result = fn(span);
+   178→
+   179→          const durationMs = Date.now() - startTime;
+   180→          this.log.debug(
+   181→            { operation: operationName, durationMs, ...getTraceContext() },
+   182→            `Completed ${operationName} in ${durationMs}ms`
+   183→          );
+   184→
+   185→          return result;
+   186→        } catch (error) {
+   187→          const durationMs = Date.now() - startTime;
+   188→          const mmsError = toMmsError(error);
+   189→
+   190→          this.log.error(
+   191→            {
+   192→              operation: operationName,
+   193→              durationMs,
+   194→              error: mmsError.toJSON(),
+   195→              ...getTraceContext(),
+   196→            },
+   197→            `Failed ${operationName}: ${mmsError.message}`
+   198→          );
+   199→
+   200→          throw mmsError;
+   201→        }
+   202→      },
+   203→      {
+   204→        kind: SpanKind.INTERNAL,
+   205→        tracer: this.tracer,
+   206→        attributes: {
+   207→          'service.name': this.serviceName,
+   208→          'operation.name': operationName,
+   209→          ...attributes,
+   210→        },
+   211→      }
+   212→    );
+   213→  }
+   214→
+   215→  /**
+   216→   * Execute a database transaction with tracing
+   217→   *
+   218→   * Automatically commits on success, rolls back on error.
+   219→   * Creates a child span for the transaction.
+   220→   *
+   221→   * @param operationName - Name of the operation
+   222→   * @param fn - Function to execute within the transaction
+   223→   */
+   224→  protected async inTransaction<T>(
+   225→    operationName: string,
+   226→    fn: (tx: Transaction, span: Span) => Promise<T>
+   227→  ): Promise<T> {
+   228→    return this.traced(
+   229→      `${operationName}.transaction`,
+   230→      async (span) => {
+   231→        span.setAttribute(MmsAttributes.DB_OPERATION, 'transaction');
+   232→        addSpanEvent('transaction.begin', undefined, span);
+   233→
+   234→        try {
+   235→          const result = await withTransaction(async (tx) => fn(tx, span));
+   236→          addSpanEvent('transaction.commit', undefined, span);
+   237→          return result;
+   238→        } catch (error) {
+   239→          addSpanEvent('transaction.rollback', undefined, span);
+   240→          throw error;
+   241→        }
+   242→      },
+   243→      { [MmsAttributes.DB_OPERATION]: 'transaction' }
+   244→    );
+   245→  }
+   246→
+   247→  /**
+   248→   * Wrap an operation result with timing and error info
+   249→   */
+   250→  protected async safeExecute<T>(
+   251→    operationName: string,
+   252→    fn: () => Promise<T>
+   253→  ): Promise<OperationResult<T>> {
+   254→    const startTime = Date.now();
+   255→
+   256→    try {
+   257→      const data = await fn();
+   258→      return {
+   259→        success: true,
+   260→        data,
+   261→        durationMs: Date.now() - startTime,
+   262→      };
+   263→    } catch (error) {
+   264→      const mmsError = toMmsError(error);
+   265→      return {
+   266→        success: false,
+   267→        error: mmsError,
+   268→        durationMs: Date.now() - startTime,
+   269→      };
+   270→    }
+   271→  }
+   272→
+   273→  /**
+   274→   * Record a domain event on the current span
+   275→   */
+   276→  protected recordEvent(
+   277→    name: string,
+   278→    attributes?: Attributes,
+   279→    span?: Span
+   280→  ): void {
+   281→    addSpanEvent(name, attributes, span);
+   282→    this.log.debug({ event: name, ...attributes }, `Event: ${name}`);
+   283→  }
+   284→
+   285→  /**
+   286→   * Record an error in logs and traces
+   287→   */
+   288→  protected recordError(error: Error | unknown, span?: Span): void {
+   289→    const mmsError = toMmsError(error);
+   290→    pinoLogError(this.log, mmsError instanceof Error ? mmsError : new Error(String(error)));
+   291→    if (span) {
+   292→      recordSpanError(span, error);
+   293→    }
+   294→  }
+   295→
+   296→  /**
+   297→   * Create a child logger with additional context
+   298→   */
+   299→  protected childLogger(context: Record<string, unknown>): Logger {
+   300→    return this.log.child(context);
+   301→  }
+   302→}
+   303→
+   304→/**
+   305→ * Export MmsAttributes for use in service implementations
+   306→ */
+   307→export { MmsAttributes };
+   308→
+   309→/**
+   310→ * Re-export types for convenience
+   311→ */
+   312→export type { Span, Attributes, Logger, Transaction, Database };
+   313→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

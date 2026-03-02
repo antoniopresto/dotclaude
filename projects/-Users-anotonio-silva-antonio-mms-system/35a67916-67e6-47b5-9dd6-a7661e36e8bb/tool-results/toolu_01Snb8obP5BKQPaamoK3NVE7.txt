@@ -1,0 +1,170 @@
+     1→/**
+     2→ * MMS Logging Configuration
+     3→ *
+     4→ * Structured logging with Pino for consistent log format across all services.
+     5→ * Features:
+     6→ * - JSON format in production
+     7→ * - Pretty print in development
+     8→ * - Sensitive field redaction
+     9→ * - Request ID propagation
+    10→ * - OpenTelemetry trace context
+    11→ *
+    12→ * @see specs/004-backend-specification.md Section 4.14
+    13→ */
+    14→
+    15→import pino, { type Logger, type LoggerOptions } from 'pino';
+    16→
+    17→const isDevelopment = process.env['NODE_ENV'] === 'development';
+    18→
+    19→/**
+    20→ * Fields to redact from logs (prevents PII/secrets leakage)
+    21→ */
+    22→const REDACT_PATHS = [
+    23→  'password',
+    24→  'passwordHash',
+    25→  'password_hash',
+    26→  'token',
+    27→  'accessToken',
+    28→  'refreshToken',
+    29→  'apiKey',
+    30→  'api_key',
+    31→  'authorization',
+    32→  'cookie',
+    33→  'creditCard',
+    34→  'ssn',
+    35→  '*.password',
+    36→  '*.token',
+    37→  '*.apiKey',
+    38→  'req.headers.authorization',
+    39→  'req.headers.cookie',
+    40→];
+    41→
+    42→/**
+    43→ * Base logger configuration
+    44→ */
+    45→const baseOptions: LoggerOptions = {
+    46→  level: process.env['LOG_LEVEL'] ?? (isDevelopment ? 'debug' : 'info'),
+    47→  redact: {
+    48→    paths: REDACT_PATHS,
+    49→    censor: '[REDACTED]',
+    50→  },
+    51→  formatters: {
+    52→    level: (label) => ({ level: label }),
+    53→    bindings: (bindings) => ({
+    54→      pid: bindings.pid,
+    55→      host: bindings.hostname,
+    56→      service: process.env['SERVICE_NAME'] ?? 'mms',
+    57→    }),
+    58→  },
+    59→  timestamp: pino.stdTimeFunctions.isoTime,
+    60→  base: {
+    61→    env: process.env['NODE_ENV'] ?? 'development',
+    62→  },
+    63→};
+    64→
+    65→/**
+    66→ * Development transport (pretty print)
+    67→ */
+    68→const developmentTransport = {
+    69→  target: 'pino-pretty',
+    70→  options: {
+    71→    colorize: true,
+    72→    translateTime: 'HH:MM:ss.l',
+    73→    ignore: 'pid,hostname',
+    74→    singleLine: false,
+    75→  },
+    76→};
+    77→
+    78→/**
+    79→ * Create the root logger instance
+    80→ */
+    81→function createLogger(): Logger {
+    82→  if (isDevelopment) {
+    83→    return pino({
+    84→      ...baseOptions,
+    85→      transport: developmentTransport,
+    86→    });
+    87→  }
+    88→
+    89→  return pino(baseOptions);
+    90→}
+    91→
+    92→/**
+    93→ * Root logger instance
+    94→ */
+    95→export const logger = createLogger();
+    96→
+    97→/**
+    98→ * Create a child logger with additional context
+    99→ * Use for service-specific or request-specific logging
+   100→ */
+   101→export function createChildLogger(context: Record<string, unknown>): Logger {
+   102→  return logger.child(context);
+   103→}
+   104→
+   105→/**
+   106→ * Create a request-scoped logger with trace context
+   107→ */
+   108→export function createRequestLogger(requestId: string, traceId?: string): Logger {
+   109→  return logger.child({
+   110→    requestId,
+   111→    ...(traceId && { traceId }),
+   112→  });
+   113→}
+   114→
+   115→/**
+   116→ * Log level type
+   117→ */
+   118→export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+   119→
+   120→/**
+   121→ * Structured error logging helper
+   122→ */
+   123→export function logError(
+   124→  log: Logger,
+   125→  error: Error,
+   126→  context?: Record<string, unknown>
+   127→): void {
+   128→  const errObj: Record<string, unknown> = {
+   129→    message: error.message,
+   130→    name: error.name,
+   131→    stack: error.stack,
+   132→  };
+   133→  if (error.cause) {
+   134→    errObj.cause = error.cause;
+   135→  }
+   136→  log.error(
+   137→    {
+   138→      err: errObj,
+   139→      ...context,
+   140→    },
+   141→    error.message
+   142→  );
+   143→}
+   144→
+   145→/**
+   146→ * Performance timing helper
+   147→ */
+   148→export function logTiming(
+   149→  log: Logger,
+   150→  operation: string,
+   151→  durationMs: number,
+   152→  context?: Record<string, unknown>
+   153→): void {
+   154→  const level: LogLevel = durationMs > 1000 ? 'warn' : 'info';
+   155→  log[level](
+   156→    {
+   157→      operation,
+   158→      durationMs,
+   159→      ...context,
+   160→    },
+   161→    `${operation} completed in ${durationMs}ms`
+   162→  );
+   163→}
+   164→
+   165→export default logger;
+   166→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

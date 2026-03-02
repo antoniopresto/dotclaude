@@ -1,0 +1,203 @@
+## **1. O que dá para afirmar com segurança apenas pelo código**
+
+Mesmo sem conseguir abrir a URL (404), pelo trecho que você trouxe:
+
+```ts
+catch (error: any) {
+  // ...
+  await this.sqsDLQService.sendToSQS(SQSEvent);              // envia manualmente para "DLQ"
+  await this.sqsEmailService.sendToSQS(message);             // envia notificação
+  await this.sqsService.deleteFromSQS(event.receiptHandle);  // remove da fila principal
+  throw error;
+}
+```
+
+Se isso estiver exatamente assim no `ProcessUserPromotion.ts`, então:
+
+- A Lambda **não deixa o SQS fazer o papel de DLQ**.
+- Ela implementa um **“DLQ manual”**:
+  - pega a mensagem que falhou,
+  - **publica uma nova mensagem** em outra fila (chamada de DLQ no código),
+  - **apaga a mensagem original** da fila principal,
+  - lança o erro (mas, como já apagou, o SQS não vai reenfileirar).
+
+Ou seja: **a origem/destino da mensagem é controlada 100% pelo código**, não pelo `RedrivePolicy` do SQS.
+
+---
+
+## **2. O que a outra AI disse que está tecnicamente correto**
+
+### ✅ 2.1. Sobre o fluxo atual
+
+A outra AI descreveu corretamente os passos básicos:
+
+1. Mensagem chega na Lambda via SQS.
+2. A Lambda tenta processar (chamadas ao CBILL).
+3. Em caso de erro:
+   - envia a mensagem para uma fila que o time chama de “DLQ” (`sqsDLQService.sendToSQS`),
+   - manda mensagem para fila de e‑mail (`sqsEmailService`),
+   - deleta a mensagem da fila principal (`deleteFromSQS`),
+   - lança o erro.
+
+Isso é coerente com o trecho de código.
+
+### ✅ 2.2. Consequência para DLQ nativo do SQS
+
+A análise sobre o impacto em relação ao DLQ nativo é, em essência, correta:
+
+- Como a mensagem **é deletada da fila principal** antes de falhar naturalmente:
+  - O SQS **não incrementa** `ApproximateReceiveCount` para gerar redrive automático.
+  - O SQS **não move** a mensagem para a DLQ configurada via `RedrivePolicy` (se houver).
+- A mensagem que aparece na fila “DLQ” foi **criada do zero** via `sendToSQS` — ou seja, ela:
+  - **não carrega metadata de origem** que o SQS usaria para um “redrive para a fila de origem”.
+  - é só uma mensagem normal em outra fila.
+
+Logo, se você quiser usar o **“Start DLQ redrive” apontando de volta para a fila de origem**, o padrão atual **não colabora** com esse recurso.
+
+Em termos de arquitetura, a outra AI está certa em dizer:
+
+- O código **funciona**, mas
+- **não usa** o mecanismo nativo de DLQ e redrive do SQS,
+- portanto, **não se beneficia** do redrive “1‑clique” padrão da AWS.
+
+### ✅ 2.3. Trade-offs apontados
+
+Os prós e contras que ela listou batem com a prática:
+
+- Manual DLQ (código atual):
+  - **Prós:**
+    - você enriquece a mensagem com erro antes de enviar para a fila de erro;
+    - decide explicitamente o que vai para a DLQ e quando;
+    - dispara e‑mail na mesma hora.
+  - **Contras:**
+    - não há retries gerenciados pelo SQS (é sempre tentativa única na fila principal; as 10 tentativas são “dentro da Lambda”, não de transporte);
+    - perde a capacidade de usar redrive automático baseado em `maxReceiveCount`;
+    - se `sendToSQS` para a DLQ **sucede** e `deleteFromSQS` **falha**, você pode acabar com:
+      - 1 mensagem na fila principal (que pode ser reprocessada de novo),
+      - 1 mensagem na fila “DLQ” (duplicidade lógica de evento).
+
+- RedrivePolicy nativo:
+  - SQS gerencia `maxReceiveCount` e move para DLQ **sem você mexer em código**;
+  - mensagens na DLQ têm o “histórico” de terem vindo de uma fila de origem via política;
+  - o console da AWS consegue fazer **redrive para fila de origem** sem esforço.
+
+Esse raciocínio está alinhado com o comportamento real do SQS.
+
+---
+
+## **3. Onde a outra AI está incompleta / imprecisa**
+
+### ⚠️ 3.1. “Sem retries” – nuance importante
+
+No quadro comparativo ela falou:
+
+> “Retries antes da DLQ: 0 (vai direto)”
+
+Isso é verdadeiro **do ponto de vista do SQS**, mas **não do ponto de vista do processo de negócio**:
+
+- Pelas issues (ex.: SPMAIS-33590, SPMAIS-33563), **sabe-se que são feitas até 10 tentativas de integração com o CBILL** antes de desistir.
+- Essas 10 tentativas parecem ser **dentro da própria Lambda** (retries em chamadas HTTP/GraphQL), não múltiplas entregas SQS.
+
+Então o que é verdade:
+
+- **SQS-level:** 1 delivery → falhou → código joga na fila de erro → não há mais entregas.
+- **Business-level:** dentro dessa 1 delivery, a Lambda pode tentar chamar o CBILL várias vezes (até 10).
+
+A outra AI misturou um pouco esses dois conceitos; vale ter essa distinção bem clara.
+
+### ⚠️ 3.2. Console “Start DLQ redrive”
+
+Ela afirma que o `Start DLQ redrive` **não funciona** porque as mensagens foram inseridas manualmente. A nuance é:
+
+- O modo “redrive de volta para a fila de origem” realmente depende de informações que só existem se a mensagem tiver sido movida pela política de DLQ do SQS.
+- Porém, o console hoje permite também **redrive para uma fila escolhida manualmente** (custom target).
+
+Ou seja:
+
+- O problema não é “não funciona redrive nenhum”.
+- O problema é: **você perde o redrive “nativo para fila de origem”**, que é justamente o mais conveniente para o caso de uso da spike.
+
+Então a conclusão estratégica dela (pior para reprocesso automatizado) continua válida, só o wording é um pouco forte demais.
+
+---
+
+## **4. Então, o código está “errado”? E o RedrivePolicy é “a solução correta”?**
+
+### 4.1. Está “errado”?
+
+- **Não é um bug**: o código faz o que foi desenhado para fazer:
+  - tratar erro,
+  - mandar a mensagem (com contexto) para uma fila de erro,
+  - disparar e‑mail,
+  - impedir que o SQS fique reentregando indefinidamente.
+- Esse padrão de “DLQ manual” é comum quando:
+  - você quer **enriquecer** a mensagem com muito contexto de erro,
+  - ou **não tem**/não quer usar `RedrivePolicy` (por exemplo, cenários multi‑origem numa mesma fila de erro).
+
+Então, do ponto de vista de **correção**, **não** dá para dizer: “o código está errado”.
+
+O que dá para dizer é:
+
+> O código está **alinhado com um modelo antigo/manual de DLQ**.  
+> Ele está **desalinhado com o objetivo atual da SPMAIS‑33885**, que é facilitar **reprocesso automatizado** (incluindo uso de redrive).
+
+### 4.2. O RedrivePolicy é “a solução correta”?
+
+Depende do objetivo arquitetural. Para a SPMAIS‑33885, o que você quer é:
+
+- Facilitar **reprocesso de mensagens que falharam** sem precisar de:
+  - ticket,
+  - reenvio de arquivo,
+  - intervenção manual pesada.
+
+Para isso, **usar RedrivePolicy + DLQ nativo do SQS** é, sim, o caminho mais alinhado com as boas práticas atuais da AWS:
+
+1. **Configurar o RedrivePolicy** da `APP_ISENCAO_MENSALIDADE_CARTAO`:
+   - `maxReceiveCount` (ex.: 3, 5… alinhado com o que fizer sentido junto com as 10 tentativas internas).
+   - `deadLetterTargetArn` → `APP_ISENCAO_MENSALIDADE_CARTAO-Erro`.
+
+2. **Simplificar a Lambda `ProcessUserPromotion`**:
+   - Em caso de erro **não enviar** para DLQ nem deletar manualmente.
+   - Apenas:
+     ```ts
+     catch (error) {
+       // logar/metricar
+       throw error; // deixa o SQS fazer o papel dele
+     }
+     ```
+
+3. **Mover a lógica de e‑mail para o consumidor da DLQ**:
+   - A Lambda `NTS-App-Fintech-StateMachine-SendEmailNotification` continua (ou passa) a:
+     - consumir a `APP_ISENCAO_MENSALIDADE_CARTAO-Erro`,
+     - ler a mensagem original,
+     - montar e enviar o e‑mail de exceção.
+
+4. **Reprocesso**:
+   - Depois de corrigir a causa raiz, você pode:
+     - usar o `Start DLQ redrive` apontando de volta para a fila de origem, **se as mensagens estiverem lá por RedrivePolicy**;
+     - ou, se quiser algo mais customizado, ter uma Lambda de reprocesso que lê da DLQ, aplica filtros (ex.: só erros técnicos, não `errorType=business`), e reenvia para a fila principal.
+
+**Então, para o objetivo da spike**, a recomendação é:
+
+> **Sim, migrar para o uso do RedrivePolicy + DLQ nativo é a solução mais adequada.**  
+> Não porque o código atual esteja “bugado”, mas porque **ele atrapalha exatamente o tipo de automação de reprocesso que você quer construir**.
+
+---
+
+## **5. Resumindo em termos práticos**
+
+- A outra AI, no geral, **acertou o diagnóstico de arquitetura**:
+  - o padrão atual de DLQ manual **não colabora** com o uso de DLQ/Redrive nativo;
+  - isso dificulta o reprocesso.
+- Os pontos que precisam só de ajuste de nuance:
+  - distinguir **retries de negócio** (10 tentativas dentro da Lambda) vs **retries de transporte** (SQS `maxReceiveCount`);
+  - o console ainda permite redrive, mas **não na forma “voltar automaticamente para a fila de origem”** se a mensagem não veio de RedrivePolicy.
+
+Se você quiser, posso no próximo passo te ajudar a rascunhar uma mudança concreta no `ProcessUserPromotion.ts` (em pseudo‑código) para:
+
+- remover o DLQ manual,
+- preservar a lógica de e‑mail,
+- e preparar o terreno para um fluxo de reprocesso alinhado com a SPMAIS‑33885.
+
+Fontes:
+

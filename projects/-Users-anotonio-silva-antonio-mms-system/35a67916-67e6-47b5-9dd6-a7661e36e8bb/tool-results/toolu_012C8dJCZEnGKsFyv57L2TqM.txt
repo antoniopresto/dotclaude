@@ -1,0 +1,504 @@
+  3000→
+  3001→---
+  3002→
+  3003→## 4.7 Baseline Service
+  3004→
+  3005→### 4.7.1 Purpose
+  3006→
+  3007→Manage published plan baselines for drift analysis and scenario comparison.
+  3008→
+  3009→### 4.7.2 Implementation
+  3010→
+  3011→```typescript
+  3012→class BaselineService {
+  3013→  async publishBaseline(
+  3014→    name: string,
+  3015→    description: string,
+  3016→    userId: string
+  3017→  ): Promise<PlanBaseline> {
+  3018→    // 1. Validate current plan has no critical conflicts
+  3019→    const validation = await this.validatePlanForPublishing();
+  3020→    if (!validation.valid) {
+  3021→      throw new ValidationError(
+  3022→        'Cannot publish baseline with critical conflicts',
+  3023→        validation.conflicts
+  3024→      );
+  3025→    }
+  3026→    
+  3027→    // 2. Generate version number
+  3028→    const latestBaseline = await this.getLatestBaseline();
+  3029→    const version = this.incrementVersion(latestBaseline?.version || 'v0.0');
+  3030→    
+  3031→    // 3. Create baseline record
+  3032→    const baseline = await this.db.transaction(async (tx) => {
+  3033→      // Create baseline
+  3034→      const [baselineRecord] = await tx.insert(planBaselines)
+  3035→        .values({
+  3036→          name,
+  3037→          description,
+  3038→          version,
+  3039→          baselineDate: new Date(),
+  3040→          horizonEnd: addYears(new Date(), 10),
+  3041→          status: 'PUBLISHED',
+  3042→          createdBy: userId,
+  3043→          publishedBy: userId,
+  3044→          publishedAt: new Date(),
+  3045→          fleetCount: await this.getActiveTrainCount(),
+  3046→          totalPmScheduled: await this.getScheduledPMCount(),
+  3047→          totalManhoursProjected: await this.getTotalProjectedHours()
+  3048→        })
+  3049→        .returning();
+  3050→      
+  3051→      // Snapshot PM schedule
+  3052→      await tx.execute(sql`
+  3053→        INSERT INTO baseline_pm_schedule 
+  3054→          (baseline_id, train_id, pm_type_id, projected_date, projected_mileage_km, assigned_depot_id, assigned_hours)
+  3055→        SELECT 
+  3056→          ${baselineRecord.id},
+  3057→          train_id,
+  3058→          pm_type_id,
+  3059→          target_date,
+  3060→          target_mileage_km,
+  3061→          assigned_depot_id,
+  3062→          assigned_hours
+  3063→        FROM pm_schedule
+  3064→        WHERE scenario_id IS NULL
+  3065→          AND status IN ('SCHEDULED', 'IN_PROGRESS')
+  3066→          AND target_date >= CURRENT_DATE
+  3067→      `);
+  3068→      
+  3069→      // Snapshot mileage projections
+  3070→      const projections = await this.generateMileageProjections(
+  3071→        baselineRecord.horizonEnd
+  3072→      );
+  3073→      
+  3074→      for (const proj of projections) {
+  3075→        await tx.insert(baselineMileageProjection)
+  3076→          .values({
+  3077→            baselineId: baselineRecord.id,
+  3078→            trainId: proj.trainId,
+  3079→            projectionDate: proj.date,
+  3080→            projectedCumulativeKm: proj.projectedKm,
+  3081→            dailyRateKm: proj.dailyRate
+  3082→          });
+  3083→      }
+  3084→      
+  3085→      // Supersede previous baseline
+  3086→      if (latestBaseline) {
+  3087→        await tx.update(planBaselines)
+  3088→          .set({
+  3089→            status: 'SUPERSEDED',
+  3090→            supersededBy: baselineRecord.id,
+  3091→            supersededAt: new Date()
+  3092→          })
+  3093→          .where(eq(planBaselines.id, latestBaseline.id));
+  3094→      }
+  3095→      
+  3096→      return baselineRecord;
+  3097→    });
+  3098→    
+  3099→    // 4. Audit log
+  3100→    await this.auditLog.record({
+  3101→      entityType: 'plan_baseline',
+  3102→      entityId: baseline.id,
+  3103→      action: 'PUBLISH',
+  3104→      userId,
+  3105→      newValues: { name, version, description }
+  3106→    });
+  3107→    
+  3108→    // 5. Notify
+  3109→    await this.notificationService.notify({
+  3110→      type: 'BASELINE_PUBLISHED',
+  3111→      title: `New baseline published: ${version}`,
+  3112→      body: description,
+  3113→      recipients: await this.getPlannerUserIds()
+  3114→    });
+  3115→    
+  3116→    return baseline;
+  3117→  }
+  3118→  
+  3119→  private async generateMileageProjections(
+  3120→    horizonEnd: Date
+  3121→  ): Promise<MileageProjection[]> {
+  3122→    const trains = await this.db.query.trains.findMany({
+  3123→      where: eq(trains.active, true)
+  3124→    });
+  3125→    
+  3126→    const projections: MileageProjection[] = [];
+  3127→    
+  3128→    for (const train of trains) {
+  3129→      // Calculate average daily mileage from last 30 days
+  3130→      const recentMileage = await this.db.query.mileageReadings.findMany({
+  3131→        where: and(
+  3132→          eq(mileageReadings.trainId, train.id),
+  3133→          gte(mileageReadings.readingDate, subDays(new Date(), 30)),
+  3134→          eq(mileageReadings.validationStatus, 'VALID')
+  3135→        )
+  3136→      });
+  3137→      
+  3138→      const avgDailyKm = recentMileage.length > 0
+  3139→        ? recentMileage.reduce((sum, r) => sum + (r.dailyKm || 0), 0) / recentMileage.length
+  3140→        : 150;  // Default if no history
+  3141→      
+  3142→      // Project forward at monthly intervals
+  3143→      let currentKm = train.currentMileageKm;
+  3144→      let currentDate = new Date();
+  3145→      
+  3146→      while (currentDate < horizonEnd) {
+  3147→        currentDate = addMonths(currentDate, 1);
+  3148→        currentKm += avgDailyKm * 30;
+  3149→        
+  3150→        projections.push({
+  3151→          trainId: train.id,
+  3152→          date: currentDate,
+  3153→          projectedKm: Math.round(currentKm),
+  3154→          dailyRate: Math.round(avgDailyKm)
+  3155→        });
+  3156→      }
+  3157→    }
+  3158→    
+  3159→    return projections;
+  3160→  }
+  3161→}
+  3162→```
+  3163→
+  3164→---
+  3165→
+  3166→## 4.8 Drift Monitor Service
+  3167→
+  3168→### 4.8.1 Purpose
+  3169→
+  3170→Compare actual state against published baseline, calculate drift metrics, and alert when thresholds are exceeded.
+  3171→
+  3172→### 4.8.2 Implementation
+  3173→
+  3174→```typescript
+  3175→interface DriftThresholds {
+  3176→  mileageDriftPct: number;        // 5.0
+  3177→  scheduleDriftDays: number;      // 14
+  3178→  fleetDriftTrainCount: number;   // 5
+  3179→}
+  3180→
+  3181→class DriftMonitorService {
+  3182→  private readonly thresholds: DriftThresholds = {
+  3183→    mileageDriftPct: 5.0,
+  3184→    scheduleDriftDays: 14,
+  3185→    fleetDriftTrainCount: 5
+  3186→  };
+  3187→  
+  3188→  /**
+  3189→   * Run nightly drift analysis
+  3190→   */
+  3191→  async runDriftAnalysis(): Promise<DriftAnalysisResult> {
+  3192→    const baseline = await this.getPublishedBaseline();
+  3193→    if (!baseline) {
+  3194→      this.logger.info('No published baseline, skipping drift analysis');
+  3195→      return { skipped: true, reason: 'No published baseline' };
+  3196→    }
+  3197→    
+  3198→    const analysisDate = new Date();
+  3199→    const trainAnalyses: TrainDriftAnalysis[] = [];
+  3200→    const alerts: DriftAlert[] = [];
+  3201→    
+  3202→    // Analyze each train
+  3203→    const trains = await this.db.query.trains.findMany({
+  3204→      where: eq(trains.active, true)
+  3205→    });
+  3206→    
+  3207→    for (const train of trains) {
+  3208→      const analysis = await this.analyzeTrainDrift(train, baseline, analysisDate);
+  3209→      trainAnalyses.push(analysis);
+  3210→      
+  3211→      // Check thresholds
+  3212→      if (analysis.requiresReplan) {
+  3213→        alerts.push({
+  3214→          trainId: train.id,
+  3215→          trainNumber: train.trainNumber,
+  3216→          severity: 'HIGH',
+  3217→          type: 'REPLAN_REQUIRED',
+  3218→          message: analysis.replanReason,
+  3219→          metrics: {
+  3220→            mileageDriftPct: analysis.mileageDriftPct,
+  3221→            avgPmDriftDays: analysis.avgPmDriftDays
+  3222→          }
+  3223→        });
+  3224→      } else if (Math.abs(analysis.mileageDriftPct) > this.thresholds.mileageDriftPct * 0.7) {
+  3225→        alerts.push({
+  3226→          trainId: train.id,
+  3227→          trainNumber: train.trainNumber,
+  3228→          severity: 'MEDIUM',
+  3229→          type: 'APPROACHING_THRESHOLD',
+  3230→          message: `Mileage drift at ${analysis.mileageDriftPct.toFixed(1)}% (threshold: ${this.thresholds.mileageDriftPct}%)`,
+  3231→          metrics: {
+  3232→            mileageDriftPct: analysis.mileageDriftPct
+  3233→          }
+  3234→        });
+  3235→      }
+  3236→      
+  3237→      // Persist analysis
+  3238→      await this.persistDriftAnalysis(analysis, baseline.id, analysisDate);
+  3239→    }
+  3240→    
+  3241→    // Fleet-level analysis
+  3242→    const trainsRequiringReplan = trainAnalyses.filter(a => a.requiresReplan).length;
+  3243→    
+  3244→    if (trainsRequiringReplan >= this.thresholds.fleetDriftTrainCount) {
+  3245→      alerts.push({
+  3246→        severity: 'CRITICAL',
+  3247→        type: 'FLEET_REPLAN_RECOMMENDED',
+  3248→        message: `${trainsRequiringReplan} trains require replanning - consider strategic replan`,
+  3249→        metrics: {
+  3250→          affectedTrains: trainsRequiringReplan
+  3251→        }
+  3252→      });
+  3253→    }
+  3254→    
+  3255→    // Send alerts
+  3256→    if (alerts.length > 0) {
+  3257→      await this.sendDriftAlerts(alerts);
+  3258→    }
+  3259→    
+  3260→    // Broadcast to canvas
+  3261→    await this.websocketHub.broadcast('drift:updated', {
+  3262→      baselineId: baseline.id,
+  3263→      analysisDate,
+  3264→      summary: {
+  3265→        totalTrains: trains.length,
+  3266→        trainsWithDrift: trainAnalyses.filter(a => Math.abs(a.mileageDriftPct) > 1).length,
+  3267→        trainsRequiringReplan,
+  3268→        avgFleetDriftPct: trainAnalyses.reduce((sum, a) => sum + a.mileageDriftPct, 0) / trainAnalyses.length
+  3269→      },
+  3270→      alerts
+  3271→    });
+  3272→    
+  3273→    return {
+  3274→      skipped: false,
+  3275→      baselineId: baseline.id,
+  3276→      analysisDate,
+  3277→      trainAnalyses,
+  3278→      alerts
+  3279→    };
+  3280→  }
+  3281→  
+  3282→  private async analyzeTrainDrift(
+  3283→    train: Train,
+  3284→    baseline: PlanBaseline,
+  3285→    analysisDate: Date
+  3286→  ): Promise<TrainDriftAnalysis> {
+  3287→    // Get baseline projection for today
+  3288→    const baselineProjection = await this.db.query.baselineMileageProjection.findFirst({
+  3289→      where: and(
+  3290→        eq(baselineMileageProjection.baselineId, baseline.id),
+  3291→        eq(baselineMileageProjection.trainId, train.id),
+  3292→        lte(baselineMileageProjection.projectionDate, analysisDate)
+  3293→      ),
+  3294→      orderBy: desc(baselineMileageProjection.projectionDate)
+  3295→    });
+  3296→    
+  3297→    // Calculate mileage drift
+  3298→    const baselineKm = baselineProjection?.projectedCumulativeKm || train.currentMileageKm;
+  3299→    const actualKm = train.currentMileageKm;
+  3300→    const mileageDriftKm = actualKm - baselineKm;
+  3301→    const mileageDriftPct = (mileageDriftKm / baselineKm) * 100;
+  3302→    
+  3303→    // Get baseline PM schedule
+  3304→    const baselinePMs = await this.db.query.baselinePmSchedule.findMany({
+  3305→      where: and(
+  3306→        eq(baselinePmSchedule.baselineId, baseline.id),
+  3307→        eq(baselinePmSchedule.trainId, train.id),
+  3308→        gte(baselinePmSchedule.projectedDate, analysisDate)
+  3309→      )
+  3310→    });
+  3311→    
+  3312→    // Get current PM schedule
+  3313→    const currentPMs = await this.db.query.pmSchedule.findMany({
+  3314→      where: and(
+  3315→        eq(pmSchedule.trainId, train.id),
+  3316→        isNull(pmSchedule.scenarioId),
+  3317→        inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+  3318→        gte(pmSchedule.targetDate, analysisDate)
+  3319→      )
+  3320→    });
+  3321→    
+  3322→    // Calculate PM drift
+  3323→    const pmDrifts: PMDrift[] = [];
+  3324→    
+  3325→    for (const baselinePM of baselinePMs) {
+  3326→      const currentPM = currentPMs.find(
+  3327→        p => p.pmTypeId === baselinePM.pmTypeId
+  3328→      );
+  3329→      
+  3330→      if (currentPM) {
+  3331→        const driftDays = differenceInDays(
+  3332→          new Date(currentPM.targetDate),
+  3333→          new Date(baselinePM.projectedDate)
+  3334→        );
+  3335→        
+  3336→        pmDrifts.push({
+  3337→          pmTypeId: baselinePM.pmTypeId,
+  3338→          baselineDate: baselinePM.projectedDate,
+  3339→          currentDate: currentPM.targetDate,
+  3340→          driftDays,
+  3341→          direction: driftDays > 0 ? 'LATER' : driftDays < 0 ? 'EARLIER' : 'ON_TRACK'
+  3342→        });
+  3343→      }
+  3344→    }
+  3345→    
+  3346→    const avgPmDriftDays = pmDrifts.length > 0
+  3347→      ? pmDrifts.reduce((sum, p) => sum + Math.abs(p.driftDays), 0) / pmDrifts.length
+  3348→      : 0;
+  3349→    
+  3350→    const maxPmDriftDays = pmDrifts.length > 0
+  3351→      ? Math.max(...pmDrifts.map(p => Math.abs(p.driftDays)))
+  3352→      : 0;
+  3353→    
+  3354→    // Determine if replan required
+  3355→    const requiresReplan = 
+  3356→      Math.abs(mileageDriftPct) > this.thresholds.mileageDriftPct ||
+  3357→      maxPmDriftDays > this.thresholds.scheduleDriftDays;
+  3358→    
+  3359→    let replanReason: string | undefined;
+  3360→    if (requiresReplan) {
+  3361→      const reasons: string[] = [];
+  3362→      if (Math.abs(mileageDriftPct) > this.thresholds.mileageDriftPct) {
+  3363→        reasons.push(`Mileage drift ${mileageDriftPct.toFixed(1)}% exceeds ${this.thresholds.mileageDriftPct}% threshold`);
+  3364→      }
+  3365→      if (maxPmDriftDays > this.thresholds.scheduleDriftDays) {
+  3366→        reasons.push(`PM schedule drift ${maxPmDriftDays} days exceeds ${this.thresholds.scheduleDriftDays} day threshold`);
+  3367→      }
+  3368→      replanReason = reasons.join('; ');
+  3369→    }
+  3370→    
+  3371→    return {
+  3372→      trainId: train.id,
+  3373→      trainNumber: train.trainNumber,
+  3374→      baselineProjectedKm: baselineKm,
+  3375→      actualKm,
+  3376→      mileageDriftKm,
+  3377→      mileageDriftPct,
+  3378→      pmDrifts,
+  3379→      avgPmDriftDays,
+  3380→      maxPmDriftDays,
+  3381→      requiresReplan,
+  3382→      replanReason
+  3383→    };
+  3384→  }
+  3385→}
+  3386→```
+  3387→
+  3388→---
+  3389→
+  3390→## 4.9 Simulation Engine
+  3391→
+  3392→### 4.9.1 Purpose
+  3393→
+  3394→Enable what-if scenario analysis with persistent storage and comparison capabilities.
+  3395→
+  3396→### 4.9.2 Implementation
+  3397→
+  3398→```typescript
+  3399→class SimulationEngine {
+  3400→  /**
+  3401→   * Create a new scenario branched from baseline or another scenario
+  3402→   */
+  3403→  async createScenario(
+  3404→    name: string,
+  3405→    description: string,
+  3406→    forkFrom: { type: 'BASELINE' | 'SCENARIO'; id: string },
+  3407→    userId: string
+  3408→  ): Promise<Scenario> {
+  3409→    const scenario = await this.db.insert(scenarios)
+  3410→      .values({
+  3411→        name,
+  3412→        description,
+  3413→        forkedFromBaselineId: forkFrom.type === 'BASELINE' ? forkFrom.id : null,
+  3414→        forkedFromScenarioId: forkFrom.type === 'SCENARIO' ? forkFrom.id : null,
+  3415→        status: 'ACTIVE',
+  3416→        createdBy: userId,
+  3417→        expiresAt: addDays(new Date(), 30)
+  3418→      })
+  3419→      .returning();
+  3420→    
+  3421→    return scenario[0];
+  3422→  }
+  3423→  
+  3424→  /**
+  3425→   * Apply a change to a scenario (event-sourced)
+  3426→   */
+  3427→  async applyChange(
+  3428→    scenarioId: string,
+  3429→    change: ScenarioChange,
+  3430→    userId: string
+  3431→  ): Promise<void> {
+  3432→    // Get next sequence number
+  3433→    const lastDelta = await this.db.query.scenarioDeltas.findFirst({
+  3434→      where: eq(scenarioDeltas.scenarioId, scenarioId),
+  3435→      orderBy: desc(scenarioDeltas.sequenceNum)
+  3436→    });
+  3437→    
+  3438→    const sequenceNum = (lastDelta?.sequenceNum || 0) + 1;
+  3439→    
+  3440→    // Record delta
+  3441→    await this.db.insert(scenarioDeltas)
+  3442→      .values({
+  3443→        scenarioId,
+  3444→        sequenceNum,
+  3445→        deltaType: change.type,
+  3446→        entityType: change.entityType,
+  3447→        entityId: change.entityId,
+  3448→        oldValues: change.oldValues,
+  3449→        newValues: change.newValues,
+  3450→        changeReason: change.reason,
+  3451→        createdBy: userId
+  3452→      });
+  3453→    
+  3454→    // Update scenario timestamp
+  3455→    await this.db.update(scenarios)
+  3456→      .set({
+  3457→        lastModifiedAt: new Date(),
+  3458→        expiresAt: addDays(new Date(), 30)  // Reset expiration
+  3459→      })
+  3460→      .where(eq(scenarios.id, scenarioId));
+  3461→  }
+  3462→  
+  3463→  /**
+  3464→   * Materialize a scenario (apply all deltas to get full state)
+  3465→   */
+  3466→  async materializeScenario(scenarioId: string): Promise<MaterializedScenario> {
+  3467→    const scenario = await this.db.query.scenarios.findFirst({
+  3468→      where: eq(scenarios.id, scenarioId)
+  3469→    });
+  3470→    
+  3471→    if (!scenario) {
+  3472→      throw new NotFoundError('Scenario not found');
+  3473→    }
+  3474→    
+  3475→    // Get base state
+  3476→    let basePMSchedule: PMScheduleRecord[];
+  3477→    
+  3478→    if (scenario.forkedFromBaselineId) {
+  3479→      basePMSchedule = await this.db.query.baselinePmSchedule.findMany({
+  3480→        where: eq(baselinePmSchedule.baselineId, scenario.forkedFromBaselineId)
+  3481→      });
+  3482→    } else if (scenario.forkedFromScenarioId) {
+  3483→      // Recursive materialization
+  3484→      const parentScenario = await this.materializeScenario(scenario.forkedFromScenarioId);
+  3485→      basePMSchedule = parentScenario.pmSchedule;
+  3486→    } else {
+  3487→      // Fork from current production
+  3488→      basePMSchedule = await this.db.query.pmSchedule.findMany({
+  3489→        where: isNull(pmSchedule.scenarioId)
+  3490→      });
+  3491→    }
+  3492→    
+  3493→    // Get all deltas in order
+  3494→    const deltas = await this.db.query.scenarioDeltas.findMany({
+  3495→      where: eq(scenarioDeltas.scenarioId, scenarioId),
+  3496→      orderBy: asc(scenarioDeltas.sequenceNum)
+  3497→    });
+  3498→    
+  3499→    // Apply deltas
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

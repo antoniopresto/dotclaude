@@ -1,0 +1,277 @@
+     1→/**
+     2→ * MMS Transaction Utilities
+     3→ *
+     4→ * Enhanced transaction helpers for reliable database operations.
+     5→ * Provides automatic rollback, nested transaction support, and tracing integration.
+     6→ *
+     7→ * @see specs/004-domain-services.md
+     8→ */
+     9→
+    10→import { db, type Transaction, type Database } from '../db/connection';
+    11→import { withSpan, addSpanEvent, MmsAttributes, SpanKind } from '../tracing';
+    12→import { DatabaseError, TimeoutError } from '../errors';
+    13→import { logger } from '../logging/logger';
+    14→
+    15→/**
+    16→ * Transaction options for controlling behavior
+    17→ */
+    18→export interface TransactionOptions {
+    19→  /** Maximum time to wait for transaction completion (ms) */
+    20→  timeoutMs?: number;
+    21→  /** Isolation level for the transaction */
+    22→  isolationLevel?: 'read_uncommitted' | 'read_committed' | 'repeatable_read' | 'serializable';
+    23→  /** Whether to trace the transaction */
+    24→  traceEnabled?: boolean;
+    25→  /** Custom operation name for tracing */
+    26→  operationName?: string;
+    27→}
+    28→
+    29→const DEFAULT_OPTIONS: Required<TransactionOptions> = {
+    30→  timeoutMs: 30000, // 30 seconds
+    31→  isolationLevel: 'read_committed',
+    32→  traceEnabled: true,
+    33→  operationName: 'transaction',
+    34→};
+    35→
+    36→/**
+    37→ * Transaction result with metadata
+    38→ */
+    39→export interface TransactionResult<T> {
+    40→  data: T;
+    41→  durationMs: number;
+    42→  rowsAffected?: number;
+    43→}
+    44→
+    45→/**
+    46→ * Execute a function within a traced database transaction
+    47→ *
+    48→ * Features:
+    49→ * - Automatic commit on success
+    50→ * - Automatic rollback on error
+    51→ * - Timeout protection
+    52→ * - OpenTelemetry tracing integration
+    53→ * - Structured logging
+    54→ *
+    55→ * @example
+    56→ * ```typescript
+    57→ * const result = await tracedTransaction(
+    58→ *   async (tx) => {
+    59→ *     await tx.insert(trains).values(trainData);
+    60→ *     await tx.insert(pmSchedule).values(scheduleData);
+    61→ *     return { trainId: trainData.id };
+    62→ *   },
+    63→ *   { operationName: 'createTrainWithSchedule', timeoutMs: 10000 }
+    64→ * );
+    65→ * ```
+    66→ */
+    67→export async function tracedTransaction<T>(
+    68→  fn: (tx: Transaction) => Promise<T>,
+    69→  options?: TransactionOptions
+    70→): Promise<TransactionResult<T>> {
+    71→  const opts = { ...DEFAULT_OPTIONS, ...options };
+    72→
+    73→  if (!opts.traceEnabled) {
+    74→    return executeTransaction(fn, opts);
+    75→  }
+    76→
+    77→  return withSpan(
+    78→    `db.${opts.operationName}`,
+    79→    async (span) => {
+    80→      span.setAttribute(MmsAttributes.DB_OPERATION, 'transaction');
+    81→      span.setAttribute('db.system', 'postgresql');
+    82→
+    83→      addSpanEvent('transaction.begin', {
+    84→        'db.transaction.isolation_level': opts.isolationLevel,
+    85→        'db.transaction.timeout_ms': opts.timeoutMs,
+    86→      });
+    87→
+    88→      try {
+    89→        const result = await executeTransaction(fn, opts);
+    90→
+    91→        addSpanEvent('transaction.commit', {
+    92→          'db.transaction.duration_ms': result.durationMs,
+    93→          ...(result.rowsAffected !== undefined && {
+    94→            'db.transaction.rows_affected': result.rowsAffected,
+    95→          }),
+    96→        });
+    97→
+    98→        span.setAttribute(MmsAttributes.DB_ROWS_AFFECTED, result.rowsAffected ?? 0);
+    99→
+   100→        return result;
+   101→      } catch (error) {
+   102→        addSpanEvent('transaction.rollback', {
+   103→          'db.transaction.error': error instanceof Error ? error.message : String(error),
+   104→        });
+   105→        throw error;
+   106→      }
+   107→    },
+   108→    { kind: SpanKind.CLIENT }
+   109→  );
+   110→}
+   111→
+   112→/**
+   113→ * Execute transaction without tracing (internal)
+   114→ */
+   115→async function executeTransaction<T>(
+   116→  fn: (tx: Transaction) => Promise<T>,
+   117→  opts: Required<TransactionOptions>
+   118→): Promise<TransactionResult<T>> {
+   119→  const startTime = Date.now();
+   120→
+   121→  // Create timeout promise
+   122→  const timeoutPromise = new Promise<never>((_, reject) => {
+   123→    setTimeout(() => {
+   124→      reject(
+   125→        new TimeoutError(`Transaction timed out after ${opts.timeoutMs}ms`, {
+   126→          operation: opts.operationName,
+   127→          timeoutMs: opts.timeoutMs,
+   128→        })
+   129→      );
+   130→    }, opts.timeoutMs);
+   131→  });
+   132→
+   133→  try {
+   134→    // Race between transaction and timeout
+   135→    const data = await Promise.race([
+   136→      db.transaction(async (tx) => fn(tx)),
+   137→      timeoutPromise,
+   138→    ]);
+   139→
+   140→    return {
+   141→      data,
+   142→      durationMs: Date.now() - startTime,
+   143→    };
+   144→  } catch (error) {
+   145→    const durationMs = Date.now() - startTime;
+   146→
+   147→    // Enhance error with context
+   148→    if (error instanceof TimeoutError) {
+   149→      throw error;
+   150→    }
+   151→
+   152→    if (error instanceof Error) {
+   153→      logger.error(
+   154→        {
+   155→          operation: opts.operationName,
+   156→          durationMs,
+   157→          error: error.message,
+   158→        },
+   159→        'Transaction failed'
+   160→      );
+   161→
+   162→      throw new DatabaseError(`Transaction failed: ${error.message}`, {
+   163→        operation: opts.operationName,
+   164→        durationMs,
+   165→        originalError: error.name,
+   166→      });
+   167→    }
+   168→
+   169→    throw error;
+   170→  }
+   171→}
+   172→
+   173→/**
+   174→ * Simple transaction wrapper (non-traced)
+   175→ *
+   176→ * Use this for simple operations where tracing overhead is unnecessary.
+   177→ */
+   178→export async function simpleTransaction<T>(
+   179→  fn: (tx: Transaction) => Promise<T>
+   180→): Promise<T> {
+   181→  return db.transaction(async (tx) => fn(tx));
+   182→}
+   183→
+   184→/**
+   185→ * Execute multiple operations in a single transaction with individual error handling
+   186→ *
+   187→ * Useful for batch operations where you want to collect errors but continue processing.
+   188→ * The transaction only commits if all operations succeed.
+   189→ *
+   190→ * @example
+   191→ * ```typescript
+   192→ * const results = await batchTransaction([
+   193→ *   (tx) => tx.insert(trains).values(train1),
+   194→ *   (tx) => tx.insert(trains).values(train2),
+   195→ *   (tx) => tx.insert(trains).values(train3),
+   196→ * ]);
+   197→ * // results contains success/error for each operation
+   198→ * ```
+   199→ */
+   200→export interface BatchResult<T> {
+   201→  index: number;
+   202→  success: boolean;
+   203→  data?: T;
+   204→  error?: Error;
+   205→}
+   206→
+   207→export async function batchTransaction<T>(
+   208→  operations: Array<(tx: Transaction) => Promise<T>>,
+   209→  options?: TransactionOptions
+   210→): Promise<BatchResult<T>[]> {
+   211→  const opts = { ...DEFAULT_OPTIONS, ...options, operationName: options?.operationName ?? 'batch' };
+   212→
+   213→  const result = await tracedTransaction<BatchResult<T>[]>(
+   214→    async (tx) => {
+   215→      const results: BatchResult<T>[] = [];
+   216→
+   217→      for (let i = 0; i < operations.length; i++) {
+   218→        const operation = operations[i];
+   219→        if (!operation) continue;
+   220→
+   221→        try {
+   222→          const data = await operation(tx);
+   223→          results.push({ index: i, success: true, data });
+   224→        } catch (error) {
+   225→          // In a strict batch, any error should fail the whole transaction
+   226→          // Re-throw to trigger rollback
+   227→          results.push({
+   228→            index: i,
+   229→            success: false,
+   230→            error: error instanceof Error ? error : new Error(String(error)),
+   231→          });
+   232→          throw error;
+   233→        }
+   234→      }
+   235→
+   236→      return results;
+   237→    },
+   238→    opts
+   239→  );
+   240→
+   241→  return result.data;
+   242→}
+   243→
+   244→/**
+   245→ * Execute a read-only query (no transaction needed, but with tracing)
+   246→ */
+   247→export async function tracedQuery<T>(
+   248→  operationName: string,
+   249→  fn: (database: Database) => Promise<T>
+   250→): Promise<T> {
+   251→  return withSpan(
+   252→    `db.query.${operationName}`,
+   253→    async (span) => {
+   254→      span.setAttribute(MmsAttributes.DB_OPERATION, 'query');
+   255→      span.setAttribute('db.system', 'postgresql');
+   256→
+   257→      const startTime = Date.now();
+   258→      const result = await fn(db);
+   259→      const durationMs = Date.now() - startTime;
+   260→
+   261→      span.setAttribute('db.query.duration_ms', durationMs);
+   262→
+   263→      return result;
+   264→    },
+   265→    { kind: SpanKind.CLIENT }
+   266→  );
+   267→}
+   268→
+   269→/**
+   270→ * Re-export Transaction type for convenience
+   271→ */
+   272→export type { Transaction, Database };
+   273→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

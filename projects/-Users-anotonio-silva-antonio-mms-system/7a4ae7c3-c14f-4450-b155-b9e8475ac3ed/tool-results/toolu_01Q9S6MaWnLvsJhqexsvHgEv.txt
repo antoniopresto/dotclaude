@@ -1,0 +1,764 @@
+     1→/**
+     2→ * MMS Material Service
+     3→ *
+     4→ * Manages inventory positions and material reservations for PM scheduling.
+     5→ * Materials are a constraint for PM scheduling - PMs cannot proceed without
+     6→ * required blocking parts.
+     7→ *
+     8→ * Key responsibilities:
+     9→ * - Query inventory positions with filtering (depot, part number, low stock)
+    10→ * - Query material reservations with filtering (PM, status)
+    11→ * - Fulfill material reservations (mark as delivered)
+    12→ * - Support soft/hard reservation lifecycle
+    13→ *
+    14→ * Integration:
+    15→ * - Inventory snapshots come from Maximo/ERP daily
+    16→ * - Reservations are created when PMs are scheduled
+    17→ * - Soft reservations auto-expire if PM moves
+    18→ *
+    19→ * Constraint enforcement:
+    20→ * - BLOCKING parts with SOFT reservation: Warning, PM can proceed
+    21→ * - BLOCKING parts without reservation: PM cannot be scheduled
+    22→ *
+    23→ * @see specs/004-domain-services.md
+    24→ * @see specs/005-api.md Section 5.11
+    25→ */
+    26→
+    27→import { eq, and, sql, desc, type SQL } from 'drizzle-orm';
+    28→import { BaseService } from '../lib/services/base';
+    29→import {
+    30→  inventoryPositions,
+    31→  materialReservations,
+    32→  depots,
+    33→  pmSchedule,
+    34→  pmTypes,
+    35→  trains,
+    36→  users,
+    37→} from '../lib/db/schema';
+    38→import { NotFoundError, ValidationError } from '../lib/errors';
+    39→
+    40→// =============================================================================
+    41→// Types
+    42→// =============================================================================
+    43→
+    44→/** Inventory position with depot info */
+    45→export interface InventoryWithDepot {
+    46→  id: string;
+    47→  depotId: string;
+    48→  depotCode: string;
+    49→  depotName: string;
+    50→  partNumber: string;
+    51→  partDescription: string | null;
+    52→  quantityOnHand: number;
+    53→  quantityReserved: number;
+    54→  quantityAvailable: number;
+    55→  quantityOnOrder: number | null;
+    56→  reorderPoint: number | null;
+    57→  reorderQuantity: number | null;
+    58→  nextDeliveryDate: string | null;
+    59→  nextDeliveryQuantity: number | null;
+    60→  unitCost: number | null;
+    61→  currency: string | null;
+    62→  lastSyncAt: string | null;
+    63→  sourceSystem: string | null;
+    64→  isLowStock: boolean;
+    65→}
+    66→
+    67→/** Reservation status for filtering */
+    68→export type ReservationStatus = 'PENDING' | 'FULFILLED' | 'EXPIRED';
+    69→
+    70→/** Material reservation with related info */
+    71→export interface ReservationWithDetails {
+    72→  id: string;
+    73→  pmScheduleId: string;
+    74→  inventoryPositionId: string;
+    75→  partNumber: string;
+    76→  quantityReserved: number;
+    77→  reservationType: 'SOFT' | 'HARD';
+    78→  reservedAt: string;
+    79→  reservedBy: string | null;
+    80→  reservedByName: string | null;
+    81→  expiresAt: string | null;
+    82→  fulfilledAt: string | null;
+    83→  fulfilledQuantity: number | null;
+    84→  status: ReservationStatus;
+    85→  pm: {
+    86→    id: string;
+    87→    trainNumber: string;
+    88→    pmCode: string;
+    89→    targetDate: string;
+    90→  };
+    91→  depot: {
+    92→    id: string;
+    93→    code: string;
+    94→    name: string;
+    95→  };
+    96→}
+    97→
+    98→/** Filters for inventory listing */
+    99→export interface InventoryFilters {
+   100→  depotId?: string;
+   101→  partNumber?: string;
+   102→  lowStock?: boolean;
+   103→}
+   104→
+   105→/** Filters for reservation listing */
+   106→export interface ReservationFilters {
+   107→  pmScheduleId?: string;
+   108→  status?: ReservationStatus;
+   109→  depotId?: string;
+   110→  partNumber?: string;
+   111→}
+   112→
+   113→/** Pagination options */
+   114→export interface PaginationOptions {
+   115→  page: number;
+   116→  pageSize: number;
+   117→}
+   118→
+   119→/** Paginated result */
+   120→export interface PaginatedResult<T> {
+   121→  items: T[];
+   122→  total: number;
+   123→  page: number;
+   124→  pageSize: number;
+   125→  totalPages: number;
+   126→}
+   127→
+   128→/** Fulfill reservation request */
+   129→export interface FulfillReservationRequest {
+   130→  reservationId: string;
+   131→  fulfilledQuantity?: number;
+   132→  userId?: string;
+   133→}
+   134→
+   135→/** Fulfill reservation result */
+   136→export interface FulfillReservationResult {
+   137→  id: string;
+   138→  partNumber: string;
+   139→  quantityReserved: number;
+   140→  fulfilledQuantity: number;
+   141→  fulfilledAt: string;
+   142→  status: ReservationStatus;
+   143→}
+   144→
+   145→// =============================================================================
+   146→// Singleton Instance
+   147→// =============================================================================
+   148→
+   149→let instance: MaterialService | null = null;
+   150→
+   151→/**
+   152→ * Get the singleton MaterialService instance
+   153→ */
+   154→export function getMaterialService(): MaterialService {
+   155→  if (!instance) {
+   156→    instance = new MaterialService();
+   157→  }
+   158→  return instance;
+   159→}
+   160→
+   161→// =============================================================================
+   162→// Service Implementation
+   163→// =============================================================================
+   164→
+   165→/**
+   166→ * Material Service
+   167→ *
+   168→ * Manages inventory and material reservations for PM scheduling.
+   169→ */
+   170→export class MaterialService extends BaseService {
+   171→  constructor() {
+   172→    super({ name: 'material-service' });
+   173→  }
+   174→
+   175→  /**
+   176→   * List inventory positions with filtering
+   177→   *
+   178→   * Supports filtering by:
+   179→   * - depotId: Filter by specific depot
+   180→   * - partNumber: Filter by exact or partial part number
+   181→   * - lowStock: Only show items where available <= reorder point
+   182→   *
+   183→   * @param filters - Query filters
+   184→   * @param pagination - Pagination options
+   185→   * @returns Paginated list of inventory positions with depot info
+   186→   */
+   187→  async listInventory(
+   188→    filters: InventoryFilters = {},
+   189→    pagination: PaginationOptions = { page: 1, pageSize: 50 }
+   190→  ): Promise<PaginatedResult<InventoryWithDepot>> {
+   191→    return this.traced('listInventory', async (span) => {
+   192→      span.setAttribute('filters.depotId', filters.depotId || '');
+   193→      span.setAttribute('filters.partNumber', filters.partNumber || '');
+   194→      span.setAttribute('filters.lowStock', filters.lowStock || false);
+   195→      span.setAttribute('pagination.page', pagination.page);
+   196→      span.setAttribute('pagination.pageSize', pagination.pageSize);
+   197→
+   198→      const offset = (pagination.page - 1) * pagination.pageSize;
+   199→
+   200→      // Build dynamic where conditions
+   201→      const conditions: SQL<unknown>[] = [];
+   202→
+   203→      if (filters.depotId) {
+   204→        conditions.push(eq(inventoryPositions.depotId, filters.depotId));
+   205→      }
+   206→
+   207→      if (filters.partNumber) {
+   208→        conditions.push(
+   209→          sql`${inventoryPositions.partNumber} ILIKE ${`%${filters.partNumber}%`}`
+   210→        );
+   211→      }
+   212→
+   213→      // Execute query with joins
+   214→      const query = this.db
+   215→        .select({
+   216→          id: inventoryPositions.id,
+   217→          depotId: inventoryPositions.depotId,
+   218→          depotCode: depots.code,
+   219→          depotName: depots.name,
+   220→          partNumber: inventoryPositions.partNumber,
+   221→          partDescription: inventoryPositions.partDescription,
+   222→          quantityOnHand: inventoryPositions.quantityOnHand,
+   223→          quantityReserved: inventoryPositions.quantityReserved,
+   224→          quantityOnOrder: inventoryPositions.quantityOnOrder,
+   225→          reorderPoint: inventoryPositions.reorderPoint,
+   226→          reorderQuantity: inventoryPositions.reorderQuantity,
+   227→          nextDeliveryDate: inventoryPositions.nextDeliveryDate,
+   228→          nextDeliveryQuantity: inventoryPositions.nextDeliveryQuantity,
+   229→          unitCost: inventoryPositions.unitCost,
+   230→          currency: inventoryPositions.currency,
+   231→          lastSyncAt: inventoryPositions.lastSyncAt,
+   232→          sourceSystem: inventoryPositions.sourceSystem,
+   233→        })
+   234→        .from(inventoryPositions)
+   235→        .innerJoin(depots, eq(inventoryPositions.depotId, depots.id))
+   236→        .where(conditions.length > 0 ? and(...conditions) : undefined);
+   237→
+   238→      // For lowStock filter, we need to do it post-query since it's a computed field
+   239→      const allResults = await query;
+   240→
+   241→      // Calculate available quantity and filter by low stock if needed
+   242→      let filteredResults = allResults.map((row) => ({
+   243→        ...row,
+   244→        quantityAvailable: row.quantityOnHand - row.quantityReserved,
+   245→        isLowStock:
+   246→          row.reorderPoint !== null &&
+   247→          row.quantityOnHand - row.quantityReserved <= row.reorderPoint,
+   248→      }));
+   249→
+   250→      if (filters.lowStock) {
+   251→        filteredResults = filteredResults.filter((r) => r.isLowStock);
+   252→      }
+   253→
+   254→      // Apply pagination
+   255→      const total = filteredResults.length;
+   256→      const paginatedItems = filteredResults.slice(offset, offset + pagination.pageSize);
+   257→
+   258→      // Format response
+   259→      const items: InventoryWithDepot[] = paginatedItems.map((row) => ({
+   260→        id: row.id,
+   261→        depotId: row.depotId,
+   262→        depotCode: row.depotCode,
+   263→        depotName: row.depotName,
+   264→        partNumber: row.partNumber,
+   265→        partDescription: row.partDescription,
+   266→        quantityOnHand: row.quantityOnHand,
+   267→        quantityReserved: row.quantityReserved,
+   268→        quantityAvailable: row.quantityAvailable,
+   269→        quantityOnOrder: row.quantityOnOrder,
+   270→        reorderPoint: row.reorderPoint,
+   271→        reorderQuantity: row.reorderQuantity,
+   272→        nextDeliveryDate: row.nextDeliveryDate,
+   273→        nextDeliveryQuantity: row.nextDeliveryQuantity,
+   274→        unitCost: row.unitCost ? Number(row.unitCost) : null,
+   275→        currency: row.currency,
+   276→        lastSyncAt: row.lastSyncAt?.toISOString() || null,
+   277→        sourceSystem: row.sourceSystem,
+   278→        isLowStock: row.isLowStock,
+   279→      }));
+   280→
+   281→      span.setAttribute('result.count', items.length);
+   282→      span.setAttribute('result.total', total);
+   283→
+   284→      return {
+   285→        items,
+   286→        total,
+   287→        page: pagination.page,
+   288→        pageSize: pagination.pageSize,
+   289→        totalPages: Math.ceil(total / pagination.pageSize),
+   290→      };
+   291→    });
+   292→  }
+   293→
+   294→  /**
+   295→   * Get a single inventory position by ID
+   296→   *
+   297→   * @param id - Inventory position ID
+   298→   * @returns Inventory position with depot info
+   299→   * @throws NotFoundError if not found
+   300→   */
+   301→  async getInventoryById(id: string): Promise<InventoryWithDepot> {
+   302→    return this.traced('getInventoryById', async (span) => {
+   303→      span.setAttribute('inventory.id', id);
+   304→
+   305→      const result = await this.db
+   306→        .select({
+   307→          id: inventoryPositions.id,
+   308→          depotId: inventoryPositions.depotId,
+   309→          depotCode: depots.code,
+   310→          depotName: depots.name,
+   311→          partNumber: inventoryPositions.partNumber,
+   312→          partDescription: inventoryPositions.partDescription,
+   313→          quantityOnHand: inventoryPositions.quantityOnHand,
+   314→          quantityReserved: inventoryPositions.quantityReserved,
+   315→          quantityOnOrder: inventoryPositions.quantityOnOrder,
+   316→          reorderPoint: inventoryPositions.reorderPoint,
+   317→          reorderQuantity: inventoryPositions.reorderQuantity,
+   318→          nextDeliveryDate: inventoryPositions.nextDeliveryDate,
+   319→          nextDeliveryQuantity: inventoryPositions.nextDeliveryQuantity,
+   320→          unitCost: inventoryPositions.unitCost,
+   321→          currency: inventoryPositions.currency,
+   322→          lastSyncAt: inventoryPositions.lastSyncAt,
+   323→          sourceSystem: inventoryPositions.sourceSystem,
+   324→        })
+   325→        .from(inventoryPositions)
+   326→        .innerJoin(depots, eq(inventoryPositions.depotId, depots.id))
+   327→        .where(eq(inventoryPositions.id, id))
+   328→        .limit(1);
+   329→
+   330→      if (result.length === 0) {
+   331→        throw new NotFoundError(`Inventory position not found: ${id}`);
+   332→      }
+   333→
+   334→      const row = result[0];
+   335→      const quantityAvailable = row.quantityOnHand - row.quantityReserved;
+   336→      const isLowStock =
+   337→        row.reorderPoint !== null && quantityAvailable <= row.reorderPoint;
+   338→
+   339→      return {
+   340→        id: row.id,
+   341→        depotId: row.depotId,
+   342→        depotCode: row.depotCode,
+   343→        depotName: row.depotName,
+   344→        partNumber: row.partNumber,
+   345→        partDescription: row.partDescription,
+   346→        quantityOnHand: row.quantityOnHand,
+   347→        quantityReserved: row.quantityReserved,
+   348→        quantityAvailable,
+   349→        quantityOnOrder: row.quantityOnOrder,
+   350→        reorderPoint: row.reorderPoint,
+   351→        reorderQuantity: row.reorderQuantity,
+   352→        nextDeliveryDate: row.nextDeliveryDate,
+   353→        nextDeliveryQuantity: row.nextDeliveryQuantity,
+   354→        unitCost: row.unitCost ? Number(row.unitCost) : null,
+   355→        currency: row.currency,
+   356→        lastSyncAt: row.lastSyncAt?.toISOString() || null,
+   357→        sourceSystem: row.sourceSystem,
+   358→        isLowStock,
+   359→      };
+   360→    });
+   361→  }
+   362→
+   363→  /**
+   364→   * List material reservations with filtering
+   365→   *
+   366→   * Supports filtering by:
+   367→   * - pmScheduleId: Filter by specific PM
+   368→   * - status: PENDING, FULFILLED, or EXPIRED
+   369→   * - depotId: Filter by depot
+   370→   * - partNumber: Filter by part number
+   371→   *
+   372→   * @param filters - Query filters
+   373→   * @param pagination - Pagination options
+   374→   * @returns Paginated list of reservations with PM and depot details
+   375→   */
+   376→  async listReservations(
+   377→    filters: ReservationFilters = {},
+   378→    pagination: PaginationOptions = { page: 1, pageSize: 50 }
+   379→  ): Promise<PaginatedResult<ReservationWithDetails>> {
+   380→    return this.traced('listReservations', async (span) => {
+   381→      span.setAttribute('filters.pmScheduleId', filters.pmScheduleId || '');
+   382→      span.setAttribute('filters.status', filters.status || '');
+   383→      span.setAttribute('pagination.page', pagination.page);
+   384→      span.setAttribute('pagination.pageSize', pagination.pageSize);
+   385→
+   386→      const offset = (pagination.page - 1) * pagination.pageSize;
+   387→      const now = new Date();
+   388→
+   389→      // Build dynamic where conditions
+   390→      const conditions: SQL<unknown>[] = [];
+   391→
+   392→      if (filters.pmScheduleId) {
+   393→        conditions.push(eq(materialReservations.pmScheduleId, filters.pmScheduleId));
+   394→      }
+   395→
+   396→      if (filters.partNumber) {
+   397→        conditions.push(eq(materialReservations.partNumber, filters.partNumber));
+   398→      }
+   399→
+   400→      // Execute query with joins
+   401→      const results = await this.db
+   402→        .select({
+   403→          id: materialReservations.id,
+   404→          pmScheduleId: materialReservations.pmScheduleId,
+   405→          inventoryPositionId: materialReservations.inventoryPositionId,
+   406→          partNumber: materialReservations.partNumber,
+   407→          quantityReserved: materialReservations.quantityReserved,
+   408→          reservationType: materialReservations.reservationType,
+   409→          reservedAt: materialReservations.reservedAt,
+   410→          reservedBy: materialReservations.reservedBy,
+   411→          expiresAt: materialReservations.expiresAt,
+   412→          fulfilledAt: materialReservations.fulfilledAt,
+   413→          fulfilledQuantity: materialReservations.fulfilledQuantity,
+   414→          pmTargetDate: pmSchedule.targetDate,
+   415→          trainId: pmSchedule.trainId,
+   416→          trainNumber: trains.trainNumber,
+   417→          pmTypeId: pmSchedule.pmTypeId,
+   418→          pmCode: pmTypes.pmCode,
+   419→          depotId: pmSchedule.assignedDepotId,
+   420→          depotCode: depots.code,
+   421→          depotName: depots.name,
+   422→          reservedByFirstName: users.firstName,
+   423→          reservedByLastName: users.lastName,
+   424→        })
+   425→        .from(materialReservations)
+   426→        .innerJoin(pmSchedule, eq(materialReservations.pmScheduleId, pmSchedule.id))
+   427→        .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   428→        .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   429→        .leftJoin(depots, eq(pmSchedule.assignedDepotId, depots.id))
+   430→        .leftJoin(users, eq(materialReservations.reservedBy, users.id))
+   431→        .where(conditions.length > 0 ? and(...conditions) : undefined)
+   432→        .orderBy(desc(materialReservations.reservedAt));
+   433→
+   434→      // Calculate status and filter
+   435→      let processedResults = results.map((row) => {
+   436→        let status: ReservationStatus;
+   437→        if (row.fulfilledAt) {
+   438→          status = 'FULFILLED';
+   439→        } else if (row.expiresAt && new Date(row.expiresAt) < now) {
+   440→          status = 'EXPIRED';
+   441→        } else {
+   442→          status = 'PENDING';
+   443→        }
+   444→
+   445→        return {
+   446→          ...row,
+   447→          status,
+   448→        };
+   449→      });
+   450→
+   451→      // Filter by status if specified
+   452→      if (filters.status) {
+   453→        processedResults = processedResults.filter((r) => r.status === filters.status);
+   454→      }
+   455→
+   456→      // Filter by depot if specified
+   457→      if (filters.depotId) {
+   458→        processedResults = processedResults.filter((r) => r.depotId === filters.depotId);
+   459→      }
+   460→
+   461→      // Apply pagination
+   462→      const total = processedResults.length;
+   463→      const paginatedItems = processedResults.slice(offset, offset + pagination.pageSize);
+   464→
+   465→      // Format response
+   466→      const items: ReservationWithDetails[] = paginatedItems.map((row) => ({
+   467→        id: row.id,
+   468→        pmScheduleId: row.pmScheduleId,
+   469→        inventoryPositionId: row.inventoryPositionId,
+   470→        partNumber: row.partNumber,
+   471→        quantityReserved: row.quantityReserved,
+   472→        reservationType: row.reservationType as 'SOFT' | 'HARD',
+   473→        reservedAt: row.reservedAt?.toISOString() || '',
+   474→        reservedBy: row.reservedBy,
+   475→        reservedByName:
+   476→          row.reservedByFirstName && row.reservedByLastName
+   477→            ? `${row.reservedByFirstName} ${row.reservedByLastName}`
+   478→            : null,
+   479→        expiresAt: row.expiresAt?.toISOString() || null,
+   480→        fulfilledAt: row.fulfilledAt?.toISOString() || null,
+   481→        fulfilledQuantity: row.fulfilledQuantity,
+   482→        status: row.status,
+   483→        pm: {
+   484→          id: row.pmScheduleId,
+   485→          trainNumber: row.trainNumber,
+   486→          pmCode: row.pmCode,
+   487→          targetDate: row.pmTargetDate,
+   488→        },
+   489→        depot: {
+   490→          id: row.depotId || '',
+   491→          code: row.depotCode || '',
+   492→          name: row.depotName || '',
+   493→        },
+   494→      }));
+   495→
+   496→      span.setAttribute('result.count', items.length);
+   497→      span.setAttribute('result.total', total);
+   498→
+   499→      return {
+   500→        items,
+   501→        total,
+   502→        page: pagination.page,
+   503→        pageSize: pagination.pageSize,
+   504→        totalPages: Math.ceil(total / pagination.pageSize),
+   505→      };
+   506→    });
+   507→  }
+   508→
+   509→  /**
+   510→   * Get a single reservation by ID
+   511→   *
+   512→   * @param id - Reservation ID
+   513→   * @returns Reservation with details
+   514→   * @throws NotFoundError if not found
+   515→   */
+   516→  async getReservationById(id: string): Promise<ReservationWithDetails> {
+   517→    return this.traced('getReservationById', async (span) => {
+   518→      span.setAttribute('reservation.id', id);
+   519→
+   520→      const now = new Date();
+   521→
+   522→      const results = await this.db
+   523→        .select({
+   524→          id: materialReservations.id,
+   525→          pmScheduleId: materialReservations.pmScheduleId,
+   526→          inventoryPositionId: materialReservations.inventoryPositionId,
+   527→          partNumber: materialReservations.partNumber,
+   528→          quantityReserved: materialReservations.quantityReserved,
+   529→          reservationType: materialReservations.reservationType,
+   530→          reservedAt: materialReservations.reservedAt,
+   531→          reservedBy: materialReservations.reservedBy,
+   532→          expiresAt: materialReservations.expiresAt,
+   533→          fulfilledAt: materialReservations.fulfilledAt,
+   534→          fulfilledQuantity: materialReservations.fulfilledQuantity,
+   535→          pmTargetDate: pmSchedule.targetDate,
+   536→          trainId: pmSchedule.trainId,
+   537→          trainNumber: trains.trainNumber,
+   538→          pmTypeId: pmSchedule.pmTypeId,
+   539→          pmCode: pmTypes.pmCode,
+   540→          depotId: pmSchedule.assignedDepotId,
+   541→          depotCode: depots.code,
+   542→          depotName: depots.name,
+   543→          reservedByFirstName: users.firstName,
+   544→          reservedByLastName: users.lastName,
+   545→        })
+   546→        .from(materialReservations)
+   547→        .innerJoin(pmSchedule, eq(materialReservations.pmScheduleId, pmSchedule.id))
+   548→        .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   549→        .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   550→        .leftJoin(depots, eq(pmSchedule.assignedDepotId, depots.id))
+   551→        .leftJoin(users, eq(materialReservations.reservedBy, users.id))
+   552→        .where(eq(materialReservations.id, id))
+   553→        .limit(1);
+   554→
+   555→      if (results.length === 0) {
+   556→        throw new NotFoundError(`Reservation not found: ${id}`);
+   557→      }
+   558→
+   559→      const row = results[0];
+   560→
+   561→      let status: ReservationStatus;
+   562→      if (row.fulfilledAt) {
+   563→        status = 'FULFILLED';
+   564→      } else if (row.expiresAt && new Date(row.expiresAt) < now) {
+   565→        status = 'EXPIRED';
+   566→      } else {
+   567→        status = 'PENDING';
+   568→      }
+   569→
+   570→      return {
+   571→        id: row.id,
+   572→        pmScheduleId: row.pmScheduleId,
+   573→        inventoryPositionId: row.inventoryPositionId,
+   574→        partNumber: row.partNumber,
+   575→        quantityReserved: row.quantityReserved,
+   576→        reservationType: row.reservationType as 'SOFT' | 'HARD',
+   577→        reservedAt: row.reservedAt?.toISOString() || '',
+   578→        reservedBy: row.reservedBy,
+   579→        reservedByName:
+   580→          row.reservedByFirstName && row.reservedByLastName
+   581→            ? `${row.reservedByFirstName} ${row.reservedByLastName}`
+   582→            : null,
+   583→        expiresAt: row.expiresAt?.toISOString() || null,
+   584→        fulfilledAt: row.fulfilledAt?.toISOString() || null,
+   585→        fulfilledQuantity: row.fulfilledQuantity,
+   586→        status,
+   587→        pm: {
+   588→          id: row.pmScheduleId,
+   589→          trainNumber: row.trainNumber,
+   590→          pmCode: row.pmCode,
+   591→          targetDate: row.pmTargetDate,
+   592→        },
+   593→        depot: {
+   594→          id: row.depotId || '',
+   595→          code: row.depotCode || '',
+   596→          name: row.depotName || '',
+   597→        },
+   598→      };
+   599→    });
+   600→  }
+   601→
+   602→  /**
+   603→   * Fulfill a material reservation
+   604→   *
+   605→   * Marks the reservation as fulfilled, indicating that the materials have been
+   606→   * delivered and are ready for the PM. Optionally can specify a different fulfilled
+   607→   * quantity than reserved (partial fulfillment).
+   608→   *
+   609→   * @param request - Fulfillment request with reservation ID
+   610→   * @returns Updated reservation details
+   611→   * @throws NotFoundError if reservation not found
+   612→   * @throws ValidationError if already fulfilled or expired
+   613→   */
+   614→  async fulfillReservation(
+   615→    request: FulfillReservationRequest
+   616→  ): Promise<FulfillReservationResult> {
+   617→    return this.traced('fulfillReservation', async (span) => {
+   618→      span.setAttribute('reservation.id', request.reservationId);
+   619→
+   620→      const now = new Date();
+   621→
+   622→      // Get current reservation state
+   623→      const existing = await this.db
+   624→        .select()
+   625→        .from(materialReservations)
+   626→        .where(eq(materialReservations.id, request.reservationId))
+   627→        .limit(1);
+   628→
+   629→      if (existing.length === 0) {
+   630→        throw new NotFoundError(`Reservation not found: ${request.reservationId}`);
+   631→      }
+   632→
+   633→      const reservation = existing[0];
+   634→
+   635→      // Check if already fulfilled
+   636→      if (reservation.fulfilledAt) {
+   637→        throw new ValidationError(
+   638→          'Reservation is already fulfilled',
+   639→          { context: { code: 'ALREADY_FULFILLED', reservationId: request.reservationId } }
+   640→        );
+   641→      }
+   642→
+   643→      // Check if expired
+   644→      if (reservation.expiresAt && new Date(reservation.expiresAt) < now) {
+   645→        throw new ValidationError(
+   646→          'Cannot fulfill an expired reservation',
+   647→          { context: { code: 'RESERVATION_EXPIRED', reservationId: request.reservationId } }
+   648→        );
+   649→      }
+   650→
+   651→      // Determine fulfilled quantity
+   652→      const fulfilledQuantity =
+   653→        request.fulfilledQuantity ?? reservation.quantityReserved;
+   654→
+   655→      // Update the reservation
+   656→      await this.db
+   657→        .update(materialReservations)
+   658→        .set({
+   659→          fulfilledAt: now,
+   660→          fulfilledQuantity,
+   661→        })
+   662→        .where(eq(materialReservations.id, request.reservationId));
+   663→
+   664→      this.log.info(
+   665→        {
+   666→          reservationId: request.reservationId,
+   667→          partNumber: reservation.partNumber,
+   668→          quantityReserved: reservation.quantityReserved,
+   669→          fulfilledQuantity,
+   670→        },
+   671→        'Reservation fulfilled'
+   672→      );
+   673→
+   674→      return {
+   675→        id: request.reservationId,
+   676→        partNumber: reservation.partNumber,
+   677→        quantityReserved: reservation.quantityReserved,
+   678→        fulfilledQuantity,
+   679→        fulfilledAt: now.toISOString(),
+   680→        status: 'FULFILLED',
+   681→      };
+   682→    });
+   683→  }
+   684→
+   685→  /**
+   686→   * Get inventory summary statistics
+   687→   *
+   688→   * Returns aggregate stats about inventory including low stock counts
+   689→   * per depot.
+   690→   */
+   691→  async getInventorySummary(): Promise<{
+   692→    totalItems: number;
+   693→    lowStockCount: number;
+   694→    byDepot: Array<{
+   695→      depotId: string;
+   696→      depotCode: string;
+   697→      itemCount: number;
+   698→      lowStockCount: number;
+   699→    }>;
+   700→  }> {
+   701→    return this.traced('getInventorySummary', async (span) => {
+   702→      // Get all inventory with depot info
+   703→      const items = await this.db
+   704→        .select({
+   705→          depotId: inventoryPositions.depotId,
+   706→          depotCode: depots.code,
+   707→          quantityOnHand: inventoryPositions.quantityOnHand,
+   708→          quantityReserved: inventoryPositions.quantityReserved,
+   709→          reorderPoint: inventoryPositions.reorderPoint,
+   710→        })
+   711→        .from(inventoryPositions)
+   712→        .innerJoin(depots, eq(inventoryPositions.depotId, depots.id));
+   713→
+   714→      // Aggregate by depot
+   715→      const depotMap = new Map<
+   716→        string,
+   717→        { depotCode: string; itemCount: number; lowStockCount: number }
+   718→      >();
+   719→
+   720→      let totalLowStock = 0;
+   721→
+   722→      for (const item of items) {
+   723→        const available = item.quantityOnHand - item.quantityReserved;
+   724→        const isLowStock =
+   725→          item.reorderPoint !== null && available <= item.reorderPoint;
+   726→
+   727→        if (isLowStock) {
+   728→          totalLowStock++;
+   729→        }
+   730→
+   731→        const existing = depotMap.get(item.depotId);
+   732→        if (existing) {
+   733→          existing.itemCount++;
+   734→          if (isLowStock) existing.lowStockCount++;
+   735→        } else {
+   736→          depotMap.set(item.depotId, {
+   737→            depotCode: item.depotCode,
+   738→            itemCount: 1,
+   739→            lowStockCount: isLowStock ? 1 : 0,
+   740→          });
+   741→        }
+   742→      }
+   743→
+   744→      const byDepot = Array.from(depotMap.entries()).map(([depotId, stats]) => ({
+   745→        depotId,
+   746→        ...stats,
+   747→      }));
+   748→
+   749→      span.setAttribute('result.totalItems', items.length);
+   750→      span.setAttribute('result.lowStockCount', totalLowStock);
+   751→
+   752→      return {
+   753→        totalItems: items.length,
+   754→        lowStockCount: totalLowStock,
+   755→        byDepot,
+   756→      };
+   757→    });
+   758→  }
+   759→}
+   760→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

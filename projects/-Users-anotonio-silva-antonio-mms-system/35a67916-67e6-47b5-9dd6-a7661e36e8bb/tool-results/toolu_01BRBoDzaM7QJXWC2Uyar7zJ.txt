@@ -1,0 +1,504 @@
+   500→    await this.db.transaction(async (tx) => {
+   501→      const [event] = await tx
+   502→        .select()
+   503→        .from(unavailabilityEvents)
+   504→        .where(eq(unavailabilityEvents.id, eventId));
+   505→      
+   506→      if (!event) {
+   507→        throw new NotFoundError(`Unavailability event ${eventId} not found`);
+   508→      }
+   509→      
+   510→      if (event.status === 'RESOLVED') {
+   511→        throw new ConflictError('Event already resolved');
+   512→      }
+   513→      
+   514→      // Update the event
+   515→      await tx
+   516→        .update(unavailabilityEvents)
+   517→        .set({
+   518→          status: 'RESOLVED',
+   519→          actualReturnDate,
+   520→          resolvedAt: new Date(),
+   521→          resolvedBy: userId,
+   522→          resolutionNotes: notes,
+   523→          updatedAt: new Date()
+   524→        })
+   525→        .where(eq(unavailabilityEvents.id, eventId));
+   526→      
+   527→      // Check if there are other active unavailability events for this train
+   528→      const otherActive = await tx
+   529→        .select({ count: count() })
+   530→        .from(unavailabilityEvents)
+   531→        .where(and(
+   532→          eq(unavailabilityEvents.trainId, event.trainId),
+   533→          eq(unavailabilityEvents.status, 'ACTIVE'),
+   534→          ne(unavailabilityEvents.id, eventId)
+   535→        ));
+   536→      
+   537→      // If no other active events, restore train to FIT
+   538→      if (otherActive[0].count === 0) {
+   539→        await tx
+   540→          .update(trains)
+   541→          .set({
+   542→            fitnessStatus: 'FIT',
+   543→            fitnessNotes: null,
+   544→            updatedAt: new Date()
+   545→          })
+   546→          .where(eq(trains.id, event.trainId));
+   547→      }
+   548→    });
+   549→    
+   550→    await this.auditService.log({
+   551→      entityType: 'unavailability_event',
+   552→      entityId: eventId,
+   553→      action: 'RESOLVE',
+   554→      userId,
+   555→      newValues: { status: 'RESOLVED', actualReturnDate }
+   556→    });
+   557→  }
+   558→  
+   559→  /**
+   560→   * Get all active unavailability events (for optimizer input)
+   561→   */
+   562→  async getActiveUnavailability(depotId?: string): Promise<UnavailabilityEvent[]> {
+   563→    let query = this.db
+   564→      .select({
+   565→        event: unavailabilityEvents,
+   566→        train: {
+   567→          trainNumber: trains.trainNumber,
+   568→          fleetId: trains.fleetId,
+   569→          currentDepotId: trains.currentDepotId
+   570→        }
+   571→      })
+   572→      .from(unavailabilityEvents)
+   573→      .innerJoin(trains, eq(unavailabilityEvents.trainId, trains.id))
+   574→      .where(eq(unavailabilityEvents.status, 'ACTIVE'));
+   575→    
+   576→    if (depotId) {
+   577→      query = query.where(eq(trains.currentDepotId, depotId));
+   578→    }
+   579→    
+   580→    const results = await query;
+   581→    return results.map(r => ({
+   582→      ...r.event,
+   583→      trainNumber: r.train.trainNumber,
+   584→      fleetId: r.train.fleetId
+   585→    }));
+   586→  }
+   587→  
+   588→  /**
+   589→   * Check if a specific train is available on a specific date
+   590→   */
+   591→  async isTrainAvailable(trainId: string, targetDate: Date): Promise<{
+   592→    available: boolean;
+   593→    blockingEvent?: UnavailabilityEvent;
+   594→  }> {
+   595→    const activeEvents = await this.db
+   596→      .select()
+   597→      .from(unavailabilityEvents)
+   598→      .where(and(
+   599→        eq(unavailabilityEvents.trainId, trainId),
+   600→        eq(unavailabilityEvents.status, 'ACTIVE'),
+   601→        or(
+   602→          isNull(unavailabilityEvents.estimatedReturnDate),
+   603→          gte(unavailabilityEvents.estimatedReturnDate, targetDate)
+   604→        )
+   605→      ))
+   606→      .limit(1);
+   607→    
+   608→    if (activeEvents.length > 0) {
+   609→      return { available: false, blockingEvent: activeEvents[0] };
+   610→    }
+   611→    
+   612→    return { available: true };
+   613→  }
+   614→  
+   615→  /**
+   616→   * Process Maximo webhook for work order status change
+   617→   */
+   618→  async processMaximoWebhook(payload: MaximoWorkOrderWebhook): Promise<void> {
+   619→    // Map Maximo work types to our event types
+   620→    const eventTypeMap: Record<string, UnavailabilityEvent['eventType']> = {
+   621→      'CM': 'CORRECTIVE',
+   622→      'EM': 'CORRECTIVE',  // Emergency maintenance
+   623→      'IN': 'INCIDENT'
+   624→    };
+   625→    
+   626→    if (!eventTypeMap[payload.worktype]) {
+   627→      // Not a corrective maintenance type, ignore
+   628→      return;
+   629→    }
+   630→    
+   631→    // Check if we already have an event for this WO
+   632→    const existing = await this.db
+   633→      .select()
+   634→      .from(unavailabilityEvents)
+   635→      .where(and(
+   636→        eq(unavailabilityEvents.sourceSystem, 'MAXIMO'),
+   637→        eq(unavailabilityEvents.externalReference, payload.wonum)
+   638→      ))
+   639→      .limit(1);
+   640→    
+   641→    if (existing.length > 0) {
+   642→      // Update existing event based on Maximo status
+   643→      await this.updateFromMaximo(existing[0], payload);
+   644→    } else if (payload.status === 'WAPPR' || payload.status === 'INPRG') {
+   645→      // Create new unavailability event
+   646→      const train = await this.findTrainByAssetnum(payload.assetnum);
+   647→      if (!train) {
+   648→        this.logger.warn({ assetnum: payload.assetnum }, 'Unknown asset in Maximo webhook');
+   649→        return;
+   650→      }
+   651→      
+   652→      await this.createEvent({
+   653→        trainId: train.id,
+   654→        eventType: eventTypeMap[payload.worktype],
+   655→        restrictionLevel: 'GROUNDED',  // Default to grounded for CM
+   656→        estimatedReturnDate: payload.schedfinish ? new Date(payload.schedfinish) : undefined,
+   657→        sourceSystem: 'MAXIMO',
+   658→        externalReference: payload.wonum,
+   659→        description: payload.description
+   660→      });
+   661→    }
+   662→  }
+   663→  
+   664→  private async updateFromMaximo(
+   665→    event: UnavailabilityEvent, 
+   666→    payload: MaximoWorkOrderWebhook
+   667→  ): Promise<void> {
+   668→    const maximoStatusMap: Record<string, 'ACTIVE' | 'RESOLVED'> = {
+   669→      'WAPPR': 'ACTIVE',
+   670→      'APPR': 'ACTIVE',
+   671→      'INPRG': 'ACTIVE',
+   672→      'COMP': 'RESOLVED',
+   673→      'CLOSE': 'RESOLVED',
+   674→      'CAN': 'RESOLVED'
+   675→    };
+   676→    
+   677→    const newStatus = maximoStatusMap[payload.status] || 'ACTIVE';
+   678→    
+   679→    if (newStatus === 'RESOLVED' && event.status === 'ACTIVE') {
+   680→      await this.resolveEvent(
+   681→        event.id, 
+   682→        new Date(), 
+   683→        'SYSTEM_MAXIMO',
+   684→        `Resolved via Maximo status: ${payload.status}`
+   685→      );
+   686→    } else {
+   687→      // Update estimated return date if changed
+   688→      await this.db
+   689→        .update(unavailabilityEvents)
+   690→        .set({
+   691→          externalStatus: payload.status,
+   692→          estimatedReturnDate: payload.schedfinish ? new Date(payload.schedfinish) : undefined,
+   693→          updatedAt: new Date()
+   694→        })
+   695→        .where(eq(unavailabilityEvents.id, event.id));
+   696→    }
+   697→  }
+   698→  
+   699→  private async checkPMConflicts(
+   700→    tx: Transaction,
+   701→    trainId: string,
+   702→    estimatedReturnDate?: Date
+   703→  ): Promise<PMSchedule[]> {
+   704→    const endDate = estimatedReturnDate || addDays(new Date(), 90); // Default 90 days
+   705→    
+   706→    return tx
+   707→      .select()
+   708→      .from(pmSchedule)
+   709→      .where(and(
+   710→        eq(pmSchedule.trainId, trainId),
+   711→        eq(pmSchedule.status, 'SCHEDULED'),
+   712→        lte(pmSchedule.targetDate, endDate),
+   713→        isNull(pmSchedule.scenarioId)
+   714→      ));
+   715→  }
+   716→}
+   717→```
+   718→
+   719→---
+   720→
+   721→## 4.2.6 Service Demand Service (NEW v2.1)
+   722→
+   723→### 4.2.6.1 Purpose
+   724→
+   725→Manage fleet availability requirements by day type. This is a **hard constraint** for the optimizer - it cannot approve maintenance schedules that would violate minimum train availability.
+   726→
+   727→### 4.2.6.2 Implementation
+   728→
+   729→```typescript
+   730→interface ServiceDemand {
+   731→  id: string;
+   732→  fleetId: string;
+   733→  effectiveDate: Date;
+   734→  dayType: 'WEEKDAY' | 'SATURDAY' | 'SUNDAY' | 'HOLIDAY';
+   735→  
+   736→  minTrainsRequired: number;
+   737→  peakAmRequirement?: number;
+   738→  middayRequirement?: number;
+   739→  peakPmRequirement?: number;
+   740→  standbyBuffer: number;
+   741→}
+   742→
+   743→interface AvailabilityValidation {
+   744→  isValid: boolean;
+   745→  availableTrains: number;
+   746→  requiredTrains: number;
+   747→  shortfall: number;
+   748→  unavailableTrains: string[];  // Train IDs
+   749→  trainsInMaintenance: string[]; // Train IDs
+   750→}
+   751→
+   752→class ServiceDemandService {
+   753→  constructor(
+   754→    private db: Database,
+   755→    private unavailabilityService: UnavailabilityService
+   756→  ) {}
+   757→  
+   758→  /**
+   759→   * Get service demand for a specific date
+   760→   */
+   761→  async getDemand(fleetId: string, targetDate: Date): Promise<ServiceDemand> {
+   762→    const dayType = this.getDayType(targetDate);
+   763→    
+   764→    const demand = await this.db
+   765→      .select()
+   766→      .from(serviceDemand)
+   767→      .where(and(
+   768→        eq(serviceDemand.fleetId, fleetId),
+   769→        eq(serviceDemand.dayType, dayType),
+   770→        lte(serviceDemand.effectiveDate, targetDate)
+   771→      ))
+   772→      .orderBy(desc(serviceDemand.effectiveDate))
+   773→      .limit(1);
+   774→    
+   775→    if (demand.length === 0) {
+   776→      // Return default: 85% of fleet
+   777→      const fleetSize = await this.getFleetSize(fleetId);
+   778→      return {
+   779→        id: 'default',
+   780→        fleetId,
+   781→        effectiveDate: targetDate,
+   782→        dayType,
+   783→        minTrainsRequired: Math.ceil(fleetSize * 0.85),
+   784→        standbyBuffer: 2
+   785→      };
+   786→    }
+   787→    
+   788→    return demand[0];
+   789→  }
+   790→  
+   791→  /**
+   792→   * Validate that enough trains will be available on a date
+   793→   */
+   794→  async validateAvailability(
+   795→    fleetId: string, 
+   796→    targetDate: Date,
+   797→    additionalUnavailable: string[] = []  // Train IDs to exclude (e.g., proposed PM)
+   798→  ): Promise<AvailabilityValidation> {
+   799→    const demand = await this.getDemand(fleetId, targetDate);
+   800→    
+   801→    // Get all trains in fleet
+   802→    const allTrains = await this.db
+   803→      .select()
+   804→      .from(trains)
+   805→      .where(and(
+   806→        eq(trains.fleetId, fleetId),
+   807→        eq(trains.active, true)
+   808→      ));
+   809→    
+   810→    // Get unavailable trains
+   811→    const unavailable = await this.unavailabilityService.getActiveUnavailability();
+   812→    const unavailableIds = new Set(unavailable.map(u => u.trainId));
+   813→    
+   814→    // Get trains in maintenance on this date
+   815→    const inMaintenance = await this.db
+   816→      .select()
+   817→      .from(pmSchedule)
+   818→      .where(and(
+   819→        eq(pmSchedule.targetDate, targetDate),
+   820→        inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   821→        isNull(pmSchedule.scenarioId)
+   822→      ));
+   823→    const maintenanceIds = new Set(inMaintenance.map(pm => pm.trainId));
+   824→    
+   825→    // Add proposed unavailable
+   826→    const proposedIds = new Set(additionalUnavailable);
+   827→    
+   828→    // Calculate available
+   829→    const availableTrains = allTrains.filter(t => 
+   830→      !unavailableIds.has(t.id) && 
+   831→      !maintenanceIds.has(t.id) &&
+   832→      !proposedIds.has(t.id) &&
+   833→      t.fitnessStatus === 'FIT'
+   834→    );
+   835→    
+   836→    const required = demand.minTrainsRequired + demand.standbyBuffer;
+   837→    const shortfall = Math.max(0, required - availableTrains.length);
+   838→    
+   839→    return {
+   840→      isValid: shortfall === 0,
+   841→      availableTrains: availableTrains.length,
+   842→      requiredTrains: required,
+   843→      shortfall,
+   844→      unavailableTrains: Array.from(unavailableIds),
+   845→      trainsInMaintenance: Array.from(maintenanceIds)
+   846→    };
+   847→  }
+   848→  
+   849→  /**
+   850→   * Find dates where service demand would be violated by proposed maintenance
+   851→   */
+   852→  async findViolations(
+   853→    fleetId: string,
+   854→    proposedPMs: { trainId: string; date: Date }[],
+   855→    horizonDays: number = 90
+   856→  ): Promise<{ date: Date; validation: AvailabilityValidation }[]> {
+   857→    const violations: { date: Date; validation: AvailabilityValidation }[] = [];
+   858→    
+   859→    // Group proposed PMs by date
+   860→    const pmsByDate = new Map<string, string[]>();
+   861→    for (const pm of proposedPMs) {
+   862→      const dateKey = pm.date.toISOString().split('T')[0];
+   863→      if (!pmsByDate.has(dateKey)) {
+   864→        pmsByDate.set(dateKey, []);
+   865→      }
+   866→      pmsByDate.get(dateKey)!.push(pm.trainId);
+   867→    }
+   868→    
+   869→    // Check each date with proposed PMs
+   870→    for (const [dateKey, trainIds] of pmsByDate) {
+   871→      const validation = await this.validateAvailability(
+   872→        fleetId, 
+   873→        new Date(dateKey), 
+   874→        trainIds
+   875→      );
+   876→      
+   877→      if (!validation.isValid) {
+   878→        violations.push({ date: new Date(dateKey), validation });
+   879→      }
+   880→    }
+   881→    
+   882→    return violations;
+   883→  }
+   884→  
+   885→  private getDayType(date: Date): ServiceDemand['dayType'] {
+   886→    // TODO: Integrate with holiday calendar
+   887→    const dayOfWeek = date.getDay();
+   888→    if (dayOfWeek === 0) return 'SUNDAY';
+   889→    if (dayOfWeek === 6) return 'SATURDAY';
+   890→    return 'WEEKDAY';
+   891→  }
+   892→  
+   893→  private async getFleetSize(fleetId: string): Promise<number> {
+   894→    const result = await this.db
+   895→      .select({ count: count() })
+   896→      .from(trains)
+   897→      .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+   898→    return result[0].count;
+   899→  }
+   900→}
+   901→```
+   902→
+   903→---
+   904→
+   905→## 4.2.7 Route Utilization Service (NEW v2.1)
+   906→
+   907→### 4.2.7.1 Purpose
+   908→
+   909→Provide route-specific daily mileage rates for accurate long-term projections. Using fleet-wide averages can result in 60,000+ km projection error over 12 years.
+   910→
+   911→### 4.2.7.2 Implementation
+   912→
+   913→```typescript
+   914→interface RouteUtilizationProfile {
+   915→  id: string;
+   916→  routeId: string;
+   917→  effectiveDate: Date;
+   918→  
+   919→  weekdayKm: number;
+   920→  saturdayKm?: number;
+   921→  sundayKm?: number;
+   922→  holidayKm?: number;
+   923→  
+   924→  peakSeasonMultiplier: number;
+   925→  offPeakMultiplier: number;
+   926→  
+   927→  confidence: 'HIGH' | 'MEDIUM' | 'LOW' | 'ESTIMATED';
+   928→}
+   929→
+   930→class RouteUtilizationService {
+   931→  constructor(private db: Database) {}
+   932→  
+   933→  /**
+   934→   * Get utilization profile for a route
+   935→   */
+   936→  async getProfile(routeId: string, asOfDate?: Date): Promise<RouteUtilizationProfile | null> {
+   937→    const date = asOfDate || new Date();
+   938→    
+   939→    const profile = await this.db
+   940→      .select()
+   941→      .from(routeUtilizationProfiles)
+   942→      .where(and(
+   943→        eq(routeUtilizationProfiles.routeId, routeId),
+   944→        lte(routeUtilizationProfiles.effectiveDate, date)
+   945→      ))
+   946→      .orderBy(desc(routeUtilizationProfiles.effectiveDate))
+   947→      .limit(1);
+   948→    
+   949→    return profile[0] || null;
+   950→  }
+   951→  
+   952→  /**
+   953→   * Calculate expected daily km for a train based on typical route assignment
+   954→   */
+   955→  async calculateDailyRate(
+   956→    trainId: string, 
+   957→    targetDate: Date
+   958→  ): Promise<{ dailyKm: number; source: string; confidence: string }> {
+   959→    // 1. Check for explicit route assignment
+   960→    const assignment = await this.getTypicalRouteAssignment(trainId);
+   961→    
+   962→    if (assignment) {
+   963→      const profile = await this.getProfile(assignment.routeId, targetDate);
+   964→      if (profile) {
+   965→        const dayType = this.getDayType(targetDate);
+   966→        const baseKm = this.getKmForDayType(profile, dayType);
+   967→        const seasonalMultiplier = this.getSeasonalMultiplier(profile, targetDate);
+   968→        
+   969→        return {
+   970→          dailyKm: Math.round(baseKm * seasonalMultiplier),
+   971→          source: `route:${assignment.routeId}`,
+   972→          confidence: profile.confidence
+   973→        };
+   974→      }
+   975→    }
+   976→    
+   977→    // 2. Fall back to fleet average
+   978→    const train = await this.db
+   979→      .select({ fleetId: trains.fleetId })
+   980→      .from(trains)
+   981→      .where(eq(trains.id, trainId))
+   982→      .limit(1);
+   983→    
+   984→    if (train[0]) {
+   985→      const fleetAverage = await this.getFleetAverage(train[0].fleetId);
+   986→      return {
+   987→        dailyKm: fleetAverage,
+   988→        source: 'fleet_average',
+   989→        confidence: 'LOW'
+   990→      };
+   991→    }
+   992→    
+   993→    // 3. System default
+   994→    return {
+   995→      dailyKm: 250,  // Conservative default
+   996→      source: 'system_default',
+   997→      confidence: 'ESTIMATED'
+   998→    };
+   999→  }
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

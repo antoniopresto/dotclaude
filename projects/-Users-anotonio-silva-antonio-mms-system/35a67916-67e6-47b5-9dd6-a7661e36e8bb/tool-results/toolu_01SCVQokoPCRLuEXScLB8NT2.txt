@@ -1,0 +1,1580 @@
+     1→/**
+     2→ * MMS Route Utilization Service
+     3→ *
+     4→ * Provides route-specific daily mileage rates for accurate long-term projections.
+     5→ * Critical for PM scheduling as fleet-wide averages can result in 60,000+ km
+     6→ * projection error over the 12-year contract period.
+     7→ *
+     8→ * Key responsibilities:
+     9→ * - Retrieve route-specific utilization profiles
+    10→ * - Calculate expected daily km for trains with fallback hierarchy
+    11→ * - Project cumulative mileage over time horizons
+    12→ * - Apply seasonal multipliers for peak/off-peak periods
+    13→ *
+    14→ * Fallback hierarchy (in priority order):
+    15→ * 1. Route-specific profile from route_utilization_profiles table
+    16→ * 2. Fleet-wide average from last 30 days of mileage readings
+    17→ * 3. System default: 250 km/day (conservative estimate)
+    18→ *
+    19→ * @see specs/004-domain-services.md Section 4.2.7 (Route Utilization Service)
+    20→ * @see specs/003-database-schema.md Section 3.2.2 (Route Utilization Profiles)
+    21→ */
+    22→
+    23→import { eq, and, sql, desc, lte, gte, avg, inArray } from 'drizzle-orm';
+    24→import type { SQL } from 'drizzle-orm';
+    25→import { addDays } from 'date-fns';
+    26→import { BaseService, MmsAttributes } from '../lib/services/base';
+    27→import {
+    28→  routeUtilizationProfiles,
+    29→  trains,
+    30→  fleets,
+    31→  routes,
+    32→  mileageReadings,
+    33→  runAssignments,
+    34→  type RouteUtilizationProfile,
+    35→  type NewRouteUtilizationProfile,
+    36→} from '../lib/db/schema';
+    37→import { NotFoundError, ValidationError, DuplicateError } from '../lib/errors';
+    38→import { addJob, QUEUE_NAMES } from '../lib/queue';
+    39→
+    40→// =============================================================================
+    41→// Types
+    42→// =============================================================================
+    43→
+    44→/** Day type for utilization lookup */
+    45→export type UtilizationDayType = 'WEEKDAY' | 'SATURDAY' | 'SUNDAY' | 'HOLIDAY';
+    46→
+    47→/** Confidence level for mileage estimates */
+    48→export type ConfidenceLevel = 'HIGH' | 'MEDIUM' | 'LOW' | 'ESTIMATED';
+    49→
+    50→/** Source of the daily rate calculation */
+    51→export type RateSource =
+    52→  | `route:${string}` // Route-specific profile with route ID
+    53→  | 'fleet_average'   // Calculated from recent mileage readings
+    54→  | 'system_default'; // Conservative fallback (250 km/day)
+    55→
+    56→/** Result of daily rate calculation */
+    57→export interface DailyRateResult {
+    58→  dailyKm: number;
+    59→  source: RateSource;
+    60→  confidence: ConfidenceLevel;
+    61→  details?: {
+    62→    routeId?: string;
+    63→    routeCode?: string;
+    64→    fleetId?: string;
+    65→    fleetCode?: string;
+    66→    dayType?: UtilizationDayType;
+    67→    seasonalMultiplier?: number;
+    68→    profileEffectiveDate?: string;
+    69→  };
+    70→}
+    71→
+    72→/** Single day projection */
+    73→export interface MileageProjection {
+    74→  date: string;
+    75→  projectedDailyKm: number;
+    76→  cumulativeKm: number;
+    77→  source: RateSource;
+    78→  confidence: ConfidenceLevel;
+    79→}
+    80→
+    81→/** Route profile with additional metadata */
+    82→export interface RouteProfileWithMeta extends RouteUtilizationProfile {
+    83→  routeCode?: string;
+    84→  routeName?: string;
+    85→}
+    86→
+    87→/** Create route utilization profile request */
+    88→export interface CreateProfileRequest {
+    89→  routeId: string;
+    90→  effectiveDate?: string;
+    91→  weekdayKm: number;
+    92→  saturdayKm?: number;
+    93→  sundayKm?: number;
+    94→  holidayKm?: number;
+    95→  peakSeasonMultiplier?: number;
+    96→  offPeakMultiplier?: number;
+    97→  serviceHoursPerDay?: number;
+    98→  roundTripKm?: number;
+    99→  tripsPerDay?: number;
+   100→  source?: string;
+   101→  confidence?: ConfidenceLevel;
+   102→  notes?: string;
+   103→}
+   104→
+   105→/** Update route utilization profile request */
+   106→export interface UpdateProfileRequest {
+   107→  weekdayKm?: number;
+   108→  saturdayKm?: number | null;
+   109→  sundayKm?: number | null;
+   110→  holidayKm?: number | null;
+   111→  peakSeasonMultiplier?: number;
+   112→  offPeakMultiplier?: number;
+   113→  serviceHoursPerDay?: number | null;
+   114→  roundTripKm?: number | null;
+   115→  tripsPerDay?: number | null;
+   116→  source?: string | null;
+   117→  confidence?: ConfidenceLevel;
+   118→  notes?: string | null;
+   119→}
+   120→
+   121→/** Filter options for listing profiles */
+   122→export interface ProfileListFilters {
+   123→  routeId?: string;
+   124→  routeIds?: string[];
+   125→  confidence?: ConfidenceLevel | ConfidenceLevel[];
+   126→  effectiveDateFrom?: string;
+   127→  effectiveDateTo?: string;
+   128→  active?: boolean;
+   129→}
+   130→
+   131→/** Fleet average calculation result */
+   132→export interface FleetAverageResult {
+   133→  fleetId: string;
+   134→  fleetCode: string;
+   135→  averageDailyKm: number;
+   136→  sampleSize: number;
+   137→  periodStart: string;
+   138→  periodEnd: string;
+   139→  confidence: ConfidenceLevel;
+   140→}
+   141→
+   142→/** Individual train projection accuracy info */
+   143→export interface TrainProjectionInfo {
+   144→  trainId: string;
+   145→  trainNumber: string;
+   146→  fleetId: string;
+   147→  fleetCode: string;
+   148→  source: RateSource;
+   149→  confidence: ConfidenceLevel;
+   150→  dailyKm: number;
+   151→  /** Estimated projection uncertainty over 12 years in km */
+   152→  projectionImpactKm: number;
+   153→  confidenceClass: 'high-confidence' | 'medium-confidence' | 'low-confidence' | 'estimated';
+   154→}
+   155→
+   156→/** Projection accuracy analysis result */
+   157→export interface ProjectionAccuracyAnalysis {
+   158→  /** Timestamp of analysis */
+   159→  analysisTime: string;
+   160→  /** Total number of trains analyzed */
+   161→  totalTrains: number;
+   162→  /** Number of trains with route-specific profiles */
+   163→  routeProfileCount: number;
+   164→  /** Number of trains using fleet average */
+   165→  fleetAverageCount: number;
+   166→  /** Number of trains using system default */
+   167→  systemDefaultCount: number;
+   168→  /** Percentage of trains with route profiles */
+   169→  routeCoveragePct: number;
+   170→  /** Trains using fallback calculations (fleet average or system default) */
+   171→  fallbackTrains: TrainProjectionInfo[];
+   172→  /** Total projected uncertainty across all fallback trains */
+   173→  totalImpactKm: number;
+   174→  /** Estimated number of PM scheduling decisions that could be affected */
+   175→  potentialMissedPMs: number;
+   176→  /** Recommendations for improving accuracy */
+   177→  recommendations: string[];
+   178→  /** Whether this analysis triggers a warning */
+   179→  requiresWarning: boolean;
+   180→  /** Warning severity if triggered */
+   181→  warningSeverity?: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+   182→}
+   183→
+   184→// =============================================================================
+   185→// Constants
+   186→// =============================================================================
+   187→
+   188→/** Conservative default daily km when no data available */
+   189→const SYSTEM_DEFAULT_DAILY_KM = 250;
+   190→
+   191→/** Number of days to look back for fleet average calculation */
+   192→const FLEET_AVERAGE_LOOKBACK_DAYS = 30;
+   193→
+   194→/** Minimum sample size for reliable fleet average */
+   195→const MIN_SAMPLE_SIZE_FOR_HIGH_CONFIDENCE = 20;
+   196→const MIN_SAMPLE_SIZE_FOR_MEDIUM_CONFIDENCE = 10;
+   197→
+   198→/** Peak months (0-indexed): Jan-Feb (CNY), Jun (school), Nov-Dec (holidays) */
+   199→const PEAK_MONTHS = [0, 1, 5, 10, 11];
+   200→
+   201→/** Default multipliers for day types relative to weekday baseline */
+   202→const DEFAULT_DAY_TYPE_MULTIPLIERS = {
+   203→  WEEKDAY: 1.0,
+   204→  SATURDAY: 0.8,
+   205→  SUNDAY: 0.7,
+   206→  HOLIDAY: 0.6,
+   207→};
+   208→
+   209→// =============================================================================
+   210→// Route Utilization Service
+   211→// =============================================================================
+   212→
+   213→export class RouteUtilizationService extends BaseService {
+   214→  constructor() {
+   215→    super({ name: 'route-utilization-service', version: '1.0.0' });
+   216→  }
+   217→
+   218→  // ===========================================================================
+   219→  // Profile Retrieval
+   220→  // ===========================================================================
+   221→
+   222→  /**
+   223→   * Get the utilization profile for a route at a specific date.
+   224→   *
+   225→   * Returns the most recent effective profile for the route. If no profile
+   226→   * exists, returns null (callers should fall back to fleet average or default).
+   227→   *
+   228→   * @param routeId - Route UUID
+   229→   * @param asOfDate - Date to find effective profile for (defaults to today)
+   230→   * @returns Profile if found, null otherwise
+   231→   */
+   232→  async getProfile(
+   233→    routeId: string,
+   234→    asOfDate?: string
+   235→  ): Promise<RouteProfileWithMeta | null> {
+   236→    return this.traced('getProfile', async (span) => {
+   237→      span.setAttribute('route.id', routeId);
+   238→      const effectiveDate = asOfDate ?? new Date().toISOString().split('T')[0];
+   239→      span.setAttribute('profile.effectiveDate', effectiveDate);
+   240→
+   241→      // Find most recent effective profile
+   242→      const profile = await this.db.query.routeUtilizationProfiles.findFirst({
+   243→        where: and(
+   244→          eq(routeUtilizationProfiles.routeId, routeId),
+   245→          lte(routeUtilizationProfiles.effectiveDate, effectiveDate)
+   246→        ),
+   247→        orderBy: desc(routeUtilizationProfiles.effectiveDate),
+   248→        with: { route: true },
+   249→      });
+   250→
+   251→      if (!profile) {
+   252→        span.setAttribute('profile.found', false);
+   253→        return null;
+   254→      }
+   255→
+   256→      span.setAttribute('profile.found', true);
+   257→      span.setAttribute('profile.id', profile.id);
+   258→      span.setAttribute('profile.confidence', profile.confidence ?? 'MEDIUM');
+   259→
+   260→      return {
+   261→        ...profile,
+   262→        routeCode: profile.route?.routeCode,
+   263→        routeName: profile.route?.routeName,
+   264→      };
+   265→    });
+   266→  }
+   267→
+   268→  /**
+   269→   * Get profile by ID.
+   270→   */
+   271→  async getProfileById(id: string): Promise<RouteProfileWithMeta> {
+   272→    return this.traced('getProfileById', async (span) => {
+   273→      span.setAttribute('profile.id', id);
+   274→
+   275→      const profile = await this.db.query.routeUtilizationProfiles.findFirst({
+   276→        where: eq(routeUtilizationProfiles.id, id),
+   277→        with: { route: true },
+   278→      });
+   279→
+   280→      if (!profile) {
+   281→        throw new NotFoundError(`Route utilization profile not found: ${id}`, {
+   282→          entityType: 'route_utilization_profile',
+   283→          entityId: id,
+   284→        });
+   285→      }
+   286→
+   287→      return {
+   288→        ...profile,
+   289→        routeCode: profile.route?.routeCode,
+   290→        routeName: profile.route?.routeName,
+   291→      };
+   292→    });
+   293→  }
+   294→
+   295→  /**
+   296→   * Get all profiles for a route (historical).
+   297→   */
+   298→  async getProfileHistory(routeId: string): Promise<RouteUtilizationProfile[]> {
+   299→    return this.traced('getProfileHistory', async (span) => {
+   300→      span.setAttribute('route.id', routeId);
+   301→
+   302→      // Verify route exists
+   303→      const route = await this.db.query.routes.findFirst({
+   304→        where: eq(routes.id, routeId),
+   305→      });
+   306→
+   307→      if (!route) {
+   308→        throw new NotFoundError(`Route not found: ${routeId}`, {
+   309→          entityType: 'route',
+   310→          entityId: routeId,
+   311→        });
+   312→      }
+   313→
+   314→      const profiles = await this.db.query.routeUtilizationProfiles.findMany({
+   315→        where: eq(routeUtilizationProfiles.routeId, routeId),
+   316→        orderBy: desc(routeUtilizationProfiles.effectiveDate),
+   317→      });
+   318→
+   319→      span.setAttribute('profile.count', profiles.length);
+   320→      return profiles;
+   321→    });
+   322→  }
+   323→
+   324→  // ===========================================================================
+   325→  // Daily Rate Calculation
+   326→  // ===========================================================================
+   327→
+   328→  /**
+   329→   * Calculate expected daily km for a train based on available data.
+   330→   *
+   331→   * This is the primary method for mileage projection. It follows the
+   332→   * fallback hierarchy:
+   333→   * 1. Route-specific profile (if train has assigned route or default route)
+   334→   * 2. Fleet-wide average from recent mileage readings
+   335→   * 3. System default (250 km/day)
+   336→   *
+   337→   * The result includes source and confidence metadata for transparency.
+   338→   *
+   339→   * @param trainId - Train UUID
+   340→   * @param targetDate - Date to calculate rate for
+   341→   * @param routeId - Optional specific route ID (if known)
+   342→   * @param holidays - Optional array of holiday dates (YYYY-MM-DD)
+   343→   * @returns Daily rate with source and confidence
+   344→   */
+   345→  async calculateDailyRate(
+   346→    trainId: string,
+   347→    targetDate: string,
+   348→    routeId?: string,
+   349→    holidays?: string[]
+   350→  ): Promise<DailyRateResult> {
+   351→    return this.traced('calculateDailyRate', async (span) => {
+   352→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   353→      span.setAttribute('rate.targetDate', targetDate);
+   354→
+   355→      // Get train details
+   356→      const train = await this.db.query.trains.findFirst({
+   357→        where: eq(trains.id, trainId),
+   358→        with: { fleet: true },
+   359→      });
+   360→
+   361→      if (!train) {
+   362→        throw new NotFoundError(`Train not found: ${trainId}`, {
+   363→          entityType: 'train',
+   364→          entityId: trainId,
+   365→        });
+   366→      }
+   367→
+   368→      span.setAttribute(MmsAttributes.FLEET_ID, train.fleetId);
+   369→
+   370→      // Determine day type
+   371→      const dayType = this.getDayType(targetDate, holidays);
+   372→      span.setAttribute('rate.dayType', dayType);
+   373→
+   374→      // Try route-specific profile first
+   375→      if (routeId) {
+   376→        const profile = await this.getProfile(routeId, targetDate);
+   377→        if (profile) {
+   378→          const result = this.calculateFromProfile(profile, targetDate, dayType);
+   379→          span.setAttribute('rate.source', result.source);
+   380→          span.setAttribute('rate.dailyKm', result.dailyKm);
+   381→          span.setAttribute('rate.confidence', result.confidence);
+   382→          return result;
+   383→        }
+   384→      }
+   385→
+   386→      // Try typical route assignment from recent history
+   387→      const typicalRoute = await this.getTypicalRouteAssignment(trainId);
+   388→      if (typicalRoute) {
+   389→        const profile = await this.getProfile(typicalRoute.routeId, targetDate);
+   390→        if (profile) {
+   391→          const result = this.calculateFromProfile(profile, targetDate, dayType);
+   392→          // Slightly lower confidence since it's inferred from history
+   393→          result.confidence = result.confidence === 'HIGH' ? 'MEDIUM' : result.confidence;
+   394→          result.details = {
+   395→            ...result.details,
+   396→            routeCode: typicalRoute.routeCode,
+   397→          };
+   398→          span.setAttribute('rate.source', result.source);
+   399→          span.setAttribute('rate.sourceMethod', 'typical_route_assignment');
+   400→          span.setAttribute('rate.dailyKm', result.dailyKm);
+   401→          span.setAttribute('rate.confidence', result.confidence);
+   402→
+   403→          this.log.debug(
+   404→            {
+   405→              trainId,
+   406→              trainNumber: train.trainNumber,
+   407→              routeId: typicalRoute.routeId,
+   408→              routeCode: typicalRoute.routeCode,
+   409→              dailyKm: result.dailyKm,
+   410→              assignmentCount: typicalRoute.assignmentCount,
+   411→            },
+   412→            `Using typical route ${typicalRoute.routeCode} for train ${train.trainNumber}: ${result.dailyKm} km/day`
+   413→          );
+   414→
+   415→          return result;
+   416→        }
+   417→      }
+   418→
+   419→      // Fall back to fleet average
+   420→      const fleetAverage = await this.getFleetAverage(train.fleetId, targetDate);
+   421→      if (fleetAverage && fleetAverage.sampleSize >= MIN_SAMPLE_SIZE_FOR_MEDIUM_CONFIDENCE) {
+   422→        const result: DailyRateResult = {
+   423→          dailyKm: Math.round(fleetAverage.averageDailyKm),
+   424→          source: 'fleet_average',
+   425→          confidence: fleetAverage.confidence,
+   426→          details: {
+   427→            fleetId: train.fleetId,
+   428→            fleetCode: train.fleet?.code,
+   429→            dayType,
+   430→          },
+   431→        };
+   432→
+   433→        span.setAttribute('rate.source', result.source);
+   434→        span.setAttribute('rate.dailyKm', result.dailyKm);
+   435→        span.setAttribute('rate.confidence', result.confidence);
+   436→
+   437→        this.log.debug(
+   438→          {
+   439→            trainId,
+   440→            fleetId: train.fleetId,
+   441→            dailyKm: result.dailyKm,
+   442→            sampleSize: fleetAverage.sampleSize,
+   443→          },
+   444→          `Using fleet average for train ${train.trainNumber}: ${result.dailyKm} km/day`
+   445→        );
+   446→
+   447→        return result;
+   448→      }
+   449→
+   450→      // Fall back to system default
+   451→      const result: DailyRateResult = {
+   452→        dailyKm: SYSTEM_DEFAULT_DAILY_KM,
+   453→        source: 'system_default',
+   454→        confidence: 'ESTIMATED',
+   455→        details: {
+   456→          fleetId: train.fleetId,
+   457→          fleetCode: train.fleet?.code,
+   458→          dayType,
+   459→        },
+   460→      };
+   461→
+   462→      span.setAttribute('rate.source', result.source);
+   463→      span.setAttribute('rate.dailyKm', result.dailyKm);
+   464→      span.setAttribute('rate.confidence', result.confidence);
+   465→
+   466→      this.log.warn(
+   467→        {
+   468→          trainId,
+   469→          trainNumber: train.trainNumber,
+   470→          fleetId: train.fleetId,
+   471→          targetDate,
+   472→        },
+   473→        `No route profile or fleet average for train ${train.trainNumber}. Using system default ${SYSTEM_DEFAULT_DAILY_KM} km/day. This may cause significant projection errors over time.`
+   474→      );
+   475→
+   476→      return result;
+   477→    });
+   478→  }
+   479→
+   480→  /**
+   481→   * Calculate rate for a specific route (without train context).
+   482→   *
+   483→   * Used when planning route-level capacity or before train assignment.
+   484→   */
+   485→  async calculateRouteRate(
+   486→    routeId: string,
+   487→    targetDate: string,
+   488→    holidays?: string[]
+   489→  ): Promise<DailyRateResult> {
+   490→    return this.traced('calculateRouteRate', async (span) => {
+   491→      span.setAttribute('route.id', routeId);
+   492→      span.setAttribute('rate.targetDate', targetDate);
+   493→
+   494→      // Verify route exists
+   495→      const route = await this.db.query.routes.findFirst({
+   496→        where: eq(routes.id, routeId),
+   497→      });
+   498→
+   499→      if (!route) {
+   500→        throw new NotFoundError(`Route not found: ${routeId}`, {
+   501→          entityType: 'route',
+   502→          entityId: routeId,
+   503→        });
+   504→      }
+   505→
+   506→      const dayType = this.getDayType(targetDate, holidays);
+   507→      span.setAttribute('rate.dayType', dayType);
+   508→
+   509→      // Try route-specific profile
+   510→      const profile = await this.getProfile(routeId, targetDate);
+   511→      if (profile) {
+   512→        const result = this.calculateFromProfile(profile, targetDate, dayType);
+   513→        span.setAttribute('rate.source', result.source);
+   514→        span.setAttribute('rate.dailyKm', result.dailyKm);
+   515→        return result;
+   516→      }
+   517→
+   518→      // Fall back to route's default daily km if defined
+   519→      if (route.defaultDailyKm) {
+   520→        const result: DailyRateResult = {
+   521→          dailyKm: route.defaultDailyKm,
+   522→          source: `route:${routeId}`,
+   523→          confidence: 'LOW',
+   524→          details: {
+   525→            routeId,
+   526→            routeCode: route.routeCode,
+   527→            dayType,
+   528→          },
+   529→        };
+   530→        span.setAttribute('rate.source', result.source);
+   531→        span.setAttribute('rate.dailyKm', result.dailyKm);
+   532→        return result;
+   533→      }
+   534→
+   535→      // Fall back to expected km per day
+   536→      if (route.expectedKmPerDay) {
+   537→        const multiplier = DEFAULT_DAY_TYPE_MULTIPLIERS[dayType];
+   538→        const result: DailyRateResult = {
+   539→          dailyKm: Math.round(route.expectedKmPerDay * multiplier),
+   540→          source: `route:${routeId}`,
+   541→          confidence: 'LOW',
+   542→          details: {
+   543→            routeId,
+   544→            routeCode: route.routeCode,
+   545→            dayType,
+   546→          },
+   547→        };
+   548→        span.setAttribute('rate.source', result.source);
+   549→        span.setAttribute('rate.dailyKm', result.dailyKm);
+   550→        return result;
+   551→      }
+   552→
+   553→      // System default
+   554→      const result: DailyRateResult = {
+   555→        dailyKm: SYSTEM_DEFAULT_DAILY_KM,
+   556→        source: 'system_default',
+   557→        confidence: 'ESTIMATED',
+   558→        details: {
+   559→          routeId,
+   560→          routeCode: route.routeCode,
+   561→          dayType,
+   562→        },
+   563→      };
+   564→      span.setAttribute('rate.source', result.source);
+   565→      span.setAttribute('rate.dailyKm', result.dailyKm);
+   566→      return result;
+   567→    });
+   568→  }
+   569→
+   570→  // ===========================================================================
+   571→  // Mileage Projection
+   572→  // ===========================================================================
+   573→
+   574→  /**
+   575→   * Project mileage for a train over a time horizon.
+   576→   *
+   577→   * Starting from the train's current mileage, calculates daily projections
+   578→   * for the specified number of days. This is used by:
+   579→   * - PM scheduling (determine when train will hit maintenance thresholds)
+   580→   * - Drift monitoring (compare projected vs. actual)
+   581→   * - Strategic planning (long-term fleet mileage distribution)
+   582→   *
+   583→   * @param trainId - Train UUID
+   584→   * @param startDate - Projection start date (YYYY-MM-DD)
+   585→   * @param horizonDays - Number of days to project
+   586→   * @param routeId - Optional fixed route for all projections
+   587→   * @param holidays - Optional array of holiday dates
+   588→   * @returns Array of daily projections with cumulative mileage
+   589→   */
+   590→  async projectMileage(
+   591→    trainId: string,
+   592→    startDate: string,
+   593→    horizonDays: number,
+   594→    routeId?: string,
+   595→    holidays?: string[]
+   596→  ): Promise<MileageProjection[]> {
+   597→    return this.traced('projectMileage', async (span) => {
+   598→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   599→      span.setAttribute('projection.startDate', startDate);
+   600→      span.setAttribute('projection.horizonDays', horizonDays);
+   601→
+   602→      if (horizonDays < 1) {
+   603→        throw new ValidationError('Horizon days must be at least 1', {
+   604→          field: 'horizonDays',
+   605→          context: { value: horizonDays },
+   606→        });
+   607→      }
+   608→
+   609→      if (horizonDays > 3650) {
+   610→        throw new ValidationError('Horizon days cannot exceed 3650 (10 years)', {
+   611→          field: 'horizonDays',
+   612→          context: { value: horizonDays },
+   613→        });
+   614→      }
+   615→
+   616→      // Get train's current mileage
+   617→      const train = await this.db.query.trains.findFirst({
+   618→        where: eq(trains.id, trainId),
+   619→      });
+   620→
+   621→      if (!train) {
+   622→        throw new NotFoundError(`Train not found: ${trainId}`, {
+   623→          entityType: 'train',
+   624→          entityId: trainId,
+   625→        });
+   626→      }
+   627→
+   628→      let cumulativeKm = train.currentMileageKm;
+   629→      const projections: MileageProjection[] = [];
+   630→      const start = new Date(startDate);
+   631→
+   632→      // Calculate daily projections
+   633→      for (let day = 0; day < horizonDays; day++) {
+   634→        const targetDate = addDays(start, day);
+   635→        const dateStr = targetDate.toISOString().split('T')[0];
+   636→
+   637→        const rate = await this.calculateDailyRate(trainId, dateStr, routeId, holidays);
+   638→        cumulativeKm += rate.dailyKm;
+   639→
+   640→        projections.push({
+   641→          date: dateStr,
+   642→          projectedDailyKm: rate.dailyKm,
+   643→          cumulativeKm,
+   644→          source: rate.source,
+   645→          confidence: rate.confidence,
+   646→        });
+   647→      }
+   648→
+   649→      span.setAttribute('projection.count', projections.length);
+   650→      span.setAttribute(
+   651→        'projection.finalCumulativeKm',
+   652→        projections[projections.length - 1]?.cumulativeKm ?? cumulativeKm
+   653→      );
+   654→
+   655→      return projections;
+   656→    });
+   657→  }
+   658→
+   659→  /**
+   660→   * Project when a train will reach a target mileage.
+   661→   *
+   662→   * Useful for PM scheduling - determines the date when a train will hit
+   663→   * the next maintenance threshold.
+   664→   *
+   665→   * @param trainId - Train UUID
+   666→   * @param targetMileageKm - Target cumulative mileage to reach
+   667→   * @param maxHorizonDays - Maximum days to search (default: 365)
+   668→   * @returns Projected date and details, or null if not reached within horizon
+   669→   */
+   670→  async projectDateForMileage(
+   671→    trainId: string,
+   672→    targetMileageKm: number,
+   673→    maxHorizonDays: number = 365,
+   674→    routeId?: string,
+   675→    holidays?: string[]
+   676→  ): Promise<{
+   677→    projectedDate: string;
+   678→    daysFromNow: number;
+   679→    projectedMileage: number;
+   680→    confidence: ConfidenceLevel;
+   681→  } | null> {
+   682→    return this.traced('projectDateForMileage', async (span) => {
+   683→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   684→      span.setAttribute('target.mileageKm', targetMileageKm);
+   685→      span.setAttribute('target.maxHorizonDays', maxHorizonDays);
+   686→
+   687→      // Get train's current mileage
+   688→      const train = await this.db.query.trains.findFirst({
+   689→        where: eq(trains.id, trainId),
+   690→      });
+   691→
+   692→      if (!train) {
+   693→        throw new NotFoundError(`Train not found: ${trainId}`, {
+   694→          entityType: 'train',
+   695→          entityId: trainId,
+   696→        });
+   697→      }
+   698→
+   699→      if (train.currentMileageKm >= targetMileageKm) {
+   700→        span.setAttribute('result.alreadyReached', true);
+   701→        return {
+   702→          projectedDate: new Date().toISOString().split('T')[0],
+   703→          daysFromNow: 0,
+   704→          projectedMileage: train.currentMileageKm,
+   705→          confidence: 'HIGH',
+   706→        };
+   707→      }
+   708→
+   709→      const startDate = new Date().toISOString().split('T')[0];
+   710→      let cumulativeKm = train.currentMileageKm;
+   711→      const start = new Date(startDate);
+   712→      let worstConfidence: ConfidenceLevel = 'HIGH';
+   713→
+   714→      for (let day = 1; day <= maxHorizonDays; day++) {
+   715→        const targetDate = addDays(start, day);
+   716→        const dateStr = targetDate.toISOString().split('T')[0];
+   717→
+   718→        const rate = await this.calculateDailyRate(trainId, dateStr, routeId, holidays);
+   719→        cumulativeKm += rate.dailyKm;
+   720→
+   721→        // Track worst confidence level
+   722→        if (this.confidenceRank(rate.confidence) < this.confidenceRank(worstConfidence)) {
+   723→          worstConfidence = rate.confidence;
+   724→        }
+   725→
+   726→        if (cumulativeKm >= targetMileageKm) {
+   727→          span.setAttribute('result.found', true);
+   728→          span.setAttribute('result.projectedDate', dateStr);
+   729→          span.setAttribute('result.daysFromNow', day);
+   730→          return {
+   731→            projectedDate: dateStr,
+   732→            daysFromNow: day,
+   733→            projectedMileage: cumulativeKm,
+   734→            confidence: worstConfidence,
+   735→          };
+   736→        }
+   737→      }
+   738→
+   739→      span.setAttribute('result.found', false);
+   740→      span.setAttribute('result.reachedMileage', cumulativeKm);
+   741→      return null;
+   742→    });
+   743→  }
+   744→
+   745→  // ===========================================================================
+   746→  // Fleet Average Calculation
+   747→  // ===========================================================================
+   748→
+   749→  /**
+   750→   * Calculate fleet-wide average daily km from recent mileage readings.
+   751→   *
+   752→   * Uses the last 30 days of validated mileage readings to compute
+   753→   * a reliable average. Returns confidence based on sample size.
+   754→   *
+   755→   * @param fleetId - Fleet UUID
+   756→   * @param asOfDate - Calculate as of this date (defaults to today)
+   757→   * @returns Fleet average with metadata, or null if no data
+   758→   */
+   759→  async getFleetAverage(
+   760→    fleetId: string,
+   761→    asOfDate?: string
+   762→  ): Promise<FleetAverageResult | null> {
+   763→    return this.traced('getFleetAverage', async (span) => {
+   764→      span.setAttribute(MmsAttributes.FLEET_ID, fleetId);
+   765→
+   766→      const endDate = asOfDate ?? new Date().toISOString().split('T')[0];
+   767→      const startDate = addDays(new Date(endDate), -FLEET_AVERAGE_LOOKBACK_DAYS)
+   768→        .toISOString()
+   769→        .split('T')[0];
+   770→
+   771→      span.setAttribute('average.startDate', startDate);
+   772→      span.setAttribute('average.endDate', endDate);
+   773→
+   774→      // Get fleet for validation and metadata
+   775→      const fleet = await this.db.query.fleets.findFirst({
+   776→        where: eq(fleets.id, fleetId),
+   777→      });
+   778→
+   779→      if (!fleet) {
+   780→        throw new NotFoundError(`Fleet not found: ${fleetId}`, {
+   781→          entityType: 'fleet',
+   782→          entityId: fleetId,
+   783→        });
+   784→      }
+   785→
+   786→      // Calculate average from valid mileage readings
+   787→      const result = await this.db
+   788→        .select({
+   789→          avgDaily: avg(mileageReadings.dailyKm),
+   790→          sampleSize: sql<number>`COUNT(*)::int`,
+   791→        })
+   792→        .from(mileageReadings)
+   793→        .innerJoin(trains, eq(mileageReadings.trainId, trains.id))
+   794→        .where(
+   795→          and(
+   796→            eq(trains.fleetId, fleetId),
+   797→            eq(trains.active, true),
+   798→            gte(mileageReadings.readingDate, startDate),
+   799→            lte(mileageReadings.readingDate, endDate),
+   800→            eq(mileageReadings.validationStatus, 'VALID'),
+   801→            sql`${mileageReadings.dailyKm} > 0` // Exclude zero or null readings
+   802→          )
+   803→        );
+   804→
+   805→      const { avgDaily, sampleSize } = result[0];
+   806→
+   807→      if (!avgDaily || sampleSize === 0) {
+   808→        span.setAttribute('average.found', false);
+   809→        this.log.debug(
+   810→          { fleetId, fleetCode: fleet.code, startDate, endDate },
+   811→          `No valid mileage readings found for fleet ${fleet.code}`
+   812→        );
+   813→        return null;
+   814→      }
+   815→
+   816→      // Determine confidence based on sample size
+   817→      let confidence: ConfidenceLevel;
+   818→      if (sampleSize >= MIN_SAMPLE_SIZE_FOR_HIGH_CONFIDENCE) {
+   819→        confidence = 'MEDIUM'; // Fleet average is never "HIGH" - route-specific is preferred
+   820→      } else if (sampleSize >= MIN_SAMPLE_SIZE_FOR_MEDIUM_CONFIDENCE) {
+   821→        confidence = 'LOW';
+   822→      } else {
+   823→        confidence = 'ESTIMATED';
+   824→      }
+   825→
+   826→      span.setAttribute('average.found', true);
+   827→      span.setAttribute('average.value', Number(avgDaily));
+   828→      span.setAttribute('average.sampleSize', sampleSize);
+   829→      span.setAttribute('average.confidence', confidence);
+   830→
+   831→      return {
+   832→        fleetId,
+   833→        fleetCode: fleet.code,
+   834→        averageDailyKm: Math.round(Number(avgDaily)),
+   835→        sampleSize,
+   836→        periodStart: startDate,
+   837→        periodEnd: endDate,
+   838→        confidence,
+   839→      };
+   840→    });
+   841→  }
+   842→
+   843→  // ===========================================================================
+   844→  // Typical Route Assignment Lookup
+   845→  // ===========================================================================
+   846→
+   847→  /**
+   848→   * Find the typical route assignment for a train based on recent history.
+   849→   *
+   850→   * Queries the run_assignments table to find the most frequently assigned
+   851→   * route for the train in the last 30 days. This enables more accurate
+   852→   * mileage projections when the train doesn't have a fixed route assignment.
+   853→   *
+   854→   * @param trainId - Train UUID
+   855→   * @returns Most common route info if found, null otherwise
+   856→   */
+   857→  private async getTypicalRouteAssignment(
+   858→    trainId: string
+   859→  ): Promise<{ routeId: string; routeCode: string; assignmentCount: number } | null> {
+   860→    return this.traced('getTypicalRouteAssignment', async (span) => {
+   861→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   862→
+   863→      const thirtyDaysAgo = addDays(new Date(), -30).toISOString().split('T')[0];
+   864→      span.setAttribute('lookback.startDate', thirtyDaysAgo);
+   865→
+   866→      // Find the most frequently assigned route in the last 30 days
+   867→      const result = await this.db
+   868→        .select({
+   869→          routeId: runAssignments.routeId,
+   870→          routeCode: routes.routeCode,
+   871→          assignmentCount: sql<number>`COUNT(*)::int`,
+   872→        })
+   873→        .from(runAssignments)
+   874→        .innerJoin(routes, eq(runAssignments.routeId, routes.id))
+   875→        .where(
+   876→          and(
+   877→            eq(runAssignments.trainId, trainId),
+   878→            gte(runAssignments.assignmentDate, thirtyDaysAgo)
+   879→          )
+   880→        )
+   881→        .groupBy(runAssignments.routeId, routes.routeCode)
+   882→        .orderBy(desc(sql`COUNT(*)`))
+   883→        .limit(1);
+   884→
+   885→      if (result.length === 0 || !result[0]) {
+   886→        span.setAttribute('typicalRoute.found', false);
+   887→        return null;
+   888→      }
+   889→
+   890→      const { routeId, routeCode, assignmentCount } = result[0];
+   891→
+   892→      span.setAttribute('typicalRoute.found', true);
+   893→      span.setAttribute('typicalRoute.routeId', routeId);
+   894→      span.setAttribute('typicalRoute.routeCode', routeCode ?? 'UNKNOWN');
+   895→      span.setAttribute('typicalRoute.assignmentCount', assignmentCount);
+   896→
+   897→      this.log.debug(
+   898→        {
+   899→          trainId,
+   900→          routeId,
+   901→          routeCode,
+   902→          assignmentCount,
+   903→        },
+   904→        `Found typical route ${routeCode} for train with ${assignmentCount} assignments in last 30 days`
+   905→      );
+   906→
+   907→      return { routeId, routeCode: routeCode ?? 'UNKNOWN', assignmentCount };
+   908→    });
+   909→  }
+   910→
+   911→  // ===========================================================================
+   912→  // CRUD Operations
+   913→  // ===========================================================================
+   914→
+   915→  /**
+   916→   * Create a new route utilization profile.
+   917→   */
+   918→  async createProfile(request: CreateProfileRequest): Promise<RouteUtilizationProfile> {
+   919→    return this.inTransaction('createProfile', async (tx, span) => {
+   920→      const {
+   921→        routeId,
+   922→        effectiveDate = new Date().toISOString().split('T')[0],
+   923→        weekdayKm,
+   924→        saturdayKm,
+   925→        sundayKm,
+   926→        holidayKm,
+   927→        peakSeasonMultiplier = 1.0,
+   928→        offPeakMultiplier = 1.0,
+   929→        serviceHoursPerDay,
+   930→        roundTripKm,
+   931→        tripsPerDay,
+   932→        source,
+   933→        confidence = 'MEDIUM',
+   934→        notes,
+   935→      } = request;
+   936→
+   937→      span.setAttribute('route.id', routeId);
+   938→      span.setAttribute('profile.effectiveDate', effectiveDate);
+   939→
+   940→      // Verify route exists
+   941→      const route = await tx.query.routes.findFirst({
+   942→        where: eq(routes.id, routeId),
+   943→      });
+   944→
+   945→      if (!route) {
+   946→        throw new NotFoundError(`Route not found: ${routeId}`, {
+   947→          entityType: 'route',
+   948→          entityId: routeId,
+   949→        });
+   950→      }
+   951→
+   952→      // Validate weekdayKm
+   953→      if (weekdayKm < 0 || weekdayKm > 2000) {
+   954→        throw new ValidationError('Weekday km must be between 0 and 2000', {
+   955→          field: 'weekdayKm',
+   956→          context: { value: weekdayKm },
+   957→        });
+   958→      }
+   959→
+   960→      // Check for duplicate (same route and effective date)
+   961→      const existing = await tx.query.routeUtilizationProfiles.findFirst({
+   962→        where: and(
+   963→          eq(routeUtilizationProfiles.routeId, routeId),
+   964→          eq(routeUtilizationProfiles.effectiveDate, effectiveDate)
+   965→        ),
+   966→      });
+   967→
+   968→      if (existing) {
+   969→        throw new DuplicateError(
+   970→          `Profile already exists for route ${route.routeCode} on ${effectiveDate}`,
+   971→          {
+   972→            field: 'effectiveDate',
+   973→            value: effectiveDate,
+   974→            context: { routeId, routeCode: route.routeCode },
+   975→          }
+   976→        );
+   977→      }
+   978→
+   979→      // Create profile
+   980→      const profileData: NewRouteUtilizationProfile = {
+   981→        routeId,
+   982→        effectiveDate,
+   983→        weekdayKm,
+   984→        saturdayKm: saturdayKm ?? null,
+   985→        sundayKm: sundayKm ?? null,
+   986→        holidayKm: holidayKm ?? null,
+   987→        peakSeasonMultiplier: peakSeasonMultiplier.toString(),
+   988→        offPeakMultiplier: offPeakMultiplier.toString(),
+   989→        serviceHoursPerDay: serviceHoursPerDay?.toString() ?? null,
+   990→        roundTripKm: roundTripKm?.toString() ?? null,
+   991→        tripsPerDay: tripsPerDay ?? null,
+   992→        source: source ?? null,
+   993→        confidence,
+   994→        notes: notes ?? null,
+   995→      };
+   996→
+   997→      const [result] = await tx
+   998→        .insert(routeUtilizationProfiles)
+   999→        .values(profileData)
+  1000→        .returning();
+  1001→
+  1002→      span.setAttribute('profile.id', result.id);
+  1003→
+  1004→      this.log.info(
+  1005→        {
+  1006→          profileId: result.id,
+  1007→          routeId,
+  1008→          routeCode: route.routeCode,
+  1009→          effectiveDate,
+  1010→          weekdayKm,
+  1011→          confidence,
+  1012→        },
+  1013→        `Created route utilization profile for ${route.routeCode}: ${weekdayKm} km/day (weekday)`
+  1014→      );
+  1015→
+  1016→      return result;
+  1017→    });
+  1018→  }
+  1019→
+  1020→  /**
+  1021→   * Update an existing route utilization profile.
+  1022→   */
+  1023→  async updateProfile(
+  1024→    id: string,
+  1025→    data: UpdateProfileRequest
+  1026→  ): Promise<RouteUtilizationProfile> {
+  1027→    return this.inTransaction('updateProfile', async (tx, span) => {
+  1028→      span.setAttribute('profile.id', id);
+  1029→
+  1030→      const existing = await tx.query.routeUtilizationProfiles.findFirst({
+  1031→        where: eq(routeUtilizationProfiles.id, id),
+  1032→        with: { route: true },
+  1033→      });
+  1034→
+  1035→      if (!existing) {
+  1036→        throw new NotFoundError(`Route utilization profile not found: ${id}`, {
+  1037→          entityType: 'route_utilization_profile',
+  1038→          entityId: id,
+  1039→        });
+  1040→      }
+  1041→
+  1042→      // Validate weekdayKm if changing
+  1043→      if (data.weekdayKm !== undefined && (data.weekdayKm < 0 || data.weekdayKm > 2000)) {
+  1044→        throw new ValidationError('Weekday km must be between 0 and 2000', {
+  1045→          field: 'weekdayKm',
+  1046→          context: { value: data.weekdayKm },
+  1047→        });
+  1048→      }
+  1049→
+  1050→      // Build update object
+  1051→      const updateData: Record<string, unknown> = { updatedAt: new Date() };
+  1052→
+  1053→      if (data.weekdayKm !== undefined) updateData.weekdayKm = data.weekdayKm;
+  1054→      if (data.saturdayKm !== undefined) updateData.saturdayKm = data.saturdayKm;
+  1055→      if (data.sundayKm !== undefined) updateData.sundayKm = data.sundayKm;
+  1056→      if (data.holidayKm !== undefined) updateData.holidayKm = data.holidayKm;
+  1057→      if (data.peakSeasonMultiplier !== undefined) {
+  1058→        updateData.peakSeasonMultiplier = data.peakSeasonMultiplier.toString();
+  1059→      }
+  1060→      if (data.offPeakMultiplier !== undefined) {
+  1061→        updateData.offPeakMultiplier = data.offPeakMultiplier.toString();
+  1062→      }
+  1063→      if (data.serviceHoursPerDay !== undefined) {
+  1064→        updateData.serviceHoursPerDay = data.serviceHoursPerDay?.toString() ?? null;
+  1065→      }
+  1066→      if (data.roundTripKm !== undefined) {
+  1067→        updateData.roundTripKm = data.roundTripKm?.toString() ?? null;
+  1068→      }
+  1069→      if (data.tripsPerDay !== undefined) updateData.tripsPerDay = data.tripsPerDay;
+  1070→      if (data.source !== undefined) updateData.source = data.source;
+  1071→      if (data.confidence !== undefined) updateData.confidence = data.confidence;
+  1072→      if (data.notes !== undefined) updateData.notes = data.notes;
+  1073→
+  1074→      const [result] = await tx
+  1075→        .update(routeUtilizationProfiles)
+  1076→        .set(updateData)
+  1077→        .where(eq(routeUtilizationProfiles.id, id))
+  1078→        .returning();
+  1079→
+  1080→      this.log.info(
+  1081→        { profileId: id, updates: data },
+  1082→        'Route utilization profile updated'
+  1083→      );
+  1084→
+  1085→      return result;
+  1086→    });
+  1087→  }
+  1088→
+  1089→  /**
+  1090→   * List profiles with filtering.
+  1091→   */
+  1092→  async listProfiles(filters?: ProfileListFilters): Promise<RouteProfileWithMeta[]> {
+  1093→    return this.traced('listProfiles', async (span) => {
+  1094→      const conditions: SQL<unknown>[] = [];
+  1095→
+  1096→      if (filters?.routeId) {
+  1097→        conditions.push(eq(routeUtilizationProfiles.routeId, filters.routeId));
+  1098→      }
+  1099→      if (filters?.routeIds && filters.routeIds.length > 0) {
+  1100→        conditions.push(inArray(routeUtilizationProfiles.routeId, filters.routeIds));
+  1101→      }
+  1102→      if (filters?.confidence) {
+  1103→        if (Array.isArray(filters.confidence)) {
+  1104→          conditions.push(inArray(routeUtilizationProfiles.confidence, filters.confidence));
+  1105→        } else {
+  1106→          conditions.push(eq(routeUtilizationProfiles.confidence, filters.confidence));
+  1107→        }
+  1108→      }
+  1109→      if (filters?.effectiveDateFrom) {
+  1110→        conditions.push(gte(routeUtilizationProfiles.effectiveDate, filters.effectiveDateFrom));
+  1111→      }
+  1112→      if (filters?.effectiveDateTo) {
+  1113→        conditions.push(lte(routeUtilizationProfiles.effectiveDate, filters.effectiveDateTo));
+  1114→      }
+  1115→
+  1116→      const profiles = await this.db.query.routeUtilizationProfiles.findMany({
+  1117→        where: conditions.length > 0 ? and(...conditions) : undefined,
+  1118→        orderBy: [desc(routeUtilizationProfiles.effectiveDate)],
+  1119→        with: { route: true },
+  1120→      });
+  1121→
+  1122→      span.setAttribute('result.count', profiles.length);
+  1123→
+  1124→      return profiles.map((p) => ({
+  1125→        ...p,
+  1126→        routeCode: p.route?.routeCode,
+  1127→        routeName: p.route?.routeName,
+  1128→      }));
+  1129→    });
+  1130→  }
+  1131→
+  1132→  /**
+  1133→   * Delete a profile.
+  1134→   */
+  1135→  async deleteProfile(id: string): Promise<void> {
+  1136→    return this.inTransaction('deleteProfile', async (tx, span) => {
+  1137→      span.setAttribute('profile.id', id);
+  1138→
+  1139→      const existing = await tx.query.routeUtilizationProfiles.findFirst({
+  1140→        where: eq(routeUtilizationProfiles.id, id),
+  1141→        with: { route: true },
+  1142→      });
+  1143→
+  1144→      if (!existing) {
+  1145→        throw new NotFoundError(`Route utilization profile not found: ${id}`, {
+  1146→          entityType: 'route_utilization_profile',
+  1147→          entityId: id,
+  1148→        });
+  1149→      }
+  1150→
+  1151→      await tx.delete(routeUtilizationProfiles).where(eq(routeUtilizationProfiles.id, id));
+  1152→
+  1153→      this.log.info(
+  1154→        {
+  1155→          profileId: id,
+  1156→          routeId: existing.routeId,
+  1157→          routeCode: existing.route?.routeCode,
+  1158→          effectiveDate: existing.effectiveDate,
+  1159→        },
+  1160→        `Deleted route utilization profile for ${existing.route?.routeCode}`
+  1161→      );
+  1162→    });
+  1163→  }
+  1164→
+  1165→  // ===========================================================================
+  1166→  // Projection Accuracy Analysis
+  1167→  // ===========================================================================
+  1168→
+  1169→  /**
+  1170→   * Analyze projection accuracy across the fleet.
+  1171→   *
+  1172→   * This method identifies trains that are using fallback calculations
+  1173→   * (fleet average or system default) instead of route-specific profiles.
+  1174→   * Fleet-wide averages can result in 60,000+ km projection error over
+  1175→   * the 12-year contract period.
+  1176→   *
+  1177→   * @param fleetIds - Optional list of fleet IDs to analyze (all fleets if not specified)
+  1178→   * @returns Comprehensive analysis of projection accuracy
+  1179→   */
+  1180→  async analyzeProjectionAccuracy(fleetIds?: string[]): Promise<ProjectionAccuracyAnalysis> {
+  1181→    return this.traced('analyzeProjectionAccuracy', async (span) => {
+  1182→      const analysisTime = new Date().toISOString();
+  1183→      const targetDate = new Date().toISOString().split('T')[0];
+  1184→
+  1185→      // Get all active trains
+  1186→      const allTrains = await this.db.query.trains.findMany({
+  1187→        where: eq(trains.fitnessStatus, 'FIT'),
+  1188→        with: { fleet: true },
+  1189→      });
+  1190→      const filteredTrains = fleetIds
+  1191→        ? allTrains.filter((t) => fleetIds.includes(t.fleetId))
+  1192→        : allTrains;
+  1193→
+  1194→      span.setAttribute('analysis.totalTrains', filteredTrains.length);
+  1195→
+  1196→      const fallbackTrains: TrainProjectionInfo[] = [];
+  1197→      let routeProfileCount = 0;
+  1198→      let fleetAverageCount = 0;
+  1199→      let systemDefaultCount = 0;
+  1200→      let totalImpactKm = 0;
+  1201→
+  1202→      // Analyze each train's projection source
+  1203→      for (const train of filteredTrains) {
+  1204→        const rate = await this.calculateDailyRate(train.id, targetDate);
+  1205→
+  1206→        if (rate.source.startsWith('route:')) {
+  1207→          routeProfileCount++;
+  1208→        } else if (rate.source === 'fleet_average') {
+  1209→          fleetAverageCount++;
+  1210→          // Estimate projection uncertainty: fleet averages have ~20% variance
+  1211→          const dailyVariance = rate.dailyKm * 0.2;
+  1212→          const yearlyImpact = dailyVariance * 365;
+  1213→          const twelveYearImpact = Math.round(yearlyImpact * 12);
+  1214→          totalImpactKm += twelveYearImpact;
+  1215→
+  1216→          fallbackTrains.push({
+  1217→            trainId: train.id,
+  1218→            trainNumber: train.trainNumber,
+  1219→            fleetId: train.fleetId,
+  1220→            fleetCode: train.fleet?.code ?? 'UNKNOWN',
+  1221→            source: rate.source,
+  1222→            confidence: rate.confidence,
+  1223→            dailyKm: rate.dailyKm,
+  1224→            projectionImpactKm: twelveYearImpact,
+  1225→            confidenceClass: this.getConfidenceClass(rate.confidence),
+  1226→          });
+  1227→        } else {
+  1228→          systemDefaultCount++;
+  1229→          // System default has very high uncertainty: ~50%
+  1230→          const dailyVariance = rate.dailyKm * 0.5;
+  1231→          const yearlyImpact = dailyVariance * 365;
+  1232→          const twelveYearImpact = Math.round(yearlyImpact * 12);
+  1233→          totalImpactKm += twelveYearImpact;
+  1234→
+  1235→          fallbackTrains.push({
+  1236→            trainId: train.id,
+  1237→            trainNumber: train.trainNumber,
+  1238→            fleetId: train.fleetId,
+  1239→            fleetCode: train.fleet?.code ?? 'UNKNOWN',
+  1240→            source: rate.source,
+  1241→            confidence: rate.confidence,
+  1242→            dailyKm: rate.dailyKm,
+  1243→            projectionImpactKm: twelveYearImpact,
+  1244→            confidenceClass: this.getConfidenceClass(rate.confidence),
+  1245→          });
+  1246→        }
+  1247→      }
+  1248→
+  1249→      const totalTrains = filteredTrains.length;
+  1250→      const routeCoveragePct =
+  1251→        totalTrains > 0 ? Math.round((routeProfileCount / totalTrains) * 100) : 0;
+  1252→
+  1253→      // Estimate potential missed PMs: each PM cycle is ~25,000 km for C1
+  1254→      const potentialMissedPMs = Math.round(totalImpactKm / 25000);
+  1255→
+  1256→      // Generate recommendations
+  1257→      const recommendations = this.generateAccuracyRecommendations(
+  1258→        routeCoveragePct,
+  1259→        fleetAverageCount,
+  1260→        systemDefaultCount,
+  1261→        fallbackTrains
+  1262→      );
+  1263→
+  1264→      // Determine if warning is needed
+  1265→      const { requiresWarning, warningSeverity } = this.determineWarningSeverity(
+  1266→        routeCoveragePct,
+  1267→        systemDefaultCount
+  1268→      );
+  1269→
+  1270→      span.setAttribute('analysis.routeCoverage', routeCoveragePct);
+  1271→      span.setAttribute('analysis.fallbackCount', fallbackTrains.length);
+  1272→      span.setAttribute('analysis.requiresWarning', requiresWarning);
+  1273→      if (warningSeverity) {
+  1274→        span.setAttribute('analysis.warningSeverity', warningSeverity);
+  1275→      }
+  1276→
+  1277→      const analysis: ProjectionAccuracyAnalysis = {
+  1278→        analysisTime,
+  1279→        totalTrains,
+  1280→        routeProfileCount,
+  1281→        fleetAverageCount,
+  1282→        systemDefaultCount,
+  1283→        routeCoveragePct,
+  1284→        fallbackTrains,
+  1285→        totalImpactKm,
+  1286→        potentialMissedPMs,
+  1287→        recommendations,
+  1288→        requiresWarning,
+  1289→        warningSeverity,
+  1290→      };
+  1291→
+  1292→      if (requiresWarning) {
+  1293→        this.log.warn(
+  1294→          {
+  1295→            routeCoveragePct,
+  1296→            fallbackCount: fallbackTrains.length,
+  1297→            systemDefaultCount,
+  1298→            totalImpactKm,
+  1299→            severity: warningSeverity,
+  1300→          },
+  1301→          `Projection accuracy warning: ${100 - routeCoveragePct}% of trains lack route-specific profiles. Potential ${totalImpactKm.toLocaleString()} km projection error over 12 years.`
+  1302→        );
+  1303→      }
+  1304→
+  1305→      return analysis;
+  1306→    });
+  1307→  }
+  1308→
+  1309→  /**
+  1310→   * Emit a projection accuracy warning notification.
+  1311→   *
+  1312→   * This should be called periodically (e.g., weekly) or when route profiles
+  1313→   * are modified to alert stakeholders about projection accuracy issues.
+  1314→   *
+  1315→   * @param analysis - The projection accuracy analysis result
+  1316→   * @param recipientIds - User IDs to receive the notification
+  1317→   * @returns Job ID if notification was queued, null if no warning needed
+  1318→   */
+  1319→  async emitProjectionAccuracyWarning(
+  1320→    analysis: ProjectionAccuracyAnalysis,
+  1321→    recipientIds: string[]
+  1322→  ): Promise<string | null> {
+  1323→    return this.traced('emitProjectionAccuracyWarning', async (span) => {
+  1324→      if (!analysis.requiresWarning) {
+  1325→        span.setAttribute('warning.skipped', true);
+  1326→        span.setAttribute('warning.reason', 'no_warning_needed');
+  1327→        return null;
+  1328→      }
+  1329→
+  1330→      span.setAttribute('warning.severity', analysis.warningSeverity ?? 'MEDIUM');
+  1331→      span.setAttribute('warning.recipientCount', recipientIds.length);
+  1332→
+  1333→      // Queue notification job
+  1334→      const job = await addJob(QUEUE_NAMES.NOTIFICATION, 'projection_accuracy_warning', {
+  1335→        type: 'PROJECTION_ACCURACY_WARNING' as const,
+  1336→        severity: analysis.warningSeverity ?? 'MEDIUM',
+  1337→        recipients: recipientIds,
+  1338→        template: 'projection_accuracy_warning',
+  1339→        subject: `[MMS] Projection Accuracy Warning - ${100 - analysis.routeCoveragePct}% of trains using fallback rates`,
+  1340→        data: {
+  1341→          severity: analysis.warningSeverity,
+  1342→          detectionTime: analysis.analysisTime,
+  1343→          trainCount: analysis.fallbackTrains.length,
+  1344→          routeCoverage: analysis.routeCoveragePct,
+  1345→          trains: analysis.fallbackTrains.slice(0, 20).map((t) => ({
+  1346→            trainNumber: t.trainNumber,
+  1347→            fleetCode: t.fleetCode,
+  1348→            confidence: t.confidence,
+  1349→            confidenceClass: t.confidenceClass,
+  1350→            source: t.source === 'fleet_average' ? 'Fleet Average' : 'System Default',
+  1351→            dailyKm: t.dailyKm,
+  1352→            projectionImpactKm: t.projectionImpactKm.toLocaleString(),
+  1353→          })),
+  1354→          totalImpactKm: analysis.totalImpactKm.toLocaleString(),
+  1355→          potentialMissedPMs: analysis.potentialMissedPMs.toLocaleString(),
+  1356→          recommendations: analysis.recommendations,
+  1357→          dashboardUrl: '/admin/route-utilization',
+  1358→        },
+  1359→      });
+  1360→
+  1361→      this.log.info(
+  1362→        {
+  1363→          jobId: job.id,
+  1364→          severity: analysis.warningSeverity,
+  1365→          fallbackCount: analysis.fallbackTrains.length,
+  1366→          totalImpactKm: analysis.totalImpactKm,
+  1367→        },
+  1368→        'Projection accuracy warning notification queued'
+  1369→      );
+  1370→
+  1371→      return job.id ?? null;
+  1372→    });
+  1373→  }
+  1374→
+  1375→  /**
+  1376→   * Get CSS class name for confidence level.
+  1377→   */
+  1378→  private getConfidenceClass(
+  1379→    confidence: ConfidenceLevel
+  1380→  ): 'high-confidence' | 'medium-confidence' | 'low-confidence' | 'estimated' {
+  1381→    switch (confidence) {
+  1382→      case 'HIGH':
+  1383→        return 'high-confidence';
+  1384→      case 'MEDIUM':
+  1385→        return 'medium-confidence';
+  1386→      case 'LOW':
+  1387→        return 'low-confidence';
+  1388→      case 'ESTIMATED':
+  1389→        return 'estimated';
+  1390→    }
+  1391→  }
+  1392→
+  1393→  /**
+  1394→   * Generate recommendations based on analysis results.
+  1395→   */
+  1396→  private generateAccuracyRecommendations(
+  1397→    routeCoveragePct: number,
+  1398→    fleetAverageCount: number,
+  1399→    systemDefaultCount: number,
+  1400→    fallbackTrains: TrainProjectionInfo[]
+  1401→  ): string[] {
+  1402→    const recommendations: string[] = [];
+  1403→
+  1404→    if (systemDefaultCount > 0) {
+  1405→      recommendations.push(
+  1406→        `CRITICAL: ${systemDefaultCount} train(s) using system default (250 km/day). ` +
+  1407→          'Add route utilization profiles or improve mileage data collection.'
+  1408→      );
+  1409→    }
+  1410→
+  1411→    if (routeCoveragePct < 50) {
+  1412→      recommendations.push(
+  1413→        `Route profile coverage is ${routeCoveragePct}% - below 50% threshold. ` +
+  1414→          'Create route-specific utilization profiles for accurate PM scheduling.'
+  1415→      );
+  1416→    }
+  1417→
+  1418→    if (fleetAverageCount > 0 && fleetAverageCount <= 10) {
+  1419→      const affectedTrains = fallbackTrains
+  1420→        .filter((t) => t.source === 'fleet_average')
+  1421→        .map((t) => t.trainNumber)
+  1422→        .slice(0, 5);
+  1423→      recommendations.push(
+  1424→        `Assign routes to these trains for improved accuracy: ${affectedTrains.join(', ')}${fleetAverageCount > 5 ? '...' : ''}`
+  1425→      );
+  1426→    }
+  1427→
+  1428→    if (routeCoveragePct >= 80 && routeCoveragePct < 95) {
+  1429→      recommendations.push(
+  1430→        'Route coverage is good but could be improved. Consider adding profiles for remaining routes.'
+  1431→      );
+  1432→    }
+  1433→
+  1434→    if (recommendations.length === 0) {
+  1435→      recommendations.push('Projection accuracy is within acceptable limits.');
+  1436→    }
+  1437→
+  1438→    return recommendations;
+  1439→  }
+  1440→
+  1441→  /**
+  1442→   * Determine warning severity based on analysis metrics.
+  1443→   */
+  1444→  private determineWarningSeverity(
+  1445→    routeCoveragePct: number,
+  1446→    systemDefaultCount: number
+  1447→  ): { requiresWarning: boolean; warningSeverity?: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' } {
+  1448→    // CRITICAL: Any train using system default (highest uncertainty)
+  1449→    if (systemDefaultCount > 0) {
+  1450→      return { requiresWarning: true, warningSeverity: 'CRITICAL' };
+  1451→    }
+  1452→
+  1453→    // HIGH: Less than 50% route coverage
+  1454→    if (routeCoveragePct < 50) {
+  1455→      return { requiresWarning: true, warningSeverity: 'HIGH' };
+  1456→    }
+  1457→
+  1458→    // MEDIUM: Less than 70% route coverage
+  1459→    if (routeCoveragePct < 70) {
+  1460→      return { requiresWarning: true, warningSeverity: 'MEDIUM' };
+  1461→    }
+  1462→
+  1463→    // LOW: Less than 90% route coverage
+  1464→    if (routeCoveragePct < 90) {
+  1465→      return { requiresWarning: true, warningSeverity: 'LOW' };
+  1466→    }
+  1467→
+  1468→    // No warning needed for >= 90% coverage with no system defaults
+  1469→    return { requiresWarning: false };
+  1470→  }
+  1471→
+  1472→  // ===========================================================================
+  1473→  // Helper Methods
+  1474→  // ===========================================================================
+  1475→
+  1476→  /**
+  1477→   * Determine day type for a given date.
+  1478→   */
+  1479→  getDayType(dateStr: string, holidays?: string[]): UtilizationDayType {
+  1480→    if (holidays?.includes(dateStr)) {
+  1481→      return 'HOLIDAY';
+  1482→    }
+  1483→
+  1484→    const date = new Date(dateStr);
+  1485→    const dayOfWeek = date.getDay();
+  1486→
+  1487→    if (dayOfWeek === 0) return 'SUNDAY';
+  1488→    if (dayOfWeek === 6) return 'SATURDAY';
+  1489→    return 'WEEKDAY';
+  1490→  }
+  1491→
+  1492→  /**
+  1493→   * Check if a date is in peak season.
+  1494→   */
+  1495→  isPeakSeason(dateStr: string): boolean {
+  1496→    const date = new Date(dateStr);
+  1497→    return PEAK_MONTHS.includes(date.getMonth());
+  1498→  }
+  1499→
+  1500→  /**
+  1501→   * Calculate daily rate from a route profile.
+  1502→   */
+  1503→  private calculateFromProfile(
+  1504→    profile: RouteUtilizationProfile,
+  1505→    targetDate: string,
+  1506→    dayType: UtilizationDayType
+  1507→  ): DailyRateResult {
+  1508→    // Get base km for day type
+  1509→    let baseKm: number;
+  1510→    switch (dayType) {
+  1511→      case 'SATURDAY':
+  1512→        baseKm = profile.saturdayKm ?? Math.round(profile.weekdayKm * DEFAULT_DAY_TYPE_MULTIPLIERS.SATURDAY);
+  1513→        break;
+  1514→      case 'SUNDAY':
+  1515→        baseKm = profile.sundayKm ?? Math.round(profile.weekdayKm * DEFAULT_DAY_TYPE_MULTIPLIERS.SUNDAY);
+  1516→        break;
+  1517→      case 'HOLIDAY':
+  1518→        baseKm = profile.holidayKm ?? Math.round(profile.weekdayKm * DEFAULT_DAY_TYPE_MULTIPLIERS.HOLIDAY);
+  1519→        break;
+  1520→      default:
+  1521→        baseKm = profile.weekdayKm;
+  1522→    }
+  1523→
+  1524→    // Apply seasonal multiplier
+  1525→    const isPeak = this.isPeakSeason(targetDate);
+  1526→    const multiplier = isPeak
+  1527→      ? parseFloat(profile.peakSeasonMultiplier ?? '1.0')
+  1528→      : parseFloat(profile.offPeakMultiplier ?? '1.0');
+  1529→
+  1530→    const dailyKm = Math.round(baseKm * multiplier);
+  1531→
+  1532→    return {
+  1533→      dailyKm,
+  1534→      source: `route:${profile.routeId}`,
+  1535→      confidence: (profile.confidence ?? 'MEDIUM') as ConfidenceLevel,
+  1536→      details: {
+  1537→        routeId: profile.routeId,
+  1538→        dayType,
+  1539→        seasonalMultiplier: multiplier,
+  1540→        profileEffectiveDate: profile.effectiveDate,
+  1541→      },
+  1542→    };
+  1543→  }
+  1544→
+  1545→  /**
+  1546→   * Get numeric rank for confidence level (higher = better).
+  1547→   */
+  1548→  private confidenceRank(confidence: ConfidenceLevel): number {
+  1549→    switch (confidence) {
+  1550→      case 'HIGH':
+  1551→        return 4;
+  1552→      case 'MEDIUM':
+  1553→        return 3;
+  1554→      case 'LOW':
+  1555→        return 2;
+  1556→      case 'ESTIMATED':
+  1557→        return 1;
+  1558→    }
+  1559→  }
+  1560→}
+  1561→
+  1562→// =============================================================================
+  1563→// Singleton Export
+  1564→// =============================================================================
+  1565→
+  1566→let routeUtilizationServiceInstance: RouteUtilizationService | null = null;
+  1567→
+  1568→export function getRouteUtilizationService(): RouteUtilizationService {
+  1569→  if (!routeUtilizationServiceInstance) {
+  1570→    routeUtilizationServiceInstance = new RouteUtilizationService();
+  1571→  }
+  1572→  return routeUtilizationServiceInstance;
+  1573→}
+  1574→
+  1575→export default RouteUtilizationService;
+  1576→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

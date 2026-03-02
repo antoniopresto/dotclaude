@@ -1,0 +1,1197 @@
+     1→/**
+     2→ * MMS Ingestion Service
+     3→ *
+     4→ * Processes daily CSV files containing mileage data.
+     5→ * Validates records, handles meter events, and updates the database.
+     6→ *
+     7→ * Data flow:
+     8→ * 1. CSV file arrives via file watcher or API upload
+     9→ * 2. File is validated (format, size, structure)
+    10→ * 3. Records are parsed and validated in batches
+    11→ * 4. Anomalies are detected (NEGATIVE, SPIKE, DUPLICATE)
+    12→ * 5. Mileage readings are inserted/updated
+    13→ * 6. Train current_mileage_km is updated
+    14→ * 7. Fleet mileage targets are recalculated
+    15→ *
+    16→ * Business rules:
+    17→ * - Max file size: 10MB
+    18→ * - Expected file pattern: mileage_YYYYMMDD.csv
+    19→ * - Batch size: 100 records per transaction
+    20→ * - Anomaly thresholds: NEGATIVE < 0, SPIKE > 1000 km/day
+    21→ * - Meter adjustments are applied to maintain mileage continuity
+    22→ *
+    23→ * @see specs/004-domain-services.md Section 4.2
+    24→ */
+    25→
+    26→import { eq, and, desc, lte, sql } from 'drizzle-orm';
+    27→import * as Papa from 'papaparse';
+    28→import * as fs from 'node:fs';
+    29→import * as path from 'node:path';
+    30→import { BaseService, MmsAttributes } from '../lib/services/base';
+    31→import { trains, mileageReadings, meterEvents } from '../lib/db/schema';
+    32→import {
+    33→  ValidationError,
+    34→  FileError,
+    35→  BusinessRuleError,
+    36→} from '../lib/errors';
+    37→import { parseMileageCsvRow } from '../lib/schemas';
+    38→import { addJob, QUEUE_NAMES, type IngestionJobData } from '../lib/queue';
+    39→import { ingestionMetrics, recordIngestionComplete, recordIngestionAnomaly } from '../lib/metrics';
+    40→
+    41→// =============================================================================
+    42→// Constants
+    43→// =============================================================================
+    44→
+    45→const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+    46→const EXPECTED_FILE_PATTERN = /^mileage_\d{8}\.csv$/;
+    47→const BATCH_SIZE = 100;
+    48→const SPIKE_THRESHOLD_KM = 1000;
+    49→const ALERT_THRESHOLD_HOURS = 2;
+    50→
+    51→// =============================================================================
+    52→// Types
+    53→// =============================================================================
+    54→
+    55→/** Anomaly types detected during ingestion */
+    56→export type AnomalyType = 'NEGATIVE' | 'SPIKE' | 'DUPLICATE' | 'MISSING' | 'FUTURE_DATE' | 'UNKNOWN_TRAIN';
+    57→
+    58→/** A detected anomaly in the mileage data */
+    59→export interface AnomalyRecord {
+    60→  trainNumber: string;
+    61→  readingDate: string;
+    62→  type: AnomalyType;
+    63→  value: number | null;
+    64→  message: string;
+    65→  rawReading?: number;
+    66→  previousReading?: number;
+    67→}
+    68→
+    69→/** Result of meter event detection */
+    70→export interface MeterEventRecord {
+    71→  trainNumber: string;
+    72→  trainId: string;
+    73→  eventDate: string;
+    74→  eventType: 'RESET' | 'REPLACEMENT' | 'CALIBRATION' | 'SWAP';
+    75→  oldReading: number;
+    76→  newReading: number;
+    77→  adjustmentKm: number;
+    78→}
+    79→
+    80→/** Configuration for the file watcher */
+    81→export interface FileWatcherConfig {
+    82→  inboxPath: string;
+    83→  processedPath: string;
+    84→  quarantinePath: string;
+    85→  expectedFilePattern?: RegExp;
+    86→  maxFileSizeBytes?: number;
+    87→  alertThresholdHours?: number;
+    88→  pollIntervalMs?: number;
+    89→}
+    90→
+    91→/** Result of file validation */
+    92→export interface FileValidationResult {
+    93→  valid: boolean;
+    94→  errors: string[];
+    95→  warnings: string[];
+    96→  fileSize: number;
+    97→  rowCount?: number;
+    98→}
+    99→
+   100→/** Result of ingestion processing */
+   101→export interface IngestionResult {
+   102→  jobId: string;
+   103→  fileName: string;
+   104→  totalRecords: number;
+   105→  validRecords: number;
+   106→  invalidRecords: number;
+   107→  anomalies: AnomalyRecord[];
+   108→  meterEvents: MeterEventRecord[];
+   109→  processingTimeMs: number;
+   110→  trainsUpdated: number;
+   111→  status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
+   112→  errorMessage?: string;
+   113→}
+   114→
+   115→/** Internal record type after parsing */
+   116→interface ParsedMileageRecord {
+   117→  trainNumber: string;
+   118→  readingDate: string;
+   119→  odometerKm: number;
+   120→  rowIndex: number;
+   121→}
+   122→
+   123→/** Row validation result */
+   124→interface RowValidationResult {
+   125→  valid: boolean;
+   126→  record?: ParsedMileageRecord;
+   127→  error?: string;
+   128→  anomaly?: AnomalyRecord;
+   129→}
+   130→
+   131→/** Filters for mileage readings query */
+   132→export interface MileageReadingFilters {
+   133→  trainId?: string;
+   134→  fromDate?: string;
+   135→  toDate?: string;
+   136→  validationStatus?: 'PENDING' | 'VALID' | 'ANOMALY' | 'CORRECTED';
+   137→  page?: number;
+   138→  pageSize?: number;
+   139→}
+   140→
+   141→/** Mileage reading with train information */
+   142→export interface MileageReadingWithTrain {
+   143→  trainId: string;
+   144→  trainNumber: string;
+   145→  readingDate: string;
+   146→  rawReading: number;
+   147→  adjustedReading: number;
+   148→  dailyKm: number | null;
+   149→  validationStatus: 'PENDING' | 'VALID' | 'ANOMALY' | 'CORRECTED';
+   150→  sourceFile: string | null;
+   151→}
+   152→
+   153→/** Database-stored anomaly types (subset of AnomalyType) */
+   154→export type DbAnomalyType = 'NEGATIVE' | 'SPIKE' | 'MISSING' | 'DUPLICATE';
+   155→
+   156→/** Filters for anomaly query */
+   157→export interface AnomalyQueryFilters {
+   158→  trainId?: string;
+   159→  fromDate?: string;
+   160→  toDate?: string;
+   161→  anomalyType?: DbAnomalyType;
+   162→  page?: number;
+   163→  pageSize?: number;
+   164→}
+   165→
+   166→/** Anomaly with details for API response */
+   167→export interface AnomalyWithDetails {
+   168→  trainId: string;
+   169→  trainNumber: string;
+   170→  readingDate: string;
+   171→  anomalyType: DbAnomalyType | null;
+   172→  rawReading: number;
+   173→  dailyKm: number | null;
+   174→  expectedRange: { min: number; max: number };
+   175→  suggestedAction: string;
+   176→}
+   177→
+   178→// =============================================================================
+   179→// Ingestion Service
+   180→// =============================================================================
+   181→
+   182→export class IngestionService extends BaseService {
+   183→  private lastFileReceivedAt: Date | null = null;
+   184→
+   185→  constructor() {
+   186→    super({ name: 'ingestion-service', version: '1.0.0' });
+   187→  }
+   188→
+   189→  // ===========================================================================
+   190→  // File Validation
+   191→  // ===========================================================================
+   192→
+   193→  /**
+   194→   * Validate a mileage CSV file before processing
+   195→   *
+   196→   * Checks:
+   197→   * - File exists and is readable
+   198→   * - File size within limit
+   199→   * - Filename matches expected pattern
+   200→   * - CSV structure is valid
+   201→   * - Required columns present
+   202→   */
+   203→  async validateFile(filePath: string): Promise<FileValidationResult> {
+   204→    return this.traced('validateFile', async (span) => {
+   205→      span.setAttribute('file.path', filePath);
+   206→
+   207→      const errors: string[] = [];
+   208→      const warnings: string[] = [];
+   209→      const fileName = path.basename(filePath);
+   210→
+   211→      // Check file exists
+   212→      if (!fs.existsSync(filePath)) {
+   213→        return {
+   214→          valid: false,
+   215→          errors: [`File not found: ${filePath}`],
+   216→          warnings: [],
+   217→          fileSize: 0,
+   218→        };
+   219→      }
+   220→
+   221→      // Check file size
+   222→      const stats = fs.statSync(filePath);
+   223→      const fileSize = stats.size;
+   224→      span.setAttribute('file.size', fileSize);
+   225→
+   226→      if (fileSize === 0) {
+   227→        errors.push('File is empty');
+   228→      }
+   229→
+   230→      if (fileSize > MAX_FILE_SIZE_BYTES) {
+   231→        errors.push(`File size ${fileSize} exceeds maximum ${MAX_FILE_SIZE_BYTES} bytes`);
+   232→      }
+   233→
+   234→      // Check filename pattern
+   235→      if (!EXPECTED_FILE_PATTERN.test(fileName)) {
+   236→        warnings.push(`Filename '${fileName}' does not match expected pattern mileage_YYYYMMDD.csv`);
+   237→      }
+   238→
+   239→      // Validate CSV structure (read first 10 lines)
+   240→      if (fileSize > 0) {
+   241→        try {
+   242→          const sample = this.readFirstLines(filePath, 10);
+   243→          const structureErrors = this.validateCsvStructure(sample);
+   244→          errors.push(...structureErrors);
+   245→        } catch (error) {
+   246→          errors.push(`Failed to read CSV: ${error instanceof Error ? error.message : 'Unknown error'}`);
+   247→        }
+   248→      }
+   249→
+   250→      const valid = errors.length === 0;
+   251→      span.setAttribute('validation.valid', valid);
+   252→      span.setAttribute('validation.errorCount', errors.length);
+   253→
+   254→      return {
+   255→        valid,
+   256→        errors,
+   257→        warnings,
+   258→        fileSize,
+   259→      };
+   260→    });
+   261→  }
+   262→
+   263→  /**
+   264→   * Read first N lines from a file
+   265→   */
+   266→  private readFirstLines(filePath: string, lineCount: number): string {
+   267→    const content = fs.readFileSync(filePath, 'utf-8');
+   268→    const lines = content.split('\n').slice(0, lineCount);
+   269→    return lines.join('\n');
+   270→  }
+   271→
+   272→  /**
+   273→   * Validate CSV structure (headers and format)
+   274→   */
+   275→  private validateCsvStructure(csvSample: string): string[] {
+   276→    const errors: string[] = [];
+   277→
+   278→    const parseResult = Papa.parse(csvSample, {
+   279→      header: true,
+   280→      skipEmptyLines: true,
+   281→    });
+   282→
+   283→    if (parseResult.errors.length > 0) {
+   284→      for (const error of parseResult.errors.slice(0, 5)) {
+   285→        errors.push(`CSV parse error at row ${error.row ?? 'unknown'}: ${error.message}`);
+   286→      }
+   287→      return errors;
+   288→    }
+   289→
+   290→    // Check required columns
+   291→    const headers = parseResult.meta.fields ?? [];
+   292→    const requiredColumns = ['train_number', 'reading_date', 'odometer_km'];
+   293→
+   294→    for (const col of requiredColumns) {
+   295→      if (!headers.includes(col)) {
+   296→        errors.push(`Missing required column: ${col}`);
+   297→      }
+   298→    }
+   299→
+   300→    return errors;
+   301→  }
+   302→
+   303→  // ===========================================================================
+   304→  // File Processing
+   305→  // ===========================================================================
+   306→
+   307→  /**
+   308→   * Queue a file for async processing
+   309→   */
+   310→  async queueFileForProcessing(
+   311→    filePath: string,
+   312→    uploadedBy?: string
+   313→  ): Promise<{ jobId: string }> {
+   314→    return this.traced('queueFileForProcessing', async (span) => {
+   315→      span.setAttribute('file.path', filePath);
+   316→
+   317→      // Validate file first
+   318→      const validation = await this.validateFile(filePath);
+   319→
+   320→      if (!validation.valid) {
+   321→        throw new ValidationError('File validation failed', {
+   322→          field: 'file',
+   323→          context: {
+   324→            errors: validation.errors,
+   325→            warnings: validation.warnings,
+   326→          },
+   327→        });
+   328→      }
+   329→
+   330→      const fileName = path.basename(filePath);
+   331→      const jobData: IngestionJobData = {
+   332→        filePath,
+   333→        fileName,
+   334→        fileSize: validation.fileSize,
+   335→        uploadedBy,
+   336→      };
+   337→
+   338→      const { id } = await addJob(
+   339→        QUEUE_NAMES.INGESTION,
+   340→        'process-mileage-csv',
+   341→        jobData,
+   342→        {
+   343→          attempts: 3,
+   344→          backoff: { type: 'exponential', delay: 5000 },
+   345→        }
+   346→      );
+   347→
+   348→      this.lastFileReceivedAt = new Date();
+   349→
+   350→      this.log.info(
+   351→        { jobId: id, fileName, fileSize: validation.fileSize, uploadedBy },
+   352→        'File queued for ingestion'
+   353→      );
+   354→
+   355→      return { jobId: id };
+   356→    });
+   357→  }
+   358→
+   359→  /**
+   360→   * Process a mileage CSV file (main ingestion entry point)
+   361→   *
+   362→   * This is the core method called by the ingestion worker.
+   363→   */
+   364→  async processFile(
+   365→    filePath: string,
+   366→    jobId: string = crypto.randomUUID()
+   367→  ): Promise<IngestionResult> {
+   368→    return this.traced('processFile', async (span) => {
+   369→      const startTime = Date.now();
+   370→      const fileName = path.basename(filePath);
+   371→
+   372→      span.setAttribute(MmsAttributes.INGESTION_FILE, fileName);
+   373→      span.setAttribute(MmsAttributes.INGESTION_JOB_ID, jobId);
+   374→
+   375→      ingestionMetrics.filesReceived.inc();
+   376→
+   377→      const result: IngestionResult = {
+   378→        jobId,
+   379→        fileName,
+   380→        totalRecords: 0,
+   381→        validRecords: 0,
+   382→        invalidRecords: 0,
+   383→        anomalies: [],
+   384→        meterEvents: [],
+   385→        processingTimeMs: 0,
+   386→        trainsUpdated: 0,
+   387→        status: 'SUCCESS',
+   388→      };
+   389→
+   390→      try {
+   391→        // Parse CSV
+   392→        const records = await this.parseCsv(filePath);
+   393→        result.totalRecords = records.length;
+   394→        span.setAttribute(MmsAttributes.INGESTION_RECORD_COUNT, records.length);
+   395→
+   396→        ingestionMetrics.recordsProcessed.inc(records.length);
+   397→
+   398→        if (records.length === 0) {
+   399→          result.status = 'PARTIAL';
+   400→          result.errorMessage = 'No valid records found in CSV';
+   401→          this.log.warn({ fileName, jobId }, 'CSV file contains no valid records');
+   402→          return result;
+   403→        }
+   404→
+   405→        // Process in batches
+   406→        const batches = this.chunk(records, BATCH_SIZE);
+   407→        const trainIdsUpdated = new Set<string>();
+   408→
+   409→        for (const batch of batches) {
+   410→          const batchResult = await this.processBatch(batch, fileName, result);
+   411→          for (const trainId of batchResult.trainIdsUpdated) {
+   412→            trainIdsUpdated.add(trainId);
+   413→          }
+   414→        }
+   415→
+   416→        result.trainsUpdated = trainIdsUpdated.size;
+   417→
+   418→        // Update train current mileage for all affected trains
+   419→        await this.updateTrainMileage(records, trainIdsUpdated);
+   420→
+   421→        // Determine final status
+   422→        if (result.invalidRecords > 0 && result.validRecords > 0) {
+   423→          result.status = 'PARTIAL';
+   424→        } else if (result.validRecords === 0) {
+   425→          result.status = 'FAILED';
+   426→          result.errorMessage = 'All records failed validation';
+   427→        }
+   428→
+   429→        result.processingTimeMs = Date.now() - startTime;
+   430→
+   431→        span.setAttribute('result.validRecords', result.validRecords);
+   432→        span.setAttribute('result.invalidRecords', result.invalidRecords);
+   433→        span.setAttribute('result.anomalyCount', result.anomalies.length);
+   434→        span.setAttribute('result.status', result.status);
+   435→
+   436→        recordIngestionComplete(result.status, result.processingTimeMs);
+   437→
+   438→        this.log.info(
+   439→          {
+   440→            jobId,
+   441→            fileName,
+   442→            totalRecords: result.totalRecords,
+   443→            validRecords: result.validRecords,
+   444→            invalidRecords: result.invalidRecords,
+   445→            anomalies: result.anomalies.length,
+   446→            trainsUpdated: result.trainsUpdated,
+   447→            processingTimeMs: result.processingTimeMs,
+   448→            status: result.status,
+   449→          },
+   450→          `Ingestion complete: ${result.validRecords}/${result.totalRecords} records processed`
+   451→        );
+   452→
+   453→        return result;
+   454→      } catch (error) {
+   455→        result.processingTimeMs = Date.now() - startTime;
+   456→        result.status = 'FAILED';
+   457→        result.errorMessage = error instanceof Error ? error.message : 'Unknown error';
+   458→
+   459→        recordIngestionComplete('FAILED', result.processingTimeMs);
+   460→
+   461→        this.log.error(
+   462→          { error, jobId, fileName },
+   463→          `Ingestion failed: ${result.errorMessage}`
+   464→        );
+   465→
+   466→        throw error;
+   467→      }
+   468→    });
+   469→  }
+   470→
+   471→  /**
+   472→   * Parse a CSV file and validate each row
+   473→   */
+   474→  private async parseCsv(filePath: string): Promise<ParsedMileageRecord[]> {
+   475→    return this.traced('parseCsv', async (span) => {
+   476→      span.setAttribute('file.path', filePath);
+   477→
+   478→      const content = fs.readFileSync(filePath, 'utf-8');
+   479→
+   480→      return new Promise<ParsedMileageRecord[]>((resolve, reject) => {
+   481→        const records: ParsedMileageRecord[] = [];
+   482→        let rowIndex = 0;
+   483→
+   484→        Papa.parse(content, {
+   485→          header: true,
+   486→          skipEmptyLines: true,
+   487→          complete: (results) => {
+   488→            span.setAttribute('parse.rowCount', results.data.length);
+   489→
+   490→            for (const row of results.data) {
+   491→              rowIndex++;
+   492→              const validation = this.validateRow(row, rowIndex);
+   493→
+   494→              if (validation.valid && validation.record) {
+   495→                records.push(validation.record);
+   496→              }
+   497→            }
+   498→
+   499→            this.log.debug(
+   500→              { filePath, totalRows: results.data.length, validRows: records.length },
+   501→              'CSV parsing complete'
+   502→            );
+   503→
+   504→            resolve(records);
+   505→          },
+   506→          error: (error: Error) => {
+   507→            reject(new FileError(`CSV parse error: ${error.message}`, {
+   508→              filePath,
+   509→              operation: 'parse',
+   510→            }));
+   511→          },
+   512→        });
+   513→      });
+   514→    });
+   515→  }
+   516→
+   517→  /**
+   518→   * Validate a single CSV row
+   519→   */
+   520→  private validateRow(
+   521→    row: unknown,
+   522→    rowIndex: number
+   523→  ): RowValidationResult {
+   524→    const parseResult = parseMileageCsvRow(row);
+   525→
+   526→    if (!parseResult.success) {
+   527→      const errorMessages = parseResult.errors.map(e => e.message).join(', ');
+   528→      return {
+   529→        valid: false,
+   530→        error: `Row ${rowIndex}: ${errorMessages}`,
+   531→      };
+   532→    }
+   533→
+   534→    const data = parseResult.data;
+   535→
+   536→    // Check for future dates
+   537→    const readingDate = new Date(data.readingDate);
+   538→    const today = new Date();
+   539→    today.setHours(23, 59, 59, 999);
+   540→
+   541→    if (readingDate > today) {
+   542→      return {
+   543→        valid: false,
+   544→        error: `Row ${rowIndex}: Reading date ${data.readingDate} is in the future`,
+   545→        anomaly: {
+   546→          trainNumber: data.trainNumber,
+   547→          readingDate: data.readingDate,
+   548→          type: 'FUTURE_DATE',
+   549→          value: null,
+   550→          message: `Reading date ${data.readingDate} is in the future`,
+   551→          rawReading: data.odometerKm,
+   552→        },
+   553→      };
+   554→    }
+   555→
+   556→    return {
+   557→      valid: true,
+   558→      record: {
+   559→        trainNumber: data.trainNumber,
+   560→        readingDate: data.readingDate,
+   561→        odometerKm: data.odometerKm,
+   562→        rowIndex,
+   563→      },
+   564→    };
+   565→  }
+   566→
+   567→  /**
+   568→   * Process a batch of records within a transaction
+   569→   */
+   570→  private async processBatch(
+   571→    batch: ParsedMileageRecord[],
+   572→    fileName: string,
+   573→    result: IngestionResult
+   574→  ): Promise<{ trainIdsUpdated: Set<string> }> {
+   575→    return this.inTransaction('processBatch', async (tx, span) => {
+   576→      span.setAttribute('batch.size', batch.length);
+   577→
+   578→      const trainIdsUpdated = new Set<string>();
+   579→
+   580→      for (const record of batch) {
+   581→        try {
+   582→          // Find train
+   583→          const train = await tx.query.trains.findFirst({
+   584→            where: eq(trains.trainNumber, record.trainNumber),
+   585→          });
+   586→
+   587→          if (!train) {
+   588→            result.invalidRecords++;
+   589→            const anomaly: AnomalyRecord = {
+   590→              trainNumber: record.trainNumber,
+   591→              readingDate: record.readingDate,
+   592→              type: 'UNKNOWN_TRAIN',
+   593→              value: null,
+   594→              message: `Train number '${record.trainNumber}' not found in database`,
+   595→              rawReading: record.odometerKm,
+   596→            };
+   597→            result.anomalies.push(anomaly);
+   598→            recordIngestionAnomaly('UNKNOWN_TRAIN');
+   599→            continue;
+   600→          }
+   601→
+   602→          // Get previous reading
+   603→          const previousReading = await tx.query.mileageReadings.findFirst({
+   604→            where: and(
+   605→              eq(mileageReadings.trainId, train.id),
+   606→              sql`${mileageReadings.readingDate} < ${record.readingDate}`
+   607→            ),
+   608→            orderBy: desc(mileageReadings.readingDate),
+   609→          });
+   610→
+   611→          // Calculate adjusted value (handle meter events)
+   612→          const adjustment = await this.getMeterAdjustment(tx, train.id, record.readingDate);
+   613→          const adjustedReading = record.odometerKm + adjustment;
+   614→
+   615→          // Calculate daily km
+   616→          let dailyKm: number | null = null;
+   617→          let anomalyType: AnomalyType | null = null;
+   618→          let anomalyMessage: string | null = null;
+   619→
+   620→          if (previousReading) {
+   621→            dailyKm = adjustedReading - previousReading.adjustedReading;
+   622→
+   623→            // Anomaly detection
+   624→            if (dailyKm < 0) {
+   625→              anomalyType = 'NEGATIVE';
+   626→              anomalyMessage = `Negative daily mileage: ${dailyKm} km (previous: ${previousReading.adjustedReading}, current: ${adjustedReading})`;
+   627→
+   628→              result.anomalies.push({
+   629→                trainNumber: record.trainNumber,
+   630→                readingDate: record.readingDate,
+   631→                type: 'NEGATIVE',
+   632→                value: dailyKm,
+   633→                message: anomalyMessage,
+   634→                rawReading: record.odometerKm,
+   635→                previousReading: previousReading.adjustedReading,
+   636→              });
+   637→              recordIngestionAnomaly('NEGATIVE');
+   638→            } else if (dailyKm > SPIKE_THRESHOLD_KM) {
+   639→              anomalyType = 'SPIKE';
+   640→              anomalyMessage = `Unusually high daily mileage: ${dailyKm} km (threshold: ${SPIKE_THRESHOLD_KM})`;
+   641→
+   642→              result.anomalies.push({
+   643→                trainNumber: record.trainNumber,
+   644→                readingDate: record.readingDate,
+   645→                type: 'SPIKE',
+   646→                value: dailyKm,
+   647→                message: anomalyMessage,
+   648→                rawReading: record.odometerKm,
+   649→                previousReading: previousReading.adjustedReading,
+   650→              });
+   651→              recordIngestionAnomaly('SPIKE');
+   652→            }
+   653→          }
+   654→
+   655→          // Insert or update reading
+   656→          await tx
+   657→            .insert(mileageReadings)
+   658→            .values({
+   659→              trainId: train.id,
+   660→              readingDate: record.readingDate,
+   661→              rawReading: record.odometerKm,
+   662→              adjustedReading,
+   663→              dailyKm,
+   664→              validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+   665→              anomalyType: anomalyType ?? undefined,
+   666→              anomalyNotes: anomalyMessage ?? undefined,
+   667→              sourceFile: fileName,
+   668→            })
+   669→            .onConflictDoUpdate({
+   670→              target: [mileageReadings.trainId, mileageReadings.readingDate],
+   671→              set: {
+   672→                rawReading: record.odometerKm,
+   673→                adjustedReading,
+   674→                dailyKm,
+   675→                validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+   676→                anomalyType: anomalyType ?? null,
+   677→                anomalyNotes: anomalyMessage ?? null,
+   678→                sourceFile: fileName,
+   679→                ingestedAt: new Date(),
+   680→              },
+   681→            });
+   682→
+   683→          result.validRecords++;
+   684→          trainIdsUpdated.add(train.id);
+   685→        } catch (error) {
+   686→          result.invalidRecords++;
+   687→          this.log.warn(
+   688→            { record, error: error instanceof Error ? error.message : 'Unknown error' },
+   689→            'Record processing failed'
+   690→          );
+   691→        }
+   692→      }
+   693→
+   694→      return { trainIdsUpdated };
+   695→    });
+   696→  }
+   697→
+   698→  /**
+   699→   * Get cumulative meter adjustment for a train as of a given date
+   700→   */
+   701→  private async getMeterAdjustment(
+   702→    tx: Parameters<Parameters<typeof this.inTransaction>[1]>[0],
+   703→    trainId: string,
+   704→    asOfDate: string
+   705→  ): Promise<number> {
+   706→    const events = await tx.query.meterEvents.findMany({
+   707→      where: and(
+   708→        eq(meterEvents.trainId, trainId),
+   709→        lte(meterEvents.eventDate, asOfDate)
+   710→      ),
+   711→    });
+   712→
+   713→    return events.reduce((sum, e) => sum + (e.adjustmentKm ?? 0), 0);
+   714→  }
+   715→
+   716→  /**
+   717→   * Update train current mileage for all affected trains
+   718→   */
+   719→  private async updateTrainMileage(
+   720→    records: ParsedMileageRecord[],
+   721→    trainIds: Set<string>
+   722→  ): Promise<void> {
+   723→    return this.traced('updateTrainMileage', async (span) => {
+   724→      span.setAttribute('trains.count', trainIds.size);
+   725→
+   726→      // Group records by train, find latest reading
+   727→      const latestByTrain = new Map<string, ParsedMileageRecord>();
+   728→
+   729→      for (const record of records) {
+   730→        const existing = latestByTrain.get(record.trainNumber);
+   731→        if (!existing || record.readingDate > existing.readingDate) {
+   732→          latestByTrain.set(record.trainNumber, record);
+   733→        }
+   734→      }
+   735→
+   736→      // Update train current_mileage for each affected train
+   737→      for (const [trainNumber, record] of latestByTrain) {
+   738→        await this.db
+   739→          .update(trains)
+   740→          .set({
+   741→            currentMileageKm: record.odometerKm,
+   742→            updatedAt: new Date(),
+   743→          })
+   744→          .where(eq(trains.trainNumber, trainNumber));
+   745→      }
+   746→
+   747→      // Update fleet mileage targets
+   748→      await this.db.execute(sql`SELECT update_fleet_mileage_targets()`);
+   749→
+   750→      this.log.info(
+   751→        { trainsUpdated: latestByTrain.size },
+   752→        'Train mileages updated'
+   753→      );
+   754→    });
+   755→  }
+   756→
+   757→  // ===========================================================================
+   758→  // Meter Event Management
+   759→  // ===========================================================================
+   760→
+   761→  /**
+   762→   * Create a meter event (for manual corrections or detected resets)
+   763→   */
+   764→  async createMeterEvent(
+   765→    trainId: string,
+   766→    eventType: 'RESET' | 'REPLACEMENT' | 'CALIBRATION' | 'SWAP',
+   767→    eventDate: string,
+   768→    oldReading: number,
+   769→    newReading: number,
+   770→    reason?: string,
+   771→    createdBy?: string
+   772→  ): Promise<MeterEventRecord> {
+   773→    return this.inTransaction('createMeterEvent', async (tx, span) => {
+   774→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   775→      span.setAttribute('event.type', eventType);
+   776→
+   777→      // Verify train exists
+   778→      const train = await tx.query.trains.findFirst({
+   779→        where: eq(trains.id, trainId),
+   780→      });
+   781→
+   782→      if (!train) {
+   783→        throw new BusinessRuleError(`Train not found: ${trainId}`, {
+   784→          rule: 'train_exists',
+   785→          context: { trainId },
+   786→        });
+   787→      }
+   788→
+   789→      // Calculate adjustment (cumulative offset to maintain mileage continuity)
+   790→      const adjustmentKm = oldReading - newReading;
+   791→
+   792→      // Insert meter event
+   793→      const [event] = await tx
+   794→        .insert(meterEvents)
+   795→        .values({
+   796→          trainId,
+   797→          eventDate,
+   798→          eventType,
+   799→          oldMeterReading: oldReading,
+   800→          newMeterReading: newReading,
+   801→          adjustmentKm,
+   802→          reason,
+   803→          createdBy,
+   804→        })
+   805→        .returning();
+   806→
+   807→      this.log.info(
+   808→        {
+   809→          eventId: event.id,
+   810→          trainId,
+   811→          trainNumber: train.trainNumber,
+   812→          eventType,
+   813→          oldReading,
+   814→          newReading,
+   815→          adjustmentKm,
+   816→        },
+   817→        'Meter event created'
+   818→      );
+   819→
+   820→      return {
+   821→        trainNumber: train.trainNumber,
+   822→        trainId,
+   823→        eventDate,
+   824→        eventType,
+   825→        oldReading,
+   826→        newReading,
+   827→        adjustmentKm,
+   828→      };
+   829→    });
+   830→  }
+   831→
+   832→  /**
+   833→   * Get meter events for a train
+   834→   */
+   835→  async getMeterEvents(trainId: string): Promise<MeterEventRecord[]> {
+   836→    return this.traced('getMeterEvents', async (span) => {
+   837→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   838→
+   839→      const train = await this.db.query.trains.findFirst({
+   840→        where: eq(trains.id, trainId),
+   841→      });
+   842→
+   843→      if (!train) {
+   844→        throw new BusinessRuleError(`Train not found: ${trainId}`, {
+   845→          rule: 'train_exists',
+   846→          context: { trainId },
+   847→        });
+   848→      }
+   849→
+   850→      const events = await this.db.query.meterEvents.findMany({
+   851→        where: eq(meterEvents.trainId, trainId),
+   852→        orderBy: desc(meterEvents.eventDate),
+   853→      });
+   854→
+   855→      return events.map((e) => ({
+   856→        trainNumber: train.trainNumber,
+   857→        trainId: e.trainId,
+   858→        eventDate: e.eventDate,
+   859→        eventType: e.eventType as 'RESET' | 'REPLACEMENT' | 'CALIBRATION' | 'SWAP',
+   860→        oldReading: e.oldMeterReading ?? 0,
+   861→        newReading: e.newMeterReading ?? 0,
+   862→        adjustmentKm: e.adjustmentKm ?? 0,
+   863→      }));
+   864→    });
+   865→  }
+   866→
+   867→  // ===========================================================================
+   868→  // Health Monitoring
+   869→  // ===========================================================================
+   870→
+   871→  /**
+   872→   * Check file arrival health
+   873→   *
+   874→   * Returns whether files have been received within the expected timeframe.
+   875→   * Used by health check endpoints and alerting.
+   876→   */
+   877→  async checkFileArrivalHealth(): Promise<{
+   878→    healthy: boolean;
+   879→    lastFileAt: Date | null;
+   880→    hoursSinceLastFile: number | null;
+   881→    alertThresholdHours: number;
+   882→  }> {
+   883→    const alertThresholdHours = ALERT_THRESHOLD_HOURS;
+   884→
+   885→    if (!this.lastFileReceivedAt) {
+   886→      return {
+   887→        healthy: true, // No baseline yet
+   888→        lastFileAt: null,
+   889→        hoursSinceLastFile: null,
+   890→        alertThresholdHours,
+   891→      };
+   892→    }
+   893→
+   894→    const hoursSinceLastFile =
+   895→      (Date.now() - this.lastFileReceivedAt.getTime()) / (1000 * 60 * 60);
+   896→
+   897→    const healthy = hoursSinceLastFile <= alertThresholdHours;
+   898→
+   899→    return {
+   900→      healthy,
+   901→      lastFileAt: this.lastFileReceivedAt,
+   902→      hoursSinceLastFile: Math.round(hoursSinceLastFile * 10) / 10,
+   903→      alertThresholdHours,
+   904→    };
+   905→  }
+   906→
+   907→  /**
+   908→   * Get ingestion statistics
+   909→   */
+   910→  async getIngestionStats(days: number = 7): Promise<{
+   911→    totalFiles: number;
+   912→    totalRecords: number;
+   913→    totalAnomalies: number;
+   914→    anomaliesByType: Record<string, number>;
+   915→    averageRecordsPerFile: number;
+   916→  }> {
+   917→    return this.traced('getIngestionStats', async (span) => {
+   918→      span.setAttribute('stats.days', days);
+   919→
+   920→      const since = new Date();
+   921→      since.setDate(since.getDate() - days);
+   922→
+   923→      // Get anomaly counts by type
+   924→      const anomalyStats = await this.db
+   925→        .select({
+   926→          anomalyType: mileageReadings.anomalyType,
+   927→          count: sql<number>`count(*)::int`,
+   928→        })
+   929→        .from(mileageReadings)
+   930→        .where(
+   931→          and(
+   932→            eq(mileageReadings.validationStatus, 'ANOMALY'),
+   933→            sql`${mileageReadings.ingestedAt} >= ${since.toISOString()}`
+   934→          )
+   935→        )
+   936→        .groupBy(mileageReadings.anomalyType);
+   937→
+   938→      const anomaliesByType: Record<string, number> = {};
+   939→      let totalAnomalies = 0;
+   940→
+   941→      for (const stat of anomalyStats) {
+   942→        const type = stat.anomalyType ?? 'UNKNOWN';
+   943→        anomaliesByType[type] = stat.count;
+   944→        totalAnomalies += stat.count;
+   945→      }
+   946→
+   947→      // Get total records count
+   948→      const [recordStats] = await this.db
+   949→        .select({
+   950→          total: sql<number>`count(*)::int`,
+   951→          files: sql<number>`count(distinct ${mileageReadings.sourceFile})::int`,
+   952→        })
+   953→        .from(mileageReadings)
+   954→        .where(sql`${mileageReadings.ingestedAt} >= ${since.toISOString()}`);
+   955→
+   956→      const totalRecords = recordStats?.total ?? 0;
+   957→      const totalFiles = recordStats?.files ?? 0;
+   958→
+   959→      return {
+   960→        totalFiles,
+   961→        totalRecords,
+   962→        totalAnomalies,
+   963→        anomaliesByType,
+   964→        averageRecordsPerFile: totalFiles > 0 ? Math.round(totalRecords / totalFiles) : 0,
+   965→      };
+   966→    });
+   967→  }
+   968→
+   969→  // ===========================================================================
+   970→  // Query Methods (for API endpoints)
+   971→  // ===========================================================================
+   972→
+   973→  /**
+   974→   * Get mileage readings with filtering
+   975→   *
+   976→   * Supports filtering by trainId, date range, and validation status.
+   977→   * Returns readings with train information for API responses.
+   978→   */
+   979→  async getMileageReadings(filters: MileageReadingFilters): Promise<{
+   980→    data: MileageReadingWithTrain[];
+   981→    total: number;
+   982→  }> {
+   983→    return this.traced('getMileageReadings', async (span) => {
+   984→      span.setAttribute('filters.trainId', filters.trainId ?? 'all');
+   985→      span.setAttribute('filters.fromDate', filters.fromDate ?? 'none');
+   986→      span.setAttribute('filters.toDate', filters.toDate ?? 'none');
+   987→
+   988→      const conditions: ReturnType<typeof eq>[] = [];
+   989→
+   990→      if (filters.trainId) {
+   991→        conditions.push(eq(mileageReadings.trainId, filters.trainId));
+   992→      }
+   993→
+   994→      if (filters.fromDate) {
+   995→        conditions.push(sql`${mileageReadings.readingDate} >= ${filters.fromDate}`);
+   996→      }
+   997→
+   998→      if (filters.toDate) {
+   999→        conditions.push(sql`${mileageReadings.readingDate} <= ${filters.toDate}`);
+  1000→      }
+  1001→
+  1002→      if (filters.validationStatus) {
+  1003→        conditions.push(eq(mileageReadings.validationStatus, filters.validationStatus));
+  1004→      }
+  1005→
+  1006→      // Build where clause
+  1007→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+  1008→
+  1009→      // Get total count
+  1010→      const [countResult] = await this.db
+  1011→        .select({ count: sql<number>`count(*)::int` })
+  1012→        .from(mileageReadings)
+  1013→        .where(whereClause);
+  1014→
+  1015→      const total = countResult?.count ?? 0;
+  1016→
+  1017→      // Get paginated readings with train info
+  1018→      const page = filters.page ?? 1;
+  1019→      const pageSize = Math.min(200, Math.max(1, filters.pageSize ?? 50));
+  1020→      const offset = (page - 1) * pageSize;
+  1021→
+  1022→      const readings = await this.db
+  1023→        .select({
+  1024→          trainId: mileageReadings.trainId,
+  1025→          trainNumber: trains.trainNumber,
+  1026→          readingDate: mileageReadings.readingDate,
+  1027→          rawReading: mileageReadings.rawReading,
+  1028→          adjustedReading: mileageReadings.adjustedReading,
+  1029→          dailyKm: mileageReadings.dailyKm,
+  1030→          validationStatus: mileageReadings.validationStatus,
+  1031→          sourceFile: mileageReadings.sourceFile,
+  1032→        })
+  1033→        .from(mileageReadings)
+  1034→        .innerJoin(trains, eq(mileageReadings.trainId, trains.id))
+  1035→        .where(whereClause)
+  1036→        .orderBy(desc(mileageReadings.readingDate))
+  1037→        .limit(pageSize)
+  1038→        .offset(offset);
+  1039→
+  1040→      return {
+  1041→        data: readings.map((r) => ({
+  1042→          trainId: r.trainId,
+  1043→          trainNumber: r.trainNumber,
+  1044→          readingDate: r.readingDate,
+  1045→          rawReading: r.rawReading,
+  1046→          adjustedReading: r.adjustedReading,
+  1047→          dailyKm: r.dailyKm,
+  1048→          validationStatus: r.validationStatus as 'PENDING' | 'VALID' | 'ANOMALY' | 'CORRECTED',
+  1049→          sourceFile: r.sourceFile,
+  1050→        })),
+  1051→        total,
+  1052→      };
+  1053→    });
+  1054→  }
+  1055→
+  1056→  /**
+  1057→   * Get mileage anomalies requiring review
+  1058→   *
+  1059→   * Returns anomalies (SPIKE, NEGATIVE, etc.) with details
+  1060→   * for investigation and correction.
+  1061→   */
+  1062→  async getAnomalies(filters: AnomalyQueryFilters): Promise<{
+  1063→    data: AnomalyWithDetails[];
+  1064→    total: number;
+  1065→  }> {
+  1066→    return this.traced('getAnomalies', async (span) => {
+  1067→      span.setAttribute('filters.trainId', filters.trainId ?? 'all');
+  1068→
+  1069→      const conditions: ReturnType<typeof eq>[] = [
+  1070→        eq(mileageReadings.validationStatus, 'ANOMALY'),
+  1071→      ];
+  1072→
+  1073→      if (filters.trainId) {
+  1074→        conditions.push(eq(mileageReadings.trainId, filters.trainId));
+  1075→      }
+  1076→
+  1077→      if (filters.fromDate) {
+  1078→        conditions.push(sql`${mileageReadings.readingDate} >= ${filters.fromDate}`);
+  1079→      }
+  1080→
+  1081→      if (filters.toDate) {
+  1082→        conditions.push(sql`${mileageReadings.readingDate} <= ${filters.toDate}`);
+  1083→      }
+  1084→
+  1085→      if (filters.anomalyType) {
+  1086→        conditions.push(eq(mileageReadings.anomalyType, filters.anomalyType));
+  1087→      }
+  1088→
+  1089→      const whereClause = and(...conditions);
+  1090→
+  1091→      // Get total count
+  1092→      const [countResult] = await this.db
+  1093→        .select({ count: sql<number>`count(*)::int` })
+  1094→        .from(mileageReadings)
+  1095→        .where(whereClause);
+  1096→
+  1097→      const total = countResult?.count ?? 0;
+  1098→
+  1099→      // Get paginated anomalies
+  1100→      const page = filters.page ?? 1;
+  1101→      const pageSize = Math.min(200, Math.max(1, filters.pageSize ?? 50));
+  1102→      const offset = (page - 1) * pageSize;
+  1103→
+  1104→      const anomalies = await this.db
+  1105→        .select({
+  1106→          trainId: mileageReadings.trainId,
+  1107→          trainNumber: trains.trainNumber,
+  1108→          readingDate: mileageReadings.readingDate,
+  1109→          anomalyType: mileageReadings.anomalyType,
+  1110→          rawReading: mileageReadings.rawReading,
+  1111→          dailyKm: mileageReadings.dailyKm,
+  1112→          anomalyNotes: mileageReadings.anomalyNotes,
+  1113→          sourceFile: mileageReadings.sourceFile,
+  1114→        })
+  1115→        .from(mileageReadings)
+  1116→        .innerJoin(trains, eq(mileageReadings.trainId, trains.id))
+  1117→        .where(whereClause)
+  1118→        .orderBy(desc(mileageReadings.readingDate))
+  1119→        .limit(pageSize)
+  1120→        .offset(offset);
+  1121→
+  1122→      // Calculate expected range for each anomaly
+  1123→      const results: AnomalyWithDetails[] = anomalies.map((a) => {
+  1124→        // Default expected range based on typical daily km
+  1125→        const expectedRange = {
+  1126→          min: 0,
+  1127→          max: SPIKE_THRESHOLD_KM,
+  1128→        };
+  1129→
+  1130→        // Suggest action based on anomaly type
+  1131→        let suggestedAction = 'Review reading and verify data source';
+  1132→        switch (a.anomalyType) {
+  1133→          case 'NEGATIVE':
+  1134→            suggestedAction = 'Check for meter event (reset/replacement) or data entry error';
+  1135→            break;
+  1136→          case 'SPIKE':
+  1137→            suggestedAction = 'Verify odometer reading or check for meter event';
+  1138→            break;
+  1139→          case 'DUPLICATE':
+  1140→            suggestedAction = 'Confirm which reading is correct and remove duplicate';
+  1141→            break;
+  1142→          case 'MISSING':
+  1143→            suggestedAction = 'Check source file for missing train data';
+  1144→            break;
+  1145→        }
+  1146→
+  1147→        return {
+  1148→          trainId: a.trainId,
+  1149→          trainNumber: a.trainNumber,
+  1150→          readingDate: a.readingDate,
+  1151→          anomalyType: a.anomalyType as DbAnomalyType | null,
+  1152→          rawReading: a.rawReading,
+  1153→          dailyKm: a.dailyKm,
+  1154→          expectedRange,
+  1155→          suggestedAction,
+  1156→        };
+  1157→      });
+  1158→
+  1159→      return { data: results, total };
+  1160→    });
+  1161→  }
+  1162→
+  1163→  // ===========================================================================
+  1164→  // Utility Methods
+  1165→  // ===========================================================================
+  1166→
+  1167→  /**
+  1168→   * Split array into chunks
+  1169→   */
+  1170→  private chunk<T>(array: T[], size: number): T[][] {
+  1171→    const chunks: T[][] = [];
+  1172→    for (let i = 0; i < array.length; i += size) {
+  1173→      chunks.push(array.slice(i, i + size));
+  1174→    }
+  1175→    return chunks;
+  1176→  }
+  1177→}
+  1178→
+  1179→// =============================================================================
+  1180→// Singleton Export
+  1181→// =============================================================================
+  1182→
+  1183→let ingestionServiceInstance: IngestionService | null = null;
+  1184→
+  1185→export function getIngestionService(): IngestionService {
+  1186→  if (!ingestionServiceInstance) {
+  1187→    ingestionServiceInstance = new IngestionService();
+  1188→  }
+  1189→  return ingestionServiceInstance;
+  1190→}
+  1191→
+  1192→export default IngestionService;
+  1193→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

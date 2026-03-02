@@ -1,0 +1,207 @@
+     1→/**
+     2→ * Harness Core
+     3→ *
+     4→ * Main orchestration class that combines:
+     5→ * - Progress management (cross-session memory)
+     6→ * - Feature tracking (task status)
+     7→ * - Task routing (model selection)
+     8→ * - Agent execution
+     9→ */
+    10→
+    11→import { createProgressManager, ProgressManager } from './progress';
+    12→import { createFeaturesManager, FeaturesManager } from './features';
+    13→import { routeTask, ensureRouterReady, quickClassify } from './router';
+    14→import * as ollama from '../clients/ollama';
+    15→import * as claude from '../clients/claude';
+    16→import { getAgent, AGENTS } from '../agents';
+    17→import type {
+    18→  ChatMessage,
+    19→  RouterDecision,
+    20→  Feature,
+    21→  Model,
+    22→  LocalModel,
+    23→  CloudModel,
+    24→} from '../types';
+    25→
+    26→export interface HarnessConfig {
+    27→  projectRoot: string;
+    28→  autoRoute?: boolean;
+    29→}
+    30→
+    31→export class Harness {
+    32→  private progress: ProgressManager;
+    33→  private features: FeaturesManager;
+    34→  private projectRoot: string;
+    35→  private autoRoute: boolean;
+    36→
+    37→  constructor(config: HarnessConfig) {
+    38→    this.projectRoot = config.projectRoot;
+    39→    this.autoRoute = config.autoRoute ?? true;
+    40→    this.progress = createProgressManager(config.projectRoot);
+    41→    this.features = createFeaturesManager(config.projectRoot);
+    42→  }
+    43→
+    44→  // Initialize harness for a new session
+    45→  async startSession(): Promise<void> {
+    46→    console.log('Starting harness session...');
+    47→
+    48→    // Ensure router model is ready
+    49→    await ensureRouterReady();
+    50→
+    51→    // Log session start
+    52→    this.progress.startSession();
+    53→
+    54→    // Show current status
+    55→    const stats = this.features.getStats();
+    56→    console.log(`Features: ${stats.complete}/${stats.total} complete`);
+    57→
+    58→    const next = this.features.getNextPending();
+    59→    if (next) {
+    60→      console.log(`Next pending: ${next.id} - ${next.description}`);
+    61→    }
+    62→  }
+    63→
+    64→  // End current session
+    65→  endSession(summary?: string): void {
+    66→    this.progress.endSession(summary);
+    67→    console.log('Session ended.');
+    68→  }
+    69→
+    70→  // Route and execute a task
+    71→  async executeTask(task: string): Promise<string> {
+    72→    // Route the task
+    73→    const decision = this.autoRoute
+    74→      ? await routeTask(task, {
+    75→          progressSummary: this.progress.getLastEntries(5).join('\n'),
+    76→          currentFeature: this.features.getInProgress()[0]?.id,
+    77→        })
+    78→      : {
+    79→          category: quickClassify(task),
+    80→          model: this.getModelForCategory(quickClassify(task)),
+    81→          confidence: 0.8,
+    82→          featureId: null,
+    83→          reasoning: 'Quick classification',
+    84→        };
+    85→
+    86→    console.log(`Routed to ${decision.model} (${decision.category})`);
+    87→
+    88→    // Execute with appropriate model
+    89→    const response = await this.chat(decision.model, task);
+    90→
+    91→    // Log to progress
+    92→    this.progress.append({
+    93→      action: `Executed: ${task.slice(0, 50)}...`,
+    94→      featureId: decision.featureId || undefined,
+    95→      status: 'completed',
+    96→      notes: `Model: ${decision.model}`,
+    97→    });
+    98→
+    99→    return response;
+   100→  }
+   101→
+   102→  // Direct chat with a specific model
+   103→  async chat(model: Model, message: string, systemPrompt?: string): Promise<string> {
+   104→    const messages: ChatMessage[] = [];
+   105→
+   106→    if (systemPrompt) {
+   107→      messages.push({ role: 'system', content: systemPrompt });
+   108→    }
+   109→    messages.push({ role: 'user', content: message });
+   110→
+   111→    if (this.isLocalModel(model)) {
+   112→      const response = await ollama.chat(model as LocalModel, messages);
+   113→      return response.message.content;
+   114→    } else {
+   115→      const response = await claude.chat(model as CloudModel, messages, {
+   116→        system: systemPrompt,
+   117→      });
+   118→      return response.content[0].text;
+   119→    }
+   120→  }
+   121→
+   122→  // Chat with a specific agent
+   123→  async chatWithAgent(agentId: string, message: string): Promise<string> {
+   124→    const agent = getAgent(agentId);
+   125→    if (!agent) {
+   126→      throw new Error(`Agent ${agentId} not found`);
+   127→    }
+   128→
+   129→    return this.chat(agent.model, message, agent.systemPrompt);
+   130→  }
+   131→
+   132→  // Feature management
+   133→  getNextFeature(): Feature | undefined {
+   134→    return this.features.getNextPending();
+   135→  }
+   136→
+   137→  startFeature(id: string): void {
+   138→    this.features.startFeature(id);
+   139→    const feature = this.features.getFeatureById(id);
+   140→    if (feature) {
+   141→      this.progress.logFeatureStart(id, feature.description);
+   142→    }
+   143→  }
+   144→
+   145→  completeFeature(id: string, summary?: string): void {
+   146→    this.features.completeFeature(id, summary);
+   147→    this.progress.logFeatureComplete(id, summary);
+   148→  }
+   149→
+   150→  failFeature(id: string, reason: string): void {
+   151→    this.features.failFeature(id, reason);
+   152→    this.progress.logFeatureFailed(id, reason);
+   153→  }
+   154→
+   155→  // Progress access
+   156→  getProgress(): string {
+   157→    return this.progress.read();
+   158→  }
+   159→
+   160→  getRecentProgress(count = 10): string[] {
+   161→    return this.progress.getLastEntries(count);
+   162→  }
+   163→
+   164→  // Feature access
+   165→  getFeatures(): Feature[] {
+   166→    return this.features.getFeatures();
+   167→  }
+   168→
+   169→  getFeatureStats() {
+   170→    return this.features.getStats();
+   171→  }
+   172→
+   173→  // Helpers
+   174→  private isLocalModel(model: Model): boolean {
+   175→    return [
+   176→      'phi4-mini-reasoning',
+   177→      'deepseek-r1:8b',
+   178→      'deepseek-r1:14b',
+   179→      'qwen2.5-coder:7b',
+   180→      'smallthinker:3b',
+   181→    ].includes(model);
+   182→  }
+   183→
+   184→  private getModelForCategory(category: string): Model {
+   185→    const map: Record<string, Model> = {
+   186→      SIMPLE: 'phi4-mini-reasoning',
+   187→      CODE: 'qwen2.5-coder:7b',
+   188→      REASONING: 'deepseek-r1:8b',
+   189→      COMPLEX: 'claude-opus',
+   190→    };
+   191→    return map[category] || 'deepseek-r1:8b';
+   192→  }
+   193→}
+   194→
+   195→// Factory function
+   196→export function createHarness(projectRoot: string, autoRoute = true): Harness {
+   197→  return new Harness({ projectRoot, autoRoute });
+   198→}
+   199→
+   200→// Re-exports
+   201→export { ProgressManager, FeaturesManager };
+   202→export * from './router';
+   203→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

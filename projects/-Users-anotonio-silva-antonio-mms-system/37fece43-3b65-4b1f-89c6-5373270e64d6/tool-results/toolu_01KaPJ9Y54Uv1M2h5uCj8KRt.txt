@@ -1,0 +1,873 @@
+     1→/**
+     2→ * MMS Drift Monitor Service
+     3→ *
+     4→ * Monitors plan stability by comparing actual fleet state against published baselines.
+     5→ * Runs nightly drift analysis and generates alerts when thresholds are exceeded.
+     6→ *
+     7→ * Key responsibilities:
+     8→ * - Compare current mileage against baseline projections
+     9→ * - Compare current PM schedule against baseline snapshots
+    10→ * - Generate alerts when drift exceeds thresholds
+    11→ * - Persist drift analysis results for trending
+    12→ * - Update Prometheus metrics for monitoring
+    13→ *
+    14→ * Drift Thresholds (from spec):
+    15→ * - Mileage: ±5.0%
+    16→ * - Schedule: ±14 days
+    17→ * - Fleet: ≥5 trains requiring replan triggers CRITICAL alert
+    18→ *
+    19→ * @see specs/004-domain-services.md Section 4.10
+    20→ */
+    21→
+    22→import { eq, and, desc, sql, inArray, gte, lte, isNull, count } from 'drizzle-orm';
+    23→import { differenceInDays, format, parseISO } from 'date-fns';
+    24→import { BaseService, MmsAttributes } from '../lib/services/base';
+    25→import {
+    26→  driftAnalysis,
+    27→  planBaselines,
+    28→  baselineMileageProjection,
+    29→  baselinePmSchedule,
+    30→  pmSchedule,
+    31→  trains,
+    32→  pmTypes,
+    33→  type PlanBaseline,
+    34→  type DriftAnalysis,
+    35→} from '../lib/db/schema';
+    36→import { NotFoundError } from '../lib/errors';
+    37→import {
+    38→  driftTrainsRequiringReplan,
+    39→  driftMileagePercent,
+    40→  driftAnalysisTotal,
+    41→} from '../lib/metrics';
+    42→
+    43→// =============================================================================
+    44→// Types
+    45→// =============================================================================
+    46→
+    47→/** Drift threshold configuration */
+    48→export interface DriftThresholds {
+    49→  /** Maximum acceptable mileage drift percentage (default: 5.0) */
+    50→  mileageDriftPct: number;
+    51→  /** Maximum acceptable PM schedule drift in days (default: 14) */
+    52→  scheduleDriftDays: number;
+    53→  /** Fleet-level threshold for CRITICAL alert (default: 5) */
+    54→  fleetDriftTrainCount: number;
+    55→}
+    56→
+    57→/** Default thresholds from specification */
+    58→export const DEFAULT_DRIFT_THRESHOLDS: DriftThresholds = {
+    59→  mileageDriftPct: 5.0,
+    60→  scheduleDriftDays: 14,
+    61→  fleetDriftTrainCount: 5,
+    62→};
+    63→
+    64→/** Direction of PM schedule drift */
+    65→export type DriftDirection = 'LATER' | 'EARLIER' | 'ON_TRACK';
+    66→
+    67→/** Drift analysis for individual PM */
+    68→export interface PMDrift {
+    69→  pmTypeId: string;
+    70→  pmCode: string;
+    71→  baselineDate: string;
+    72→  currentDate: string;
+    73→  driftDays: number;
+    74→  direction: DriftDirection;
+    75→}
+    76→
+    77→/** Per-train drift analysis result */
+    78→export interface TrainDriftAnalysis {
+    79→  trainId: string;
+    80→  trainNumber: string;
+    81→  baselineProjectedKm: number;
+    82→  actualKm: number;
+    83→  mileageDriftKm: number;
+    84→  mileageDriftPct: number;
+    85→  pmDrifts: PMDrift[];
+    86→  avgPmDriftDays: number;
+    87→  maxPmDriftDays: number;
+    88→  requiresReplan: boolean;
+    89→  replanReason?: string;
+    90→}
+    91→
+    92→/** Alert severity levels */
+    93→export type AlertSeverity = 'HIGH' | 'MEDIUM' | 'CRITICAL';
+    94→
+    95→/** Alert types */
+    96→export type AlertType = 'REPLAN_REQUIRED' | 'APPROACHING_THRESHOLD' | 'FLEET_REPLAN_RECOMMENDED';
+    97→
+    98→/** Drift alert structure */
+    99→export interface DriftAlert {
+   100→  trainId?: string;
+   101→  trainNumber?: string;
+   102→  severity: AlertSeverity;
+   103→  type: AlertType;
+   104→  message: string;
+   105→  metrics: {
+   106→    mileageDriftPct?: number;
+   107→    avgPmDriftDays?: number;
+   108→    affectedTrains?: number;
+   109→  };
+   110→}
+   111→
+   112→/** Result when drift analysis is skipped */
+   113→export interface DriftAnalysisSkipped {
+   114→  skipped: true;
+   115→  reason: string;
+   116→}
+   117→
+   118→/** Result of successful drift analysis */
+   119→export interface DriftAnalysisSuccess {
+   120→  skipped: false;
+   121→  baselineId: string;
+   122→  baselineVersion: string;
+   123→  analysisDate: string;
+   124→  trainAnalyses: TrainDriftAnalysis[];
+   125→  alerts: DriftAlert[];
+   126→  summary: {
+   127→    totalTrains: number;
+   128→    trainsWithDrift: number;
+   129→    trainsRequiringReplan: number;
+   130→    avgFleetDriftPct: number;
+   131→  };
+   132→}
+   133→
+   134→/** Full drift analysis result */
+   135→export type DriftAnalysisResult = DriftAnalysisSkipped | DriftAnalysisSuccess;
+   136→
+   137→/** Filters for querying drift history */
+   138→export interface DriftHistoryFilters {
+   139→  baselineId?: string;
+   140→  trainId?: string;
+   141→  fromDate?: Date;
+   142→  toDate?: Date;
+   143→  requiresReplan?: boolean;
+   144→}
+   145→
+   146→/** Paginated drift history result */
+   147→export interface PaginatedDriftHistory {
+   148→  data: DriftAnalysis[];
+   149→  total: number;
+   150→  page: number;
+   151→  pageSize: number;
+   152→  totalPages: number;
+   153→}
+   154→
+   155→// =============================================================================
+   156→// Singleton instance
+   157→// =============================================================================
+   158→
+   159→let instance: DriftMonitorService | null = null;
+   160→
+   161→/**
+   162→ * Get the singleton DriftMonitorService instance
+   163→ */
+   164→export function getDriftMonitorService(): DriftMonitorService {
+   165→  if (!instance) {
+   166→    instance = new DriftMonitorService();
+   167→  }
+   168→  return instance;
+   169→}
+   170→
+   171→// =============================================================================
+   172→// DriftMonitorService Implementation
+   173→// =============================================================================
+   174→
+   175→/**
+   176→ * Drift Monitor Service for monitoring plan stability
+   177→ *
+   178→ * @example
+   179→ * ```typescript
+   180→ * const driftService = getDriftMonitorService();
+   181→ *
+   182→ * // Run nightly drift analysis
+   183→ * const result = await driftService.runDriftAnalysis();
+   184→ *
+   185→ * if (!result.skipped) {
+   186→ *   console.log(`Analyzed ${result.trainAnalyses.length} trains`);
+   187→ *   console.log(`${result.alerts.length} alerts generated`);
+   188→ * }
+   189→ *
+   190→ * // Get latest analysis for a specific train
+   191→ * const trainDrift = await driftService.getLatestTrainDrift('train-123');
+   192→ * ```
+   193→ */
+   194→export class DriftMonitorService extends BaseService {
+   195→  /** Drift thresholds */
+   196→  private readonly thresholds: DriftThresholds;
+   197→
+   198→  constructor(thresholds?: Partial<DriftThresholds>) {
+   199→    super({ name: 'drift-monitor-service' });
+   200→    this.thresholds = {
+   201→      ...DEFAULT_DRIFT_THRESHOLDS,
+   202→      ...thresholds,
+   203→    };
+   204→  }
+   205→
+   206→  // ===========================================================================
+   207→  // Public Methods
+   208→  // ===========================================================================
+   209→
+   210→  /**
+   211→   * Run drift analysis comparing current state against published baseline
+   212→   *
+   213→   * This is the main nightly job that:
+   214→   * 1. Retrieves the latest published baseline
+   215→   * 2. Compares each active train's mileage against baseline projections
+   216→   * 3. Compares current PM schedule against baseline snapshots
+   217→   * 4. Generates alerts for threshold breaches
+   218→   * 5. Persists results for trending
+   219→   * 6. Updates Prometheus metrics
+   220→   *
+   221→   * @param analysisDate - Date for analysis (defaults to today)
+   222→   * @returns Analysis result or skipped indicator
+   223→   */
+   224→  async runDriftAnalysis(analysisDate?: Date): Promise<DriftAnalysisResult> {
+   225→    return this.traced('runDriftAnalysis', async (span) => {
+   226→      const effectiveDate = analysisDate ?? new Date();
+   227→      const dateStr = format(effectiveDate, 'yyyy-MM-dd');
+   228→      span.setAttribute('drift.analysisDate', dateStr);
+   229→
+   230→      // 1. Get latest published baseline
+   231→      const baseline = await this.getPublishedBaseline();
+   232→
+   233→      if (!baseline) {
+   234→        this.log.info('No published baseline found, skipping drift analysis');
+   235→        driftAnalysisTotal.inc({ result: 'skipped' });
+   236→        return {
+   237→          skipped: true,
+   238→          reason: 'No published baseline exists',
+   239→        };
+   240→      }
+   241→
+   242→      span.setAttribute(MmsAttributes.BASELINE_ID, baseline.id);
+   243→      span.setAttribute('baseline.version', baseline.version);
+   244→
+   245→      // 2. Get all active trains
+   246→      const activeTrains = await this.db
+   247→        .select({
+   248→          id: trains.id,
+   249→          trainNumber: trains.trainNumber,
+   250→          currentMileageKm: trains.currentMileageKm,
+   251→        })
+   252→        .from(trains)
+   253→        .where(eq(trains.active, true));
+   254→
+   255→      span.setAttribute('drift.trainCount', activeTrains.length);
+   256→
+   257→      if (activeTrains.length === 0) {
+   258→        this.log.info('No active trains found, skipping drift analysis');
+   259→        driftAnalysisTotal.inc({ result: 'skipped' });
+   260→        return {
+   261→          skipped: true,
+   262→          reason: 'No active trains in fleet',
+   263→        };
+   264→      }
+   265→
+   266→      // 3. Analyze each train
+   267→      const trainAnalyses: TrainDriftAnalysis[] = [];
+   268→
+   269→      for (const train of activeTrains) {
+   270→        const analysis = await this.analyzeTrainDrift(
+   271→          train.id,
+   272→          train.trainNumber,
+   273→          train.currentMileageKm ?? 0,
+   274→          baseline,
+   275→          effectiveDate
+   276→        );
+   277→        trainAnalyses.push(analysis);
+   278→      }
+   279→
+   280→      // 4. Generate alerts
+   281→      const alerts = this.generateAlerts(trainAnalyses);
+   282→
+   283→      // 5. Persist results
+   284→      await this.persistDriftAnalysis(trainAnalyses, baseline.id, dateStr);
+   285→
+   286→      // 6. Update metrics
+   287→      this.updateMetrics(trainAnalyses, baseline.id);
+   288→
+   289→      // Calculate summary
+   290→      const trainsWithDrift = trainAnalyses.filter(
+   291→        (a) => Math.abs(a.mileageDriftPct) > 1.0
+   292→      ).length;
+   293→      const trainsRequiringReplan = trainAnalyses.filter(
+   294→        (a) => a.requiresReplan
+   295→      ).length;
+   296→      const avgFleetDriftPct =
+   297→        trainAnalyses.length > 0
+   298→          ? trainAnalyses.reduce((sum, a) => sum + a.mileageDriftPct, 0) /
+   299→            trainAnalyses.length
+   300→          : 0;
+   301→
+   302→      span.setAttribute('drift.trainsWithDrift', trainsWithDrift);
+   303→      span.setAttribute('drift.trainsRequiringReplan', trainsRequiringReplan);
+   304→      span.setAttribute('drift.alertCount', alerts.length);
+   305→
+   306→      driftAnalysisTotal.inc({ result: 'completed' });
+   307→
+   308→      this.log.info(
+   309→        {
+   310→          baselineId: baseline.id,
+   311→          baselineVersion: baseline.version,
+   312→          trainCount: trainAnalyses.length,
+   313→          trainsRequiringReplan,
+   314→          alertCount: alerts.length,
+   315→        },
+   316→        'Drift analysis completed'
+   317→      );
+   318→
+   319→      return {
+   320→        skipped: false,
+   321→        baselineId: baseline.id,
+   322→        baselineVersion: baseline.version,
+   323→        analysisDate: dateStr,
+   324→        trainAnalyses,
+   325→        alerts,
+   326→        summary: {
+   327→          totalTrains: trainAnalyses.length,
+   328→          trainsWithDrift,
+   329→          trainsRequiringReplan,
+   330→          avgFleetDriftPct: Math.round(avgFleetDriftPct * 100) / 100,
+   331→        },
+   332→      };
+   333→    });
+   334→  }
+   335→
+   336→  /**
+   337→   * Get the latest drift analysis for a specific train
+   338→   *
+   339→   * @param trainId - Train to retrieve drift for
+   340→   * @throws NotFoundError if no drift analysis exists
+   341→   */
+   342→  async getLatestTrainDrift(trainId: string): Promise<DriftAnalysis> {
+   343→    return this.traced('getLatestTrainDrift', async (span) => {
+   344→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   345→
+   346→      const result = await this.db
+   347→        .select()
+   348→        .from(driftAnalysis)
+   349→        .where(eq(driftAnalysis.trainId, trainId))
+   350→        .orderBy(desc(driftAnalysis.analysisDate))
+   351→        .limit(1);
+   352→
+   353→      const drift = result[0];
+   354→      if (!drift) {
+   355→        throw new NotFoundError(`No drift analysis found for train: ${trainId}`);
+   356→      }
+   357→
+   358→      return drift;
+   359→    });
+   360→  }
+   361→
+   362→  /**
+   363→   * Get drift analysis history with filtering and pagination
+   364→   */
+   365→  async getDriftHistory(
+   366→    filters?: DriftHistoryFilters,
+   367→    pagination?: { page?: number; pageSize?: number }
+   368→  ): Promise<PaginatedDriftHistory> {
+   369→    return this.traced('getDriftHistory', async (span) => {
+   370→      const page = pagination?.page ?? 1;
+   371→      const pageSize = pagination?.pageSize ?? 50;
+   372→      const offset = (page - 1) * pageSize;
+   373→
+   374→      // Build where conditions
+   375→      const conditions: ReturnType<typeof eq>[] = [];
+   376→
+   377→      if (filters?.baselineId) {
+   378→        conditions.push(eq(driftAnalysis.baselineId, filters.baselineId));
+   379→      }
+   380→
+   381→      if (filters?.trainId) {
+   382→        conditions.push(eq(driftAnalysis.trainId, filters.trainId));
+   383→      }
+   384→
+   385→      if (filters?.fromDate) {
+   386→        conditions.push(
+   387→          gte(driftAnalysis.analysisDate, format(filters.fromDate, 'yyyy-MM-dd'))
+   388→        );
+   389→      }
+   390→
+   391→      if (filters?.toDate) {
+   392→        conditions.push(
+   393→          lte(driftAnalysis.analysisDate, format(filters.toDate, 'yyyy-MM-dd'))
+   394→        );
+   395→      }
+   396→
+   397→      if (filters?.requiresReplan !== undefined) {
+   398→        conditions.push(eq(driftAnalysis.requiresReplan, filters.requiresReplan));
+   399→      }
+   400→
+   401→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   402→
+   403→      // Get total count
+   404→      const [{ totalCount }] = await this.db
+   405→        .select({ totalCount: count() })
+   406→        .from(driftAnalysis)
+   407→        .where(whereClause);
+   408→
+   409→      // Get paginated data
+   410→      const data = await this.db
+   411→        .select()
+   412→        .from(driftAnalysis)
+   413→        .where(whereClause)
+   414→        .orderBy(desc(driftAnalysis.analysisDate), driftAnalysis.trainId)
+   415→        .limit(pageSize)
+   416→        .offset(offset);
+   417→
+   418→      span.setAttribute('drift.resultCount', data.length);
+   419→      span.setAttribute('drift.totalCount', totalCount);
+   420→
+   421→      return {
+   422→        data,
+   423→        total: totalCount,
+   424→        page,
+   425→        pageSize,
+   426→        totalPages: Math.ceil(totalCount / pageSize),
+   427→      };
+   428→    });
+   429→  }
+   430→
+   431→  /**
+   432→   * Get latest drift analysis results for all trains requiring replan
+   433→   */
+   434→  async getTrainsRequiringReplan(): Promise<DriftAnalysis[]> {
+   435→    return this.traced('getTrainsRequiringReplan', async (span) => {
+   436→      // Get the latest baseline
+   437→      const baseline = await this.getPublishedBaseline();
+   438→
+   439→      if (!baseline) {
+   440→        return [];
+   441→      }
+   442→
+   443→      // Get most recent analysis date for this baseline
+   444→      const latestDate = await this.db
+   445→        .select({ maxDate: sql<string>`MAX(analysis_date)` })
+   446→        .from(driftAnalysis)
+   447→        .where(eq(driftAnalysis.baselineId, baseline.id));
+   448→
+   449→      if (!latestDate[0]?.maxDate) {
+   450→        return [];
+   451→      }
+   452→
+   453→      // Get all trains requiring replan from that date
+   454→      const results = await this.db
+   455→        .select()
+   456→        .from(driftAnalysis)
+   457→        .where(
+   458→          and(
+   459→            eq(driftAnalysis.baselineId, baseline.id),
+   460→            eq(driftAnalysis.analysisDate, latestDate[0].maxDate),
+   461→            eq(driftAnalysis.requiresReplan, true)
+   462→          )
+   463→        )
+   464→        .orderBy(desc(sql`ABS(${driftAnalysis.mileageDriftPct})`));
+   465→
+   466→      span.setAttribute('drift.trainsRequiringReplan', results.length);
+   467→
+   468→      return results;
+   469→    });
+   470→  }
+   471→
+   472→  /**
+   473→   * Get drift analysis summary for a baseline
+   474→   */
+   475→  async getDriftSummary(baselineId: string, analysisDate?: string): Promise<{
+   476→    totalTrains: number;
+   477→    trainsWithDrift: number;
+   478→    trainsRequiringReplan: number;
+   479→    avgMileageDriftPct: number;
+   480→    maxMileageDriftPct: number;
+   481→    avgPmDriftDays: number;
+   482→    maxPmDriftDays: number;
+   483→  } | null> {
+   484→    return this.traced('getDriftSummary', async (span) => {
+   485→      span.setAttribute(MmsAttributes.BASELINE_ID, baselineId);
+   486→
+   487→      // Determine analysis date to use
+   488→      let dateToUse = analysisDate;
+   489→      if (!dateToUse) {
+   490→        const latestDate = await this.db
+   491→          .select({ maxDate: sql<string>`MAX(analysis_date)` })
+   492→          .from(driftAnalysis)
+   493→          .where(eq(driftAnalysis.baselineId, baselineId));
+   494→
+   495→        dateToUse = latestDate[0]?.maxDate;
+   496→      }
+   497→
+   498→      if (!dateToUse) {
+   499→        return null;
+   500→      }
+   501→
+   502→      span.setAttribute('drift.analysisDate', dateToUse);
+   503→
+   504→      // Get summary statistics
+   505→      const summary = await this.db
+   506→        .select({
+   507→          totalTrains: count(),
+   508→          avgMileageDriftPct: sql<string>`AVG(${driftAnalysis.mileageDriftPct})`,
+   509→          maxMileageDriftPct: sql<string>`MAX(ABS(${driftAnalysis.mileageDriftPct}))`,
+   510→          avgPmDriftDays: sql<string>`AVG(${driftAnalysis.avgPmDriftDays})`,
+   511→          maxPmDriftDays: sql<number>`MAX(${driftAnalysis.maxPmDriftDays})`,
+   512→        })
+   513→        .from(driftAnalysis)
+   514→        .where(
+   515→          and(
+   516→            eq(driftAnalysis.baselineId, baselineId),
+   517→            eq(driftAnalysis.analysisDate, dateToUse)
+   518→          )
+   519→        );
+   520→
+   521→      const stats = summary[0];
+   522→      if (!stats || stats.totalTrains === 0) {
+   523→        return null;
+   524→      }
+   525→
+   526→      // Count trains with significant drift (>1%)
+   527→      const [{ driftCount }] = await this.db
+   528→        .select({ driftCount: count() })
+   529→        .from(driftAnalysis)
+   530→        .where(
+   531→          and(
+   532→            eq(driftAnalysis.baselineId, baselineId),
+   533→            eq(driftAnalysis.analysisDate, dateToUse),
+   534→            sql`ABS(${driftAnalysis.mileageDriftPct}) > 1.0`
+   535→          )
+   536→        );
+   537→
+   538→      // Count trains requiring replan
+   539→      const [{ replanCount }] = await this.db
+   540→        .select({ replanCount: count() })
+   541→        .from(driftAnalysis)
+   542→        .where(
+   543→          and(
+   544→            eq(driftAnalysis.baselineId, baselineId),
+   545→            eq(driftAnalysis.analysisDate, dateToUse),
+   546→            eq(driftAnalysis.requiresReplan, true)
+   547→          )
+   548→        );
+   549→
+   550→      return {
+   551→        totalTrains: stats.totalTrains,
+   552→        trainsWithDrift: driftCount,
+   553→        trainsRequiringReplan: replanCount,
+   554→        avgMileageDriftPct: parseFloat(stats.avgMileageDriftPct ?? '0'),
+   555→        maxMileageDriftPct: parseFloat(stats.maxMileageDriftPct ?? '0'),
+   556→        avgPmDriftDays: parseFloat(stats.avgPmDriftDays ?? '0'),
+   557→        maxPmDriftDays: stats.maxPmDriftDays ?? 0,
+   558→      };
+   559→    });
+   560→  }
+   561→
+   562→  /**
+   563→   * Get current thresholds configuration
+   564→   */
+   565→  getThresholds(): DriftThresholds {
+   566→    return { ...this.thresholds };
+   567→  }
+   568→
+   569→  // ===========================================================================
+   570→  // Private Helper Methods
+   571→  // ===========================================================================
+   572→
+   573→  /**
+   574→   * Get the latest published baseline
+   575→   */
+   576→  private async getPublishedBaseline(): Promise<PlanBaseline | null> {
+   577→    const result = await this.db
+   578→      .select()
+   579→      .from(planBaselines)
+   580→      .where(eq(planBaselines.status, 'PUBLISHED'))
+   581→      .orderBy(desc(planBaselines.publishedAt))
+   582→      .limit(1);
+   583→
+   584→    return result[0] ?? null;
+   585→  }
+   586→
+   587→  /**
+   588→   * Analyze drift for a single train
+   589→   */
+   590→  private async analyzeTrainDrift(
+   591→    trainId: string,
+   592→    trainNumber: string,
+   593→    actualKm: number,
+   594→    baseline: PlanBaseline,
+   595→    analysisDate: Date
+   596→  ): Promise<TrainDriftAnalysis> {
+   597→    const dateStr = format(analysisDate, 'yyyy-MM-dd');
+   598→
+   599→    // Get baseline mileage projection closest to analysis date
+   600→    const baselineProjection = await this.db
+   601→      .select()
+   602→      .from(baselineMileageProjection)
+   603→      .where(
+   604→        and(
+   605→          eq(baselineMileageProjection.baselineId, baseline.id),
+   606→          eq(baselineMileageProjection.trainId, trainId),
+   607→          lte(baselineMileageProjection.projectionDate, dateStr)
+   608→        )
+   609→      )
+   610→      .orderBy(desc(baselineMileageProjection.projectionDate))
+   611→      .limit(1);
+   612→
+   613→    // Calculate mileage drift
+   614→    const baselineProjectedKm = baselineProjection[0]?.projectedCumulativeKm ?? actualKm;
+   615→    const mileageDriftKm = actualKm - baselineProjectedKm;
+   616→    const mileageDriftPct =
+   617→      baselineProjectedKm > 0
+   618→        ? (mileageDriftKm / baselineProjectedKm) * 100
+   619→        : 0;
+   620→
+   621→    // Get baseline PM schedule for this train (future PMs from analysis date)
+   622→    const baselinePms = await this.db
+   623→      .select({
+   624→        pmTypeId: baselinePmSchedule.pmTypeId,
+   625→        projectedDate: baselinePmSchedule.projectedDate,
+   626→        pmCode: pmTypes.pmCode,
+   627→      })
+   628→      .from(baselinePmSchedule)
+   629→      .innerJoin(pmTypes, eq(baselinePmSchedule.pmTypeId, pmTypes.id))
+   630→      .where(
+   631→        and(
+   632→          eq(baselinePmSchedule.baselineId, baseline.id),
+   633→          eq(baselinePmSchedule.trainId, trainId),
+   634→          gte(baselinePmSchedule.projectedDate, dateStr)
+   635→        )
+   636→      )
+   637→      .orderBy(baselinePmSchedule.projectedDate);
+   638→
+   639→    // Get current PM schedule for this train
+   640→    const currentPms = await this.db
+   641→      .select({
+   642→        pmTypeId: pmSchedule.pmTypeId,
+   643→        targetDate: pmSchedule.targetDate,
+   644→        pmCode: pmTypes.pmCode,
+   645→      })
+   646→      .from(pmSchedule)
+   647→      .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   648→      .where(
+   649→        and(
+   650→          eq(pmSchedule.trainId, trainId),
+   651→          isNull(pmSchedule.scenarioId),
+   652→          inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   653→          gte(pmSchedule.targetDate, dateStr)
+   654→        )
+   655→      )
+   656→      .orderBy(pmSchedule.targetDate);
+   657→
+   658→    // Calculate PM drift by matching PM types
+   659→    const pmDrifts: PMDrift[] = [];
+   660→
+   661→    for (const baselinePm of baselinePms) {
+   662→      // Find matching current PM by PM type (first occurrence)
+   663→      const matchingCurrent = currentPms.find(
+   664→        (cp) =>
+   665→          cp.pmTypeId === baselinePm.pmTypeId &&
+   666→          !pmDrifts.some((d) => d.currentDate === cp.targetDate && d.pmTypeId === cp.pmTypeId)
+   667→      );
+   668→
+   669→      if (matchingCurrent) {
+   670→        const baselineDate = parseISO(baselinePm.projectedDate);
+   671→        const currentDate = parseISO(matchingCurrent.targetDate);
+   672→        const driftDays = differenceInDays(currentDate, baselineDate);
+   673→
+   674→        let direction: DriftDirection = 'ON_TRACK';
+   675→        if (driftDays > 0) direction = 'LATER';
+   676→        else if (driftDays < 0) direction = 'EARLIER';
+   677→
+   678→        pmDrifts.push({
+   679→          pmTypeId: baselinePm.pmTypeId,
+   680→          pmCode: baselinePm.pmCode,
+   681→          baselineDate: baselinePm.projectedDate,
+   682→          currentDate: matchingCurrent.targetDate,
+   683→          driftDays,
+   684→          direction,
+   685→        });
+   686→      }
+   687→    }
+   688→
+   689→    // Calculate PM drift statistics
+   690→    const avgPmDriftDays =
+   691→      pmDrifts.length > 0
+   692→        ? pmDrifts.reduce((sum, d) => sum + Math.abs(d.driftDays), 0) / pmDrifts.length
+   693→        : 0;
+   694→    const maxPmDriftDays =
+   695→      pmDrifts.length > 0
+   696→        ? Math.max(...pmDrifts.map((d) => Math.abs(d.driftDays)))
+   697→        : 0;
+   698→
+   699→    // Determine if replan is required
+   700→    const mileageExceedsThreshold = Math.abs(mileageDriftPct) > this.thresholds.mileageDriftPct;
+   701→    const scheduleExceedsThreshold = maxPmDriftDays > this.thresholds.scheduleDriftDays;
+   702→    const requiresReplan = mileageExceedsThreshold || scheduleExceedsThreshold;
+   703→
+   704→    // Build replan reason
+   705→    let replanReason: string | undefined;
+   706→    if (requiresReplan) {
+   707→      const reasons: string[] = [];
+   708→      if (mileageExceedsThreshold) {
+   709→        reasons.push(
+   710→          `Mileage drift ${mileageDriftPct.toFixed(1)}% exceeds ${this.thresholds.mileageDriftPct}% threshold`
+   711→        );
+   712→      }
+   713→      if (scheduleExceedsThreshold) {
+   714→        reasons.push(
+   715→          `PM schedule drift ${maxPmDriftDays} days exceeds ${this.thresholds.scheduleDriftDays} day threshold`
+   716→        );
+   717→      }
+   718→      replanReason = reasons.join('; ');
+   719→    }
+   720→
+   721→    return {
+   722→      trainId,
+   723→      trainNumber,
+   724→      baselineProjectedKm,
+   725→      actualKm,
+   726→      mileageDriftKm,
+   727→      mileageDriftPct: Math.round(mileageDriftPct * 100) / 100,
+   728→      pmDrifts,
+   729→      avgPmDriftDays: Math.round(avgPmDriftDays * 10) / 10,
+   730→      maxPmDriftDays,
+   731→      requiresReplan,
+   732→      replanReason,
+   733→    };
+   734→  }
+   735→
+   736→  /**
+   737→   * Generate alerts based on drift analysis results
+   738→   */
+   739→  private generateAlerts(trainAnalyses: TrainDriftAnalysis[]): DriftAlert[] {
+   740→    const alerts: DriftAlert[] = [];
+   741→    const trainsRequiringReplan = trainAnalyses.filter((a) => a.requiresReplan);
+   742→
+   743→    // Individual train alerts
+   744→    for (const analysis of trainAnalyses) {
+   745→      if (analysis.requiresReplan) {
+   746→        // HIGH severity: Train requires immediate replan
+   747→        alerts.push({
+   748→          trainId: analysis.trainId,
+   749→          trainNumber: analysis.trainNumber,
+   750→          severity: 'HIGH',
+   751→          type: 'REPLAN_REQUIRED',
+   752→          message: analysis.replanReason ?? 'Train requires schedule replan',
+   753→          metrics: {
+   754→            mileageDriftPct: analysis.mileageDriftPct,
+   755→            avgPmDriftDays: analysis.avgPmDriftDays,
+   756→          },
+   757→        });
+   758→      } else if (
+   759→        Math.abs(analysis.mileageDriftPct) > this.thresholds.mileageDriftPct * 0.7
+   760→      ) {
+   761→        // MEDIUM severity: Approaching threshold (>70% of threshold)
+   762→        alerts.push({
+   763→          trainId: analysis.trainId,
+   764→          trainNumber: analysis.trainNumber,
+   765→          severity: 'MEDIUM',
+   766→          type: 'APPROACHING_THRESHOLD',
+   767→          message: `Mileage drift ${analysis.mileageDriftPct.toFixed(1)}% approaching ${this.thresholds.mileageDriftPct}% threshold`,
+   768→          metrics: {
+   769→            mileageDriftPct: analysis.mileageDriftPct,
+   770→          },
+   771→        });
+   772→      }
+   773→    }
+   774→
+   775→    // Fleet-level alert
+   776→    if (trainsRequiringReplan.length >= this.thresholds.fleetDriftTrainCount) {
+   777→      alerts.push({
+   778→        severity: 'CRITICAL',
+   779→        type: 'FLEET_REPLAN_RECOMMENDED',
+   780→        message: `${trainsRequiringReplan.length} trains require schedule replan - fleet-level action recommended`,
+   781→        metrics: {
+   782→          affectedTrains: trainsRequiringReplan.length,
+   783→        },
+   784→      });
+   785→    }
+   786→
+   787→    return alerts;
+   788→  }
+   789→
+   790→  /**
+   791→   * Persist drift analysis results to database
+   792→   */
+   793→  private async persistDriftAnalysis(
+   794→    analyses: TrainDriftAnalysis[],
+   795→    baselineId: string,
+   796→    analysisDate: string
+   797→  ): Promise<void> {
+   798→    return this.inTransaction('persistDriftAnalysis', async (tx, span) => {
+   799→      span.setAttribute('drift.recordCount', analyses.length);
+   800→
+   801→      // Delete existing records for this baseline + date (upsert behavior)
+   802→      await tx
+   803→        .delete(driftAnalysis)
+   804→        .where(
+   805→          and(
+   806→            eq(driftAnalysis.baselineId, baselineId),
+   807→            eq(driftAnalysis.analysisDate, analysisDate)
+   808→          )
+   809→        );
+   810→
+   811→      // Insert new records in batches
+   812→      const BATCH_SIZE = 100;
+   813→      for (let i = 0; i < analyses.length; i += BATCH_SIZE) {
+   814→        const batch = analyses.slice(i, i + BATCH_SIZE);
+   815→        await tx.insert(driftAnalysis).values(
+   816→          batch.map((a) => ({
+   817→            baselineId,
+   818→            analysisDate,
+   819→            trainId: a.trainId,
+   820→            baselineProjectedKm: a.baselineProjectedKm,
+   821→            actualKm: a.actualKm,
+   822→            mileageDriftPct: a.mileageDriftPct.toFixed(2),
+   823→            avgPmDriftDays: a.avgPmDriftDays.toFixed(1),
+   824→            maxPmDriftDays: a.maxPmDriftDays,
+   825→            requiresReplan: a.requiresReplan,
+   826→            replanReason: a.replanReason ?? null,
+   827→          }))
+   828→        );
+   829→      }
+   830→
+   831→      // Note: Drift analysis is a system job, not a user-initiated action.
+   832→      // Audit trail is maintained through:
+   833→      // 1. drift_analysis table records with timestamps
+   834→      // 2. OpenTelemetry distributed tracing
+   835→      // 3. Prometheus metrics (mms_drift_analysis_total)
+   836→      // 4. Application logs below
+   837→
+   838→      const replanCount = analyses.filter((a) => a.requiresReplan).length;
+   839→      this.log.info(
+   840→        { baselineId, analysisDate, recordCount: analyses.length, replanCount },
+   841→        'Persisted drift analysis results'
+   842→      );
+   843→    });
+   844→  }
+   845→
+   846→  /**
+   847→   * Update Prometheus metrics
+   848→   */
+   849→  private updateMetrics(analyses: TrainDriftAnalysis[], baselineId: string): void {
+   850→    const trainsRequiringReplan = analyses.filter((a) => a.requiresReplan).length;
+   851→
+   852→    // Update gauge for trains requiring replan
+   853→    driftTrainsRequiringReplan.set({ baseline_id: baselineId }, trainsRequiringReplan);
+   854→
+   855→    // Update per-train mileage drift
+   856→    for (const analysis of analyses) {
+   857→      driftMileagePercent.set(
+   858→        { train_id: analysis.trainId, baseline_id: baselineId },
+   859→        analysis.mileageDriftPct
+   860→      );
+   861→    }
+   862→
+   863→    this.log.debug(
+   864→      { trainsRequiringReplan, baselineId },
+   865→      'Updated drift metrics'
+   866→    );
+   867→  }
+   868→}
+   869→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

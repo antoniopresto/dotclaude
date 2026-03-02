@@ -1,0 +1,1027 @@
+174:### 4.2.3 Ingestion Worker
+175:
+176:```typescript
+177:interface MileageRecord {
+178:  trainNumber: string;
+179:  readingDate: string;  // YYYY-MM-DD
+180:  odometerValue: number;
+181:  source?: string;
+182:}
+183:
+184:interface IngestionResult {
+185:  jobId: string;
+186:  filename: string;
+187:  totalRecords: number;
+188:  validRecords: number;
+189:  invalidRecords: number;
+190:  anomalies: AnomalyRecord[];
+191:  meterEvents: MeterEventRecord[];
+192:  processingTimeMs: number;
+193:}
+194:
+195:class IngestionWorker {
+196:  async process(job: Job<IngestionJobData>): Promise<IngestionResult> {
+197:    const startTime = Date.now();
+198:    const { jobId, filePath, filename } = job.data;
+199:    
+200:    const result: IngestionResult = {
+201:      jobId,
+202:      filename,
+203:      totalRecords: 0,
+204:      validRecords: 0,
+205:      invalidRecords: 0,
+206:      anomalies: [],
+207:      meterEvents: [],
+208:      processingTimeMs: 0
+209:    };
+210:    
+211:    // Parse CSV
+212:    const records = await this.parseCSV(filePath);
+213:    result.totalRecords = records.length;
+214:    
+215:    // Process in batches
+216:    const batches = this.chunk(records, 100);
+217:    
+218:    for (const batch of batches) {
+219:      await this.db.transaction(async (tx) => {
+220:        for (const record of batch) {
+221:          try {
+222:            await this.processRecord(tx, record, result);
+223:            result.validRecords++;
+224:          } catch (error) {
+225:            result.invalidRecords++;
+226:            this.logger.warn({ record, error }, 'Record processing failed');
+227:          }
+228:        }
+229:      });
+230:    }
+231:    
+232:    // Move file to processed
+233:    const processedPath = path.join(
+234:      this.config.processedPath,
+235:      `${Date.now()}_${filename}`
+236:    );
+237:    await fs.rename(filePath, processedPath);
+238:    
+239:    // Update train current mileage
+240:    await this.updateTrainMileage(records);
+241:    
+242:    // Trigger downstream processing
+243:    await this.triggerDriftCheck();
+244:    
+245:    result.processingTimeMs = Date.now() - startTime;
+246:    
+247:    return result;
+248:  }
+249:  
+250:  private async processRecord(
+251:    tx: Transaction,
+252:    record: MileageRecord,
+253:    result: IngestionResult
+254:  ): Promise<void> {
+255:    // Find train
+256:    const train = await tx.query.trains.findFirst({
+257:      where: eq(trains.trainNumber, record.trainNumber)
+258:    });
+259:    
+260:    if (!train) {
+261:      throw new Error(`Unknown train: ${record.trainNumber}`);
+262:    }
+263:    
+264:    // Get previous reading
+265:    const previousReading = await tx.query.mileageReadings.findFirst({
+266:      where: and(
+267:        eq(mileageReadings.trainId, train.id),
+268:        lt(mileageReadings.readingDate, record.readingDate)
+269:      ),
+270:      orderBy: desc(mileageReadings.readingDate)
+271:    });
+272:    
+273:    // Calculate adjusted value (handle meter events)
+274:    const adjustment = await this.getMeterAdjustment(tx, train.id, record.readingDate);
+275:    const adjustedReading = record.odometerValue + adjustment;
+276:    
+277:    // Calculate daily km
+278:    let dailyKm: number | null = null;
+279:    let anomalyType: string | null = null;
+280:    
+281:    if (previousReading) {
+282:      dailyKm = adjustedReading - previousReading.adjustedReading;
+283:      
+284:      // Anomaly detection
+285:      if (dailyKm < 0) {
+286:        anomalyType = 'NEGATIVE';
+287:        result.anomalies.push({
+288:          trainNumber: record.trainNumber,
+289:          date: record.readingDate,
+290:          type: 'NEGATIVE',
+291:          value: dailyKm,
+292:          message: `Negative daily mileage: ${dailyKm} km`
+293:        });
+294:      } else if (dailyKm > 1000) {  // Spike threshold
+295:        anomalyType = 'SPIKE';
+296:        result.anomalies.push({
+297:          trainNumber: record.trainNumber,
+298:          date: record.readingDate,
+299:          type: 'SPIKE',
+300:          value: dailyKm,
+301:          message: `Unusually high daily mileage: ${dailyKm} km`
+302:        });
+303:      }
+304:    }
+305:    
+306:    // Insert or update reading
+307:    await tx.insert(mileageReadings)
+308:      .values({
+309:        trainId: train.id,
+310:        readingDate: record.readingDate,
+311:        rawReading: record.odometerValue,
+312:        adjustedReading,
+313:        dailyKm,
+314:        validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+315:        anomalyType,
+316:        sourceFile: result.filename
+317:      })
+318:      .onConflictDoUpdate({
+319:        target: [mileageReadings.trainId, mileageReadings.readingDate],
+320:        set: {
+321:          rawReading: record.odometerValue,
+322:          adjustedReading,
+323:          dailyKm,
+324:          validationStatus: anomalyType ? 'ANOMALY' : 'VALID',
+325:          anomalyType,
+326:          sourceFile: result.filename
+327:        }
+328:      });
+329:  }
+330:  
+331:  private async getMeterAdjustment(
+332:    tx: Transaction,
+333:    trainId: string,
+334:    asOfDate: string
+335:  ): Promise<number> {
+336:    // Sum all meter event adjustments up to this date
+337:    const events = await tx.query.meterEvents.findMany({
+338:      where: and(
+339:        eq(meterEvents.trainId, trainId),
+340:        lte(meterEvents.eventDate, asOfDate)
+341:      )
+342:    });
+343:    
+344:    return events.reduce((sum, e) => sum + (e.adjustmentKm || 0), 0);
+345:  }
+346:  
+347:  private async updateTrainMileage(records: MileageRecord[]): Promise<void> {
+348:    // Group by train, find latest reading
+349:    const latestByTrain = new Map<string, MileageRecord>();
+350:    
+351:    for (const record of records) {
+352:      const existing = latestByTrain.get(record.trainNumber);
+353:      if (!existing || record.readingDate > existing.readingDate) {
+354:        latestByTrain.set(record.trainNumber, record);
+355:      }
+356:    }
+357:    
+358:    // Update train current_mileage
+359:    for (const [trainNumber, record] of latestByTrain) {
+360:      await this.db.update(trains)
+361:        .set({ 
+362:          currentMileageKm: record.odometerValue,
+363:          updatedAt: new Date()
+364:        })
+365:        .where(eq(trains.trainNumber, trainNumber));
+366:    }
+367:    
+368:    // Update fleet mileage targets
+369:    await this.db.execute(sql`SELECT update_fleet_mileage_targets()`);
+370:  }
+371:}
+372:```
+373:
+374:---
+375:
+376:## 4.2.5 Unavailability Service (NEW v2.1)
+377:
+378:### 4.2.5.1 Purpose
+379:
+380:Track trains that are unavailable due to corrective maintenance, incidents, or other blocking factors. This service is **critical** for schedule validity - without it, the optimizer can schedule PMs for trains that are grounded for weeks.
+381:
+382:### 4.2.5.2 Implementation
+383:
+384:```typescript
+385:interface UnavailabilityEvent {
+386:  id: string;
+387:  trainId: string;
+388:  eventType: 'CORRECTIVE' | 'INCIDENT' | 'COLLISION' | 'VANDALISM' | 'EXTERNAL' | 'PLANNED_OUTAGE';
+389:  status: 'ACTIVE' | 'RESOLVED';
+390:  restrictionLevel: 'RESTRICTED' | 'GROUNDED';
+391:  
+392:  reportedAt: Date;
+393:  estimatedRepairHours?: number;
+394:  estimatedReturnDate?: Date;
+395:  actualReturnDate?: Date;
+396:  
+397:  sourceSystem: 'MAXIMO' | 'OCC' | 'MANUAL';
+398:  externalReference?: string;   // Maximo WO number
+399:  externalStatus?: string;      // Maximo status
+400:  
+401:  description?: string;
+402:  failureCode?: string;
+403:  affectedSystem?: string;
+404:  
+405:  blocksPmScheduling: boolean;
+406:  blocksRunAssignment: boolean;
+407:}
+408:
+409:interface CreateUnavailabilityInput {
+410:  trainId: string;
+411:  eventType: UnavailabilityEvent['eventType'];
+412:  restrictionLevel: UnavailabilityEvent['restrictionLevel'];
+413:  estimatedReturnDate?: Date;
+414:  estimatedRepairHours?: number;
+415:  sourceSystem: UnavailabilityEvent['sourceSystem'];
+416:  externalReference?: string;
+417:  description?: string;
+418:  affectedSystem?: string;
+419:}
+420:
+421:class UnavailabilityService {
+422:  constructor(
+423:    private db: Database,
+424:    private alertService: AlertService,
+425:    private auditService: AuditService
+426:  ) {}
+427:  
+428:  /**
+429:   * Create a new unavailability event (e.g., from Maximo webhook)
+430:   */
+431:  async createEvent(input: CreateUnavailabilityInput, userId?: string): Promise<UnavailabilityEvent> {
+432:    const event = await this.db.transaction(async (tx) => {
+433:      // 1. Create the unavailability event
+434:      const [newEvent] = await tx
+435:        .insert(unavailabilityEvents)
+436:        .values({
+437:          ...input,
+438:          status: 'ACTIVE',
+439:          reportedAt: new Date(),
+440:          blocksPmScheduling: true,
+441:          blocksRunAssignment: input.restrictionLevel === 'GROUNDED',
+442:        })
+443:        .returning();
+444:      
+445:      // 2. Update train fitness status (trigger handles this, but we can be explicit)
+446:      await tx
+447:        .update(trains)
+448:        .set({
+449:          fitnessStatus: input.restrictionLevel,
+450:          fitnessNotes: input.description || `Unavailability: ${input.eventType}`,
+451:          updatedAt: new Date()
+452:        })
+453:        .where(eq(trains.id, input.trainId));
+454:      
+455:      // 3. Check for conflicts with scheduled PMs
+456:      const conflicts = await this.checkPMConflicts(tx, input.trainId, input.estimatedReturnDate);
+457:      
+458:      return { event: newEvent, conflicts };
+459:    });
+460:    
+461:    // Alert if PM conflicts exist
+462:    if (event.conflicts.length > 0) {
+463:      await this.alertService.send({
+464:        type: 'UNAVAILABILITY_PM_CONFLICT',
+465:        severity: 'WARNING',
+466:        message: `Train ${event.event.trainId} unavailable - ${event.conflicts.length} scheduled PMs may be affected`,
+467:        data: {
+468:          trainId: event.event.trainId,
+469:          eventId: event.event.id,
+470:          conflictingPMs: event.conflicts.map(pm => ({
+471:            pmId: pm.id,
+472:            pmType: pm.pmTypeCode,
+473:            targetDate: pm.targetDate
+474:          }))
+475:        }
+476:      });
+477:    }
+478:    
+479:    // Audit log
+480:    await this.auditService.log({
+481:      entityType: 'unavailability_event',
+482:      entityId: event.event.id,
+483:      action: 'CREATE',
+484:      userId,
+485:      newValues: event.event
+486:    });
+487:    
+488:    return event.event;
+489:  }
+490:  
+491:  /**
+492:   * Resolve an unavailability event (train returns to service)
+493:   */
+494:  async resolveEvent(
+495:    eventId: string, 
+496:    actualReturnDate: Date, 
+497:    userId: string,
+498:    notes?: string
+499:  ): Promise<void> {
+500:    await this.db.transaction(async (tx) => {
+501:      const [event] = await tx
+502:        .select()
+503:        .from(unavailabilityEvents)
+504:        .where(eq(unavailabilityEvents.id, eventId));
+505:      
+506:      if (!event) {
+507:        throw new NotFoundError(`Unavailability event ${eventId} not found`);
+508:      }
+509:      
+510:      if (event.status === 'RESOLVED') {
+511:        throw new ConflictError('Event already resolved');
+512:      }
+513:      
+514:      // Update the event
+515:      await tx
+516:        .update(unavailabilityEvents)
+517:        .set({
+518:          status: 'RESOLVED',
+519:          actualReturnDate,
+520:          resolvedAt: new Date(),
+521:          resolvedBy: userId,
+522:          resolutionNotes: notes,
+523:          updatedAt: new Date()
+524:        })
+525:        .where(eq(unavailabilityEvents.id, eventId));
+526:      
+527:      // Check if there are other active unavailability events for this train
+528:      const otherActive = await tx
+529:        .select({ count: count() })
+530:        .from(unavailabilityEvents)
+531:        .where(and(
+532:          eq(unavailabilityEvents.trainId, event.trainId),
+533:          eq(unavailabilityEvents.status, 'ACTIVE'),
+534:          ne(unavailabilityEvents.id, eventId)
+535:        ));
+536:      
+537:      // If no other active events, restore train to FIT
+538:      if (otherActive[0].count === 0) {
+539:        await tx
+540:          .update(trains)
+541:          .set({
+542:            fitnessStatus: 'FIT',
+543:            fitnessNotes: null,
+544:            updatedAt: new Date()
+545:          })
+546:          .where(eq(trains.id, event.trainId));
+547:      }
+548:    });
+549:    
+550:    await this.auditService.log({
+551:      entityType: 'unavailability_event',
+552:      entityId: eventId,
+553:      action: 'RESOLVE',
+554:      userId,
+555:      newValues: { status: 'RESOLVED', actualReturnDate }
+556:    });
+557:  }
+558:  
+559:  /**
+560:   * Get all active unavailability events (for optimizer input)
+561:   */
+562:  async getActiveUnavailability(depotId?: string): Promise<UnavailabilityEvent[]> {
+563:    let query = this.db
+564:      .select({
+565:        event: unavailabilityEvents,
+566:        train: {
+567:          trainNumber: trains.trainNumber,
+568:          fleetId: trains.fleetId,
+569:          currentDepotId: trains.currentDepotId
+570:        }
+571:      })
+572:      .from(unavailabilityEvents)
+573:      .innerJoin(trains, eq(unavailabilityEvents.trainId, trains.id))
+574:      .where(eq(unavailabilityEvents.status, 'ACTIVE'));
+575:    
+576:    if (depotId) {
+577:      query = query.where(eq(trains.currentDepotId, depotId));
+578:    }
+579:    
+580:    const results = await query;
+581:    return results.map(r => ({
+582:      ...r.event,
+583:      trainNumber: r.train.trainNumber,
+584:      fleetId: r.train.fleetId
+585:    }));
+586:  }
+587:  
+588:  /**
+589:   * Check if a specific train is available on a specific date
+590:   */
+591:  async isTrainAvailable(trainId: string, targetDate: Date): Promise<{
+592:    available: boolean;
+593:    blockingEvent?: UnavailabilityEvent;
+594:  }> {
+595:    const activeEvents = await this.db
+596:      .select()
+597:      .from(unavailabilityEvents)
+598:      .where(and(
+599:        eq(unavailabilityEvents.trainId, trainId),
+600:        eq(unavailabilityEvents.status, 'ACTIVE'),
+601:        or(
+602:          isNull(unavailabilityEvents.estimatedReturnDate),
+603:          gte(unavailabilityEvents.estimatedReturnDate, targetDate)
+604:        )
+605:      ))
+606:      .limit(1);
+607:    
+608:    if (activeEvents.length > 0) {
+609:      return { available: false, blockingEvent: activeEvents[0] };
+610:    }
+611:    
+612:    return { available: true };
+613:  }
+614:  
+615:  /**
+616:   * Process Maximo webhook for work order status change
+617:   */
+618:  async processMaximoWebhook(payload: MaximoWorkOrderWebhook): Promise<void> {
+619:    // Map Maximo work types to our event types
+620:    const eventTypeMap: Record<string, UnavailabilityEvent['eventType']> = {
+621:      'CM': 'CORRECTIVE',
+622:      'EM': 'CORRECTIVE',  // Emergency maintenance
+623:      'IN': 'INCIDENT'
+624:    };
+625:    
+626:    if (!eventTypeMap[payload.worktype]) {
+627:      // Not a corrective maintenance type, ignore
+628:      return;
+629:    }
+630:    
+631:    // Check if we already have an event for this WO
+632:    const existing = await this.db
+633:      .select()
+634:      .from(unavailabilityEvents)
+635:      .where(and(
+636:        eq(unavailabilityEvents.sourceSystem, 'MAXIMO'),
+637:        eq(unavailabilityEvents.externalReference, payload.wonum)
+638:      ))
+639:      .limit(1);
+640:    
+641:    if (existing.length > 0) {
+642:      // Update existing event based on Maximo status
+643:      await this.updateFromMaximo(existing[0], payload);
+644:    } else if (payload.status === 'WAPPR' || payload.status === 'INPRG') {
+645:      // Create new unavailability event
+646:      const train = await this.findTrainByAssetnum(payload.assetnum);
+647:      if (!train) {
+648:        this.logger.warn({ assetnum: payload.assetnum }, 'Unknown asset in Maximo webhook');
+649:        return;
+650:      }
+651:      
+652:      await this.createEvent({
+653:        trainId: train.id,
+654:        eventType: eventTypeMap[payload.worktype],
+655:        restrictionLevel: 'GROUNDED',  // Default to grounded for CM
+656:        estimatedReturnDate: payload.schedfinish ? new Date(payload.schedfinish) : undefined,
+657:        sourceSystem: 'MAXIMO',
+658:        externalReference: payload.wonum,
+659:        description: payload.description
+660:      });
+661:    }
+662:  }
+663:  
+664:  private async updateFromMaximo(
+665:    event: UnavailabilityEvent, 
+666:    payload: MaximoWorkOrderWebhook
+667:  ): Promise<void> {
+668:    const maximoStatusMap: Record<string, 'ACTIVE' | 'RESOLVED'> = {
+669:      'WAPPR': 'ACTIVE',
+670:      'APPR': 'ACTIVE',
+671:      'INPRG': 'ACTIVE',
+672:      'COMP': 'RESOLVED',
+673:      'CLOSE': 'RESOLVED',
+674:      'CAN': 'RESOLVED'
+675:    };
+676:    
+677:    const newStatus = maximoStatusMap[payload.status] || 'ACTIVE';
+678:    
+679:    if (newStatus === 'RESOLVED' && event.status === 'ACTIVE') {
+680:      await this.resolveEvent(
+681:        event.id, 
+682:        new Date(), 
+683:        'SYSTEM_MAXIMO',
+684:        `Resolved via Maximo status: ${payload.status}`
+685:      );
+686:    } else {
+687:      // Update estimated return date if changed
+688:      await this.db
+689:        .update(unavailabilityEvents)
+690:        .set({
+691:          externalStatus: payload.status,
+692:          estimatedReturnDate: payload.schedfinish ? new Date(payload.schedfinish) : undefined,
+693:          updatedAt: new Date()
+694:        })
+695:        .where(eq(unavailabilityEvents.id, event.id));
+696:    }
+697:  }
+698:  
+699:  private async checkPMConflicts(
+700:    tx: Transaction,
+701:    trainId: string,
+702:    estimatedReturnDate?: Date
+703:  ): Promise<PMSchedule[]> {
+704:    const endDate = estimatedReturnDate || addDays(new Date(), 90); // Default 90 days
+705:    
+706:    return tx
+707:      .select()
+708:      .from(pmSchedule)
+709:      .where(and(
+710:        eq(pmSchedule.trainId, trainId),
+711:        eq(pmSchedule.status, 'SCHEDULED'),
+712:        lte(pmSchedule.targetDate, endDate),
+713:        isNull(pmSchedule.scenarioId)
+714:      ));
+715:  }
+716:}
+717:```
+718:
+719:---
+720:
+721:## 4.2.6 Service Demand Service (NEW v2.1)
+722:
+723:### 4.2.6.1 Purpose
+724:
+725:Manage fleet availability requirements by day type. This is a **hard constraint** for the optimizer - it cannot approve maintenance schedules that would violate minimum train availability.
+726:
+727:### 4.2.6.2 Implementation
+728:
+729:```typescript
+730:interface ServiceDemand {
+731:  id: string;
+732:  fleetId: string;
+733:  effectiveDate: Date;
+734:  dayType: 'WEEKDAY' | 'SATURDAY' | 'SUNDAY' | 'HOLIDAY';
+735:  
+736:  minTrainsRequired: number;
+737:  peakAmRequirement?: number;
+738:  middayRequirement?: number;
+739:  peakPmRequirement?: number;
+740:  standbyBuffer: number;
+741:}
+742:
+743:interface AvailabilityValidation {
+744:  isValid: boolean;
+745:  availableTrains: number;
+746:  requiredTrains: number;
+747:  shortfall: number;
+748:  unavailableTrains: string[];  // Train IDs
+749:  trainsInMaintenance: string[]; // Train IDs
+750:}
+751:
+752:class ServiceDemandService {
+753:  constructor(
+754:    private db: Database,
+755:    private unavailabilityService: UnavailabilityService
+756:  ) {}
+757:  
+758:  /**
+759:   * Get service demand for a specific date
+760:   */
+761:  async getDemand(fleetId: string, targetDate: Date): Promise<ServiceDemand> {
+762:    const dayType = this.getDayType(targetDate);
+763:    
+764:    const demand = await this.db
+765:      .select()
+766:      .from(serviceDemand)
+767:      .where(and(
+768:        eq(serviceDemand.fleetId, fleetId),
+769:        eq(serviceDemand.dayType, dayType),
+770:        lte(serviceDemand.effectiveDate, targetDate)
+771:      ))
+772:      .orderBy(desc(serviceDemand.effectiveDate))
+773:      .limit(1);
+774:    
+775:    if (demand.length === 0) {
+776:      // Return default: 85% of fleet
+777:      const fleetSize = await this.getFleetSize(fleetId);
+778:      return {
+779:        id: 'default',
+780:        fleetId,
+781:        effectiveDate: targetDate,
+782:        dayType,
+783:        minTrainsRequired: Math.ceil(fleetSize * 0.85),
+784:        standbyBuffer: 2
+785:      };
+786:    }
+787:    
+788:    return demand[0];
+789:  }
+790:  
+791:  /**
+792:   * Validate that enough trains will be available on a date
+793:   */
+794:  async validateAvailability(
+795:    fleetId: string, 
+796:    targetDate: Date,
+797:    additionalUnavailable: string[] = []  // Train IDs to exclude (e.g., proposed PM)
+798:  ): Promise<AvailabilityValidation> {
+799:    const demand = await this.getDemand(fleetId, targetDate);
+800:    
+801:    // Get all trains in fleet
+802:    const allTrains = await this.db
+803:      .select()
+804:      .from(trains)
+805:      .where(and(
+806:        eq(trains.fleetId, fleetId),
+807:        eq(trains.active, true)
+808:      ));
+809:    
+810:    // Get unavailable trains
+811:    const unavailable = await this.unavailabilityService.getActiveUnavailability();
+812:    const unavailableIds = new Set(unavailable.map(u => u.trainId));
+813:    
+814:    // Get trains in maintenance on this date
+815:    const inMaintenance = await this.db
+816:      .select()
+817:      .from(pmSchedule)
+818:      .where(and(
+819:        eq(pmSchedule.targetDate, targetDate),
+820:        inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+821:        isNull(pmSchedule.scenarioId)
+822:      ));
+823:    const maintenanceIds = new Set(inMaintenance.map(pm => pm.trainId));
+824:    
+825:    // Add proposed unavailable
+826:    const proposedIds = new Set(additionalUnavailable);
+827:    
+828:    // Calculate available
+829:    const availableTrains = allTrains.filter(t => 
+830:      !unavailableIds.has(t.id) && 
+831:      !maintenanceIds.has(t.id) &&
+832:      !proposedIds.has(t.id) &&
+833:      t.fitnessStatus === 'FIT'
+834:    );
+835:    
+836:    const required = demand.minTrainsRequired + demand.standbyBuffer;
+837:    const shortfall = Math.max(0, required - availableTrains.length);
+838:    
+839:    return {
+840:      isValid: shortfall === 0,
+841:      availableTrains: availableTrains.length,
+842:      requiredTrains: required,
+843:      shortfall,
+844:      unavailableTrains: Array.from(unavailableIds),
+845:      trainsInMaintenance: Array.from(maintenanceIds)
+846:    };
+847:  }
+848:  
+849:  /**
+850:   * Find dates where service demand would be violated by proposed maintenance
+851:   */
+852:  async findViolations(
+853:    fleetId: string,
+854:    proposedPMs: { trainId: string; date: Date }[],
+855:    horizonDays: number = 90
+856:  ): Promise<{ date: Date; validation: AvailabilityValidation }[]> {
+857:    const violations: { date: Date; validation: AvailabilityValidation }[] = [];
+858:    
+859:    // Group proposed PMs by date
+860:    const pmsByDate = new Map<string, string[]>();
+861:    for (const pm of proposedPMs) {
+862:      const dateKey = pm.date.toISOString().split('T')[0];
+863:      if (!pmsByDate.has(dateKey)) {
+864:        pmsByDate.set(dateKey, []);
+865:      }
+866:      pmsByDate.get(dateKey)!.push(pm.trainId);
+867:    }
+868:    
+869:    // Check each date with proposed PMs
+870:    for (const [dateKey, trainIds] of pmsByDate) {
+871:      const validation = await this.validateAvailability(
+872:        fleetId, 
+873:        new Date(dateKey), 
+874:        trainIds
+875:      );
+876:      
+877:      if (!validation.isValid) {
+878:        violations.push({ date: new Date(dateKey), validation });
+879:      }
+880:    }
+881:    
+882:    return violations;
+883:  }
+884:  
+885:  private getDayType(date: Date): ServiceDemand['dayType'] {
+886:    // TODO: Integrate with holiday calendar
+887:    const dayOfWeek = date.getDay();
+888:    if (dayOfWeek === 0) return 'SUNDAY';
+889:    if (dayOfWeek === 6) return 'SATURDAY';
+890:    return 'WEEKDAY';
+891:  }
+892:  
+893:  private async getFleetSize(fleetId: string): Promise<number> {
+894:    const result = await this.db
+895:      .select({ count: count() })
+896:      .from(trains)
+897:      .where(and(eq(trains.fleetId, fleetId), eq(trains.active, true)));
+898:    return result[0].count;
+899:  }
+900:}
+901:```
+902:
+903:---
+904:
+905:## 4.2.7 Route Utilization Service (NEW v2.1)
+906:
+907:### 4.2.7.1 Purpose
+908:
+909:Provide route-specific daily mileage rates for accurate long-term projections. Using fleet-wide averages can result in 60,000+ km projection error over 12 years.
+910:
+911:### 4.2.7.2 Implementation
+912:
+913:```typescript
+914:interface RouteUtilizationProfile {
+915:  id: string;
+916:  routeId: string;
+917:  effectiveDate: Date;
+918:  
+919:  weekdayKm: number;
+920:  saturdayKm?: number;
+921:  sundayKm?: number;
+922:  holidayKm?: number;
+923:  
+924:  peakSeasonMultiplier: number;
+925:  offPeakMultiplier: number;
+926:  
+927:  confidence: 'HIGH' | 'MEDIUM' | 'LOW' | 'ESTIMATED';
+928:}
+929:
+930:class RouteUtilizationService {
+931:  constructor(private db: Database) {}
+932:  
+933:  /**
+934:   * Get utilization profile for a route
+935:   */
+936:  async getProfile(routeId: string, asOfDate?: Date): Promise<RouteUtilizationProfile | null> {
+937:    const date = asOfDate || new Date();
+938:    
+939:    const profile = await this.db
+940:      .select()
+941:      .from(routeUtilizationProfiles)
+942:      .where(and(
+943:        eq(routeUtilizationProfiles.routeId, routeId),
+944:        lte(routeUtilizationProfiles.effectiveDate, date)
+945:      ))
+946:      .orderBy(desc(routeUtilizationProfiles.effectiveDate))
+947:      .limit(1);
+948:    
+949:    return profile[0] || null;
+950:  }
+951:  
+952:  /**
+953:   * Calculate expected daily km for a train based on typical route assignment
+954:   */
+955:  async calculateDailyRate(
+956:    trainId: string, 
+957:    targetDate: Date
+958:  ): Promise<{ dailyKm: number; source: string; confidence: string }> {
+959:    // 1. Check for explicit route assignment
+960:    const assignment = await this.getTypicalRouteAssignment(trainId);
+961:    
+962:    if (assignment) {
+963:      const profile = await this.getProfile(assignment.routeId, targetDate);
+964:      if (profile) {
+965:        const dayType = this.getDayType(targetDate);
+966:        const baseKm = this.getKmForDayType(profile, dayType);
+967:        const seasonalMultiplier = this.getSeasonalMultiplier(profile, targetDate);
+968:        
+969:        return {
+970:          dailyKm: Math.round(baseKm * seasonalMultiplier),
+971:          source: `route:${assignment.routeId}`,
+972:          confidence: profile.confidence
+973:        };
+974:      }
+975:    }
+976:    
+977:    // 2. Fall back to fleet average
+978:    const train = await this.db
+979:      .select({ fleetId: trains.fleetId })
+980:      .from(trains)
+981:      .where(eq(trains.id, trainId))
+982:      .limit(1);
+983:    
+984:    if (train[0]) {
+985:      const fleetAverage = await this.getFleetAverage(train[0].fleetId);
+986:      return {
+987:        dailyKm: fleetAverage,
+988:        source: 'fleet_average',
+989:        confidence: 'LOW'
+990:      };
+991:    }
+992:    
+993:    // 3. System default
+994:    return {
+995:      dailyKm: 250,  // Conservative default
+996:      source: 'system_default',
+997:      confidence: 'ESTIMATED'
+998:    };
+999:  }
+1000:  
+1001:  /**
+1002:   * Project mileage for a train over a time horizon
+1003:   */
+1004:  async projectMileage(
+1005:    trainId: string,
+1006:    startDate: Date,
+1007:    horizonDays: number
+1008:  ): Promise<{ date: Date; projectedKm: number; cumulativeKm: number }[]> {
+1009:    const train = await this.db
+1010:      .select()
+1011:      .from(trains)
+1012:      .where(eq(trains.id, trainId))
+1013:      .limit(1);
+1014:    
+1015:    if (!train[0]) {
+1016:      throw new NotFoundError(`Train ${trainId} not found`);
+1017:    }
+1018:    
+1019:    let cumulativeKm = train[0].currentMileageKm;
+1020:    const projections: { date: Date; projectedKm: number; cumulativeKm: number }[] = [];
+1021:    
+1022:    for (let day = 0; day < horizonDays; day++) {
+1023:      const targetDate = addDays(startDate, day);
+1024:      const { dailyKm } = await this.calculateDailyRate(trainId, targetDate);
+1025:      
+1026:      cumulativeKm += dailyKm;
+1027:      projections.push({
+1028:        date: targetDate,
+1029:        projectedKm: dailyKm,
+1030:        cumulativeKm
+1031:      });
+1032:    }
+1033:    
+1034:    return projections;
+1035:  }
+1036:  
+1037:  private async getTypicalRouteAssignment(trainId: string): Promise<{ routeId: string } | null> {
+1038:    // Look at recent run assignments to determine typical route
+1039:    const recentAssignments = await this.db
+1040:      .select({ routeId: runAssignments.routeId, count: count() })
+1041:      .from(runAssignments)
+1042:      .where(and(
+1043:        eq(runAssignments.trainId, trainId),
+1044:        gte(runAssignments.assignmentDate, addDays(new Date(), -30))
+1045:      ))
+1046:      .groupBy(runAssignments.routeId)
+1047:      .orderBy(desc(count()))
+1048:      .limit(1);
+1049:    
+1050:    return recentAssignments[0] || null;
+1051:  }
+1052:  
+1053:  private async getFleetAverage(fleetId: string): Promise<number> {
+1054:    // Calculate from recent mileage readings
+1055:    const result = await this.db
+1056:      .select({ avgDaily: avg(mileageReadings.dailyKm) })
+1057:      .from(mileageReadings)
+1058:      .innerJoin(trains, eq(mileageReadings.trainId, trains.id))
+1059:      .where(and(
+1060:        eq(trains.fleetId, fleetId),
+1061:        gte(mileageReadings.readingDate, addDays(new Date(), -30)),
+1062:        eq(mileageReadings.validationStatus, 'VALID')
+1063:      ));
+1064:    
+1065:    return Math.round(result[0]?.avgDaily || 250);
+1066:  }
+1067:  
+1068:  private getKmForDayType(profile: RouteUtilizationProfile, dayType: string): number {
+1069:    switch (dayType) {
+1070:      case 'SATURDAY': return profile.saturdayKm || profile.weekdayKm * 0.8;
+1071:      case 'SUNDAY': return profile.sundayKm || profile.weekdayKm * 0.7;
+1072:      case 'HOLIDAY': return profile.holidayKm || profile.weekdayKm * 0.6;
+1073:      default: return profile.weekdayKm;
+1074:    }
+1075:  }
+1076:  
+1077:  private getSeasonalMultiplier(profile: RouteUtilizationProfile, date: Date): number {
+1078:    // TODO: Integrate with season calendar
+1079:    const month = date.getMonth();
+1080:    // Peak season: CNY (Jan-Feb), School holidays (Jun, Nov-Dec)
+1081:    const peakMonths = [0, 1, 5, 10, 11];
+1082:    return peakMonths.includes(month) ? profile.peakSeasonMultiplier : profile.offPeakMultiplier;
+1083:  }
+1084:  
+1085:  private getDayType(date: Date): string {
+1086:    const dayOfWeek = date.getDay();
+1087:    if (dayOfWeek === 0) return 'SUNDAY';
+1088:    if (dayOfWeek === 6) return 'SATURDAY';
+1089:    return 'WEEKDAY';
+1090:  }
+1091:}
+1092:```
+1093:
+1094:---
+1095:
+1096:## 4.3 Run Assignment Optimizer
+1097:
+1098:### 4.3.1 Purpose
+1099:
+1100:Optimize daily train-to-route assignments for mileage balancing while respecting hard constraints (fitness, PM due, **unavailability**, **service demand**) and minimizing soft constraint penalties.
+1101:
+1102:### 4.3.2 Optimizer Service (TypeScript Wrapper)
+1103:
+1104:```typescript
+1105:interface OptimizerConfig {
+1106:  binaryPath: string;          // ./mms-optimizer
+1107:  maxSolveTimeSeconds: number; // 30
+1108:  numWorkers: number;          // 4
+1109:  timeoutMs: number;           // 60000
+1110:  fallbackEnabled: boolean;    // true
+1111:}
+1112:
+1113:class RunAssignmentOptimizer {
+1114:  private process: Subprocess | null = null;
+1115:  
+1116:  async optimize(input: OptimizerInput): Promise<OptimizerResult> {
+1117:    const startTime = Date.now();
+1118:    
+1119:    try {
+1120:      // Try C++ optimizer first
+1121:      const result = await this.runCppOptimizer(input);
+1122:      
+1123:      // Validate result
+1124:      if (result.status === 'INFEASIBLE' && this.config.fallbackEnabled) {
+1125:        this.logger.warn('C++ optimizer returned INFEASIBLE, using fallback');
+1126:        return await this.runFallbackOptimizer(input);
+1127:      }
+1128:      
+1129:      return result;
+1130:      
+1131:    } catch (error) {
+1132:      this.logger.error({ error }, 'C++ optimizer failed, using fallback');
+1133:      
+1134:      if (this.config.fallbackEnabled) {
+1135:        return await this.runFallbackOptimizer(input);
+1136:      }
+1137:      
+1138:      throw error;
+1139:    }
+1140:  }
+1141:  
+1142:  private async runCppOptimizer(input: OptimizerInput): Promise<OptimizerResult> {
+1143:    return new Promise((resolve, reject) => {
+1144:      const timeout = setTimeout(() => {
+1145:        this.process?.kill();
+1146:        reject(new Error('Optimizer timeout'));
+1147:      }, this.config.timeoutMs);
+1148:      
+1149:      this.process = Bun.spawn([this.config.binaryPath], {
+1150:        stdin: 'pipe',
+1151:        stdout: 'pipe',
+1152:        stderr: 'pipe'
+1153:      });
+1154:      
+1155:      // Write input
+1156:      const writer = this.process.stdin.getWriter();
+1157:      writer.write(new TextEncoder().encode(JSON.stringify(input) + '\n'));
+1158:      writer.close();
+1159:      
+1160:      // Read stdout (results)
+1161:      const results: any[] = [];
+1162:      const reader = this.process.stdout.getReader();
+1163:      const decoder = new TextDecoder();
+1164:      let buffer = '';
+1165:      
+1166:      const readStream = async () => {
+1167:        while (true) {
+1168:          const { done, value } = await reader.read();
+1169:          if (done) break;
+1170:          
+1171:          buffer += decoder.decode(value, { stream: true });
+1172:          const lines = buffer.split('\n');
+1173:          buffer = lines.pop() || '';
+1174:          
+1175:          for (const line of lines) {
+1176:            if (!line.trim()) continue;
+1177:            
+1178:            try {
+1179:              const msg = JSON.parse(line);
+1180:              
+1181:              if (msg.type === 'PROGRESS') {
+1182:                this.emitProgress(msg);
+1183:              } else if (msg.type === 'RESULT') {
+1184:                clearTimeout(timeout);
+1185:                resolve(this.mapResult(msg));
+1186:                return;
+1187:              }
+1188:            } catch (e) {
+1189:              this.logger.warn({ line }, 'Failed to parse optimizer output');
+1190:            }
+1191:          }
+1192:        }
+1193:      };
+1194:      
+1195:      // Read stderr (metrics/logs)
+1196:      this.readStderr(this.process.stderr);
+1197:      
+1198:      readStream().catch(reject);
+1199:      
+1200:      this.process.exited.then((code) => {

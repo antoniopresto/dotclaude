@@ -1,0 +1,1128 @@
+     1→/**
+     2→ * MMS Baseline Assumption Service
+     3→ *
+     4→ * Manages PM history assumptions for cold start scenarios during data migration.
+     5→ * Implements inference rules, manual review queue, and approval workflow.
+     6→ *
+     7→ * Key features:
+     8→ * - Inference rules for missing PM history (from commissioning, higher PM, etc.)
+     9→ * - Manual review queue for LOW/ESTIMATED confidence assumptions
+    10→ * - Review/approval workflow with audit trail
+    11→ * - Integration with PM scheduler for baseline calculation
+    12→ *
+    13→ * @see specs/003-database-schema.md Section 3.2.6
+    14→ * @see ADR-014: PM History Assumptions for Cold Start
+    15→ */
+    16→
+    17→import { eq, and, inArray, isNull, desc, asc, sql, count, SQL } from 'drizzle-orm';
+    18→import { BaseService, MmsAttributes, type Span } from '../lib/services/base';
+    19→import {
+    20→  pmBaselineAssumptions,
+    21→  trains,
+    22→  pmTypes,
+    23→  pmSchedule,
+    24→  users,
+    25→  type PmBaselineAssumption,
+    26→  type NewPmBaselineAssumption,
+    27→  type Train,
+    28→  type PmType,
+    29→} from '../lib/db/schema';
+    30→import { NotFoundError, ValidationError, ConflictError } from '../lib/errors';
+    31→import { addDays, addMonths, differenceInDays, parseISO, format } from 'date-fns';
+    32→
+    33→// =============================================================================
+    34→// Types
+    35→// =============================================================================
+    36→
+    37→/** Assumption type for PM history inference */
+    38→export type AssumptionType =
+    39→  | 'INFERRED_FROM_COMMISSIONING'
+    40→  | 'INFERRED_FROM_HIGHER_PM'
+    41→  | 'MANUAL_OVERRIDE'
+    42→  | 'IMPORTED'
+    43→  | 'NO_HISTORY';
+    44→
+    45→/** Confidence level for assumption quality */
+    46→export type ConfidenceLevel = 'HIGH' | 'MEDIUM' | 'LOW' | 'ESTIMATED';
+    47→
+    48→/** Review status for assumptions */
+    49→export type ReviewStatus = 'PENDING_REVIEW' | 'REVIEWED' | 'APPLIED' | 'REJECTED';
+    50→
+    51→/** PM hierarchy mapping - higher PMs satisfy lower ones */
+    52→const PM_HIERARCHY: Record<string, string[]> = {
+    53→  OVERHAUL: ['C4', 'C3', 'C2', 'C1'],
+    54→  C4: ['C3', 'C2', 'C1'],
+    55→  C3: ['C2', 'C1'],
+    56→  C2: ['C1'],
+    57→  C1: [],
+    58→};
+    59→
+    60→/** Default PM intervals in months */
+    61→const DEFAULT_PM_INTERVALS: Record<string, number> = {
+    62→  C1: 6,
+    63→  C2: 12,
+    64→  C3: 24,
+    65→  C4: 48,
+    66→  OVERHAUL: 96,
+    67→};
+    68→
+    69→/** Request to create a new assumption */
+    70→export interface CreateAssumptionRequest {
+    71→  trainId: string;
+    72→  pmTypeId: string;
+    73→  assumptionType: AssumptionType;
+    74→  assumedLastPmDate?: string; // ISO date
+    75→  assumedLastPmMileage?: number;
+    76→  confidenceLevel: ConfidenceLevel;
+    77→  inferenceSource?: string;
+    78→  inferenceData?: Record<string, unknown>;
+    79→  requiresReview?: boolean;
+    80→}
+    81→
+    82→/** Request to update an assumption */
+    83→export interface UpdateAssumptionRequest {
+    84→  assumedLastPmDate?: string;
+    85→  assumedLastPmMileage?: number;
+    86→  confidenceLevel?: ConfidenceLevel;
+    87→  inferenceSource?: string;
+    88→  inferenceData?: Record<string, unknown>;
+    89→  requiresReview?: boolean;
+    90→}
+    91→
+    92→/** Request to review an assumption */
+    93→export interface ReviewAssumptionRequest {
+    94→  reviewNotes?: string;
+    95→  approved: boolean;
+    96→  /** If approved=false and corrections provided, update the assumption */
+    97→  correctedDate?: string;
+    98→  correctedMileage?: number;
+    99→}
+   100→
+   101→/** Request to apply an assumption to the PM schedule */
+   102→export interface ApplyAssumptionRequest {
+   103→  /** Override the assumed values if needed */
+   104→  overrideDate?: string;
+   105→  overrideMileage?: number;
+   106→}
+   107→
+   108→/** Request to infer assumptions from commissioning date */
+   109→export interface InferFromCommissioningRequest {
+   110→  trainId: string;
+   111→  /** PM type codes to generate assumptions for */
+   112→  pmTypeCodes?: string[];
+   113→}
+   114→
+   115→/** Request to infer assumptions from higher PM */
+   116→export interface InferFromHigherPmRequest {
+   117→  trainId: string;
+   118→  /** Known PM type code (e.g., C4) */
+   119→  knownPmTypeCode: string;
+   120→  /** Date of the known PM */
+   121→  knownPmDate: string;
+   122→  /** Mileage at the known PM */
+   123→  knownPmMileage: number;
+   124→}
+   125→
+   126→/** Filters for querying assumptions */
+   127→export interface AssumptionFilters {
+   128→  trainId?: string;
+   129→  pmTypeId?: string;
+   130→  confidenceLevel?: ConfidenceLevel | ConfidenceLevel[];
+   131→  assumptionType?: AssumptionType | AssumptionType[];
+   132→  requiresReview?: boolean;
+   133→  reviewed?: boolean;
+   134→  applied?: boolean;
+   135→}
+   136→
+   137→/** Pagination options */
+   138→export interface PaginationOptions {
+   139→  page?: number;
+   140→  pageSize?: number;
+   141→  sortBy?: 'createdAt' | 'confidenceLevel' | 'trainNumber';
+   142→  sortOrder?: 'asc' | 'desc';
+   143→}
+   144→
+   145→/** Paginated result */
+   146→export interface PaginatedResult<T> {
+   147→  items: T[];
+   148→  total: number;
+   149→  page: number;
+   150→  pageSize: number;
+   151→  totalPages: number;
+   152→}
+   153→
+   154→/** Assumption with related data */
+   155→export interface AssumptionWithDetails extends PmBaselineAssumption {
+   156→  train: Pick<Train, 'id' | 'trainNumber' | 'currentMileageKm' | 'commissioningDate'>;
+   157→  pmType: Pick<PmType, 'id' | 'pmCode' | 'intervalKm' | 'intervalMonths'>;
+   158→  reviewedByUser?: { id: string; email: string } | null;
+   159→  appliedByUser?: { id: string; email: string } | null;
+   160→  reviewStatus: ReviewStatus;
+   161→}
+   162→
+   163→/** Review queue summary */
+   164→export interface ReviewQueueSummary {
+   165→  totalPendingReview: number;
+   166→  byConfidenceLevel: Record<ConfidenceLevel, number>;
+   167→  byAssumptionType: Record<AssumptionType, number>;
+   168→  oldestPendingDate: Date | null;
+   169→}
+   170→
+   171→/** Inference result for batch operations */
+   172→export interface InferenceResult {
+   173→  created: number;
+   174→  skipped: number;
+   175→  errors: Array<{ trainId: string; pmTypeId: string; error: string }>;
+   176→  assumptions: AssumptionWithDetails[];
+   177→}
+   178→
+   179→// =============================================================================
+   180→// Service Implementation
+   181→// =============================================================================
+   182→
+   183→/**
+   184→ * Baseline Assumption Service
+   185→ *
+   186→ * Manages PM history assumptions for cold start data migration scenarios.
+   187→ */
+   188→export class BaselineAssumptionService extends BaseService {
+   189→  constructor() {
+   190→    super({ name: 'baseline-assumption-service' });
+   191→  }
+   192→
+   193→  // ===========================================================================
+   194→  // CRUD Operations
+   195→  // ===========================================================================
+   196→
+   197→  /**
+   198→   * Create a new baseline assumption
+   199→   */
+   200→  async createAssumption(
+   201→    request: CreateAssumptionRequest,
+   202→    userId?: string
+   203→  ): Promise<AssumptionWithDetails> {
+   204→    return this.traced('createAssumption', async (span) => {
+   205→      span.setAttribute(MmsAttributes.TRAIN_ID, request.trainId);
+   206→
+   207→      // Validate train exists
+   208→      const train = await this.db.query.trains.findFirst({
+   209→        where: eq(trains.id, request.trainId),
+   210→      });
+   211→      if (!train) {
+   212→        throw new NotFoundError('Train not found', {
+   213→          entityType: 'train',
+   214→          entityId: request.trainId,
+   215→        });
+   216→      }
+   217→
+   218→      // Validate PM type exists
+   219→      const pmType = await this.db.query.pmTypes.findFirst({
+   220→        where: eq(pmTypes.id, request.pmTypeId),
+   221→      });
+   222→      if (!pmType) {
+   223→        throw new NotFoundError('PM type not found', {
+   224→          entityType: 'pmType',
+   225→          entityId: request.pmTypeId,
+   226→        });
+   227→      }
+   228→
+   229→      // Check for existing assumption
+   230→      const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   231→        where: and(
+   232→          eq(pmBaselineAssumptions.trainId, request.trainId),
+   233→          eq(pmBaselineAssumptions.pmTypeId, request.pmTypeId)
+   234→        ),
+   235→      });
+   236→      if (existing) {
+   237→        throw new ConflictError(
+   238→          `Assumption already exists for train ${train.trainNumber} and PM type ${pmType.pmCode}`,
+   239→          { existingId: existing.id }
+   240→        );
+   241→      }
+   242→
+   243→      // Determine if review is required based on confidence
+   244→      const requiresReview =
+   245→        request.requiresReview ??
+   246→        (request.confidenceLevel === 'LOW' || request.confidenceLevel === 'ESTIMATED');
+   247→
+   248→      const newAssumption: NewPmBaselineAssumption = {
+   249→        trainId: request.trainId,
+   250→        pmTypeId: request.pmTypeId,
+   251→        assumptionType: request.assumptionType,
+   252→        assumedLastPmDate: request.assumedLastPmDate ?? null,
+   253→        assumedLastPmMileage: request.assumedLastPmMileage ?? null,
+   254→        confidenceLevel: request.confidenceLevel,
+   255→        inferenceSource: request.inferenceSource ?? null,
+   256→        inferenceData: request.inferenceData ?? null,
+   257→        requiresReview,
+   258→      };
+   259→
+   260→      const [created] = await this.db
+   261→        .insert(pmBaselineAssumptions)
+   262→        .values(newAssumption)
+   263→        .returning();
+   264→
+   265→      this.log.info(
+   266→        { assumptionId: created.id, trainId: request.trainId, pmTypeCode: pmType.pmCode },
+   267→        'Created baseline assumption'
+   268→      );
+   269→
+   270→      return this.getAssumptionById(created.id);
+   271→    });
+   272→  }
+   273→
+   274→  /**
+   275→   * Get assumption by ID with full details
+   276→   */
+   277→  async getAssumptionById(id: string): Promise<AssumptionWithDetails> {
+   278→    return this.traced('getAssumptionById', async (span) => {
+   279→      span.setAttribute('assumption.id', id);
+   280→
+   281→      const assumption = await this.db.query.pmBaselineAssumptions.findFirst({
+   282→        where: eq(pmBaselineAssumptions.id, id),
+   283→        with: {
+   284→          train: true,
+   285→          pmType: true,
+   286→          reviewedByUser: true,
+   287→          appliedByUser: true,
+   288→        },
+   289→      });
+   290→
+   291→      if (!assumption) {
+   292→        throw new NotFoundError('Assumption not found', {
+   293→          entityType: 'pmBaselineAssumption',
+   294→          entityId: id,
+   295→        });
+   296→      }
+   297→
+   298→      return this.mapToAssumptionWithDetails(assumption);
+   299→    });
+   300→  }
+   301→
+   302→  /**
+   303→   * List assumptions with filtering and pagination
+   304→   */
+   305→  async listAssumptions(
+   306→    filters: AssumptionFilters = {},
+   307→    pagination: PaginationOptions = {}
+   308→  ): Promise<PaginatedResult<AssumptionWithDetails>> {
+   309→    return this.traced('listAssumptions', async (span) => {
+   310→      const page = pagination.page ?? 1;
+   311→      const pageSize = pagination.pageSize ?? 20;
+   312→      const offset = (page - 1) * pageSize;
+   313→
+   314→      // Build where conditions
+   315→      const conditions: SQL<unknown>[] = [];
+   316→
+   317→      if (filters.trainId) {
+   318→        conditions.push(eq(pmBaselineAssumptions.trainId, filters.trainId));
+   319→      }
+   320→      if (filters.pmTypeId) {
+   321→        conditions.push(eq(pmBaselineAssumptions.pmTypeId, filters.pmTypeId));
+   322→      }
+   323→      if (filters.confidenceLevel) {
+   324→        const levels = Array.isArray(filters.confidenceLevel)
+   325→          ? filters.confidenceLevel
+   326→          : [filters.confidenceLevel];
+   327→        conditions.push(inArray(pmBaselineAssumptions.confidenceLevel, levels));
+   328→      }
+   329→      if (filters.assumptionType) {
+   330→        const types = Array.isArray(filters.assumptionType)
+   331→          ? filters.assumptionType
+   332→          : [filters.assumptionType];
+   333→        conditions.push(inArray(pmBaselineAssumptions.assumptionType, types));
+   334→      }
+   335→      if (filters.requiresReview !== undefined) {
+   336→        conditions.push(eq(pmBaselineAssumptions.requiresReview, filters.requiresReview));
+   337→      }
+   338→      if (filters.reviewed !== undefined) {
+   339→        if (filters.reviewed) {
+   340→          conditions.push(sql`${pmBaselineAssumptions.reviewedAt} IS NOT NULL`);
+   341→        } else {
+   342→          conditions.push(isNull(pmBaselineAssumptions.reviewedAt));
+   343→        }
+   344→      }
+   345→      if (filters.applied !== undefined) {
+   346→        if (filters.applied) {
+   347→          conditions.push(sql`${pmBaselineAssumptions.appliedAt} IS NOT NULL`);
+   348→        } else {
+   349→          conditions.push(isNull(pmBaselineAssumptions.appliedAt));
+   350→        }
+   351→      }
+   352→
+   353→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   354→
+   355→      // Get total count
+   356→      const [{ total }] = await this.db
+   357→        .select({ total: count() })
+   358→        .from(pmBaselineAssumptions)
+   359→        .where(whereClause);
+   360→
+   361→      // Build order by
+   362→      let orderBy: SQL;
+   363→      const sortOrder = pagination.sortOrder === 'asc' ? asc : desc;
+   364→      switch (pagination.sortBy) {
+   365→        case 'confidenceLevel':
+   366→          orderBy = sortOrder(pmBaselineAssumptions.confidenceLevel);
+   367→          break;
+   368→        case 'trainNumber':
+   369→          orderBy = sortOrder(trains.trainNumber);
+   370→          break;
+   371→        default:
+   372→          orderBy = sortOrder(pmBaselineAssumptions.createdAt);
+   373→      }
+   374→
+   375→      // Query with joins
+   376→      const results = await this.db.query.pmBaselineAssumptions.findMany({
+   377→        where: whereClause,
+   378→        with: {
+   379→          train: true,
+   380→          pmType: true,
+   381→          reviewedByUser: true,
+   382→          appliedByUser: true,
+   383→        },
+   384→        orderBy: [orderBy],
+   385→        limit: pageSize,
+   386→        offset,
+   387→      });
+   388→
+   389→      span.setAttribute('results.count', results.length);
+   390→      span.setAttribute('results.total', total);
+   391→
+   392→      return {
+   393→        items: results.map((r) => this.mapToAssumptionWithDetails(r)),
+   394→        total,
+   395→        page,
+   396→        pageSize,
+   397→        totalPages: Math.ceil(total / pageSize),
+   398→      };
+   399→    });
+   400→  }
+   401→
+   402→  /**
+   403→   * Update an assumption
+   404→   */
+   405→  async updateAssumption(
+   406→    id: string,
+   407→    request: UpdateAssumptionRequest,
+   408→    userId?: string
+   409→  ): Promise<AssumptionWithDetails> {
+   410→    return this.traced('updateAssumption', async (span) => {
+   411→      span.setAttribute('assumption.id', id);
+   412→
+   413→      const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   414→        where: eq(pmBaselineAssumptions.id, id),
+   415→      });
+   416→
+   417→      if (!existing) {
+   418→        throw new NotFoundError('Assumption not found', {
+   419→          entityType: 'pmBaselineAssumption',
+   420→          entityId: id,
+   421→        });
+   422→      }
+   423→
+   424→      // Cannot update applied assumptions
+   425→      if (existing.appliedAt) {
+   426→        throw new ConflictError('Cannot update an assumption that has already been applied');
+   427→      }
+   428→
+   429→      const updates: Partial<NewPmBaselineAssumption> = {
+   430→        updatedAt: new Date(),
+   431→      };
+   432→
+   433→      if (request.assumedLastPmDate !== undefined) {
+   434→        updates.assumedLastPmDate = request.assumedLastPmDate;
+   435→      }
+   436→      if (request.assumedLastPmMileage !== undefined) {
+   437→        updates.assumedLastPmMileage = request.assumedLastPmMileage;
+   438→      }
+   439→      if (request.confidenceLevel !== undefined) {
+   440→        updates.confidenceLevel = request.confidenceLevel;
+   441→        // Update review requirement based on new confidence
+   442→        updates.requiresReview =
+   443→          request.confidenceLevel === 'LOW' || request.confidenceLevel === 'ESTIMATED';
+   444→      }
+   445→      if (request.inferenceSource !== undefined) {
+   446→        updates.inferenceSource = request.inferenceSource;
+   447→      }
+   448→      if (request.inferenceData !== undefined) {
+   449→        updates.inferenceData = request.inferenceData;
+   450→      }
+   451→      if (request.requiresReview !== undefined) {
+   452→        updates.requiresReview = request.requiresReview;
+   453→      }
+   454→
+   455→      await this.db
+   456→        .update(pmBaselineAssumptions)
+   457→        .set(updates)
+   458→        .where(eq(pmBaselineAssumptions.id, id));
+   459→
+   460→      this.log.info({ assumptionId: id }, 'Updated baseline assumption');
+   461→
+   462→      return this.getAssumptionById(id);
+   463→    });
+   464→  }
+   465→
+   466→  /**
+   467→   * Delete an assumption
+   468→   */
+   469→  async deleteAssumption(id: string): Promise<void> {
+   470→    return this.traced('deleteAssumption', async (span) => {
+   471→      span.setAttribute('assumption.id', id);
+   472→
+   473→      const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   474→        where: eq(pmBaselineAssumptions.id, id),
+   475→      });
+   476→
+   477→      if (!existing) {
+   478→        throw new NotFoundError('Assumption not found', {
+   479→          entityType: 'pmBaselineAssumption',
+   480→          entityId: id,
+   481→        });
+   482→      }
+   483→
+   484→      // Cannot delete applied assumptions
+   485→      if (existing.appliedAt) {
+   486→        throw new ConflictError('Cannot delete an assumption that has already been applied');
+   487→      }
+   488→
+   489→      await this.db.delete(pmBaselineAssumptions).where(eq(pmBaselineAssumptions.id, id));
+   490→
+   491→      this.log.info({ assumptionId: id }, 'Deleted baseline assumption');
+   492→    });
+   493→  }
+   494→
+   495→  // ===========================================================================
+   496→  // Review Queue Operations
+   497→  // ===========================================================================
+   498→
+   499→  /**
+   500→   * Get assumptions requiring manual review (the review queue)
+   501→   */
+   502→  async getReviewQueue(pagination: PaginationOptions = {}): Promise<PaginatedResult<AssumptionWithDetails>> {
+   503→    return this.traced('getReviewQueue', async (span) => {
+   504→      return this.listAssumptions(
+   505→        {
+   506→          requiresReview: true,
+   507→          reviewed: false,
+   508→        },
+   509→        {
+   510→          ...pagination,
+   511→          sortBy: pagination.sortBy ?? 'createdAt',
+   512→          sortOrder: pagination.sortOrder ?? 'asc', // Oldest first
+   513→        }
+   514→      );
+   515→    });
+   516→  }
+   517→
+   518→  /**
+   519→   * Get review queue summary statistics
+   520→   */
+   521→  async getReviewQueueSummary(): Promise<ReviewQueueSummary> {
+   522→    return this.traced('getReviewQueueSummary', async (span) => {
+   523→      // Get pending review assumptions
+   524→      const pendingReview = await this.db.query.pmBaselineAssumptions.findMany({
+   525→        where: and(
+   526→          eq(pmBaselineAssumptions.requiresReview, true),
+   527→          isNull(pmBaselineAssumptions.reviewedAt)
+   528→        ),
+   529→      });
+   530→
+   531→      // Count by confidence level
+   532→      const byConfidenceLevel: Record<ConfidenceLevel, number> = {
+   533→        HIGH: 0,
+   534→        MEDIUM: 0,
+   535→        LOW: 0,
+   536→        ESTIMATED: 0,
+   537→      };
+   538→
+   539→      // Count by assumption type
+   540→      const byAssumptionType: Record<AssumptionType, number> = {
+   541→        INFERRED_FROM_COMMISSIONING: 0,
+   542→        INFERRED_FROM_HIGHER_PM: 0,
+   543→        MANUAL_OVERRIDE: 0,
+   544→        IMPORTED: 0,
+   545→        NO_HISTORY: 0,
+   546→      };
+   547→
+   548→      let oldestDate: Date | null = null;
+   549→
+   550→      for (const assumption of pendingReview) {
+   551→        byConfidenceLevel[assumption.confidenceLevel as ConfidenceLevel]++;
+   552→        byAssumptionType[assumption.assumptionType as AssumptionType]++;
+   553→
+   554→        if (!oldestDate || (assumption.createdAt && assumption.createdAt < oldestDate)) {
+   555→          oldestDate = assumption.createdAt;
+   556→        }
+   557→      }
+   558→
+   559→      return {
+   560→        totalPendingReview: pendingReview.length,
+   561→        byConfidenceLevel,
+   562→        byAssumptionType,
+   563→        oldestPendingDate: oldestDate,
+   564→      };
+   565→    });
+   566→  }
+   567→
+   568→  /**
+   569→   * Review an assumption (approve or reject)
+   570→   */
+   571→  async reviewAssumption(
+   572→    id: string,
+   573→    request: ReviewAssumptionRequest,
+   574→    userId: string
+   575→  ): Promise<AssumptionWithDetails> {
+   576→    return this.traced('reviewAssumption', async (span) => {
+   577→      span.setAttribute('assumption.id', id);
+   578→      span.setAttribute('review.approved', request.approved);
+   579→
+   580→      const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   581→        where: eq(pmBaselineAssumptions.id, id),
+   582→      });
+   583→
+   584→      if (!existing) {
+   585→        throw new NotFoundError('Assumption not found', {
+   586→          entityType: 'pmBaselineAssumption',
+   587→          entityId: id,
+   588→        });
+   589→      }
+   590→
+   591→      // Already applied cannot be reviewed again
+   592→      if (existing.appliedAt) {
+   593→        throw new ConflictError('Cannot review an assumption that has already been applied');
+   594→      }
+   595→
+   596→      const updates: Partial<NewPmBaselineAssumption> = {
+   597→        reviewedBy: userId,
+   598→        reviewedAt: new Date(),
+   599→        reviewNotes: request.reviewNotes ?? null,
+   600→        updatedAt: new Date(),
+   601→      };
+   602→
+   603→      if (request.approved) {
+   604→        // If corrections provided, update the assumed values
+   605→        if (request.correctedDate !== undefined) {
+   606→          updates.assumedLastPmDate = request.correctedDate;
+   607→        }
+   608→        if (request.correctedMileage !== undefined) {
+   609→          updates.assumedLastPmMileage = request.correctedMileage;
+   610→        }
+   611→        // Upgrade confidence if corrections were made
+   612→        if (request.correctedDate !== undefined || request.correctedMileage !== undefined) {
+   613→          updates.confidenceLevel = 'HIGH';
+   614→          updates.assumptionType = 'MANUAL_OVERRIDE';
+   615→        }
+   616→        // Clear the review flag
+   617→        updates.requiresReview = false;
+   618→      } else {
+   619→        // Rejected - keep in review queue or mark for deletion
+   620→        updates.reviewNotes = `REJECTED: ${request.reviewNotes ?? 'No reason provided'}`;
+   621→      }
+   622→
+   623→      await this.db
+   624→        .update(pmBaselineAssumptions)
+   625→        .set(updates)
+   626→        .where(eq(pmBaselineAssumptions.id, id));
+   627→
+   628→      this.log.info(
+   629→        { assumptionId: id, approved: request.approved, reviewedBy: userId },
+   630→        `Assumption ${request.approved ? 'approved' : 'rejected'}`
+   631→      );
+   632→
+   633→      return this.getAssumptionById(id);
+   634→    });
+   635→  }
+   636→
+   637→  /**
+   638→   * Apply an assumption to the PM scheduling baseline
+   639→   *
+   640→   * This marks the assumption as applied and updates PM scheduler calculations.
+   641→   */
+   642→  async applyAssumption(
+   643→    id: string,
+   644→    request: ApplyAssumptionRequest,
+   645→    userId: string
+   646→  ): Promise<AssumptionWithDetails> {
+   647→    return this.traced('applyAssumption', async (span) => {
+   648→      span.setAttribute('assumption.id', id);
+   649→
+   650→      const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   651→        where: eq(pmBaselineAssumptions.id, id),
+   652→        with: {
+   653→          train: true,
+   654→          pmType: true,
+   655→        },
+   656→      });
+   657→
+   658→      if (!existing) {
+   659→        throw new NotFoundError('Assumption not found', {
+   660→          entityType: 'pmBaselineAssumption',
+   661→          entityId: id,
+   662→        });
+   663→      }
+   664→
+   665→      // Must be reviewed first (unless HIGH confidence)
+   666→      if (
+   667→        existing.requiresReview &&
+   668→        !existing.reviewedAt &&
+   669→        existing.confidenceLevel !== 'HIGH'
+   670→      ) {
+   671→        throw new ValidationError(
+   672→          'Assumption must be reviewed before it can be applied',
+   673→          { field: 'reviewedAt' }
+   674→        );
+   675→      }
+   676→
+   677→      // Already applied
+   678→      if (existing.appliedAt) {
+   679→        throw new ConflictError('Assumption has already been applied');
+   680→      }
+   681→
+   682→      // Determine final values
+   683→      const finalDate = request.overrideDate ?? existing.assumedLastPmDate;
+   684→      const finalMileage = request.overrideMileage ?? existing.assumedLastPmMileage;
+   685→
+   686→      if (!finalDate && !finalMileage) {
+   687→        throw new ValidationError(
+   688→          'Cannot apply assumption without a date or mileage value',
+   689→          { field: 'assumedLastPmDate' }
+   690→        );
+   691→      }
+   692→
+   693→      // Update the assumption as applied
+   694→      await this.db
+   695→        .update(pmBaselineAssumptions)
+   696→        .set({
+   697→          appliedAt: new Date(),
+   698→          appliedBy: userId,
+   699→          assumedLastPmDate: finalDate,
+   700→          assumedLastPmMileage: finalMileage,
+   701→          updatedAt: new Date(),
+   702→        })
+   703→        .where(eq(pmBaselineAssumptions.id, id));
+   704→
+   705→      this.log.info(
+   706→        {
+   707→          assumptionId: id,
+   708→          trainId: existing.trainId,
+   709→          pmTypeId: existing.pmTypeId,
+   710→          appliedDate: finalDate,
+   711→          appliedMileage: finalMileage,
+   712→          appliedBy: userId,
+   713→        },
+   714→        'Applied baseline assumption'
+   715→      );
+   716→
+   717→      return this.getAssumptionById(id);
+   718→    });
+   719→  }
+   720→
+   721→  // ===========================================================================
+   722→  // Inference Operations
+   723→  // ===========================================================================
+   724→
+   725→  /**
+   726→   * Infer assumptions from train commissioning date
+   727→   *
+   728→   * For each PM type, assumes the first PM occurred at commissioning date + interval.
+   729→   * Sets confidence to LOW and requires review.
+   730→   */
+   731→  async inferFromCommissioning(
+   732→    request: InferFromCommissioningRequest,
+   733→    userId?: string
+   734→  ): Promise<InferenceResult> {
+   735→    return this.traced('inferFromCommissioning', async (span) => {
+   736→      span.setAttribute(MmsAttributes.TRAIN_ID, request.trainId);
+   737→
+   738→      const train = await this.db.query.trains.findFirst({
+   739→        where: eq(trains.id, request.trainId),
+   740→      });
+   741→
+   742→      if (!train) {
+   743→        throw new NotFoundError('Train not found', {
+   744→          entityType: 'train',
+   745→          entityId: request.trainId,
+   746→        });
+   747→      }
+   748→
+   749→      if (!train.commissioningDate) {
+   750→        throw new ValidationError(
+   751→          'Train does not have a commissioning date set',
+   752→          { field: 'commissioningDate' }
+   753→        );
+   754→      }
+   755→
+   756→      // Get PM types for this train's fleet
+   757→      let pmTypesQuery = this.db.query.pmTypes.findMany({
+   758→        where: train.fleetId ? eq(pmTypes.fleetId, train.fleetId) : undefined,
+   759→      });
+   760→
+   761→      const fleetPmTypes = await pmTypesQuery;
+   762→
+   763→      // Filter by requested codes if provided
+   764→      const targetPmTypes = request.pmTypeCodes
+   765→        ? fleetPmTypes.filter((pt) => request.pmTypeCodes!.includes(pt.pmCode))
+   766→        : fleetPmTypes;
+   767→
+   768→      const result: InferenceResult = {
+   769→        created: 0,
+   770→        skipped: 0,
+   771→        errors: [],
+   772→        assumptions: [],
+   773→      };
+   774→
+   775→      const commissioningDate = new Date(train.commissioningDate);
+   776→
+   777→      for (const pmType of targetPmTypes) {
+   778→        try {
+   779→          // Check if assumption already exists
+   780→          const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   781→            where: and(
+   782→              eq(pmBaselineAssumptions.trainId, train.id),
+   783→              eq(pmBaselineAssumptions.pmTypeId, pmType.id)
+   784→            ),
+   785→          });
+   786→
+   787→          if (existing) {
+   788→            result.skipped++;
+   789→            continue;
+   790→          }
+   791→
+   792→          // Calculate assumed first PM date
+   793→          const intervalMonths =
+   794→            pmType.intervalMonths ?? DEFAULT_PM_INTERVALS[pmType.pmCode] ?? 12;
+   795→          const assumedFirstPmDate = addMonths(commissioningDate, intervalMonths);
+   796→
+   797→          // Calculate assumed mileage if interval is known
+   798→          let assumedMileage: number | undefined;
+   799→          if (pmType.intervalKm && train.currentMileageKm) {
+   800→            // Rough estimate based on interval
+   801→            assumedMileage = pmType.intervalKm;
+   802→          }
+   803→
+   804→          const assumption = await this.createAssumption(
+   805→            {
+   806→              trainId: train.id,
+   807→              pmTypeId: pmType.id,
+   808→              assumptionType: 'INFERRED_FROM_COMMISSIONING',
+   809→              assumedLastPmDate: format(assumedFirstPmDate, 'yyyy-MM-dd'),
+   810→              assumedLastPmMileage: assumedMileage,
+   811→              confidenceLevel: 'LOW',
+   812→              inferenceSource: `Inferred from commissioning date ${train.commissioningDate}`,
+   813→              inferenceData: {
+   814→                commissioningDate: train.commissioningDate,
+   815→                intervalMonths,
+   816→                calculationMethod: 'commission_date_plus_interval',
+   817→              },
+   818→              requiresReview: true,
+   819→            },
+   820→            userId
+   821→          );
+   822→
+   823→          result.created++;
+   824→          result.assumptions.push(assumption);
+   825→        } catch (error) {
+   826→          result.errors.push({
+   827→            trainId: train.id,
+   828→            pmTypeId: pmType.id,
+   829→            error: error instanceof Error ? error.message : String(error),
+   830→          });
+   831→        }
+   832→      }
+   833→
+   834→      this.log.info(
+   835→        {
+   836→          trainId: train.id,
+   837→          created: result.created,
+   838→          skipped: result.skipped,
+   839→          errors: result.errors.length,
+   840→        },
+   841→        'Completed commissioning date inference'
+   842→      );
+   843→
+   844→      return result;
+   845→    });
+   846→  }
+   847→
+   848→  /**
+   849→   * Infer assumptions from a known higher-level PM
+   850→   *
+   851→   * When a higher PM (like C4) is known, it satisfies and resets counters
+   852→   * for lower PMs (C1, C2, C3).
+   853→   */
+   854→  async inferFromHigherPm(
+   855→    request: InferFromHigherPmRequest,
+   856→    userId?: string
+   857→  ): Promise<InferenceResult> {
+   858→    return this.traced('inferFromHigherPm', async (span) => {
+   859→      span.setAttribute(MmsAttributes.TRAIN_ID, request.trainId);
+   860→
+   861→      const train = await this.db.query.trains.findFirst({
+   862→        where: eq(trains.id, request.trainId),
+   863→      });
+   864→
+   865→      if (!train) {
+   866→        throw new NotFoundError('Train not found', {
+   867→          entityType: 'train',
+   868→          entityId: request.trainId,
+   869→        });
+   870→      }
+   871→
+   872→      // Find the known PM type
+   873→      const knownPmType = await this.db.query.pmTypes.findFirst({
+   874→        where: and(
+   875→          eq(pmTypes.pmCode, request.knownPmTypeCode),
+   876→          train.fleetId ? eq(pmTypes.fleetId, train.fleetId) : undefined
+   877→        ),
+   878→      });
+   879→
+   880→      if (!knownPmType) {
+   881→        throw new NotFoundError('PM type not found', {
+   882→          entityType: 'pmType',
+   883→          entityId: request.knownPmTypeCode,
+   884→        });
+   885→      }
+   886→
+   887→      // Get satisfied PM codes from hierarchy
+   888→      const satisfiedCodes = PM_HIERARCHY[request.knownPmTypeCode] ?? [];
+   889→
+   890→      if (satisfiedCodes.length === 0) {
+   891→        return {
+   892→          created: 0,
+   893→          skipped: 0,
+   894→          errors: [],
+   895→          assumptions: [],
+   896→        };
+   897→      }
+   898→
+   899→      // Get PM types for satisfied codes
+   900→      const satisfiedPmTypes = await this.db.query.pmTypes.findMany({
+   901→        where: and(
+   902→          inArray(pmTypes.pmCode, satisfiedCodes),
+   903→          train.fleetId ? eq(pmTypes.fleetId, train.fleetId) : undefined
+   904→        ),
+   905→      });
+   906→
+   907→      const result: InferenceResult = {
+   908→        created: 0,
+   909→        skipped: 0,
+   910→        errors: [],
+   911→        assumptions: [],
+   912→      };
+   913→
+   914→      for (const pmType of satisfiedPmTypes) {
+   915→        try {
+   916→          // Check if assumption already exists
+   917→          const existing = await this.db.query.pmBaselineAssumptions.findFirst({
+   918→            where: and(
+   919→              eq(pmBaselineAssumptions.trainId, train.id),
+   920→              eq(pmBaselineAssumptions.pmTypeId, pmType.id)
+   921→            ),
+   922→          });
+   923→
+   924→          if (existing) {
+   925→            result.skipped++;
+   926→            continue;
+   927→          }
+   928→
+   929→          const assumption = await this.createAssumption(
+   930→            {
+   931→              trainId: train.id,
+   932→              pmTypeId: pmType.id,
+   933→              assumptionType: 'INFERRED_FROM_HIGHER_PM',
+   934→              assumedLastPmDate: request.knownPmDate,
+   935→              assumedLastPmMileage: request.knownPmMileage,
+   936→              confidenceLevel: 'HIGH', // High confidence because derived from actual PM
+   937→              inferenceSource: `Counters reset by ${request.knownPmTypeCode} on ${request.knownPmDate}`,
+   938→              inferenceData: {
+   939→                higherPmCode: request.knownPmTypeCode,
+   940→                higherPmDate: request.knownPmDate,
+   941→                higherPmMileage: request.knownPmMileage,
+   942→                satisfiedBy: request.knownPmTypeCode,
+   943→              },
+   944→              requiresReview: false, // High confidence, no review needed
+   945→            },
+   946→            userId
+   947→          );
+   948→
+   949→          result.created++;
+   950→          result.assumptions.push(assumption);
+   951→        } catch (error) {
+   952→          result.errors.push({
+   953→            trainId: train.id,
+   954→            pmTypeId: pmType.id,
+   955→            error: error instanceof Error ? error.message : String(error),
+   956→          });
+   957→        }
+   958→      }
+   959→
+   960→      // Also create/update assumption for the known PM itself
+   961→      try {
+   962→        const existingKnown = await this.db.query.pmBaselineAssumptions.findFirst({
+   963→          where: and(
+   964→            eq(pmBaselineAssumptions.trainId, train.id),
+   965→            eq(pmBaselineAssumptions.pmTypeId, knownPmType.id)
+   966→          ),
+   967→        });
+   968→
+   969→        if (!existingKnown) {
+   970→          const assumption = await this.createAssumption(
+   971→            {
+   972→              trainId: train.id,
+   973→              pmTypeId: knownPmType.id,
+   974→              assumptionType: 'IMPORTED',
+   975→              assumedLastPmDate: request.knownPmDate,
+   976→              assumedLastPmMileage: request.knownPmMileage,
+   977→              confidenceLevel: 'HIGH',
+   978→              inferenceSource: 'Imported known PM completion',
+   979→              inferenceData: {
+   980→                source: 'inferFromHigherPm',
+   981→              },
+   982→              requiresReview: false,
+   983→            },
+   984→            userId
+   985→          );
+   986→          result.created++;
+   987→          result.assumptions.push(assumption);
+   988→        }
+   989→      } catch (error) {
+   990→        result.errors.push({
+   991→          trainId: train.id,
+   992→          pmTypeId: knownPmType.id,
+   993→          error: error instanceof Error ? error.message : String(error),
+   994→        });
+   995→      }
+   996→
+   997→      this.log.info(
+   998→        {
+   999→          trainId: train.id,
+  1000→          knownPmCode: request.knownPmTypeCode,
+  1001→          created: result.created,
+  1002→          skipped: result.skipped,
+  1003→          errors: result.errors.length,
+  1004→        },
+  1005→        'Completed higher PM inference'
+  1006→      );
+  1007→
+  1008→      return result;
+  1009→    });
+  1010→  }
+  1011→
+  1012→  /**
+  1013→   * Get assumptions for a train (useful for PM scheduler integration)
+  1014→   */
+  1015→  async getAssumptionsForTrain(trainId: string): Promise<AssumptionWithDetails[]> {
+  1016→    return this.traced('getAssumptionsForTrain', async (span) => {
+  1017→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+  1018→
+  1019→      const result = await this.listAssumptions({ trainId }, { pageSize: 100 });
+  1020→      return result.items;
+  1021→    });
+  1022→  }
+  1023→
+  1024→  /**
+  1025→   * Get applied assumptions for PM baseline calculation
+  1026→   */
+  1027→  async getAppliedAssumptions(trainId?: string): Promise<AssumptionWithDetails[]> {
+  1028→    return this.traced('getAppliedAssumptions', async (span) => {
+  1029→      if (trainId) {
+  1030→        span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+  1031→      }
+  1032→
+  1033→      const result = await this.listAssumptions(
+  1034→        {
+  1035→          trainId,
+  1036→          applied: true,
+  1037→        },
+  1038→        { pageSize: 1000 }
+  1039→      );
+  1040→
+  1041→      return result.items;
+  1042→    });
+  1043→  }
+  1044→
+  1045→  // ===========================================================================
+  1046→  // Private Helpers
+  1047→  // ===========================================================================
+  1048→
+  1049→  /**
+  1050→   * Map database result to AssumptionWithDetails
+  1051→   */
+  1052→  private mapToAssumptionWithDetails(
+  1053→    assumption: PmBaselineAssumption & {
+  1054→      train?: Train | null;
+  1055→      pmType?: PmType | null;
+  1056→      reviewedByUser?: { id: string; email: string } | null;
+  1057→      appliedByUser?: { id: string; email: string } | null;
+  1058→    }
+  1059→  ): AssumptionWithDetails {
+  1060→    // Determine review status
+  1061→    let reviewStatus: ReviewStatus;
+  1062→    if (assumption.appliedAt) {
+  1063→      reviewStatus = 'APPLIED';
+  1064→    } else if (assumption.reviewedAt) {
+  1065→      if (assumption.reviewNotes?.startsWith('REJECTED:')) {
+  1066→        reviewStatus = 'REJECTED';
+  1067→      } else {
+  1068→        reviewStatus = 'REVIEWED';
+  1069→      }
+  1070→    } else {
+  1071→      reviewStatus = 'PENDING_REVIEW';
+  1072→    }
+  1073→
+  1074→    return {
+  1075→      ...assumption,
+  1076→      train: assumption.train
+  1077→        ? {
+  1078→            id: assumption.train.id,
+  1079→            trainNumber: assumption.train.trainNumber,
+  1080→            currentMileageKm: assumption.train.currentMileageKm,
+  1081→            commissioningDate: assumption.train.commissioningDate,
+  1082→          }
+  1083→        : ({
+  1084→            id: assumption.trainId,
+  1085→            trainNumber: 'Unknown',
+  1086→            currentMileageKm: 0,
+  1087→            commissioningDate: null,
+  1088→          } as Pick<Train, 'id' | 'trainNumber' | 'currentMileageKm' | 'commissioningDate'>),
+  1089→      pmType: assumption.pmType
+  1090→        ? {
+  1091→            id: assumption.pmType.id,
+  1092→            pmCode: assumption.pmType.pmCode,
+  1093→            intervalKm: assumption.pmType.intervalKm,
+  1094→            intervalMonths: assumption.pmType.intervalMonths,
+  1095→          }
+  1096→        : ({
+  1097→            id: assumption.pmTypeId,
+  1098→            pmCode: 'Unknown',
+  1099→            intervalKm: null,
+  1100→            intervalMonths: null,
+  1101→          } as Pick<PmType, 'id' | 'pmCode' | 'intervalKm' | 'intervalMonths'>),
+  1102→      reviewedByUser: assumption.reviewedByUser ?? null,
+  1103→      appliedByUser: assumption.appliedByUser ?? null,
+  1104→      reviewStatus,
+  1105→    };
+  1106→  }
+  1107→}
+  1108→
+  1109→// =============================================================================
+  1110→// Singleton Instance
+  1111→// =============================================================================
+  1112→
+  1113→let baselineAssumptionServiceInstance: BaselineAssumptionService | null = null;
+  1114→
+  1115→/**
+  1116→ * Get singleton instance of BaselineAssumptionService
+  1117→ */
+  1118→export function getBaselineAssumptionService(): BaselineAssumptionService {
+  1119→  if (!baselineAssumptionServiceInstance) {
+  1120→    baselineAssumptionServiceInstance = new BaselineAssumptionService();
+  1121→  }
+  1122→  return baselineAssumptionServiceInstance;
+  1123→}
+  1124→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

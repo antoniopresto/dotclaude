@@ -1,0 +1,155 @@
+     1→/**
+     2→ * MMS Mileage Tracking Tables
+     3→ *
+     4→ * Time-series odometer data and meter events.
+     5→ * Uses TimescaleDB hypertable for efficient storage and querying.
+     6→ *
+     7→ * Data flow:
+     8→ * 1. CSV file arrives via file watcher
+     9→ * 2. Ingestion worker validates and inserts into mileage_readings
+    10→ * 3. Anomaly detection flags suspicious readings
+    11→ * 4. Meter events track odometer replacements/resets
+    12→ *
+    13→ * @see specs/003-database-schema.md Section 3.3
+    14→ */
+    15→
+    16→import { relations } from 'drizzle-orm';
+    17→import {
+    18→  date,
+    19→  index,
+    20→  integer,
+    21→  pgTable,
+    22→  primaryKey,
+    23→  text,
+    24→  timestamp,
+    25→  uuid,
+    26→  varchar,
+    27→} from 'drizzle-orm/pg-core';
+    28→import { trains } from './core-fleet';
+    29→import { anomalyTypeEnum, meterEventTypeEnum, validationStatusEnum } from './enums';
+    30→import { users } from './users';
+    31→
+    32→/**
+    33→ * Meter Events - Odometer replacements, resets, calibrations
+    34→ *
+    35→ * Tracks events that affect mileage continuity:
+    36→ * - REPLACEMENT: New meter installed
+    37→ * - RESET: Meter zeroed
+    38→ * - CALIBRATION: Meter adjusted
+    39→ * - SWAP: Meter moved between trains
+    40→ *
+    41→ * The adjustment_km field represents the cumulative mileage that must be
+    42→ * added to all subsequent readings to maintain accurate lifetime mileage.
+    43→ */
+    44→export const meterEvents = pgTable(
+    45→  'meter_events',
+    46→  {
+    47→    id: uuid('id').primaryKey().defaultRandom(),
+    48→    trainId: uuid('train_id')
+    49→      .notNull()
+    50→      .references(() => trains.id),
+    51→    eventDate: date('event_date').notNull(),
+    52→    eventType: meterEventTypeEnum('event_type').notNull(),
+    53→
+    54→    oldMeterSerial: varchar('old_meter_serial', { length: 50 }),
+    55→    newMeterSerial: varchar('new_meter_serial', { length: 50 }),
+    56→    oldMeterReading: integer('old_meter_reading'),
+    57→    newMeterReading: integer('new_meter_reading'),
+    58→    adjustmentKm: integer('adjustment_km'), // Cumulative adjustment to apply
+    59→
+    60→    reason: text('reason'),
+    61→    approvedBy: uuid('approved_by').references(() => users.id),
+    62→    approvedAt: timestamp('approved_at', { withTimezone: true }),
+    63→
+    64→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    65→    createdBy: uuid('created_by').references(() => users.id),
+    66→  },
+    67→  (table) => [index('idx_meter_events_train').on(table.trainId, table.eventDate)]
+    68→);
+    69→
+    70→/**
+    71→ * Mileage Readings - Daily odometer readings
+    72→ *
+    73→ * This table is designed for TimescaleDB hypertable conversion:
+    74→ * - Partitioned by reading_date (7-day chunks)
+    75→ * - Compressed after 30 days
+    76→ * - Retained for 13 years (contract + buffer)
+    77→ *
+    78→ * Key fields:
+    79→ * - raw_reading: Direct value from CSV
+    80→ * - adjusted_reading: After meter event adjustments
+    81→ * - daily_km: Calculated as today - yesterday
+    82→ * - validation_status: PENDING -> VALID | ANOMALY -> CORRECTED
+    83→ *
+    84→ * Note: In production, this table should be converted to a TimescaleDB
+    85→ * hypertable with:
+    86→ * SELECT create_hypertable('mileage_readings', 'reading_date');
+    87→ */
+    88→export const mileageReadings = pgTable(
+    89→  'mileage_readings',
+    90→  {
+    91→    trainId: uuid('train_id')
+    92→      .notNull()
+    93→      .references(() => trains.id),
+    94→    readingDate: date('reading_date').notNull(),
+    95→
+    96→    // Raw and adjusted values
+    97→    rawReading: integer('raw_reading').notNull(), // Direct from CSV
+    98→    adjustedReading: integer('adjusted_reading').notNull(), // After meter adjustments
+    99→    dailyKm: integer('daily_km'), // Calculated: today - yesterday
+   100→
+   101→    // Validation
+   102→    validationStatus: validationStatusEnum('validation_status').default('PENDING'),
+   103→    anomalyType: anomalyTypeEnum('anomaly_type'),
+   104→    anomalyNotes: text('anomaly_notes'),
+   105→
+   106→    // Source tracking
+   107→    sourceFile: varchar('source_file', { length: 255 }),
+   108→    meterEventId: uuid('meter_event_id').references(() => meterEvents.id),
+   109→
+   110→    ingestedAt: timestamp('ingested_at', { withTimezone: true }).defaultNow(),
+   111→  },
+   112→  (table) => [
+   113→    primaryKey({ columns: [table.trainId, table.readingDate] }),
+   114→    index('idx_mileage_train_date').on(table.trainId, table.readingDate),
+   115→    index('idx_mileage_validation').on(table.validationStatus, table.readingDate),
+   116→  ]
+   117→);
+   118→
+   119→// ============================================================================
+   120→// Relations
+   121→// ============================================================================
+   122→
+   123→export const meterEventsRelations = relations(meterEvents, ({ one, many }) => ({
+   124→  train: one(trains, {
+   125→    fields: [meterEvents.trainId],
+   126→    references: [trains.id],
+   127→  }),
+   128→  approvedByUser: one(users, {
+   129→    fields: [meterEvents.approvedBy],
+   130→    references: [users.id],
+   131→    relationName: 'approvedBy',
+   132→  }),
+   133→  createdByUser: one(users, {
+   134→    fields: [meterEvents.createdBy],
+   135→    references: [users.id],
+   136→    relationName: 'createdBy',
+   137→  }),
+   138→  mileageReadings: many(mileageReadings),
+   139→}));
+   140→
+   141→export const mileageReadingsRelations = relations(mileageReadings, ({ one }) => ({
+   142→  train: one(trains, {
+   143→    fields: [mileageReadings.trainId],
+   144→    references: [trains.id],
+   145→  }),
+   146→  meterEvent: one(meterEvents, {
+   147→    fields: [mileageReadings.meterEventId],
+   148→    references: [meterEvents.id],
+   149→  }),
+   150→}));
+   151→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

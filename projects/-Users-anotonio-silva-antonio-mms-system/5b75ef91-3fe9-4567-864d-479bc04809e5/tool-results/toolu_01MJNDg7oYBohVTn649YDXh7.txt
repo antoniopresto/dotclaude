@@ -1,0 +1,1739 @@
+     1→/**
+     2→ * Canvas Data Routes
+     3→ *
+     4→ * REST endpoints for Canvas visualization data.
+     5→ * Provides strategic (yearly), tactical (weekly), and overlay data
+     6→ * for the scheduling canvas UI component.
+     7→ *
+     8→ * Canvas Views:
+     9→ * - Strategic: Yearly PM aggregates per train for heatmap display
+    10→ * - Tactical: Weekly PM blocks with constraint walls for detailed scheduling
+    11→ * - Man-hour overlay: Depot workload utilization by week
+    12→ * - Drift overlay: Train drift severity relative to baseline
+    13→ *
+    14→ * @see specs/005-api.md Section 5.13
+    15→ */
+    16→
+    17→import { Hono } from 'hono';
+    18→import { and, desc, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
+    19→import {
+    20→  success,
+    21→  error,
+    22→  ErrorCodes,
+    23→  type AppVariables,
+    24→} from '../types';
+    25→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    26→import { db } from '../../lib/db/connection';
+    27→import {
+    28→  trains,
+    29→  fleets,
+    30→  pmSchedule,
+    31→  pmTypes,
+    32→  tracks,
+    33→  depots,
+    34→  manhourProjections,
+    35→  manhourAdjustments,
+    36→  driftAnalysis,
+    37→  planBaselines,
+    38→} from '../../lib/db/schema';
+    39→import { isValidUuid } from '../../lib/schemas';
+    40→
+    41→export const canvasRoutes = new Hono<{ Variables: AppVariables }>();
+    42→
+    43→/**
+    44→ * GET /canvas/strategic
+    45→ *
+    46→ * Get strategic-level canvas data with yearly PM aggregates.
+    47→ * Used for the heatmap view showing PM density over multi-year horizons.
+    48→ *
+    49→ * Query Parameters:
+    50→ * - fleetId: Filter by fleet (UUID, optional)
+    51→ * - fromYear: Start year (number, defaults to current year)
+    52→ * - toYear: End year (number, defaults to current year + 10)
+    53→ */
+    54→canvasRoutes.get('/canvas/strategic', async (c) => {
+    55→  const requestId = getRequestId(c);
+    56→  
+    57→  const fleetIdParam = c.req.query('fleetId');
+    58→  const fromYearParam = c.req.query('fromYear');
+    59→  const toYearParam = c.req.query('toYear');
+    60→
+    61→  if (fleetIdParam && !isValidUuid(fleetIdParam)) {
+    62→    return c.json(
+    63→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid fleet ID format', requestId),
+    64→      400
+    65→    );
+    66→  }
+    67→
+    68→  const currentYear = new Date().getFullYear();
+    69→  const fromYear = fromYearParam ? parseInt(fromYearParam, 10) : currentYear;
+    70→  const toYear = toYearParam ? parseInt(toYearParam, 10) : currentYear + 10;
+    71→
+    72→  if (isNaN(fromYear) || isNaN(toYear) || fromYear > toYear) {
+    73→    return c.json(
+    74→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid year range', requestId),
+    75→      400
+    76→    );
+    77→  }
+    78→
+    79→  const fromDate = `${fromYear}-01-01`;
+    80→  const toDate = `${toYear}-12-31`;
+    81→
+    82→  const conditions = [
+    83→    gte(pmSchedule.targetDate, fromDate),
+    84→    lte(pmSchedule.targetDate, toDate),
+    85→    isNull(pmSchedule.scenarioId),
+    86→  ];
+    87→
+    88→  if (fleetIdParam) {
+    89→    conditions.push(eq(trains.fleetId, fleetIdParam));
+    90→  }
+    91→
+    92→  const results = await db
+    93→    .select({
+    94→      trainId: trains.id,
+    95→      trainNumber: trains.trainNumber,
+    96→      fleetId: trains.fleetId,
+    97→      fleetCode: fleets.code,
+    98→      year: sql<number>`EXTRACT(YEAR FROM ${pmSchedule.targetDate})::integer`.as('year'),
+    99→      pmCount: sql<number>`COUNT(${pmSchedule.id})::integer`.as('pm_count'),
+   100→      totalHours: sql<string>`COALESCE(SUM(${pmSchedule.assignedHours}), 0)`.as('total_hours'),
+   101→      completedCount: sql<number>`COUNT(CASE WHEN ${pmSchedule.status} = 'COMPLETED' THEN 1 END)::integer`.as('completed_count'),
+   102→      lockedCount: sql<number>`COUNT(CASE WHEN ${pmSchedule.isLocked} = true THEN 1 END)::integer`.as('locked_count'),
+   103→    })
+   104→    .from(pmSchedule)
+   105→    .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   106→    .innerJoin(fleets, eq(trains.fleetId, fleets.id))
+   107→    .where(and(...conditions))
+   108→    .groupBy(
+   109→      trains.id,
+   110→      trains.trainNumber,
+   111→      trains.fleetId,
+   112→      fleets.code,
+   113→      sql`EXTRACT(YEAR FROM ${pmSchedule.targetDate})`
+   114→    )
+   115→    .orderBy(trains.trainNumber, sql`year`);
+   116→
+   117→  const trainMap = new Map<string, {
+   118→    trainId: string;
+   119→    trainNumber: string;
+   120→    fleetCode: string;
+   121→    years: Array<{
+   122→      year: number;
+   123→      pmCount: number;
+   124→      totalHours: number;
+   125→      completedCount: number;
+   126→      lockedCount: number;
+   127→    }>;
+   128→  }>();
+   129→
+   130→  let maxPmCount = 0;
+   131→  let maxHours = 0;
+   132→
+   133→  for (const row of results) {
+   134→    const hours = parseFloat(row.totalHours) || 0;
+   135→    maxPmCount = Math.max(maxPmCount, row.pmCount);
+   136→    maxHours = Math.max(maxHours, hours);
+   137→
+   138→    if (!trainMap.has(row.trainId)) {
+   139→      trainMap.set(row.trainId, {
+   140→        trainId: row.trainId,
+   141→        trainNumber: row.trainNumber,
+   142→        fleetCode: row.fleetCode,
+   143→        years: [],
+   144→      });
+   145→    }
+   146→
+   147→    trainMap.get(row.trainId)!.years.push({
+   148→      year: row.year,
+   149→      pmCount: row.pmCount,
+   150→      totalHours: Math.round(hours * 10) / 10,
+   151→      completedCount: row.completedCount,
+   152→      lockedCount: row.lockedCount,
+   153→    });
+   154→  }
+   155→
+   156→  return c.json(
+   157→    success(
+   158→      {
+   159→        trains: Array.from(trainMap.values()),
+   160→        heatmapData: {
+   161→          maxPmCount,
+   162→          maxHours: Math.round(maxHours * 10) / 10,
+   163→        },
+   164→      },
+   165→      { timing: { durationMs: getRequestDuration(c) } }
+   166→    )
+   167→  );
+   168→});
+   169→
+   170→/**
+   171→ * GET /canvas/tactical
+   172→ *
+   173→ * Get tactical-level canvas data with weekly PM blocks.
+   174→ * Used for the detailed scheduling view with drag-and-drop PM movement.
+   175→ *
+   176→ * Query Parameters:
+   177→ * - trainIds: Comma-separated train IDs (UUID[], optional - defaults to all)
+   178→ * - fromWeek: Start date of first week (ISO date, defaults to today)
+   179→ * - toWeek: End date of last week (ISO date, defaults to +12 weeks)
+   180→ */
+   181→canvasRoutes.get('/canvas/tactical', async (c) => {
+   182→  const requestId = getRequestId(c);
+   183→  
+   184→  const trainIdsParam = c.req.query('trainIds');
+   185→  const fromWeekParam = c.req.query('fromWeek');
+   186→  const toWeekParam = c.req.query('toWeek');
+   187→
+   188→  const trainIds = trainIdsParam ? trainIdsParam.split(',').map((id) => id.trim()) : [];
+   189→
+   190→  for (const id of trainIds) {
+   191→    if (!isValidUuid(id)) {
+   192→      return c.json(
+   193→        error(ErrorCodes.VALIDATION_ERROR, `Invalid train ID format: ${id}`, requestId),
+   194→        400
+   195→      );
+   196→    }
+   197→  }
+   198→
+   199→  const today = new Date();
+   200→  const defaultFromWeek = new Date(today);
+   201→  defaultFromWeek.setDate(today.getDate() - today.getDay());
+   202→
+   203→  const defaultToWeek = new Date(defaultFromWeek);
+   204→  defaultToWeek.setDate(defaultToWeek.getDate() + 12 * 7);
+   205→
+   206→  let fromWeek: Date;
+   207→  let toWeek: Date;
+   208→
+   209→  if (fromWeekParam) {
+   210→    fromWeek = new Date(fromWeekParam);
+   211→    if (isNaN(fromWeek.getTime())) {
+   212→      return c.json(
+   213→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromWeek date format', requestId),
+   214→        400
+   215→      );
+   216→    }
+   217→  } else {
+   218→    fromWeek = defaultFromWeek;
+   219→  }
+   220→
+   221→  if (toWeekParam) {
+   222→    toWeek = new Date(toWeekParam);
+   223→    if (isNaN(toWeek.getTime())) {
+   224→      return c.json(
+   225→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toWeek date format', requestId),
+   226→        400
+   227→      );
+   228→    }
+   229→  } else {
+   230→    toWeek = defaultToWeek;
+   231→  }
+   232→
+   233→  const fromDate = fromWeek.toISOString().split('T')[0];
+   234→  const toDate = toWeek.toISOString().split('T')[0];
+   235→
+   236→  const conditions = [
+   237→    gte(pmSchedule.targetDate, fromDate),
+   238→    lte(pmSchedule.targetDate, toDate),
+   239→    isNull(pmSchedule.scenarioId),
+   240→  ];
+   241→
+   242→  if (trainIds.length > 0) {
+   243→    conditions.push(inArray(pmSchedule.trainId, trainIds));
+   244→  }
+   245→
+   246→  const results = await db
+   247→    .select({
+   248→      pmId: pmSchedule.id,
+   249→      trainId: pmSchedule.trainId,
+   250→      trainNumber: trains.trainNumber,
+   251→      pmCode: pmTypes.pmCode,
+   252→      targetDate: pmSchedule.targetDate,
+   253→      status: pmSchedule.status,
+   254→      constraintStart: pmSchedule.constraintStart,
+   255→      constraintEnd: pmSchedule.constraintEnd,
+   256→      isLocked: pmSchedule.isLocked,
+   257→      trackNumber: tracks.trackNumber,
+   258→      depotCode: depots.code,
+   259→      displayColor: pmTypes.displayColor,
+   260→      estimatedHours: pmTypes.estimatedHours,
+   261→      minTrackDays: pmTypes.minTrackDays,
+   262→    })
+   263→    .from(pmSchedule)
+   264→    .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   265→    .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   266→    .leftJoin(tracks, eq(pmSchedule.assignedTrackId, tracks.id))
+   267→    .leftJoin(depots, eq(pmSchedule.assignedDepotId, depots.id))
+   268→    .where(and(...conditions))
+   269→    .orderBy(pmSchedule.targetDate);
+   270→
+   271→  const pmBlocks = results.map((row) => ({
+   272→    pmId: row.pmId,
+   273→    trainId: row.trainId,
+   274→    trainNumber: row.trainNumber,
+   275→    pmCode: row.pmCode,
+   276→    targetDate: row.targetDate,
+   277→    durationDays: row.minTrackDays ?? 1,
+   278→    status: row.status,
+   279→    constraintStart: row.constraintStart,
+   280→    constraintEnd: row.constraintEnd,
+   281→    isLocked: row.isLocked ?? false,
+   282→    trackNumber: row.trackNumber,
+   283→    depotCode: row.depotCode,
+   284→    displayColor: row.displayColor ?? '#3B82F6',
+   285→    estimatedHours: row.estimatedHours ? parseFloat(row.estimatedHours) : null,
+   286→  }));
+   287→
+   288→  const constraintWalls: Array<{
+   289→    pmId: string;
+   290→    type: 'COMPLIANCE_START' | 'COMPLIANCE_END';
+   291→    date: string;
+   292→  }> = [];
+   293→
+   294→  for (const pm of results) {
+   295→    constraintWalls.push(
+   296→      { pmId: pm.pmId, type: 'COMPLIANCE_START', date: pm.constraintStart },
+   297→      { pmId: pm.pmId, type: 'COMPLIANCE_END', date: pm.constraintEnd }
+   298→    );
+   299→  }
+   300→
+   301→  return c.json(
+   302→    success(
+   303→      {
+   304→        pmBlocks,
+   305→        constraintWalls,
+   306→      },
+   307→      { timing: { durationMs: getRequestDuration(c) } }
+   308→    )
+   309→  );
+   310→});
+   311→
+   312→/**
+   313→ * GET /canvas/tactical-wide
+   314→ *
+   315→ * Get tactical-wide canvas data with monthly PM blocks.
+   316→ * Used for the compressed Gantt view bridging strategic and tactical views.
+   317→ * Shows 1-year of PM data at monthly granularity.
+   318→ *
+   319→ * Query Parameters:
+   320→ * - trainIds: Comma-separated train IDs (UUID[], optional - defaults to all)
+   321→ * - fromDate: Start date (ISO date, defaults to start of current month)
+   322→ * - toDate: End date (ISO date, defaults to +12 months)
+   323→ *
+   324→ * @see specs/006-user-interface.md Section 6.3.1 (Tactical-Wide zoom level 4-8)
+   325→ */
+   326→canvasRoutes.get('/canvas/tactical-wide', async (c) => {
+   327→  const requestId = getRequestId(c);
+   328→
+   329→  const trainIdsParam = c.req.query('trainIds');
+   330→  const fromDateParam = c.req.query('fromDate');
+   331→  const toDateParam = c.req.query('toDate');
+   332→
+   333→  const trainIds = trainIdsParam ? trainIdsParam.split(',').map((id) => id.trim()) : [];
+   334→
+   335→  for (const id of trainIds) {
+   336→    if (!isValidUuid(id)) {
+   337→      return c.json(
+   338→        error(ErrorCodes.VALIDATION_ERROR, `Invalid train ID format: ${id}`, requestId),
+   339→        400
+   340→      );
+   341→    }
+   342→  }
+   343→
+   344→  // Default to 12 months starting from current month
+   345→  const today = new Date();
+   346→  const defaultFromDate = new Date(today.getFullYear(), today.getMonth(), 1);
+   347→  const defaultToDate = new Date(defaultFromDate);
+   348→  defaultToDate.setMonth(defaultToDate.getMonth() + 12);
+   349→
+   350→  let fromDate: Date;
+   351→  let toDate: Date;
+   352→
+   353→  if (fromDateParam) {
+   354→    fromDate = new Date(fromDateParam);
+   355→    if (isNaN(fromDate.getTime())) {
+   356→      return c.json(
+   357→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromDate format', requestId),
+   358→        400
+   359→      );
+   360→    }
+   361→  } else {
+   362→    fromDate = defaultFromDate;
+   363→  }
+   364→
+   365→  if (toDateParam) {
+   366→    toDate = new Date(toDateParam);
+   367→    if (isNaN(toDate.getTime())) {
+   368→      return c.json(
+   369→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toDate format', requestId),
+   370→        400
+   371→      );
+   372→    }
+   373→  } else {
+   374→    toDate = defaultToDate;
+   375→  }
+   376→
+   377→  const fromDateStr = fromDate.toISOString().split('T')[0];
+   378→  const toDateStr = toDate.toISOString().split('T')[0];
+   379→
+   380→  // Fetch trains for the response
+   381→  const trainConditions = trainIds.length > 0
+   382→    ? [inArray(trains.id, trainIds)]
+   383→    : [];
+   384→
+   385→  const trainsResult = await db
+   386→    .select({
+   387→      trainId: trains.id,
+   388→      trainNumber: trains.trainNumber,
+   389→      fleetCode: fleets.code,
+   390→    })
+   391→    .from(trains)
+   392→    .innerJoin(fleets, eq(trains.fleetId, fleets.id))
+   393→    .where(trainConditions.length > 0 ? and(...trainConditions) : undefined)
+   394→    .orderBy(trains.trainNumber);
+   395→
+   396→  // Fetch PM blocks for the date range
+   397→  const pmConditions = [
+   398→    gte(pmSchedule.targetDate, fromDateStr),
+   399→    lte(pmSchedule.targetDate, toDateStr),
+   400→    isNull(pmSchedule.scenarioId),
+   401→  ];
+   402→
+   403→  if (trainIds.length > 0) {
+   404→    pmConditions.push(inArray(pmSchedule.trainId, trainIds));
+   405→  }
+   406→
+   407→  const pmResults = await db
+   408→    .select({
+   409→      pmId: pmSchedule.id,
+   410→      trainId: pmSchedule.trainId,
+   411→      pmCode: pmTypes.pmCode,
+   412→      targetDate: pmSchedule.targetDate,
+   413→      status: pmSchedule.status,
+   414→      isLocked: pmSchedule.isLocked,
+   415→      displayColor: pmTypes.displayColor,
+   416→      minTrackDays: pmTypes.minTrackDays,
+   417→    })
+   418→    .from(pmSchedule)
+   419→    .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   420→    .where(and(...pmConditions))
+   421→    .orderBy(pmSchedule.targetDate);
+   422→
+   423→  // Transform trains response
+   424→  const trainsList = trainsResult.map((row) => ({
+   425→    trainId: row.trainId,
+   426→    trainNumber: row.trainNumber,
+   427→    fleetCode: row.fleetCode,
+   428→  }));
+   429→
+   430→  // Transform PM blocks (simplified for tactical-wide view)
+   431→  const pmBlocks = pmResults.map((row) => ({
+   432→    pmId: row.pmId,
+   433→    trainId: row.trainId,
+   434→    pmCode: row.pmCode,
+   435→    targetDate: row.targetDate,
+   436→    durationDays: row.minTrackDays ?? 1,
+   437→    status: row.status,
+   438→    isLocked: row.isLocked ?? false,
+   439→    displayColor: row.displayColor ?? '#3B82F6',
+   440→  }));
+   441→
+   442→  return c.json(
+   443→    success(
+   444→      {
+   445→        trains: trainsList,
+   446→        pmBlocks,
+   447→      },
+   448→      { timing: { durationMs: getRequestDuration(c) } }
+   449→    )
+   450→  );
+   451→});
+   452→
+   453→/**
+   454→ * GET /canvas/operational
+   455→ *
+   456→ * Get operational-level canvas data with detailed PM cards.
+   457→ * Used for the 4-week operational view with material status.
+   458→ * Zoom levels 12-16 (daily granularity).
+   459→ *
+   460→ * Query Parameters:
+   461→ * - trainIds: Comma-separated train IDs (UUID[], optional - defaults to all)
+   462→ * - fromDate: Start date (ISO date, defaults to start of current week)
+   463→ * - toDate: End date (ISO date, defaults to +4 weeks)
+   464→ *
+   465→ * @see specs/006-user-interface.md Section 6.3.4 (Operational zoom level 12-16)
+   466→ */
+   467→canvasRoutes.get('/canvas/operational', async (c) => {
+   468→  const requestId = getRequestId(c);
+   469→
+   470→  const trainIdsParam = c.req.query('trainIds');
+   471→  const fromDateParam = c.req.query('fromDate');
+   472→  const toDateParam = c.req.query('toDate');
+   473→
+   474→  const trainIds = trainIdsParam ? trainIdsParam.split(',').map((id) => id.trim()) : [];
+   475→
+   476→  for (const id of trainIds) {
+   477→    if (!isValidUuid(id)) {
+   478→      return c.json(
+   479→        error(ErrorCodes.VALIDATION_ERROR, `Invalid train ID format: ${id}`, requestId),
+   480→        400
+   481→      );
+   482→    }
+   483→  }
+   484→
+   485→  // Default to 4 weeks starting from current week
+   486→  const today = new Date();
+   487→  const defaultFromDate = new Date(today);
+   488→  defaultFromDate.setDate(today.getDate() - today.getDay()); // Start of week
+   489→  const defaultToDate = new Date(defaultFromDate);
+   490→  defaultToDate.setDate(defaultToDate.getDate() + 4 * 7); // 4 weeks ahead
+   491→
+   492→  let fromDate: Date;
+   493→  let toDate: Date;
+   494→
+   495→  if (fromDateParam) {
+   496→    fromDate = new Date(fromDateParam);
+   497→    if (isNaN(fromDate.getTime())) {
+   498→      return c.json(
+   499→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromDate format', requestId),
+   500→        400
+   501→      );
+   502→    }
+   503→  } else {
+   504→    fromDate = defaultFromDate;
+   505→  }
+   506→
+   507→  if (toDateParam) {
+   508→    toDate = new Date(toDateParam);
+   509→    if (isNaN(toDate.getTime())) {
+   510→      return c.json(
+   511→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toDate format', requestId),
+   512→        400
+   513→      );
+   514→    }
+   515→  } else {
+   516→    toDate = defaultToDate;
+   517→  }
+   518→
+   519→  const fromDateStr = fromDate.toISOString().split('T')[0];
+   520→  const toDateStr = toDate.toISOString().split('T')[0];
+   521→
+   522→  // Fetch PM blocks with detailed information
+   523→  const pmConditions = [
+   524→    gte(pmSchedule.targetDate, fromDateStr),
+   525→    lte(pmSchedule.targetDate, toDateStr),
+   526→    isNull(pmSchedule.scenarioId),
+   527→  ];
+   528→
+   529→  if (trainIds.length > 0) {
+   530→    pmConditions.push(inArray(pmSchedule.trainId, trainIds));
+   531→  }
+   532→
+   533→  const pmResults = await db
+   534→    .select({
+   535→      pmId: pmSchedule.id,
+   536→      trainId: pmSchedule.trainId,
+   537→      trainNumber: trains.trainNumber,
+   538→      fleetCode: fleets.code,
+   539→      pmCode: pmTypes.pmCode,
+   540→      pmName: pmTypes.pmName,
+   541→      targetDate: pmSchedule.targetDate,
+   542→      status: pmSchedule.status,
+   543→      constraintStart: pmSchedule.constraintStart,
+   544→      constraintEnd: pmSchedule.constraintEnd,
+   545→      isLocked: pmSchedule.isLocked,
+   546→      trackNumber: tracks.trackNumber,
+   547→      depotCode: depots.code,
+   548→      displayColor: pmTypes.displayColor,
+   549→      estimatedHours: pmTypes.estimatedHours,
+   550→      minTrackDays: pmTypes.minTrackDays,
+   551→      assignedShift: pmSchedule.assignedShift,
+   552→    })
+   553→    .from(pmSchedule)
+   554→    .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   555→    .innerJoin(fleets, eq(trains.fleetId, fleets.id))
+   556→    .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   557→    .leftJoin(tracks, eq(pmSchedule.assignedTrackId, tracks.id))
+   558→    .leftJoin(depots, eq(pmSchedule.assignedDepotId, depots.id))
+   559→    .where(and(...pmConditions))
+   560→    .orderBy(pmSchedule.targetDate);
+   561→
+   562→  // Transform PM blocks with detailed information
+   563→  const pmBlocks = pmResults.map((row) => {
+   564→    const durationDays = row.minTrackDays ?? 1;
+   565→    const targetDate = new Date(row.targetDate);
+   566→    const endDate = new Date(targetDate);
+   567→    endDate.setDate(targetDate.getDate() + durationDays - 1);
+   568→
+   569→    return {
+   570→      pmId: row.pmId,
+   571→      trainId: row.trainId,
+   572→      trainNumber: row.trainNumber,
+   573→      fleetCode: row.fleetCode,
+   574→      pmCode: row.pmCode,
+   575→      pmDescription: row.pmName ?? row.pmCode,
+   576→      targetDate: row.targetDate,
+   577→      endDate: endDate.toISOString().split('T')[0],
+   578→      durationDays,
+   579→      status: row.status,
+   580→      constraintStart: row.constraintStart,
+   581→      constraintEnd: row.constraintEnd,
+   582→      isLocked: row.isLocked ?? false,
+   583→      trackNumber: row.trackNumber,
+   584→      depotCode: row.depotCode,
+   585→      estimatedHours: row.estimatedHours ? parseFloat(row.estimatedHours) : null,
+   586→      assignedShift: row.assignedShift,
+   587→      // Material requirements are fetched separately if needed
+   588→      // For now return empty array - can be expanded when inventory integration is complete
+   589→      materials: [] as Array<{
+   590→        materialId: string;
+   591→        materialName: string;
+   592→        quantityRequired: number;
+   593→        quantityAvailable: number;
+   594→        status: 'AVAILABLE' | 'LOW_STOCK' | 'UNAVAILABLE' | 'ARRIVING';
+   595→        arrivalDate?: string;
+   596→      }>,
+   597→      displayColor: row.displayColor ?? '#3B82F6',
+   598→    };
+   599→  });
+   600→
+   601→  return c.json(
+   602→    success(
+   603→      {
+   604→        pmBlocks,
+   605→        dateRange: {
+   606→          fromDate: fromDateStr,
+   607→          toDate: toDateStr,
+   608→        },
+   609→      },
+   610→      { timing: { durationMs: getRequestDuration(c) } }
+   611→    )
+   612→  );
+   613→});
+   614→
+   615→/**
+   616→ * GET /canvas/manhour-overlay
+   617→ *
+   618→ * Get man-hour overlay data showing depot workload by week.
+   619→ * Used to visualize resource utilization in the canvas sidebar.
+   620→ *
+   621→ * Query Parameters:
+   622→ * - depotId: Filter by depot (UUID, optional)
+   623→ * - weeks: Number of weeks to include (default: 12)
+   624→ */
+   625→canvasRoutes.get('/canvas/manhour-overlay', async (c) => {
+   626→  const requestId = getRequestId(c);
+   627→  
+   628→  const depotIdParam = c.req.query('depotId');
+   629→  const weeksParam = c.req.query('weeks');
+   630→
+   631→  if (depotIdParam && !isValidUuid(depotIdParam)) {
+   632→    return c.json(
+   633→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid depot ID format', requestId),
+   634→      400
+   635→    );
+   636→  }
+   637→
+   638→  const numWeeks = weeksParam ? parseInt(weeksParam, 10) : 12;
+   639→  if (isNaN(numWeeks) || numWeeks < 1 || numWeeks > 52) {
+   640→    return c.json(
+   641→      error(ErrorCodes.VALIDATION_ERROR, 'Weeks must be between 1 and 52', requestId),
+   642→      400
+   643→    );
+   644→  }
+   645→
+   646→  const latestRunResult = await db
+   647→    .select({ projectionRunId: manhourProjections.projectionRunId })
+   648→    .from(manhourProjections)
+   649→    .orderBy(desc(manhourProjections.createdAt))
+   650→    .limit(1);
+   651→
+   652→  if (latestRunResult.length === 0) {
+   653→    return c.json(
+   654→      success(
+   655→        { weeks: [] },
+   656→        { timing: { durationMs: getRequestDuration(c) } }
+   657→      )
+   658→    );
+   659→  }
+   660→
+   661→  const latestRunId = latestRunResult[0].projectionRunId;
+   662→
+   663→  const conditions = [
+   664→    eq(manhourProjections.projectionRunId, latestRunId),
+   665→    eq(manhourProjections.granularity, 'WEEKLY'),
+   666→  ];
+   667→
+   668→  if (depotIdParam) {
+   669→    conditions.push(eq(manhourProjections.depotId, depotIdParam));
+   670→  }
+   671→
+   672→  const projections = await db
+   673→    .select({
+   674→      projectionId: manhourProjections.id,
+   675→      depotId: manhourProjections.depotId,
+   676→      depotCode: depots.code,
+   677→      periodStart: manhourProjections.periodStart,
+   678→      periodEnd: manhourProjections.periodEnd,
+   679→      requiredHours: manhourProjections.requiredTotalHours,
+   680→      availableHours: manhourProjections.availableTotalHours,
+   681→    })
+   682→    .from(manhourProjections)
+   683→    .innerJoin(depots, eq(manhourProjections.depotId, depots.id))
+   684→    .where(and(...conditions))
+   685→    .orderBy(manhourProjections.periodStart, depots.code)
+   686→    .limit(numWeeks * 10);
+   687→
+   688→  const adjustmentsResult = await db
+   689→    .select({
+   690→      projectionId: manhourAdjustments.projectionId,
+   691→      adjustmentType: manhourAdjustments.adjustmentType,
+   692→      hoursAdjusted: manhourAdjustments.hoursAdjusted,
+   693→      status: manhourAdjustments.status,
+   694→    })
+   695→    .from(manhourAdjustments)
+   696→    .where(
+   697→      and(
+   698→        inArray(
+   699→          manhourAdjustments.projectionId,
+   700→          projections.map((p) => p.projectionId)
+   701→        ),
+   702→        eq(manhourAdjustments.status, 'PROPOSED')
+   703→      )
+   704→    );
+   705→
+   706→  const adjustmentsByProjection = new Map<string, typeof adjustmentsResult>();
+   707→  for (const adj of adjustmentsResult) {
+   708→    if (!adjustmentsByProjection.has(adj.projectionId)) {
+   709→      adjustmentsByProjection.set(adj.projectionId, []);
+   710→    }
+   711→    adjustmentsByProjection.get(adj.projectionId)!.push(adj);
+   712→  }
+   713→
+   714→  const weekMap = new Map<string, {
+   715→    weekStart: string;
+   716→    depots: Array<{
+   717→      depotId: string;
+   718→      depotCode: string;
+   719→      requiredHours: number;
+   720→      availableHours: number;
+   721→      utilizationPct: number;
+   722→      status: 'OVERLOADED' | 'OPTIMAL' | 'UNDERUTILIZED';
+   723→      adjustments: Array<{
+   724→        type: string;
+   725→        hours: number;
+   726→        status: string;
+   727→      }>;
+   728→    }>;
+   729→  }>();
+   730→
+   731→  for (const proj of projections) {
+   732→    const weekStart = proj.periodStart;
+   733→    const required = parseFloat(proj.requiredHours);
+   734→    const available = parseFloat(proj.availableHours);
+   735→    const utilizationPct = available > 0 ? (required / available) * 100 : 0;
+   736→
+   737→    let status: 'OVERLOADED' | 'OPTIMAL' | 'UNDERUTILIZED';
+   738→    if (required > available) {
+   739→      status = 'OVERLOADED';
+   740→    } else if (utilizationPct < 70) {
+   741→      status = 'UNDERUTILIZED';
+   742→    } else {
+   743→      status = 'OPTIMAL';
+   744→    }
+   745→
+   746→    const adjustments = (adjustmentsByProjection.get(proj.projectionId) || []).map((a) => ({
+   747→      type: a.adjustmentType,
+   748→      hours: parseFloat(a.hoursAdjusted),
+   749→      status: a.status ?? 'PROPOSED',
+   750→    }));
+   751→
+   752→    if (!weekMap.has(weekStart)) {
+   753→      weekMap.set(weekStart, { weekStart, depots: [] });
+   754→    }
+   755→
+   756→    weekMap.get(weekStart)!.depots.push({
+   757→      depotId: proj.depotId,
+   758→      depotCode: proj.depotCode,
+   759→      requiredHours: Math.round(required * 10) / 10,
+   760→      availableHours: Math.round(available * 10) / 10,
+   761→      utilizationPct: Math.round(utilizationPct * 10) / 10,
+   762→      status,
+   763→      adjustments,
+   764→    });
+   765→  }
+   766→
+   767→  const weeks = Array.from(weekMap.values()).sort(
+   768→    (a, b) => a.weekStart.localeCompare(b.weekStart)
+   769→  );
+   770→
+   771→  return c.json(
+   772→    success(
+   773→      { weeks },
+   774→      { timing: { durationMs: getRequestDuration(c) } }
+   775→    )
+   776→  );
+   777→});
+   778→
+   779→/**
+   780→ * GET /canvas/detail
+   781→ *
+   782→ * Get detail-level canvas data with full PM information.
+   783→ * Used for the detail view (zoom 16+) with rich editing capabilities.
+   784→ * Includes change history, constraint validation, and crew assignments.
+   785→ *
+   786→ * Query Parameters:
+   787→ * - trainIds: Comma-separated train IDs (UUID[], optional - defaults to all)
+   788→ * - fromDate: Start date (ISO date, defaults to start of current week)
+   789→ * - toDate: End date (ISO date, defaults to +1 week)
+   790→ *
+   791→ * @see specs/006-user-interface.md Section 6.3.4, 6.3.5 (Detail zoom level 16+)
+   792→ */
+   793→canvasRoutes.get('/canvas/detail', async (c) => {
+   794→  const requestId = getRequestId(c);
+   795→
+   796→  const trainIdsParam = c.req.query('trainIds');
+   797→  const fromDateParam = c.req.query('fromDate');
+   798→  const toDateParam = c.req.query('toDate');
+   799→
+   800→  const trainIds = trainIdsParam ? trainIdsParam.split(',').map((id) => id.trim()) : [];
+   801→
+   802→  for (const id of trainIds) {
+   803→    if (!isValidUuid(id)) {
+   804→      return c.json(
+   805→        error(ErrorCodes.VALIDATION_ERROR, `Invalid train ID format: ${id}`, requestId),
+   806→        400
+   807→      );
+   808→    }
+   809→  }
+   810→
+   811→  // Default to 1 week starting from current week (for detailed view)
+   812→  const today = new Date();
+   813→  const defaultFromDate = new Date(today);
+   814→  defaultFromDate.setDate(today.getDate() - today.getDay()); // Start of week
+   815→  const defaultToDate = new Date(defaultFromDate);
+   816→  defaultToDate.setDate(defaultToDate.getDate() + 7); // 1 week ahead
+   817→
+   818→  let fromDate: Date;
+   819→  let toDate: Date;
+   820→
+   821→  if (fromDateParam) {
+   822→    fromDate = new Date(fromDateParam);
+   823→    if (isNaN(fromDate.getTime())) {
+   824→      return c.json(
+   825→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromDate format', requestId),
+   826→        400
+   827→      );
+   828→    }
+   829→  } else {
+   830→    fromDate = defaultFromDate;
+   831→  }
+   832→
+   833→  if (toDateParam) {
+   834→    toDate = new Date(toDateParam);
+   835→    if (isNaN(toDate.getTime())) {
+   836→      return c.json(
+   837→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toDate format', requestId),
+   838→        400
+   839→      );
+   840→    }
+   841→  } else {
+   842→    toDate = defaultToDate;
+   843→  }
+   844→
+   845→  const fromDateStr = fromDate.toISOString().split('T')[0];
+   846→  const toDateStr = toDate.toISOString().split('T')[0];
+   847→
+   848→  // Fetch PM blocks with detailed information
+   849→  const pmConditions = [
+   850→    gte(pmSchedule.targetDate, fromDateStr),
+   851→    lte(pmSchedule.targetDate, toDateStr),
+   852→    isNull(pmSchedule.scenarioId),
+   853→  ];
+   854→
+   855→  if (trainIds.length > 0) {
+   856→    pmConditions.push(inArray(pmSchedule.trainId, trainIds));
+   857→  }
+   858→
+   859→  const pmResults = await db
+   860→    .select({
+   861→      pmId: pmSchedule.id,
+   862→      trainId: pmSchedule.trainId,
+   863→      trainNumber: trains.trainNumber,
+   864→      fleetCode: fleets.code,
+   865→      pmCode: pmTypes.pmCode,
+   866→      pmName: pmTypes.pmName,
+   867→      targetDate: pmSchedule.targetDate,
+   868→      status: pmSchedule.status,
+   869→      constraintStart: pmSchedule.constraintStart,
+   870→      constraintEnd: pmSchedule.constraintEnd,
+   871→      isLocked: pmSchedule.isLocked,
+   872→      trackNumber: tracks.trackNumber,
+   873→      depotCode: depots.code,
+   874→      displayColor: pmTypes.displayColor,
+   875→      estimatedHours: pmTypes.estimatedHours,
+   876→      minTrackDays: pmTypes.minTrackDays,
+   877→      assignedShift: pmSchedule.assignedShift,
+   878→      createdAt: pmSchedule.createdAt,
+   879→      updatedAt: pmSchedule.updatedAt,
+   880→    })
+   881→    .from(pmSchedule)
+   882→    .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+   883→    .innerJoin(fleets, eq(trains.fleetId, fleets.id))
+   884→    .innerJoin(pmTypes, eq(pmSchedule.pmTypeId, pmTypes.id))
+   885→    .leftJoin(tracks, eq(pmSchedule.assignedTrackId, tracks.id))
+   886→    .leftJoin(depots, eq(pmSchedule.assignedDepotId, depots.id))
+   887→    .where(and(...pmConditions))
+   888→    .orderBy(pmSchedule.targetDate);
+   889→
+   890→  // Transform PM blocks with full detail information
+   891→  const pmBlocks = pmResults.map((row) => {
+   892→    const durationDays = row.minTrackDays ?? 1;
+   893→    const targetDate = new Date(row.targetDate);
+   894→    const endDate = new Date(targetDate);
+   895→    endDate.setDate(targetDate.getDate() + durationDays - 1);
+   896→
+   897→    // Mock change history (in production, this would come from audit trail)
+   898→    type ChangeHistoryChangeType = 'CREATE' | 'MOVE' | 'REASSIGN' | 'LOCK' | 'UNLOCK' | 'STATUS_CHANGE';
+   899→    const changeHistory: Array<{
+   900→      id: string;
+   901→      timestamp: string;
+   902→      changeType: ChangeHistoryChangeType;
+   903→      userId: string;
+   904→      userName: string;
+   905→      reason?: string;
+   906→    }> = [
+   907→      {
+   908→        id: `${row.pmId}-create`,
+   909→        timestamp: row.createdAt?.toISOString() ?? new Date().toISOString(),
+   910→        changeType: 'CREATE',
+   911→        userId: 'system',
+   912→        userName: 'System',
+   913→        reason: 'Initial PM scheduling',
+   914→      },
+   915→    ];
+   916→
+   917→    // Add update entry if updatedAt differs from createdAt
+   918→    if (row.updatedAt && row.createdAt && row.updatedAt.getTime() !== row.createdAt.getTime()) {
+   919→      changeHistory.push({
+   920→        id: `${row.pmId}-update`,
+   921→        timestamp: row.updatedAt.toISOString(),
+   922→        changeType: 'MOVE',
+   923→        userId: 'system',
+   924→        userName: 'System',
+   925→        reason: 'PM updated',
+   926→      });
+   927→    }
+   928→
+   929→    // Calculate constraint validation
+   930→    const today = new Date();
+   931→    today.setHours(0, 0, 0, 0);
+   932→    const constraintEnd = new Date(row.constraintEnd);
+   933→    const daysToDeadline = Math.floor((constraintEnd.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+   934→
+   935→    const violations: Array<{
+   936→      type: 'HARD' | 'SOFT';
+   937→      constraint: string;
+   938→      message: string;
+   939→      canOverride: boolean;
+   940→    }> = [];
+   941→
+   942→    const warnings: Array<{
+   943→      type: string;
+   944→      message: string;
+   945→    }> = [];
+   946→
+   947→    if (daysToDeadline < 0) {
+   948→      violations.push({
+   949→        type: 'HARD',
+   950→        constraint: 'Compliance Window',
+   951→        message: `PM is ${Math.abs(daysToDeadline)} days past compliance deadline`,
+   952→        canOverride: false,
+   953→      });
+   954→    } else if (daysToDeadline < 7) {
+   955→      warnings.push({
+   956→        type: 'COMPLIANCE_WARNING',
+   957→        message: `Compliance window closes in ${daysToDeadline} days`,
+   958→      });
+   959→    }
+   960→
+   961→    return {
+   962→      pmId: row.pmId,
+   963→      trainId: row.trainId,
+   964→      trainNumber: row.trainNumber,
+   965→      fleetCode: row.fleetCode,
+   966→      pmCode: row.pmCode,
+   967→      pmDescription: row.pmName ?? row.pmCode,
+   968→      targetDate: row.targetDate,
+   969→      endDate: endDate.toISOString().split('T')[0],
+   970→      durationDays,
+   971→      status: row.status,
+   972→      constraintStart: row.constraintStart,
+   973→      constraintEnd: row.constraintEnd,
+   974→      isLocked: row.isLocked ?? false,
+   975→      trackNumber: row.trackNumber,
+   976→      depotCode: row.depotCode,
+   977→      estimatedHours: row.estimatedHours ? parseFloat(row.estimatedHours) : null,
+   978→      assignedShift: row.assignedShift,
+   979→      // Material requirements - empty for now, can be populated from inventory integration
+   980→      materials: [] as Array<{
+   981→        materialId: string;
+   982→        materialName: string;
+   983→        quantityRequired: number;
+   984→        quantityAvailable: number;
+   985→        status: 'AVAILABLE' | 'LOW_STOCK' | 'UNAVAILABLE' | 'ARRIVING';
+   986→        arrivalDate?: string;
+   987→      }>,
+   988→      displayColor: row.displayColor ?? '#3B82F6',
+   989→      // Detail-specific fields
+   990→      changeHistory,
+   991→      constraintValidation: {
+   992→        isValid: violations.length === 0,
+   993→        violations,
+   994→        warnings,
+   995→      },
+   996→      assignedCrew: [] as Array<{
+   997→        crewId: string;
+   998→        crewName: string;
+   999→        role: string;
+  1000→        shift: string;
+  1001→      }>,
+  1002→    };
+  1003→  });
+  1004→
+  1005→  return c.json(
+  1006→    success(
+  1007→      {
+  1008→        pmBlocks,
+  1009→        dateRange: {
+  1010→          fromDate: fromDateStr,
+  1011→          toDate: toDateStr,
+  1012→        },
+  1013→      },
+  1014→      { timing: { durationMs: getRequestDuration(c) } }
+  1015→    )
+  1016→  );
+  1017→});
+  1018→
+  1019→/**
+  1020→ * GET /canvas/drift-overlay
+  1021→ *
+  1022→ * Get drift overlay data showing train drift severity relative to baseline.
+  1023→ * Used to highlight trains requiring attention in the canvas.
+  1024→ *
+  1025→ * Query Parameters:
+  1026→ * - baselineId: Baseline to compare against (UUID, optional - defaults to latest published)
+  1027→ */
+  1028→canvasRoutes.get('/canvas/drift-overlay', async (c) => {
+  1029→  const requestId = getRequestId(c);
+  1030→  
+  1031→  const baselineIdParam = c.req.query('baselineId');
+  1032→
+  1033→  if (baselineIdParam && !isValidUuid(baselineIdParam)) {
+  1034→    return c.json(
+  1035→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId),
+  1036→      400
+  1037→    );
+  1038→  }
+  1039→
+  1040→  let baseline;
+  1041→  if (baselineIdParam) {
+  1042→    const result = await db
+  1043→      .select()
+  1044→      .from(planBaselines)
+  1045→      .where(eq(planBaselines.id, baselineIdParam))
+  1046→      .limit(1);
+  1047→
+  1048→    if (result.length === 0) {
+  1049→      return c.json(
+  1050→        error(ErrorCodes.NOT_FOUND, `Baseline not found: ${baselineIdParam}`, requestId),
+  1051→        404
+  1052→      );
+  1053→    }
+  1054→    baseline = result[0];
+  1055→  } else {
+  1056→    const result = await db
+  1057→      .select()
+  1058→      .from(planBaselines)
+  1059→      .where(eq(planBaselines.status, 'PUBLISHED'))
+  1060→      .orderBy(desc(planBaselines.publishedAt))
+  1061→      .limit(1);
+  1062→
+  1063→    if (result.length === 0) {
+  1064→      return c.json(
+  1065→        error(ErrorCodes.NOT_FOUND, 'No published baseline found', requestId),
+  1066→        404
+  1067→      );
+  1068→    }
+  1069→    baseline = result[0];
+  1070→  }
+  1071→
+  1072→  const latestAnalysisResult = await db
+  1073→    .select({ analysisDate: driftAnalysis.analysisDate })
+  1074→    .from(driftAnalysis)
+  1075→    .where(eq(driftAnalysis.baselineId, baseline.id))
+  1076→    .orderBy(desc(driftAnalysis.analysisDate))
+  1077→    .limit(1);
+  1078→
+  1079→  if (latestAnalysisResult.length === 0) {
+  1080→    return c.json(
+  1081→      success(
+  1082→        {
+  1083→          baselineId: baseline.id,
+  1084→          baselineName: baseline.name,
+  1085→          trains: [],
+  1086→        },
+  1087→        { timing: { durationMs: getRequestDuration(c) } }
+  1088→      )
+  1089→    );
+  1090→  }
+  1091→
+  1092→  const latestDate = latestAnalysisResult[0].analysisDate;
+  1093→
+  1094→  const driftResults = await db
+  1095→    .select({
+  1096→      trainId: driftAnalysis.trainId,
+  1097→      trainNumber: trains.trainNumber,
+  1098→      baselineProjectedKm: driftAnalysis.baselineProjectedKm,
+  1099→      actualKm: driftAnalysis.actualKm,
+  1100→      mileageDriftPct: driftAnalysis.mileageDriftPct,
+  1101→      avgPmDriftDays: driftAnalysis.avgPmDriftDays,
+  1102→      maxPmDriftDays: driftAnalysis.maxPmDriftDays,
+  1103→      requiresReplan: driftAnalysis.requiresReplan,
+  1104→    })
+  1105→    .from(driftAnalysis)
+  1106→    .innerJoin(trains, eq(driftAnalysis.trainId, trains.id))
+  1107→    .where(
+  1108→      and(
+  1109→        eq(driftAnalysis.baselineId, baseline.id),
+  1110→        eq(driftAnalysis.analysisDate, latestDate)
+  1111→      )
+  1112→    )
+  1113→    .orderBy(trains.trainNumber);
+  1114→
+  1115→  const thresholds = {
+  1116→    mileageDriftPct: 5.0,
+  1117→    scheduleDriftDays: 14,
+  1118→  };
+  1119→
+  1120→  const trainDrifts = driftResults.map((drift) => {
+  1121→    const mileagePct = drift.mileageDriftPct ? parseFloat(drift.mileageDriftPct) : 0;
+  1122→    const maxPmDays = drift.maxPmDriftDays ?? 0;
+  1123→
+  1124→    let driftSeverity: 'GREEN' | 'YELLOW' | 'RED';
+  1125→    if (drift.requiresReplan) {
+  1126→      driftSeverity = 'RED';
+  1127→    } else if (
+  1128→      Math.abs(mileagePct) > thresholds.mileageDriftPct * 0.7 ||
+  1129→      maxPmDays > thresholds.scheduleDriftDays * 0.7
+  1130→    ) {
+  1131→      driftSeverity = 'YELLOW';
+  1132→    } else {
+  1133→      driftSeverity = 'GREEN';
+  1134→    }
+  1135→
+  1136→    return {
+  1137→      trainId: drift.trainId,
+  1138→      trainNumber: drift.trainNumber,
+  1139→      driftSeverity,
+  1140→      mileageDriftPct: Math.round(mileagePct * 100) / 100,
+  1141→      pmDrifts: [],
+  1142→    };
+  1143→  });
+  1144→
+  1145→  return c.json(
+  1146→    success(
+  1147→      {
+  1148→        baselineId: baseline.id,
+  1149→        baselineName: baseline.name,
+  1150→        trains: trainDrifts,
+  1151→      },
+  1152→      { timing: { durationMs: getRequestDuration(c) } }
+  1153→    )
+  1154→  );
+  1155→});
+  1156→
+  1157→/**
+  1158→ * GET /canvas/baseline-shadow
+  1159→ *
+  1160→ * Get baseline shadow overlay data showing PM positions from baseline vs current.
+  1161→ * Used to render shadow blocks behind current PM positions on the canvas.
+  1162→ *
+  1163→ * Query Parameters:
+  1164→ * - baselineId: Baseline to compare against (UUID, optional - defaults to latest published)
+  1165→ * - fromDate: Start date for PM blocks (ISO date, optional - defaults to today)
+  1166→ * - toDate: End date for PM blocks (ISO date, optional - defaults to +12 weeks)
+  1167→ * - trainIds: Comma-separated train IDs to filter (optional)
+  1168→ */
+  1169→canvasRoutes.get('/canvas/baseline-shadow', async (c) => {
+  1170→  const requestId = getRequestId(c);
+  1171→
+  1172→  const baselineIdParam = c.req.query('baselineId');
+  1173→  const fromDateParam = c.req.query('fromDate');
+  1174→  const toDateParam = c.req.query('toDate');
+  1175→  const trainIdsParam = c.req.query('trainIds');
+  1176→
+  1177→  if (baselineIdParam && !isValidUuid(baselineIdParam)) {
+  1178→    return c.json(
+  1179→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId),
+  1180→      400
+  1181→    );
+  1182→  }
+  1183→
+  1184→  const trainIdFilter = trainIdsParam ? trainIdsParam.split(',').map((id) => id.trim()) : [];
+  1185→  for (const id of trainIdFilter) {
+  1186→    if (!isValidUuid(id)) {
+  1187→      return c.json(
+  1188→        error(ErrorCodes.VALIDATION_ERROR, `Invalid train ID format: ${id}`, requestId),
+  1189→        400
+  1190→      );
+  1191→    }
+  1192→  }
+  1193→
+  1194→  // Get baseline (specified or latest published)
+  1195→  let baseline;
+  1196→  if (baselineIdParam) {
+  1197→    const result = await db
+  1198→      .select()
+  1199→      .from(planBaselines)
+  1200→      .where(eq(planBaselines.id, baselineIdParam))
+  1201→      .limit(1);
+  1202→
+  1203→    if (result.length === 0) {
+  1204→      return c.json(
+  1205→        error(ErrorCodes.NOT_FOUND, `Baseline not found: ${baselineIdParam}`, requestId),
+  1206→        404
+  1207→      );
+  1208→    }
+  1209→    baseline = result[0];
+  1210→  } else {
+  1211→    const result = await db
+  1212→      .select()
+  1213→      .from(planBaselines)
+  1214→      .where(eq(planBaselines.status, 'PUBLISHED'))
+  1215→      .orderBy(desc(planBaselines.publishedAt))
+  1216→      .limit(1);
+  1217→
+  1218→    if (result.length === 0) {
+  1219→      return c.json(
+  1220→        error(ErrorCodes.NOT_FOUND, 'No published baseline found', requestId),
+  1221→        404
+  1222→      );
+  1223→    }
+  1224→    baseline = result[0];
+  1225→  }
+  1226→
+  1227→  // Calculate date range
+  1228→  const today = new Date();
+  1229→  const defaultFromDate = new Date(today);
+  1230→  const defaultToDate = new Date(today);
+  1231→  defaultToDate.setDate(defaultToDate.getDate() + 12 * 7); // 12 weeks
+  1232→
+  1233→  let fromDate: Date;
+  1234→  let toDate: Date;
+  1235→
+  1236→  if (fromDateParam) {
+  1237→    fromDate = new Date(fromDateParam);
+  1238→    if (isNaN(fromDate.getTime())) {
+  1239→      return c.json(
+  1240→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid fromDate format', requestId),
+  1241→        400
+  1242→      );
+  1243→    }
+  1244→  } else {
+  1245→    fromDate = defaultFromDate;
+  1246→  }
+  1247→
+  1248→  if (toDateParam) {
+  1249→    toDate = new Date(toDateParam);
+  1250→    if (isNaN(toDate.getTime())) {
+  1251→      return c.json(
+  1252→        error(ErrorCodes.VALIDATION_ERROR, 'Invalid toDate format', requestId),
+  1253→        400
+  1254→      );
+  1255→    }
+  1256→  } else {
+  1257→    toDate = defaultToDate;
+  1258→  }
+  1259→
+  1260→  const fromDateStr = fromDate.toISOString().split('T')[0];
+  1261→  const toDateStr = toDate.toISOString().split('T')[0];
+  1262→
+  1263→  // Import baseline PM schedule table
+  1264→  const { baselinePmSchedule } = await import('../../lib/db/schema');
+  1265→
+  1266→  // Query baseline PM schedule
+  1267→  const baselineConditions = [
+  1268→    eq(baselinePmSchedule.baselineId, baseline.id),
+  1269→    gte(baselinePmSchedule.projectedDate, fromDateStr),
+  1270→    lte(baselinePmSchedule.projectedDate, toDateStr),
+  1271→  ];
+  1272→
+  1273→  if (trainIdFilter.length > 0) {
+  1274→    baselineConditions.push(inArray(baselinePmSchedule.trainId, trainIdFilter));
+  1275→  }
+  1276→
+  1277→  const baselinePms = await db
+  1278→    .select({
+  1279→      baselinePmId: baselinePmSchedule.id,
+  1280→      trainId: baselinePmSchedule.trainId,
+  1281→      trainNumber: trains.trainNumber,
+  1282→      pmTypeId: baselinePmSchedule.pmTypeId,
+  1283→      pmCode: pmTypes.pmCode,
+  1284→      projectedDate: baselinePmSchedule.projectedDate,
+  1285→      displayColor: pmTypes.displayColor,
+  1286→    })
+  1287→    .from(baselinePmSchedule)
+  1288→    .innerJoin(trains, eq(baselinePmSchedule.trainId, trains.id))
+  1289→    .innerJoin(pmTypes, eq(baselinePmSchedule.pmTypeId, pmTypes.id))
+  1290→    .where(and(...baselineConditions))
+  1291→    .orderBy(baselinePmSchedule.projectedDate);
+  1292→
+  1293→  // Query current PM schedule for comparison
+  1294→  const currentConditions = [
+  1295→    gte(pmSchedule.targetDate, fromDateStr),
+  1296→    lte(pmSchedule.targetDate, toDateStr),
+  1297→    isNull(pmSchedule.scenarioId), // Production schedule only
+  1298→  ];
+  1299→
+  1300→  if (trainIdFilter.length > 0) {
+  1301→    currentConditions.push(inArray(pmSchedule.trainId, trainIdFilter));
+  1302→  }
+  1303→
+  1304→  const currentPms = await db
+  1305→    .select({
+  1306→      pmId: pmSchedule.id,
+  1307→      trainId: pmSchedule.trainId,
+  1308→      pmTypeId: pmSchedule.pmTypeId,
+  1309→      targetDate: pmSchedule.targetDate,
+  1310→    })
+  1311→    .from(pmSchedule)
+  1312→    .where(and(...currentConditions));
+  1313→
+  1314→  // Build a map of current PM positions by train+pmType+date (or nearest)
+  1315→  const currentPmMap = new Map<string, { pmId: string; targetDate: string }>();
+  1316→  for (const pm of currentPms) {
+  1317→    // Key by train+pmType (we'll find the closest match)
+  1318→    const key = `${pm.trainId}:${pm.pmTypeId}`;
+  1319→    const existing = currentPmMap.get(key);
+  1320→    if (!existing || pm.targetDate < existing.targetDate) {
+  1321→      // Keep the earliest PM of this type for this train
+  1322→      currentPmMap.set(key, { pmId: pm.pmId, targetDate: pm.targetDate });
+  1323→    }
+  1324→  }
+  1325→
+  1326→  // Create a set of current PM IDs for "added" detection
+  1327→  const currentPmKeys = new Set<string>();
+  1328→  for (const pm of currentPms) {
+  1329→    currentPmKeys.add(`${pm.trainId}:${pm.pmTypeId}:${pm.targetDate}`);
+  1330→  }
+  1331→
+  1332→  // Calculate drift and build response
+  1333→  type BaselineStatus = 'UNCHANGED' | 'MOVED' | 'ADDED' | 'REMOVED';
+  1334→  const pmBlocks: Array<{
+  1335→    pmId: string;
+  1336→    trainId: string;
+  1337→    trainNumber: string;
+  1338→    pmCode: string;
+  1339→    baselineDate: string;
+  1340→    currentDate: string | null;
+  1341→    driftDays: number;
+  1342→    status: BaselineStatus;
+  1343→    displayColor: string;
+  1344→  }> = [];
+  1345→
+  1346→  // Track baseline PMs
+  1347→  const baselinePmKeys = new Set<string>();
+  1348→
+  1349→  for (const bpm of baselinePms) {
+  1350→    const key = `${bpm.trainId}:${bpm.pmTypeId}`;
+  1351→    const exactKey = `${bpm.trainId}:${bpm.pmTypeId}:${bpm.projectedDate}`;
+  1352→    baselinePmKeys.add(exactKey);
+  1353→
+  1354→    const currentPm = currentPmMap.get(key);
+  1355→    const baselineDate = new Date(bpm.projectedDate);
+  1356→
+  1357→    let status: BaselineStatus;
+  1358→    let currentDate: string | null = null;
+  1359→    let driftDays = 0;
+  1360→
+  1361→    if (!currentPm) {
+  1362→      // PM exists in baseline but not in current schedule (within date range)
+  1363→      status = 'REMOVED';
+  1364→    } else if (currentPm.targetDate === bpm.projectedDate) {
+  1365→      status = 'UNCHANGED';
+  1366→      currentDate = currentPm.targetDate;
+  1367→    } else {
+  1368→      status = 'MOVED';
+  1369→      currentDate = currentPm.targetDate;
+  1370→      const currentDateObj = new Date(currentPm.targetDate);
+  1371→      driftDays = Math.round((currentDateObj.getTime() - baselineDate.getTime()) / (1000 * 60 * 60 * 24));
+  1372→    }
+  1373→
+  1374→    pmBlocks.push({
+  1375→      pmId: bpm.baselinePmId,
+  1376→      trainId: bpm.trainId,
+  1377→      trainNumber: bpm.trainNumber,
+  1378→      pmCode: bpm.pmCode,
+  1379→      baselineDate: bpm.projectedDate,
+  1380→      currentDate,
+  1381→      driftDays,
+  1382→      status,
+  1383→      displayColor: bpm.displayColor ?? '#6B7280', // Gray for shadow
+  1384→    });
+  1385→  }
+  1386→
+  1387→  // Find PMs that exist in current but not in baseline (ADDED)
+  1388→  for (const pm of currentPms) {
+  1389→    const exactKey = `${pm.trainId}:${pm.pmTypeId}:${pm.targetDate}`;
+  1390→    if (!baselinePmKeys.has(exactKey)) {
+  1391→      // Check if there's ANY baseline PM for this train+pmType
+  1392→      const hasBaseline = baselinePms.some(b => b.trainId === pm.trainId && b.pmTypeId === pm.pmTypeId);
+  1393→      if (!hasBaseline) {
+  1394→        // This is a truly added PM
+  1395→        const train = await db.select({ trainNumber: trains.trainNumber }).from(trains).where(eq(trains.id, pm.trainId)).limit(1);
+  1396→        const pmType = await db.select({ pmCode: pmTypes.pmCode, displayColor: pmTypes.displayColor }).from(pmTypes).where(eq(pmTypes.id, pm.pmTypeId)).limit(1);
+  1397→
+  1398→        if (train.length > 0 && pmType.length > 0) {
+  1399→          pmBlocks.push({
+  1400→            pmId: pm.pmId,
+  1401→            trainId: pm.trainId,
+  1402→            trainNumber: train[0].trainNumber,
+  1403→            pmCode: pmType[0].pmCode,
+  1404→            baselineDate: pm.targetDate, // Use current date as reference
+  1405→            currentDate: pm.targetDate,
+  1406→            driftDays: 0,
+  1407→            status: 'ADDED',
+  1408→            displayColor: pmType[0].displayColor ?? '#10B981', // Green for added
+  1409→          });
+  1410→        }
+  1411→      }
+  1412→    }
+  1413→  }
+  1414→
+  1415→  // Calculate summary statistics
+  1416→  const summary = {
+  1417→    totalPms: pmBlocks.length,
+  1418→    movedPms: pmBlocks.filter(b => b.status === 'MOVED').length,
+  1419→    addedPms: pmBlocks.filter(b => b.status === 'ADDED').length,
+  1420→    removedPms: pmBlocks.filter(b => b.status === 'REMOVED').length,
+  1421→    unchangedPms: pmBlocks.filter(b => b.status === 'UNCHANGED').length,
+  1422→    avgDriftDays: pmBlocks.length > 0
+  1423→      ? Math.round(pmBlocks.reduce((sum, b) => sum + Math.abs(b.driftDays), 0) / pmBlocks.length * 10) / 10
+  1424→      : 0,
+  1425→  };
+  1426→
+  1427→  return c.json(
+  1428→    success(
+  1429→      {
+  1430→        baselineId: baseline.id,
+  1431→        baselineName: baseline.name,
+  1432→        baselineDate: baseline.baselineDate,
+  1433→        pmBlocks,
+  1434→        summary,
+  1435→      },
+  1436→      { timing: { durationMs: getRequestDuration(c) } }
+  1437→    )
+  1438→  );
+  1439→});
+  1440→
+  1441→/**
+  1442→ * GET /canvas/bow-wave
+  1443→ *
+  1444→ * Get bow-wave analysis data showing maintenance clustering risk.
+  1445→ * Bow-wave occurs when PM work accumulates in later periods, causing
+  1446→ * operational overload. This data is derived from strategic planner analysis.
+  1447→ *
+  1448→ * Thresholds:
+  1449→ * - >15 PMs/month = warning (yellow)
+  1450→ * - >40% fleet in simultaneous maintenance = critical (red)
+  1451→ * - Second half load > 1.5x first half = bow-wave detected
+  1452→ *
+  1453→ * Query Parameters:
+  1454→ * - fleetId: Filter by fleet (UUID, optional)
+  1455→ * - planId: Use specific strategic plan (UUID, optional - defaults to latest)
+  1456→ *
+  1457→ * @see specs/006-user-interface.md Section 6.5 - BowWaveIndicator
+  1458→ * @see specs/004-domain-services.md Section 4.6 - Strategic Planner (bow-wave detection)
+  1459→ */
+  1460→canvasRoutes.get('/canvas/bow-wave', async (c) => {
+  1461→  const requestId = getRequestId(c);
+  1462→
+  1463→  const fleetIdParam = c.req.query('fleetId');
+  1464→  const planIdParam = c.req.query('planId');
+  1465→
+  1466→  if (fleetIdParam && !isValidUuid(fleetIdParam)) {
+  1467→    return c.json(
+  1468→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid fleet ID format', requestId),
+  1469→      400
+  1470→    );
+  1471→  }
+  1472→
+  1473→  if (planIdParam && !isValidUuid(planIdParam)) {
+  1474→    return c.json(
+  1475→      error(ErrorCodes.VALIDATION_ERROR, 'Invalid plan ID format', requestId),
+  1476→      400
+  1477→    );
+  1478→  }
+  1479→
+  1480→  // Calculate quarterly PM loads for the next 10 years
+  1481→  const currentYear = new Date().getFullYear();
+  1482→  const horizonYears = 10;
+  1483→  const endYear = currentYear + horizonYears;
+  1484→
+  1485→  // Build conditions for PM query
+  1486→  const pmConditions = [
+  1487→    gte(pmSchedule.targetDate, `${currentYear}-01-01`),
+  1488→    lte(pmSchedule.targetDate, `${endYear}-12-31`),
+  1489→    isNull(pmSchedule.scenarioId),
+  1490→  ];
+  1491→
+  1492→  if (fleetIdParam) {
+  1493→    pmConditions.push(eq(trains.fleetId, fleetIdParam));
+  1494→  }
+  1495→
+  1496→  // Query PM counts by quarter
+  1497→  const quarterlyResults = await db
+  1498→    .select({
+  1499→      year: sql<number>`EXTRACT(YEAR FROM ${pmSchedule.targetDate})::integer`.as('year'),
+  1500→      quarter: sql<number>`EXTRACT(QUARTER FROM ${pmSchedule.targetDate})::integer`.as('quarter'),
+  1501→      pmCount: sql<number>`COUNT(${pmSchedule.id})::integer`.as('pm_count'),
+  1502→      totalHours: sql<string>`COALESCE(SUM(${pmSchedule.assignedHours}), 0)`.as('total_hours'),
+  1503→    })
+  1504→    .from(pmSchedule)
+  1505→    .innerJoin(trains, eq(pmSchedule.trainId, trains.id))
+  1506→    .where(and(...pmConditions))
+  1507→    .groupBy(
+  1508→      sql`EXTRACT(YEAR FROM ${pmSchedule.targetDate})`,
+  1509→      sql`EXTRACT(QUARTER FROM ${pmSchedule.targetDate})`
+  1510→    )
+  1511→    .orderBy(
+  1512→      sql`EXTRACT(YEAR FROM ${pmSchedule.targetDate})`,
+  1513→      sql`EXTRACT(QUARTER FROM ${pmSchedule.targetDate})`
+  1514→    );
+  1515→
+  1516→  // Transform quarterly results
+  1517→  type BowWaveRiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  1518→
+  1519→  const quarterlyLoads = quarterlyResults.map((row) => {
+  1520→    const hours = parseFloat(row.totalHours) || 0;
+  1521→    // Estimate capacity utilization (assuming 160 hours/quarter/track average)
+  1522→    const estimatedCapacity = 640; // 4 tracks * 160 hours
+  1523→    const utilizationPct = Math.round((hours / estimatedCapacity) * 100);
+  1524→
+  1525→    return {
+  1526→      quarter: `${row.year} Q${row.quarter}`,
+  1527→      year: row.year,
+  1528→      quarterNum: row.quarter,
+  1529→      pmCount: row.pmCount,
+  1530→      totalHours: Math.round(hours * 10) / 10,
+  1531→      capacityUtilizationPct: Math.min(utilizationPct, 200), // Cap at 200%
+  1532→    };
+  1533→  });
+  1534→
+  1535→  // Calculate first-half vs second-half load distribution
+  1536→  const midpoint = Math.floor(quarterlyLoads.length / 2);
+  1537→  const firstHalfLoads = quarterlyLoads.slice(0, midpoint);
+  1538→  const secondHalfLoads = quarterlyLoads.slice(midpoint);
+  1539→
+  1540→  const firstHalfTotal = firstHalfLoads.reduce((sum, q) => sum + q.pmCount, 0);
+  1541→  const secondHalfTotal = secondHalfLoads.reduce((sum, q) => sum + q.pmCount, 0);
+  1542→  const loadImbalanceRatio = firstHalfTotal > 0 ? secondHalfTotal / firstHalfTotal : 1;
+  1543→
+  1544→  // Calculate risk score based on imbalance
+  1545→  // Score = 0 if balanced, increases as second half exceeds first half
+  1546→  let riskScore = 0;
+  1547→  if (loadImbalanceRatio > 1) {
+  1548→    // Risk increases from 0 to 1 as ratio goes from 1 to 2
+  1549→    riskScore = Math.min(1, (loadImbalanceRatio - 1) / 1);
+  1550→  }
+  1551→
+  1552→  // Determine risk level
+  1553→  let riskLevel: BowWaveRiskLevel;
+  1554→  if (riskScore < 0.25) {
+  1555→    riskLevel = 'LOW';
+  1556→  } else if (riskScore < 0.5) {
+  1557→    riskLevel = 'MEDIUM';
+  1558→  } else if (riskScore < 0.75) {
+  1559→    riskLevel = 'HIGH';
+  1560→  } else {
+  1561→    riskLevel = 'CRITICAL';
+  1562→  }
+  1563→
+  1564→  // Identify peak periods (quarters with >15 PMs/month equivalent)
+  1565→  interface BowWavePeakPeriod {
+  1566→    startQuarter: string;
+  1567→    endQuarter: string;
+  1568→    averageLoad: number;
+  1569→    peakLoad: number;
+  1570→    riskLevel: BowWaveRiskLevel;
+  1571→  }
+  1572→
+  1573→  const peakPeriods: BowWavePeakPeriod[] = [];
+  1574→  let currentPeak: {
+  1575→    start: string;
+  1576→    end: string;
+  1577→    loads: number[];
+  1578→    peak: number;
+  1579→  } | null = null;
+  1580→
+  1581→  for (const q of quarterlyLoads) {
+  1582→    const monthlyAvg = q.pmCount / 3;
+  1583→    const isPeak = monthlyAvg > 15; // >15 PMs/month threshold
+  1584→
+  1585→    if (isPeak) {
+  1586→      if (!currentPeak) {
+  1587→        currentPeak = {
+  1588→          start: q.quarter,
+  1589→          end: q.quarter,
+  1590→          loads: [q.pmCount],
+  1591→          peak: q.pmCount,
+  1592→        };
+  1593→      } else {
+  1594→        currentPeak.end = q.quarter;
+  1595→        currentPeak.loads.push(q.pmCount);
+  1596→        currentPeak.peak = Math.max(currentPeak.peak, q.pmCount);
+  1597→      }
+  1598→    } else if (currentPeak) {
+  1599→      // End of peak period
+  1600→      const avgLoad = Math.round(currentPeak.loads.reduce((a, b) => a + b, 0) / currentPeak.loads.length);
+  1601→      const monthlyPeak = Math.round(currentPeak.peak / 3);
+  1602→
+  1603→      let periodRisk: BowWaveRiskLevel;
+  1604→      if (monthlyPeak > 40) {
+  1605→        periodRisk = 'CRITICAL';
+  1606→      } else if (monthlyPeak > 25) {
+  1607→        periodRisk = 'HIGH';
+  1608→      } else if (monthlyPeak > 15) {
+  1609→        periodRisk = 'MEDIUM';
+  1610→      } else {
+  1611→        periodRisk = 'LOW';
+  1612→      }
+  1613→
+  1614→      peakPeriods.push({
+  1615→        startQuarter: currentPeak.start,
+  1616→        endQuarter: currentPeak.end,
+  1617→        averageLoad: avgLoad,
+  1618→        peakLoad: currentPeak.peak,
+  1619→        riskLevel: periodRisk,
+  1620→      });
+  1621→
+  1622→      currentPeak = null;
+  1623→    }
+  1624→  }
+  1625→
+  1626→  // Handle trailing peak period
+  1627→  if (currentPeak) {
+  1628→    const avgLoad = Math.round(currentPeak.loads.reduce((a, b) => a + b, 0) / currentPeak.loads.length);
+  1629→    const monthlyPeak = Math.round(currentPeak.peak / 3);
+  1630→
+  1631→    let periodRisk: BowWaveRiskLevel;
+  1632→    if (monthlyPeak > 40) {
+  1633→      periodRisk = 'CRITICAL';
+  1634→    } else if (monthlyPeak > 25) {
+  1635→      periodRisk = 'HIGH';
+  1636→    } else if (monthlyPeak > 15) {
+  1637→      periodRisk = 'MEDIUM';
+  1638→    } else {
+  1639→      periodRisk = 'LOW';
+  1640→    }
+  1641→
+  1642→    peakPeriods.push({
+  1643→      startQuarter: currentPeak.start,
+  1644→      endQuarter: currentPeak.end,
+  1645→      averageLoad: avgLoad,
+  1646→      peakLoad: currentPeak.peak,
+  1647→      riskLevel: periodRisk,
+  1648→    });
+  1649→  }
+  1650→
+  1651→  // Generate recommendations based on analysis
+  1652→  type RecommendationType = 'ADVANCE_PM' | 'DEFER_PM' | 'ADD_CAPACITY' | 'SPREAD_WORKLOAD';
+  1653→  type RecommendationPriority = 'HIGH' | 'MEDIUM' | 'LOW';
+  1654→
+  1655→  interface BowWaveRecommendation {
+  1656→    type: RecommendationType;
+  1657→    description: string;
+  1658→    impact: string;
+  1659→    priority: RecommendationPriority;
+  1660→  }
+  1661→
+  1662→  const recommendations: BowWaveRecommendation[] = [];
+  1663→
+  1664→  if (riskLevel === 'CRITICAL' || riskLevel === 'HIGH') {
+  1665→    recommendations.push({
+  1666→      type: 'SPREAD_WORKLOAD',
+  1667→      description: 'Redistribute PM load from second half to first half of planning horizon',
+  1668→      impact: `Could reduce imbalance ratio from ${loadImbalanceRatio.toFixed(2)}x to ~1.2x`,
+  1669→      priority: 'HIGH',
+  1670→    });
+  1671→  }
+  1672→
+  1673→  if (peakPeriods.some(p => p.riskLevel === 'CRITICAL')) {
+  1674→    recommendations.push({
+  1675→      type: 'ADVANCE_PM',
+  1676→      description: 'Advance non-critical PMs from peak periods to earlier quarters',
+  1677→      impact: 'Reduces peak load and prevents operational bottlenecks',
+  1678→      priority: 'HIGH',
+  1679→    });
+  1680→  }
+  1681→
+  1682→  if (peakPeriods.length > 2) {
+  1683→    recommendations.push({
+  1684→      type: 'ADD_CAPACITY',
+  1685→      description: 'Consider contractor support during peak periods',
+  1686→      impact: 'Increases throughput by 20-30% during critical periods',
+  1687→      priority: 'MEDIUM',
+  1688→    });
+  1689→  }
+  1690→
+  1691→  if (riskLevel === 'MEDIUM') {
+  1692→    recommendations.push({
+  1693→      type: 'DEFER_PM',
+  1694→      description: 'Review PMs that can be safely deferred within compliance windows',
+  1695→      impact: 'Smooths workload distribution across quarters',
+  1696→      priority: 'LOW',
+  1697→    });
+  1698→  }
+  1699→
+  1700→  // Get affected fleets
+  1701→  const fleetConditions = fleetIdParam
+  1702→    ? [eq(fleets.id, fleetIdParam)]
+  1703→    : [];
+  1704→
+  1705→  const affectedFleetsResult = await db
+  1706→    .select({ code: fleets.code })
+  1707→    .from(fleets)
+  1708→    .where(fleetConditions.length > 0 ? and(...fleetConditions) : undefined)
+  1709→    .orderBy(fleets.code);
+  1710→
+  1711→  const affectedFleets = affectedFleetsResult.map((f) => f.code);
+  1712→
+  1713→  // Build response
+  1714→  const bowWaveData = {
+  1715→    riskLevel,
+  1716→    riskScore: Math.round(riskScore * 100) / 100,
+  1717→    planId: planIdParam ?? null,
+  1718→    planDate: new Date().toISOString().split('T')[0],
+  1719→    quarterlyLoads,
+  1720→    peakPeriods,
+  1721→    recommendations,
+  1722→    summary: {
+  1723→      totalPms: firstHalfTotal + secondHalfTotal,
+  1724→      firstHalfLoad: firstHalfTotal,
+  1725→      secondHalfLoad: secondHalfTotal,
+  1726→      loadImbalanceRatio: Math.round(loadImbalanceRatio * 100) / 100,
+  1727→      affectedFleets,
+  1728→    },
+  1729→  };
+  1730→
+  1731→  return c.json(
+  1732→    success(bowWaveData, { timing: { durationMs: getRequestDuration(c) } })
+  1733→  );
+  1734→});
+  1735→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

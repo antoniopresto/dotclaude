@@ -1,0 +1,590 @@
+     1→# Ralph Wiggum Implementation Improvement Plan
+     2→
+     3→> **Project**: MMS (Metro Fleet Mileage Management System)
+     4→> **Date**: 2026-01-20
+     5→> **Based on**: Community research, Geoffrey Huntley's guidance, and analysis of current implementation
+     6→
+     7→---
+     8→
+     9→## Executive Summary
+    10→
+    11→Your Ralph implementation is **well-engineered (7.5/10)** but has critical issues preventing optimal autonomous operation. This plan addresses the key problems while **preserving your 24h+ continuous run capability** as requested.
+    12→
+    13→### Key Philosophy from Geoffrey Huntley
+    14→
+    15→> *"Disk is state, git is memory."*
+    16→
+    17→Progress persists in files and git history, NOT in the LLM's context window. This is the fundamental insight that solves most Ralph problems.
+    18→
+    19→---
+    20→
+    21→## Part 1: Critical Fixes (Do Immediately)
+    22→
+    23→### 1.1 IMPLEMENTATION_PLAN.md is Too Large (44k tokens)
+    24→
+    25→**Problem**: Exceeds Claude's 25k token read limit, causing "context rot" and partial reads.
+    26→
+    27→**Solution**: Implement **hierarchical plan structure** with automatic archival.
+    28→
+    29→#### File Structure Change
+    30→
+    31→```
+    32→ralph/
+    33→├── IMPLEMENTATION_PLAN.md          # Active tasks ONLY (<400 lines)
+    34→├── IMPLEMENTATION_ARCHIVE/
+    35→│   ├── 2026-01-phase-1-complete.md
+    36→│   ├── 2026-01-phase-2-complete.md
+    37→│   └── ...
+    38→└── LEARNINGS.md                    # Accumulated knowledge (append-only)
+    39→```
+    40→
+    41→#### New IMPLEMENTATION_PLAN.md Format (Lean)
+    42→
+    43→```markdown
+    44→# MMS Implementation Plan
+    45→
+    46→> **Status**: 70% complete | **Active Phase**: 7 (UI)
+    47→> **Last Updated**: 2026-01-20
+    48→
+    49→## 🔴 BLOCKERS (Resolve First)
+    50→- [ ] P1: [Description] - [Location]
+    51→
+    52→## ⚠️ IN PROGRESS
+    53→- [ ] P2: [Current task being worked on]
+    54→
+    55→## 📋 NEXT UP (Max 10 items)
+    56→- [ ] P2: [Next priority task]
+    57→- [ ] P3: [Following task]
+    58→
+    59→## 📊 Quick Stats
+    60→| Component | Status | Tests |
+    61→|-----------|--------|-------|
+    62→| Database  | ✅     | N/A   |
+    63→| Services  | ✅     | 700+  |
+    64→| API       | ⚠️ 98% | 500+  |
+    65→| UI        | ⚠️ 50% | 7     |
+    66→
+    67→---
+    68→*Full history: `ralph/IMPLEMENTATION_ARCHIVE/`*
+    69→*Learnings: `ralph/LEARNINGS.md`*
+    70→```
+    71→
+    72→#### Archive Script (Add to ralph/scripts/)
+    73→
+    74→Create `ralph/scripts/archive-completed.sh`:
+    75→
+    76→```bash
+    77→#!/bin/bash
+    78→# Archives completed tasks from IMPLEMENTATION_PLAN.md
+    79→ARCHIVE_DIR="ralph/IMPLEMENTATION_ARCHIVE"
+    80→PLAN_FILE="ralph/IMPLEMENTATION_PLAN.md"
+    81→DATE=$(date +%Y-%m-%d)
+    82→
+    83→mkdir -p "$ARCHIVE_DIR"
+    84→
+    85→# Extract completed sections
+    86→grep -A 100 "### GAP-.*RESOLVED" "$PLAN_FILE" > "$ARCHIVE_DIR/$DATE-resolved-gaps.md" 2>/dev/null || true
+    87→grep -A 5 "^\- \[x\]" "$PLAN_FILE" >> "$ARCHIVE_DIR/$DATE-completed-tasks.md" 2>/dev/null || true
+    88→
+    89→# Count lines
+    90→LINES=$(wc -l < "$PLAN_FILE")
+    91→echo "Current IMPLEMENTATION_PLAN.md: $LINES lines"
+    92→
+    93→if [ "$LINES" -gt 400 ]; then
+    94→    echo "⚠️  Plan exceeds 400 lines. Consider archiving more completed items."
+    95→fi
+    96→```
+    97→
+    98→#### Prompt Instruction Addition
+    99→
+   100→Add to `PROMPT_build.md` (after existing cleanup instruction):
+   101→
+   102→```markdown
+   103→99999999999. **PLAN SIZE GUARD**: Before starting work, check IMPLEMENTATION_PLAN.md size:
+   104→    - If > 400 lines: Archive completed phases to `ralph/IMPLEMENTATION_ARCHIVE/` using a subagent
+   105→    - Move resolved GAPs to archive (keep only unresolved)
+   106→    - Keep only: BLOCKERS, IN PROGRESS, NEXT UP (max 10 items), Quick Stats
+   107→    - Plans are disposable—regenerate from specs rather than accumulate
+   108→```
+   109→
+   110→### 1.2 Circuit Breaker Defaults (Keep High for 24h+ Runs)
+   111→
+   112→**Your Configuration is Intentional**: You want unlimited runs. Keep it.
+   113→
+   114→However, add **progress-based detection** instead of iteration limits:
+   115→
+   116→```bash
+   117→# In circuit-breaker.sh - change from:
+   118→CB_NO_PROGRESS_THRESHOLD=${CB_NO_PROGRESS_THRESHOLD:-9999999}
+   119→
+   120→# To (detects stuck loops without limiting total iterations):
+   121→CB_NO_PROGRESS_THRESHOLD=${CB_NO_PROGRESS_THRESHOLD:-10}  # 10 iterations without commit = stuck
+   122→CB_MAX_COST_USD=${CB_MAX_COST_USD:-9999999}              # Keep unlimited cost
+   123→```
+   124→
+   125→**Rationale**: 10 iterations without a single git commit indicates a genuine stuck loop, not normal operation. This protects without limiting 24h+ runs.
+   126→
+   127→### 1.3 NO_PUSH Default (Critical Data Safety)
+   128→
+   129→**Problem**: `NO_PUSH=true` by default means work only exists locally.
+   130→
+   131→**Fix in loop.sh line 348**:
+   132→
+   133→```bash
+   134→# Change from:
+   135→NO_PUSH=true
+   136→
+   137→# To:
+   138→NO_PUSH=${NO_PUSH:-false}  # Default to pushing (safe)
+   139→```
+   140→
+   141→**Alternative**: If you have authentication issues, keep `NO_PUSH=true` but add a warning:
+   142→
+   143→```bash
+   144→if [[ "$NO_PUSH" == "true" ]]; then
+   145→    log_warn "⚠️  NO_PUSH=true: Work is LOCAL ONLY. Set NO_PUSH=false or run 'git push' manually."
+   146→fi
+   147→```
+   148→
+   149→---
+   150→
+   151→## Part 2: Mid-Course Corrections (How to Steer Ralph)
+   152→
+   153→### 2.1 How Geoffrey Huntley Does It
+   154→
+   155→From the Dev Interrupted podcast (January 13, 2026):
+   156→
+   157→> *"Ralph is deterministically bad in an undeterministic world. You tune Ralph like a guitar."*
+   158→
+   159→**Methods Huntley Uses**:
+   160→
+   161→1. **Edit prompt files directly** (PROMPT_build.md, PROMPT_plan.md)
+   162→2. **Add "signage" to prompts** - specific instructions for current issues
+   163→3. **Never interrupt the loop** - let it finish, then adjust
+   164→4. **Plans are disposable** - regenerate rather than accumulate
+   165→
+   166→### 2.2 Community Patterns for Mid-Course Corrections
+   167→
+   168→#### Pattern A: The "Signpost" Method (Most Common)
+   169→
+   170→Add temporary instructions to the TOP of `PROMPT_build.md`:
+   171→
+   172→```markdown
+   173→## ⚡ CURRENT FOCUS (Remove after completion)
+   174→- **Priority Override**: Focus ONLY on writing integration tests for AuthService
+   175→- **Do NOT**: Start new features or refactor existing code
+   176→- **Deliverable**: All tests in `src/services/auth.test.ts` passing
+   177→
+   178→---
+   179→[Rest of normal prompt...]
+   180→```
+   181→
+   182→**How to apply**: Edit the file manually while Ralph is between iterations (during the `sleep 5` pause).
+   183→
+   184→#### Pattern B: The "@fix_plan.md" Pattern (snarktank/ralph)
+   185→
+   186→Create a separate file for immediate tasks:
+   187→
+   188→```
+   189→ralph/
+   190→├── @fix_plan.md          # Immediate focus (read first)
+   191→├── PROMPT_build.md       # General instructions
+   192→└── IMPLEMENTATION_PLAN.md
+   193→```
+   194→
+   195→Add to `PROMPT_build.md`:
+   196→
+   197→```markdown
+   198→0. **FIRST**: If `@fix_plan.md` exists, complete ALL tasks in it before anything else.
+   199→   Once complete, delete `@fix_plan.md` and proceed with normal workflow.
+   200→```
+   201→
+   202→Example `@fix_plan.md`:
+   203→
+   204→```markdown
+   205→# Immediate Task: Documentation
+   206→
+   207→## Objective
+   208→Create comprehensive documentation for running the application.
+   209→
+   210→## Deliverables
+   211→1. Update `ralph/AGENTS.md` with:
+   212→   - How to start frontend (`bun run dev`)
+   213→   - How to start backend (`bun run src/api/server.ts`)
+   214→   - How to run both together
+   215→   - Required environment variables
+   216→   - Database setup commands
+   217→
+   218→2. Create `docs/QUICKSTART.md` with:
+   219→   - Prerequisites
+   220→   - Step-by-step setup
+   221→   - Verification commands
+   222→   - Troubleshooting
+   223→
+   224→## Completion Signal
+   225→When both files are complete with all sections, output:
+   226→<promise>DOCS_COMPLETE</promise>
+   227→```
+   228→
+   229→**How to use**: Create `@fix_plan.md`, Ralph will pick it up on next iteration.
+   230→
+   231→#### Pattern C: The "Interrupt and Redirect" Method
+   232→
+   233→1. **Ctrl+C** to stop current iteration
+   234→2. Edit `IMPLEMENTATION_PLAN.md` to add a P1 BLOCKER at the top:
+   235→
+   236→```markdown
+   237→## 🔴 BLOCKERS (Resolve First)
+   238→- [ ] P1: **HUMAN REQUEST**: Create comprehensive documentation for running frontend and backend
+   239→  - Location: docs/QUICKSTART.md and ralph/AGENTS.md
+   240→  - Acceptance: Can follow docs to start app from scratch
+   241→```
+   242→
+   243→3. Restart Ralph: `./loop.sh`
+   244→
+   245→### 2.3 Specific Example: Requesting Documentation
+   246→
+   247→You mentioned not understanding how to run frontend/backend. Here's how to request it:
+   248→
+   249→**Option 1: Quick Signpost** (Add to top of PROMPT_build.md)
+   250→
+   251→```markdown
+   252→## ⚡ IMMEDIATE TASK
+   253→Before any other work, create `docs/QUICKSTART.md` explaining:
+   254→1. How to start PostgreSQL and Redis (Docker commands)
+   255→2. How to run database migrations
+   256→3. How to start the backend API
+   257→4. How to start the frontend dev server
+   258→5. How to verify everything is working
+   259→
+   260→Commit this documentation before proceeding with other tasks.
+   261→---
+   262→```
+   263→
+   264→**Option 2: Create @fix_plan.md**
+   265→
+   266→```markdown
+   267→# Fix Plan: Application Documentation
+   268→
+   269→## Task
+   270→Create comprehensive documentation for running MMS locally.
+   271→
+   272→## Requirements
+   273→1. **File**: `docs/QUICKSTART.md`
+   274→2. **Sections**:
+   275→   - Prerequisites (Node, Bun, Docker, etc.)
+   276→   - Environment Setup (.env configuration)
+   277→   - Database Setup (Docker, migrations, seeding)
+   278→   - Running Backend (commands, expected output)
+   279→   - Running Frontend (commands, expected output)
+   280→   - Running Both (recommended terminal setup)
+   281→   - Verification (how to know it's working)
+   282→   - Troubleshooting (common issues)
+   283→
+   284→3. **Update**: `ralph/AGENTS.md` quick reference section
+   285→
+   286→## Completion
+   287→Output: <promise>QUICKSTART_DONE</promise>
+   288→```
+   289→
+   290→### 2.4 Request Types and How to Handle Them
+   291→
+   292→| Request Type | Method | Example |
+   293→|--------------|--------|---------|
+   294→| **Specific test** | @fix_plan.md | "Write integration tests for /api/v1/trains" |
+   295→| **Documentation** | @fix_plan.md or signpost | "Document how to run the app" |
+   296→| **Bug fix** | Add to BLOCKERS section | "P1: Fix authentication timeout" |
+   297→| **Feature focus** | Signpost in PROMPT_build.md | "Focus ONLY on Phase 7.2 this session" |
+   298→| **Architecture question** | Use `./loop.sh plan` mode | Analyze and plan, don't implement |
+   299→| **Stop and review** | Create completion signal | Add task that outputs `<promise>REVIEW_NEEDED</promise>` |
+   300→
+   301→---
+   302→
+   303→## Part 3: Prompt File Improvements
+   304→
+   305→### 3.1 Fix Unrealistic Subagent Counts
+   306→
+   307→**Problem**: "500 parallel Opus subagents" is impossible. Claude Code supports ~3-5 concurrent subagents.
+   308→
+   309→**Fix in PROMPT_build.md and PROMPT_plan.md**:
+   310→
+   311→```markdown
+   312→# Change from:
+   313→0a. Study `specs/*` with up to 500 parallel Opus (Min 4.5) subagents
+   314→
+   315→# To:
+   316→0a. Study `specs/*` systematically. Use subagents for parallel file reads when beneficial.
+   317→```
+   318→
+   319→**Rationale**: Let Claude decide optimal parallelism rather than specifying impossible numbers.
+   320→
+   321→### 3.2 Fix Nonsensical Line Numbers
+   322→
+   323→**Problem**: Instructions numbered 99999999999 are confusing.
+   324→
+   325→**Fix**: Use categorical numbering:
+   326→
+   327→```markdown
+   328→## Setup Phase (0.x)
+   329→0a. Study specs
+   330→0b. Study IMPLEMENTATION_PLAN.md
+   331→0c. Study src/lib
+   332→
+   333→## Work Phase (1.x)
+   334→1. Choose task from IMPLEMENTATION_PLAN.md
+   335→2. Implement with validation
+   336→
+   337→## Completion Phase (9.x)
+   338→9a. Update IMPLEMENTATION_PLAN.md
+   339→9b. Commit changes
+   340→9c. Check for remaining tasks
+   341→
+   342→## Guardrails (G.x)
+   343→G1. PLAN SIZE: Archive if > 400 lines
+   344→G2. TESTS: Required tests must pass before commit
+   345→G3. DOCUMENTATION: Capture the "why"
+   346→```
+   347→
+   348→### 3.3 Add Case-Insensitive Completion Detection
+   349→
+   350→**Fix in loop.sh line 187**:
+   351→
+   352→```bash
+   353→# Change from:
+   354→if grep -q "$signal" "$output_file" 2>/dev/null; then
+   355→
+   356→# To:
+   357→if grep -qi "$signal" "$output_file" 2>/dev/null; then  # -i for case-insensitive
+   358→```
+   359→
+   360→---
+   361→
+   362→## Part 4: Automation Scripts
+   363→
+   364→### 4.1 Pre-Iteration Hook (Check Plan Size)
+   365→
+   366→Create `ralph/hooks/pre-iteration.sh`:
+   367→
+   368→```bash
+   369→#!/bin/bash
+   370→PLAN_FILE="ralph/IMPLEMENTATION_PLAN.md"
+   371→MAX_LINES=400
+   372→
+   373→if [ -f "$PLAN_FILE" ]; then
+   374→    LINES=$(wc -l < "$PLAN_FILE")
+   375→    if [ "$LINES" -gt "$MAX_LINES" ]; then
+   376→        echo "⚠️  IMPLEMENTATION_PLAN.md has $LINES lines (max: $MAX_LINES)"
+   377→        echo "Consider running: ./ralph/scripts/archive-completed.sh"
+   378→    fi
+   379→fi
+   380→```
+   381→
+   382→Add to loop.sh before Claude call:
+   383→
+   384→```bash
+   385→# Pre-iteration checks
+   386→if [[ -f "$SCRIPT_DIR/hooks/pre-iteration.sh" ]]; then
+   387→    source "$SCRIPT_DIR/hooks/pre-iteration.sh"
+   388→fi
+   389→```
+   390→
+   391→### 4.2 Refresh Plan Script (Regenerate from Specs)
+   392→
+   393→Create `ralph/scripts/refresh-plan.sh`:
+   394→
+   395→```bash
+   396→#!/bin/bash
+   397→# Regenerates IMPLEMENTATION_PLAN.md from specs (disposable plans philosophy)
+   398→
+   399→echo "🔄 Regenerating implementation plan from specs..."
+   400→
+   401→# Archive current plan
+   402→cp ralph/IMPLEMENTATION_PLAN.md "ralph/IMPLEMENTATION_ARCHIVE/$(date +%Y-%m-%d)-pre-refresh.md"
+   403→
+   404→# Run planning mode
+   405→./ralph/loop.sh plan 3
+   406→
+   407→echo "✅ Plan refreshed. Review ralph/IMPLEMENTATION_PLAN.md"
+   408→```
+   409→
+   410→### 4.3 Request Documentation Script
+   411→
+   412→Create `ralph/scripts/request-docs.sh`:
+   413→
+   414→```bash
+   415→#!/bin/bash
+   416→# Creates @fix_plan.md for documentation request
+   417→
+   418→cat > ralph/@fix_plan.md << 'EOF'
+   419→# Fix Plan: Application Documentation
+   420→
+   421→## Task
+   422→Create comprehensive documentation for running MMS locally.
+   423→
+   424→## Deliverables
+   425→1. **docs/QUICKSTART.md** with:
+   426→   - Prerequisites
+   427→   - Environment setup
+   428→   - Database setup
+   429→   - Running backend
+   430→   - Running frontend
+   431→   - Verification steps
+   432→
+   433→2. **Update ralph/AGENTS.md** quick reference
+   434→
+   435→## Completion
+   436→<promise>DOCS_COMPLETE</promise>
+   437→EOF
+   438→
+   439→echo "✅ Created ralph/@fix_plan.md"
+   440→echo "Run ./ralph/loop.sh to execute"
+   441→```
+   442→
+   443→---
+   444→
+   445→## Part 5: Quick Reference Commands
+   446→
+   447→### Steering Ralph (Mid-Course Corrections)
+   448→
+   449→```bash
+   450→# Request specific documentation
+   451→echo "## ⚡ IMMEDIATE: Create docs/QUICKSTART.md with full setup guide" >> ralph/PROMPT_build.md
+   452→
+   453→# Request specific tests
+   454→cat > ralph/@fix_plan.md << 'EOF'
+   455→# Task: Write tests for AuthService
+   456→Complete auth.test.ts with 100% coverage
+   457→<promise>AUTH_TESTS_DONE</promise>
+   458→EOF
+   459→
+   460→# Change focus to specific phase
+   461→sed -i '1i ## ⚡ FOCUS: Phase 7.2 ONLY this session\n---' ralph/PROMPT_build.md
+   462→
+   463→# Archive completed work
+   464→./ralph/scripts/archive-completed.sh
+   465→
+   466→# Regenerate plan from specs
+   467→./ralph/scripts/refresh-plan.sh
+   468→
+   469→# Check plan size
+   470→wc -l ralph/IMPLEMENTATION_PLAN.md
+   471→```
+   472→
+   473→### Monitoring
+   474→
+   475→```bash
+   476→# Watch progress
+   477→./ralph/monitor.sh dashboard
+   478→
+   479→# Check circuit breaker
+   480→./ralph/circuit-breaker.sh status
+   481→
+   482→# View recent commits
+   483→git log --oneline -20
+   484→
+   485→# Check current iteration cost estimate
+   486→cat /tmp/ralph-circuit-breaker/state.json | jq '.estimated_cost'
+   487→```
+   488→
+   489→### Recovery
+   490→
+   491→```bash
+   492→# Reset circuit breaker after stuck loop
+   493→./ralph/circuit-breaker.sh reset
+   494→
+   495→# Revert bad iteration
+   496→git reset --hard HEAD~1
+   497→
+   498→# Force push after revert (if needed)
+   499→git push --force-with-lease
+   500→```
+   501→
+   502→---
+   503→
+   504→## Part 6: Implementation Checklist
+   505→
+   506→### Immediate Actions (Do Now)
+   507→
+   508→- [ ] Create `ralph/IMPLEMENTATION_ARCHIVE/` directory
+   509→- [ ] Archive resolved GAPs from IMPLEMENTATION_PLAN.md
+   510→- [ ] Reduce IMPLEMENTATION_PLAN.md to <400 lines
+   511→- [ ] Change `NO_PUSH=true` to `NO_PUSH=${NO_PUSH:-false}` in loop.sh
+   512→- [ ] Set `CB_NO_PROGRESS_THRESHOLD=10` in circuit-breaker.sh
+   513→- [ ] Add `-i` flag to grep in check_completion_signal function
+   514→
+   515→### Short-Term (This Week)
+   516→
+   517→- [ ] Create `ralph/scripts/archive-completed.sh`
+   518→- [ ] Create `ralph/scripts/refresh-plan.sh`
+   519→- [ ] Create `ralph/hooks/pre-iteration.sh`
+   520→- [ ] Update subagent counts in PROMPT files
+   521→- [ ] Add @fix_plan.md support to PROMPT_build.md
+   522→
+   523→### Documentation Request (Use Immediately)
+   524→
+   525→Create this file to get your documentation:
+   526→
+   527→```bash
+   528→cat > ralph/@fix_plan.md << 'EOF'
+   529→# Fix Plan: Application Startup Documentation
+   530→
+   531→## Objective
+   532→Document exactly how to run the MMS application locally.
+   533→
+   534→## Deliverables
+   535→
+   536→### 1. docs/QUICKSTART.md
+   537→Full guide including:
+   538→- Prerequisites (Bun, Docker, etc.)
+   539→- Clone and install
+   540→- Environment variables (.env setup)
+   541→- Start PostgreSQL and Redis (docker compose commands)
+   542→- Run migrations
+   543→- Start backend API (exact command and expected output)
+   544→- Start frontend dev server (exact command and expected output)
+   545→- Verify everything works (what URLs to visit, what to see)
+   546→- Common issues and fixes
+   547→
+   548→### 2. Update ralph/AGENTS.md
+   549→Add/update "Quick Start" section at top with:
+   550→- One-liner to start everything
+   551→- Individual commands for each service
+   552→- Port numbers and URLs
+   553→
+   554→## Acceptance Criteria
+   555→- Can follow docs from fresh clone to running app
+   556→- Both frontend and backend accessible in browser
+   557→- No assumed knowledge
+   558→
+   559→## Completion Signal
+   560→<promise>QUICKSTART_COMPLETE</promise>
+   561→EOF
+   562→```
+   563→
+   564→Then run: `./ralph/loop.sh`
+   565→
+   566→---
+   567→
+   568→## Part 7: The 5 Golden Rules (Community Consensus)
+   569→
+   570→1. **"Disk is state, git is memory"** — Never depend on context for history
+   571→2. **"Plans are disposable"** — Regenerate rather than accumulate
+   572→3. **"Fresh context is reliability"** — Rotate at 40% context, not 90%
+   573→4. **"Ralph maintains Ralph"** — Use subagents for self-cleanup
+   574→5. **"Deterministically bad > unpredictably good"** — Expect failures, tune prompts
+   575→
+   576→---
+   577→
+   578→## Sources
+   579→
+   580→- Geoffrey Huntley's Ralph: https://ghuntley.com/ralph/
+   581→- Dev Interrupted Podcast (Jan 13, 2026): https://linearb.io/dev-interrupted/podcast/inventing-the-ralph-wiggum-loop
+   582→- GitHub: ghuntley/how-to-ralph-wiggum
+   583→- GitHub: snarktank/ralph (archival patterns)
+   584→- GitHub: frankbria/ralph-claude-code (circuit breaker patterns)
+   585→- Anthropic Claude Code Issues #5615 (timeout configuration)
+   586→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

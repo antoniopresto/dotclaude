@@ -1,0 +1,93 @@
+     1→# MMS Run Assignment Optimizer
+     2→# Multi-stage build for C++ OR-Tools CP-SAT solver
+     3→#
+     4→# Build:
+     5→#   docker build -t mms-optimizer .
+     6→#
+     7→# Run:
+     8→#   echo '{"request_id":"...", ...}' | docker run -i mms-optimizer
+     9→#
+    10→# Or with the binary extracted:
+    11→#   docker cp $(docker create mms-optimizer):/app/mms-optimizer ./mms-optimizer
+    12→
+    13→# =============================================================================
+    14→# Stage 1: Build environment
+    15→# =============================================================================
+    16→FROM debian:bookworm-slim AS builder
+    17→
+    18→# Install build dependencies
+    19→RUN apt-get update && apt-get install -y --no-install-recommends \
+    20→    build-essential \
+    21→    cmake \
+    22→    pkg-config \
+    23→    git \
+    24→    wget \
+    25→    ca-certificates \
+    26→    nlohmann-json3-dev \
+    27→    libfmt-dev \
+    28→    && rm -rf /var/lib/apt/lists/*
+    29→
+    30→# Install OR-Tools from binary package (faster than building from source)
+    31→# Using v9.8 for stable CP-SAT API
+    32→ARG ORTOOLS_VERSION=9.8.3296
+    33→ARG ORTOOLS_PLATFORM=debian-12
+    34→
+    35→WORKDIR /opt
+    36→
+    37→RUN wget -q https://github.com/google/or-tools/releases/download/v${ORTOOLS_VERSION}/or-tools_amd64_${ORTOOLS_PLATFORM}_cpp_v${ORTOOLS_VERSION}.tar.gz \
+    38→    && tar -xzf or-tools_amd64_${ORTOOLS_PLATFORM}_cpp_v${ORTOOLS_VERSION}.tar.gz \
+    39→    && mv or-tools_* ortools \
+    40→    && rm or-tools_*.tar.gz
+    41→
+    42→# Set OR-Tools paths for CMake
+    43→ENV CMAKE_PREFIX_PATH=/opt/ortools
+    44→ENV LD_LIBRARY_PATH=/opt/ortools/lib:${LD_LIBRARY_PATH}
+    45→
+    46→# Copy source
+    47→WORKDIR /build
+    48→COPY CMakeLists.txt .
+    49→COPY src/ src/
+    50→
+    51→# Build optimizer
+    52→RUN cmake -B build \
+    53→    -DCMAKE_BUILD_TYPE=Release \
+    54→    -DCMAKE_PREFIX_PATH=/opt/ortools \
+    55→    && cmake --build build --parallel $(nproc)
+    56→
+    57→# Strip binary for smaller size
+    58→RUN strip build/mms-optimizer
+    59→
+    60→# =============================================================================
+    61→# Stage 2: Runtime environment
+    62→# =============================================================================
+    63→FROM debian:bookworm-slim AS runtime
+    64→
+    65→# Install runtime dependencies only
+    66→RUN apt-get update && apt-get install -y --no-install-recommends \
+    67→    libstdc++6 \
+    68→    libgcc-s1 \
+    69→    libgomp1 \
+    70→    && rm -rf /var/lib/apt/lists/*
+    71→
+    72→# Copy OR-Tools shared libraries
+    73→COPY --from=builder /opt/ortools/lib/*.so* /usr/local/lib/
+    74→RUN ldconfig
+    75→
+    76→# Create non-root user
+    77→RUN useradd -m -s /bin/sh optimizer
+    78→WORKDIR /app
+    79→
+    80→# Copy optimizer binary
+    81→COPY --from=builder /build/build/mms-optimizer .
+    82→RUN chown optimizer:optimizer mms-optimizer
+    83→
+    84→# Switch to non-root user
+    85→USER optimizer
+    86→
+    87→# Entry point
+    88→ENTRYPOINT ["./mms-optimizer"]
+    89→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

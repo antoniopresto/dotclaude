@@ -1,0 +1,871 @@
+     1→/**
+     2→ * MMS Unavailability Service
+     3→ *
+     4→ * Tracks trains that are out of service due to corrective maintenance,
+     5→ * incidents, collisions, or other events. This is a CRITICAL v2.1 service
+     6→ * that integrates with Maximo CMMS and provides constraints to the optimizer.
+     7→ *
+     8→ * Key responsibilities:
+     9→ * - Create/resolve unavailability events
+    10→ * - Automatically sync train fitness status
+    11→ * - Detect conflicts with scheduled PM
+    12→ * - Provide active events for optimizer constraints
+    13→ * - Support Maximo work order integration
+    14→ *
+    15→ * Business rules:
+    16→ * - ACTIVE events update train fitness to restriction_level (RESTRICTED/GROUNDED)
+    17→ * - RESOLVED events restore train fitness to FIT (unless other active events exist)
+    18→ * - Events with blocks_run_assignment=true prevent optimizer from assigning train
+    19→ * - Events with blocks_pm_scheduling=true prevent PM scheduler from planning train
+    20→ *
+    21→ * @see specs/003-database-schema.md Section 3.2.3 (Unavailability Events)
+    22→ * @see specs/004-domain-services.md Section 4.2.5 (Unavailability Service)
+    23→ */
+    24→
+    25→import { eq, and, inArray, sql, desc, count, gte, lte } from 'drizzle-orm';
+    26→import type { SQL } from 'drizzle-orm';
+    27→import { BaseService, MmsAttributes } from '../lib/services/base';
+    28→import {
+    29→  unavailabilityEvents,
+    30→  trains,
+    31→  pmSchedule,
+    32→  type UnavailabilityEvent,
+    33→  type NewUnavailabilityEvent,
+    34→  type Train,
+    35→} from '../lib/db/schema';
+    36→import {
+    37→  NotFoundError,
+    38→  TrainNotFoundError,
+    39→  BusinessRuleError,
+    40→  ConflictError,
+    41→} from '../lib/errors';
+    42→
+    43→// =============================================================================
+    44→// Types
+    45→// =============================================================================
+    46→
+    47→/** Unavailability event types */
+    48→type UnavailabilityType = 'CORRECTIVE' | 'INCIDENT' | 'COLLISION' | 'VANDALISM' | 'EXTERNAL' | 'PLANNED_OUTAGE';
+    49→
+    50→/** Event status */
+    51→type UnavailabilityStatus = 'ACTIVE' | 'RESOLVED';
+    52→
+    53→/** Restriction level (maps to fitness status) */
+    54→type RestrictionLevel = 'RESTRICTED' | 'GROUNDED';
+    55→
+    56→/** Create event request */
+    57→export interface CreateEventRequest {
+    58→  trainId: string;
+    59→  eventType: UnavailabilityType;
+    60→  restrictionLevel: RestrictionLevel;
+    61→  description?: string;
+    62→  failureCode?: string;
+    63→  affectedSystem?: string;
+    64→  estimatedRepairHours?: number;
+    65→  estimatedReturnDate?: string;
+    66→  sourceSystem?: string;
+    67→  externalReference?: string;
+    68→  externalStatus?: string;
+    69→  blocksPmScheduling?: boolean;
+    70→  blocksRunAssignment?: boolean;
+    71→  reportedBy?: string;
+    72→}
+    73→
+    74→/** Resolve event request */
+    75→export interface ResolveEventRequest {
+    76→  eventId: string;
+    77→  actualReturnDate: string;
+    78→  resolutionNotes?: string;
+    79→  resolvedBy?: string;
+    80→}
+    81→
+    82→/** Query filters for listing events */
+    83→export interface EventListFilters {
+    84→  trainId?: string;
+    85→  trainIds?: string[];
+    86→  status?: UnavailabilityStatus;
+    87→  eventType?: UnavailabilityType | UnavailabilityType[];
+    88→  restrictionLevel?: RestrictionLevel;
+    89→  sourceSystem?: string;
+    90→  dateFrom?: string;
+    91→  dateTo?: string;
+    92→  blocksPmScheduling?: boolean;
+    93→  blocksRunAssignment?: boolean;
+    94→}
+    95→
+    96→/** PM conflict detection result */
+    97→export interface PMConflict {
+    98→  pmScheduleId: string;
+    99→  trainId: string;
+   100→  trainNumber: string;
+   101→  pmCode: string;
+   102→  targetDate: string;
+   103→  unavailabilityEventId: string;
+   104→  eventType: UnavailabilityType;
+   105→  estimatedReturnDate: string | null;
+   106→  severity: 'HIGH' | 'MEDIUM' | 'LOW';
+   107→  message: string;
+   108→}
+   109→
+   110→/** Event with related train details */
+   111→export interface EventWithTrain extends UnavailabilityEvent {
+   112→  train: Train | null;
+   113→}
+   114→
+   115→/** Active events summary for optimizer */
+   116→export interface OptimizerConstraints {
+   117→  groundedTrainIds: string[];
+   118→  restrictedTrainIds: string[];
+   119→  blockedFromPmTrainIds: string[];
+   120→  blockedFromRunAssignmentTrainIds: string[];
+   121→  totalActiveEvents: number;
+   122→}
+   123→
+   124→// =============================================================================
+   125→// Unavailability Service
+   126→// =============================================================================
+   127→
+   128→export class UnavailabilityService extends BaseService {
+   129→  constructor() {
+   130→    super({ name: 'unavailability-service', version: '1.0.0' });
+   131→  }
+   132→
+   133→  // ===========================================================================
+   134→  // Event Creation
+   135→  // ===========================================================================
+   136→
+   137→  /**
+   138→   * Create a new unavailability event.
+   139→   *
+   140→   * This method:
+   141→   * 1. Validates the train exists
+   142→   * 2. Creates the event record
+   143→   * 3. Updates train fitness status to match restriction level
+   144→   *
+   145→   * @param request - Event creation parameters
+   146→   * @returns Created event with updated train fitness
+   147→   */
+   148→  async createEvent(request: CreateEventRequest): Promise<UnavailabilityEvent> {
+   149→    return this.inTransaction('createEvent', async (tx, span) => {
+   150→      const {
+   151→        trainId,
+   152→        eventType,
+   153→        restrictionLevel,
+   154→        description,
+   155→        failureCode,
+   156→        affectedSystem,
+   157→        estimatedRepairHours,
+   158→        estimatedReturnDate,
+   159→        sourceSystem,
+   160→        externalReference,
+   161→        externalStatus,
+   162→        blocksPmScheduling = true,
+   163→        blocksRunAssignment = true,
+   164→      } = request;
+   165→
+   166→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   167→      span.setAttribute('event.type', eventType);
+   168→      span.setAttribute('event.restrictionLevel', restrictionLevel);
+   169→
+   170→      // Validate train exists
+   171→      const train = await tx.query.trains.findFirst({
+   172→        where: eq(trains.id, trainId),
+   173→      });
+   174→
+   175→      if (!train) {
+   176→        throw new TrainNotFoundError(trainId);
+   177→      }
+   178→
+   179→      span.setAttribute(MmsAttributes.TRAIN_NUMBER, train.trainNumber);
+   180→
+   181→      // Check for duplicate external reference if provided
+   182→      if (externalReference && sourceSystem) {
+   183→        const existing = await tx.query.unavailabilityEvents.findFirst({
+   184→          where: and(
+   185→            eq(unavailabilityEvents.sourceSystem, sourceSystem),
+   186→            eq(unavailabilityEvents.externalReference, externalReference)
+   187→          ),
+   188→        });
+   189→
+   190→        if (existing) {
+   191→          throw new ConflictError(
+   192→            `Unavailability event already exists for ${sourceSystem} reference ${externalReference}`
+   193→          );
+   194→        }
+   195→      }
+   196→
+   197→      // Create the event
+   198→      const eventData: NewUnavailabilityEvent = {
+   199→        trainId,
+   200→        eventType,
+   201→        status: 'ACTIVE',
+   202→        restrictionLevel,
+   203→        reportedAt: new Date(),
+   204→        estimatedRepairHours,
+   205→        estimatedReturnDate: estimatedReturnDate ?? null,
+   206→        sourceSystem,
+   207→        externalReference,
+   208→        externalStatus,
+   209→        description,
+   210→        failureCode,
+   211→        affectedSystem,
+   212→        blocksPmScheduling,
+   213→        blocksRunAssignment,
+   214→      };
+   215→
+   216→      const [event] = await tx.insert(unavailabilityEvents).values(eventData).returning();
+   217→      span.setAttribute('event.id', event.id);
+   218→
+   219→      // Update train fitness status
+   220→      await tx
+   221→        .update(trains)
+   222→        .set({
+   223→          fitnessStatus: restrictionLevel,
+   224→          fitnessNotes: `${eventType}: ${description ?? 'No description provided'}`,
+   225→          updatedAt: new Date(),
+   226→        })
+   227→        .where(eq(trains.id, trainId));
+   228→
+   229→      this.log.info(
+   230→        {
+   231→          eventId: event.id,
+   232→          trainId,
+   233→          trainNumber: train.trainNumber,
+   234→          eventType,
+   235→          restrictionLevel,
+   236→          sourceSystem,
+   237→          externalReference,
+   238→        },
+   239→        `Unavailability event created: ${train.trainNumber} is now ${restrictionLevel}`
+   240→      );
+   241→
+   242→      this.recordEvent('unavailability.created', {
+   243→        [MmsAttributes.TRAIN_ID]: trainId,
+   244→        [MmsAttributes.TRAIN_NUMBER]: train.trainNumber,
+   245→        'event.id': event.id,
+   246→        'event.type': eventType,
+   247→        'event.restrictionLevel': restrictionLevel,
+   248→      }, span);
+   249→
+   250→      return event;
+   251→    });
+   252→  }
+   253→
+   254→  // ===========================================================================
+   255→  // Event Resolution
+   256→  // ===========================================================================
+   257→
+   258→  /**
+   259→   * Resolve an unavailability event.
+   260→   *
+   261→   * This method:
+   262→   * 1. Updates the event status to RESOLVED
+   263→   * 2. Records actual return date and resolution notes
+   264→   * 3. Restores train fitness to FIT (if no other active events)
+   265→   *
+   266→   * @param request - Resolution parameters
+   267→   * @returns Resolved event
+   268→   */
+   269→  async resolveEvent(request: ResolveEventRequest): Promise<UnavailabilityEvent> {
+   270→    return this.inTransaction('resolveEvent', async (tx, span) => {
+   271→      const { eventId, actualReturnDate, resolutionNotes, resolvedBy } = request;
+   272→
+   273→      span.setAttribute('event.id', eventId);
+   274→
+   275→      // Get the event
+   276→      const event = await tx.query.unavailabilityEvents.findFirst({
+   277→        where: eq(unavailabilityEvents.id, eventId),
+   278→        with: { train: true },
+   279→      });
+   280→
+   281→      if (!event) {
+   282→        throw new NotFoundError(`Unavailability event not found: ${eventId}`, {
+   283→          entityType: 'unavailability_event',
+   284→          entityId: eventId,
+   285→        });
+   286→      }
+   287→
+   288→      if (event.status === 'RESOLVED') {
+   289→        throw new BusinessRuleError('Event is already resolved', {
+   290→          rule: 'event_already_resolved',
+   291→          context: { eventId, resolvedAt: event.resolvedAt },
+   292→        });
+   293→      }
+   294→
+   295→      span.setAttribute(MmsAttributes.TRAIN_ID, event.trainId);
+   296→
+   297→      // Resolve the event
+   298→      const [resolvedEvent] = await tx
+   299→        .update(unavailabilityEvents)
+   300→        .set({
+   301→          status: 'RESOLVED',
+   302→          actualReturnDate,
+   303→          resolvedAt: new Date(),
+   304→          resolvedBy: resolvedBy ?? null,
+   305→          resolutionNotes,
+   306→          updatedAt: new Date(),
+   307→        })
+   308→        .where(eq(unavailabilityEvents.id, eventId))
+   309→        .returning();
+   310→
+   311→      // Check if train has any other active events
+   312→      const otherActiveEvents = await tx.query.unavailabilityEvents.findMany({
+   313→        where: and(
+   314→          eq(unavailabilityEvents.trainId, event.trainId),
+   315→          eq(unavailabilityEvents.status, 'ACTIVE')
+   316→        ),
+   317→      });
+   318→
+   319→      // Determine new fitness status
+   320→      let newFitnessStatus: 'FIT' | 'RESTRICTED' | 'GROUNDED' = 'FIT';
+   321→      let fitnessNotes = 'All unavailability events resolved';
+   322→
+   323→      if (otherActiveEvents.length > 0) {
+   324→        // Find the most restrictive active event
+   325→        const hasGrounded = otherActiveEvents.some((e) => e.restrictionLevel === 'GROUNDED');
+   326→        newFitnessStatus = hasGrounded ? 'GROUNDED' : 'RESTRICTED';
+   327→        fitnessNotes = `${otherActiveEvents.length} active unavailability event(s) remaining`;
+   328→      }
+   329→
+   330→      // Update train fitness
+   331→      await tx
+   332→        .update(trains)
+   333→        .set({
+   334→          fitnessStatus: newFitnessStatus,
+   335→          fitnessNotes,
+   336→          updatedAt: new Date(),
+   337→        })
+   338→        .where(eq(trains.id, event.trainId));
+   339→
+   340→      const trainNumber = (event as EventWithTrain).train?.trainNumber ?? 'unknown';
+   341→
+   342→      this.log.info(
+   343→        {
+   344→          eventId,
+   345→          trainId: event.trainId,
+   346→          trainNumber,
+   347→          actualReturnDate,
+   348→          newFitnessStatus,
+   349→          remainingActiveEvents: otherActiveEvents.length,
+   350→        },
+   351→        `Unavailability event resolved: ${trainNumber} is now ${newFitnessStatus}`
+   352→      );
+   353→
+   354→      this.recordEvent('unavailability.resolved', {
+   355→        [MmsAttributes.TRAIN_ID]: event.trainId,
+   356→        'event.id': eventId,
+   357→        'event.actualReturnDate': actualReturnDate,
+   358→        'train.newFitnessStatus': newFitnessStatus,
+   359→      }, span);
+   360→
+   361→      return resolvedEvent;
+   362→    });
+   363→  }
+   364→
+   365→  // ===========================================================================
+   366→  // Event Queries
+   367→  // ===========================================================================
+   368→
+   369→  /**
+   370→   * Get an event by ID with train details
+   371→   */
+   372→  async getEventById(eventId: string): Promise<EventWithTrain> {
+   373→    return this.traced('getEventById', async (span) => {
+   374→      span.setAttribute('event.id', eventId);
+   375→
+   376→      const event = await this.db.query.unavailabilityEvents.findFirst({
+   377→        where: eq(unavailabilityEvents.id, eventId),
+   378→        with: { train: true },
+   379→      });
+   380→
+   381→      if (!event) {
+   382→        throw new NotFoundError(`Unavailability event not found: ${eventId}`, {
+   383→          entityType: 'unavailability_event',
+   384→          entityId: eventId,
+   385→        });
+   386→      }
+   387→
+   388→      return event as EventWithTrain;
+   389→    });
+   390→  }
+   391→
+   392→  /**
+   393→   * Get event by external reference (Maximo WO number)
+   394→   */
+   395→  async getEventByExternalReference(
+   396→    sourceSystem: string,
+   397→    externalReference: string
+   398→  ): Promise<UnavailabilityEvent | null> {
+   399→    return this.traced('getEventByExternalReference', async (span) => {
+   400→      span.setAttribute('event.sourceSystem', sourceSystem);
+   401→      span.setAttribute('event.externalReference', externalReference);
+   402→
+   403→      const event = await this.db.query.unavailabilityEvents.findFirst({
+   404→        where: and(
+   405→          eq(unavailabilityEvents.sourceSystem, sourceSystem),
+   406→          eq(unavailabilityEvents.externalReference, externalReference)
+   407→        ),
+   408→      });
+   409→
+   410→      return event ?? null;
+   411→    });
+   412→  }
+   413→
+   414→  /**
+   415→   * List events with filtering
+   416→   */
+   417→  async listEvents(filters?: EventListFilters): Promise<UnavailabilityEvent[]> {
+   418→    return this.traced('listEvents', async (span) => {
+   419→      const conditions: SQL<unknown>[] = [];
+   420→
+   421→      if (filters?.trainId) {
+   422→        conditions.push(eq(unavailabilityEvents.trainId, filters.trainId));
+   423→      }
+   424→      if (filters?.trainIds && filters.trainIds.length > 0) {
+   425→        conditions.push(inArray(unavailabilityEvents.trainId, filters.trainIds));
+   426→      }
+   427→      if (filters?.status) {
+   428→        conditions.push(eq(unavailabilityEvents.status, filters.status));
+   429→      }
+   430→      if (filters?.eventType) {
+   431→        if (Array.isArray(filters.eventType)) {
+   432→          conditions.push(inArray(unavailabilityEvents.eventType, filters.eventType));
+   433→        } else {
+   434→          conditions.push(eq(unavailabilityEvents.eventType, filters.eventType));
+   435→        }
+   436→      }
+   437→      if (filters?.restrictionLevel) {
+   438→        conditions.push(eq(unavailabilityEvents.restrictionLevel, filters.restrictionLevel));
+   439→      }
+   440→      if (filters?.sourceSystem) {
+   441→        conditions.push(eq(unavailabilityEvents.sourceSystem, filters.sourceSystem));
+   442→      }
+   443→      if (filters?.dateFrom) {
+   444→        conditions.push(gte(unavailabilityEvents.reportedAt, new Date(filters.dateFrom)));
+   445→      }
+   446→      if (filters?.dateTo) {
+   447→        conditions.push(lte(unavailabilityEvents.reportedAt, new Date(filters.dateTo)));
+   448→      }
+   449→      if (filters?.blocksPmScheduling !== undefined) {
+   450→        conditions.push(eq(unavailabilityEvents.blocksPmScheduling, filters.blocksPmScheduling));
+   451→      }
+   452→      if (filters?.blocksRunAssignment !== undefined) {
+   453→        conditions.push(eq(unavailabilityEvents.blocksRunAssignment, filters.blocksRunAssignment));
+   454→      }
+   455→
+   456→      const result = await this.db.query.unavailabilityEvents.findMany({
+   457→        where: conditions.length > 0 ? and(...conditions) : undefined,
+   458→        orderBy: desc(unavailabilityEvents.reportedAt),
+   459→      });
+   460→
+   461→      span.setAttribute('result.count', result.length);
+   462→      return result;
+   463→    });
+   464→  }
+   465→
+   466→  /**
+   467→   * Query active events for a train
+   468→   */
+   469→  async getActiveEventsForTrain(trainId: string): Promise<UnavailabilityEvent[]> {
+   470→    return this.traced('getActiveEventsForTrain', async (span) => {
+   471→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   472→
+   473→      const result = await this.db.query.unavailabilityEvents.findMany({
+   474→        where: and(
+   475→          eq(unavailabilityEvents.trainId, trainId),
+   476→          eq(unavailabilityEvents.status, 'ACTIVE')
+   477→        ),
+   478→        orderBy: desc(unavailabilityEvents.reportedAt),
+   479→      });
+   480→
+   481→      span.setAttribute('result.count', result.length);
+   482→      return result;
+   483→    });
+   484→  }
+   485→
+   486→  /**
+   487→   * Query all active events (for optimizer constraints)
+   488→   */
+   489→  async queryActiveEvents(): Promise<OptimizerConstraints> {
+   490→    return this.traced('queryActiveEvents', async (span) => {
+   491→      const activeEvents = await this.db.query.unavailabilityEvents.findMany({
+   492→        where: eq(unavailabilityEvents.status, 'ACTIVE'),
+   493→      });
+   494→
+   495→      const groundedTrainIds = new Set<string>();
+   496→      const restrictedTrainIds = new Set<string>();
+   497→      const blockedFromPmTrainIds = new Set<string>();
+   498→      const blockedFromRunAssignmentTrainIds = new Set<string>();
+   499→
+   500→      for (const event of activeEvents) {
+   501→        if (event.restrictionLevel === 'GROUNDED') {
+   502→          groundedTrainIds.add(event.trainId);
+   503→        } else if (event.restrictionLevel === 'RESTRICTED') {
+   504→          restrictedTrainIds.add(event.trainId);
+   505→        }
+   506→
+   507→        if (event.blocksPmScheduling) {
+   508→          blockedFromPmTrainIds.add(event.trainId);
+   509→        }
+   510→        if (event.blocksRunAssignment) {
+   511→          blockedFromRunAssignmentTrainIds.add(event.trainId);
+   512→        }
+   513→      }
+   514→
+   515→      const result: OptimizerConstraints = {
+   516→        groundedTrainIds: Array.from(groundedTrainIds),
+   517→        restrictedTrainIds: Array.from(restrictedTrainIds),
+   518→        blockedFromPmTrainIds: Array.from(blockedFromPmTrainIds),
+   519→        blockedFromRunAssignmentTrainIds: Array.from(blockedFromRunAssignmentTrainIds),
+   520→        totalActiveEvents: activeEvents.length,
+   521→      };
+   522→
+   523→      span.setAttribute('result.groundedCount', result.groundedTrainIds.length);
+   524→      span.setAttribute('result.restrictedCount', result.restrictedTrainIds.length);
+   525→      span.setAttribute('result.totalEvents', result.totalActiveEvents);
+   526→
+   527→      this.log.debug(
+   528→        {
+   529→          groundedCount: result.groundedTrainIds.length,
+   530→          restrictedCount: result.restrictedTrainIds.length,
+   531→          pmBlockedCount: result.blockedFromPmTrainIds.length,
+   532→          runBlockedCount: result.blockedFromRunAssignmentTrainIds.length,
+   533→        },
+   534→        'Optimizer constraints from active unavailability events'
+   535→      );
+   536→
+   537→      return result;
+   538→    });
+   539→  }
+   540→
+   541→  // ===========================================================================
+   542→  // PM Conflict Detection
+   543→  // ===========================================================================
+   544→
+   545→  /**
+   546→   * Detect PM schedule conflicts with unavailability events.
+   547→   *
+   548→   * Checks if any scheduled PM overlaps with active unavailability events
+   549→   * where the train cannot be scheduled for maintenance.
+   550→   *
+   551→   * @param dateFrom - Start of date range to check
+   552→   * @param dateTo - End of date range to check
+   553→   * @returns List of detected conflicts
+   554→   */
+   555→  async detectPMConflicts(dateFrom: string, dateTo: string): Promise<PMConflict[]> {
+   556→    return this.traced('detectPMConflicts', async (span) => {
+   557→      span.setAttribute('dateRange.from', dateFrom);
+   558→      span.setAttribute('dateRange.to', dateTo);
+   559→
+   560→      // Get active unavailability events that block PM scheduling
+   561→      const blockingEvents = await this.db.query.unavailabilityEvents.findMany({
+   562→        where: and(
+   563→          eq(unavailabilityEvents.status, 'ACTIVE'),
+   564→          eq(unavailabilityEvents.blocksPmScheduling, true)
+   565→        ),
+   566→        with: { train: true },
+   567→      });
+   568→
+   569→      if (blockingEvents.length === 0) {
+   570→        span.setAttribute('result.conflicts', 0);
+   571→        return [];
+   572→      }
+   573→
+   574→      const blockedTrainIds = blockingEvents.map((e) => e.trainId);
+   575→
+   576→      // Get scheduled PM for blocked trains in the date range
+   577→      const scheduledPm = await this.db.query.pmSchedule.findMany({
+   578→        where: and(
+   579→          inArray(pmSchedule.trainId, blockedTrainIds),
+   580→          eq(pmSchedule.status, 'SCHEDULED'),
+   581→          gte(pmSchedule.targetDate, dateFrom),
+   582→          lte(pmSchedule.targetDate, dateTo)
+   583→        ),
+   584→        with: {
+   585→          train: true,
+   586→          pmType: true,
+   587→        },
+   588→      });
+   589→
+   590→      // Build conflict report
+   591→      const conflicts: PMConflict[] = [];
+   592→
+   593→      for (const pm of scheduledPm) {
+   594→        const event = blockingEvents.find((e) => e.trainId === pm.trainId);
+   595→        if (!event) continue;
+   596→
+   597→        const pmTargetDate = pm.targetDate;
+   598→        const estimatedReturn = event.estimatedReturnDate;
+   599→
+   600→        // Determine severity
+   601→        let severity: 'HIGH' | 'MEDIUM' | 'LOW' = 'MEDIUM';
+   602→        if (event.restrictionLevel === 'GROUNDED') {
+   603→          severity = 'HIGH';
+   604→        } else if (estimatedReturn && pmTargetDate && pmTargetDate < estimatedReturn) {
+   605→          severity = 'HIGH';
+   606→        }
+   607→
+   608→        const trainNumber = pm.train?.trainNumber ?? 'unknown';
+   609→        const pmCode = pm.pmType?.pmCode ?? 'unknown';
+   610→
+   611→        conflicts.push({
+   612→          pmScheduleId: pm.id,
+   613→          trainId: pm.trainId,
+   614→          trainNumber,
+   615→          pmCode,
+   616→          targetDate: pmTargetDate ?? '',
+   617→          unavailabilityEventId: event.id,
+   618→          eventType: event.eventType as UnavailabilityType,
+   619→          estimatedReturnDate: estimatedReturn,
+   620→          severity,
+   621→          message: `PM ${pmCode} for ${trainNumber} scheduled on ${pmTargetDate} conflicts with ${event.eventType} event (${event.restrictionLevel})`,
+   622→        });
+   623→      }
+   624→
+   625→      span.setAttribute('result.conflicts', conflicts.length);
+   626→
+   627→      if (conflicts.length > 0) {
+   628→        this.log.warn(
+   629→          {
+   630→            conflictCount: conflicts.length,
+   631→            dateRange: { from: dateFrom, to: dateTo },
+   632→            highSeverityCount: conflicts.filter((c) => c.severity === 'HIGH').length,
+   633→          },
+   634→          `Detected ${conflicts.length} PM scheduling conflicts with unavailability events`
+   635→        );
+   636→      }
+   637→
+   638→      return conflicts;
+   639→    });
+   640→  }
+   641→
+   642→  // ===========================================================================
+   643→  // Maximo Integration Helpers
+   644→  // ===========================================================================
+   645→
+   646→  /**
+   647→   * Update event from Maximo status change.
+   648→   * Called by Maximo webhook receiver.
+   649→   */
+   650→  async updateFromMaximo(
+   651→    externalReference: string,
+   652→    maximoStatus: string,
+   653→    updates?: Partial<{
+   654→      estimatedRepairHours: number;
+   655→      estimatedReturnDate: string;
+   656→      description: string;
+   657→      failureCode: string;
+   658→    }>
+   659→  ): Promise<UnavailabilityEvent | null> {
+   660→    return this.inTransaction('updateFromMaximo', async (tx, span) => {
+   661→      span.setAttribute('maximo.reference', externalReference);
+   662→      span.setAttribute('maximo.status', maximoStatus);
+   663→
+   664→      const event = await tx.query.unavailabilityEvents.findFirst({
+   665→        where: and(
+   666→          eq(unavailabilityEvents.sourceSystem, 'MAXIMO'),
+   667→          eq(unavailabilityEvents.externalReference, externalReference)
+   668→        ),
+   669→      });
+   670→
+   671→      if (!event) {
+   672→        this.log.warn(
+   673→          { externalReference, maximoStatus },
+   674→          'Maximo status update for unknown event - ignoring'
+   675→        );
+   676→        return null;
+   677→      }
+   678→
+   679→      // Map Maximo status to event status
+   680→      // COMP, CLOSE, CAN = resolved
+   681→      const isResolved = ['COMP', 'CLOSE', 'CAN'].includes(maximoStatus);
+   682→
+   683→      if (isResolved && event.status === 'ACTIVE') {
+   684→        // Resolve the event
+   685→        const [resolved] = await tx
+   686→          .update(unavailabilityEvents)
+   687→          .set({
+   688→            status: 'RESOLVED',
+   689→            externalStatus: maximoStatus,
+   690→            actualReturnDate: new Date().toISOString().split('T')[0],
+   691→            resolvedAt: new Date(),
+   692→            resolutionNotes: `Resolved via Maximo status: ${maximoStatus}`,
+   693→            updatedAt: new Date(),
+   694→            ...updates,
+   695→          })
+   696→          .where(eq(unavailabilityEvents.id, event.id))
+   697→          .returning();
+   698→
+   699→        // Restore train fitness (check for other active events)
+   700→        await this.restoreTrainFitness(tx, event.trainId);
+   701→
+   702→        this.log.info(
+   703→          { eventId: event.id, trainId: event.trainId, maximoStatus },
+   704→          `Event resolved via Maximo status: ${maximoStatus}`
+   705→        );
+   706→
+   707→        return resolved;
+   708→      } else {
+   709→        // Just update the external status and any provided fields
+   710→        const [updated] = await tx
+   711→          .update(unavailabilityEvents)
+   712→          .set({
+   713→            externalStatus: maximoStatus,
+   714→            updatedAt: new Date(),
+   715→            ...updates,
+   716→          })
+   717→          .where(eq(unavailabilityEvents.id, event.id))
+   718→          .returning();
+   719→
+   720→        return updated;
+   721→      }
+   722→    });
+   723→  }
+   724→
+   725→  /**
+   726→   * Restore train fitness status after event resolution.
+   727→   * Checks for other active events and sets appropriate status.
+   728→   */
+   729→  private async restoreTrainFitness(
+   730→    tx: Parameters<Parameters<BaseService['inTransaction']>[1]>[0],
+   731→    trainId: string
+   732→  ): Promise<void> {
+   733→    const otherActiveEvents = await tx.query.unavailabilityEvents.findMany({
+   734→      where: and(
+   735→        eq(unavailabilityEvents.trainId, trainId),
+   736→        eq(unavailabilityEvents.status, 'ACTIVE')
+   737→      ),
+   738→    });
+   739→
+   740→    let newFitnessStatus: 'FIT' | 'RESTRICTED' | 'GROUNDED' = 'FIT';
+   741→    let fitnessNotes = 'All unavailability events resolved';
+   742→
+   743→    if (otherActiveEvents.length > 0) {
+   744→      const hasGrounded = otherActiveEvents.some((e) => e.restrictionLevel === 'GROUNDED');
+   745→      newFitnessStatus = hasGrounded ? 'GROUNDED' : 'RESTRICTED';
+   746→      fitnessNotes = `${otherActiveEvents.length} active unavailability event(s) remaining`;
+   747→    }
+   748→
+   749→    await tx
+   750→      .update(trains)
+   751→      .set({
+   752→        fitnessStatus: newFitnessStatus,
+   753→        fitnessNotes,
+   754→        updatedAt: new Date(),
+   755→      })
+   756→      .where(eq(trains.id, trainId));
+   757→  }
+   758→
+   759→  // ===========================================================================
+   760→  // Statistics
+   761→  // ===========================================================================
+   762→
+   763→  /**
+   764→   * Get summary statistics for unavailability events
+   765→   */
+   766→  async getStatistics(): Promise<{
+   767→    totalActive: number;
+   768→    byType: Record<UnavailabilityType, number>;
+   769→    byRestrictionLevel: Record<RestrictionLevel, number>;
+   770→    avgResolutionHours: number;
+   771→    trainsAffected: number;
+   772→  }> {
+   773→    return this.traced('getStatistics', async (span) => {
+   774→      // Active events count
+   775→      const [{ activeCount }] = await this.db
+   776→        .select({ activeCount: count() })
+   777→        .from(unavailabilityEvents)
+   778→        .where(eq(unavailabilityEvents.status, 'ACTIVE'));
+   779→
+   780→      // Count by type
+   781→      const byTypeResults = await this.db
+   782→        .select({
+   783→          eventType: unavailabilityEvents.eventType,
+   784→          count: count(),
+   785→        })
+   786→        .from(unavailabilityEvents)
+   787→        .where(eq(unavailabilityEvents.status, 'ACTIVE'))
+   788→        .groupBy(unavailabilityEvents.eventType);
+   789→
+   790→      const byType: Record<string, number> = {};
+   791→      for (const row of byTypeResults) {
+   792→        byType[row.eventType] = row.count;
+   793→      }
+   794→
+   795→      // Count by restriction level
+   796→      const byLevelResults = await this.db
+   797→        .select({
+   798→          restrictionLevel: unavailabilityEvents.restrictionLevel,
+   799→          count: count(),
+   800→        })
+   801→        .from(unavailabilityEvents)
+   802→        .where(eq(unavailabilityEvents.status, 'ACTIVE'))
+   803→        .groupBy(unavailabilityEvents.restrictionLevel);
+   804→
+   805→      const byRestrictionLevel: Record<string, number> = {};
+   806→      for (const row of byLevelResults) {
+   807→        if (row.restrictionLevel) {
+   808→          byRestrictionLevel[row.restrictionLevel] = row.count;
+   809→        }
+   810→      }
+   811→
+   812→      // Unique affected trains
+   813→      const affectedTrains = await this.db
+   814→        .selectDistinct({ trainId: unavailabilityEvents.trainId })
+   815→        .from(unavailabilityEvents)
+   816→        .where(eq(unavailabilityEvents.status, 'ACTIVE'));
+   817→
+   818→      // Average resolution time (for resolved events with actual return)
+   819→      const avgResolutionResult = await this.db
+   820→        .select({
+   821→          avgHours: sql<number>`
+   822→            AVG(
+   823→              EXTRACT(EPOCH FROM (${unavailabilityEvents.resolvedAt} - ${unavailabilityEvents.reportedAt})) / 3600
+   824→            )
+   825→          `,
+   826→        })
+   827→        .from(unavailabilityEvents)
+   828→        .where(
+   829→          and(
+   830→            eq(unavailabilityEvents.status, 'RESOLVED'),
+   831→            sql`${unavailabilityEvents.resolvedAt} IS NOT NULL`
+   832→          )
+   833→        );
+   834→
+   835→      const avgResolutionHours = Math.round(Number(avgResolutionResult[0]?.avgHours) || 0);
+   836→
+   837→      const result = {
+   838→        totalActive: activeCount,
+   839→        byType: byType as Record<UnavailabilityType, number>,
+   840→        byRestrictionLevel: byRestrictionLevel as Record<RestrictionLevel, number>,
+   841→        avgResolutionHours,
+   842→        trainsAffected: affectedTrains.length,
+   843→      };
+   844→
+   845→      span.setAttribute('stats.totalActive', result.totalActive);
+   846→      span.setAttribute('stats.trainsAffected', result.trainsAffected);
+   847→
+   848→      return result;
+   849→    });
+   850→  }
+   851→}
+   852→
+   853→// =============================================================================
+   854→// Singleton Export
+   855→// =============================================================================
+   856→
+   857→let unavailabilityServiceInstance: UnavailabilityService | null = null;
+   858→
+   859→export function getUnavailabilityService(): UnavailabilityService {
+   860→  if (!unavailabilityServiceInstance) {
+   861→    unavailabilityServiceInstance = new UnavailabilityService();
+   862→  }
+   863→  return unavailabilityServiceInstance;
+   864→}
+   865→
+   866→export default UnavailabilityService;
+   867→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

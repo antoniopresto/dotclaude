@@ -1,0 +1,182 @@
+     1→/**
+     2→ * MMS Redis Connection
+     3→ *
+     4→ * Provides Redis connection utilities for:
+     5→ * - BullMQ job queues
+     6→ * - Session storage
+     7→ * - Caching layer
+     8→ *
+     9→ * @see specs/003-database-schema.md Section 3.2
+    10→ */
+    11→
+    12→import Redis, { type RedisOptions } from 'ioredis';
+    13→
+    14→export interface RedisConfig {
+    15→  host: string;
+    16→  port: number;
+    17→  password?: string;
+    18→  db?: number;
+    19→  maxRetriesPerRequest: number | null;
+    20→  enableReadyCheck: boolean;
+    21→  lazyConnect?: boolean;
+    22→  keyPrefix?: string;
+    23→}
+    24→
+    25→const defaultConfig: RedisConfig = {
+    26→  host: process.env['REDIS_HOST'] ?? 'localhost',
+    27→  port: parseInt(process.env['REDIS_PORT'] ?? '6379', 10),
+    28→  password: process.env['REDIS_PASSWORD'],
+    29→  db: parseInt(process.env['REDIS_DB'] ?? '0', 10),
+    30→  maxRetriesPerRequest: null, // Required for BullMQ
+    31→  enableReadyCheck: true,
+    32→  lazyConnect: false,
+    33→};
+    34→
+    35→let redisClient: Redis | null = null;
+    36→let bullmqConnection: Redis | null = null;
+    37→
+    38→/**
+    39→ * Get or create the main Redis client
+    40→ * Used for caching and general operations
+    41→ */
+    42→export function getRedisClient(config: Partial<RedisConfig> = {}): Redis {
+    43→  if (!redisClient) {
+    44→    const mergedConfig: RedisOptions = {
+    45→      ...defaultConfig,
+    46→      ...config,
+    47→      keyPrefix: config.keyPrefix ?? 'mms:',
+    48→    };
+    49→    redisClient = new Redis(mergedConfig);
+    50→
+    51→    redisClient.on('error', (err) => {
+    52→      console.error('[Redis] Connection error:', err.message);
+    53→    });
+    54→
+    55→    redisClient.on('connect', () => {
+    56→      console.info('[Redis] Connected successfully');
+    57→    });
+    58→
+    59→    redisClient.on('ready', () => {
+    60→      console.info('[Redis] Ready to accept commands');
+    61→    });
+    62→  }
+    63→
+    64→  return redisClient;
+    65→}
+    66→
+    67→/**
+    68→ * Get or create a Redis connection for BullMQ
+    69→ * Separate instance to avoid blocking queue operations
+    70→ */
+    71→export function getBullMQConnection(config: Partial<RedisConfig> = {}): Redis {
+    72→  if (!bullmqConnection) {
+    73→    const mergedConfig: RedisOptions = {
+    74→      ...defaultConfig,
+    75→      ...config,
+    76→      maxRetriesPerRequest: null, // Critical for BullMQ
+    77→      enableReadyCheck: false, // Faster startup for workers
+    78→    };
+    79→    bullmqConnection = new Redis(mergedConfig);
+    80→
+    81→    bullmqConnection.on('error', (err) => {
+    82→      console.error('[BullMQ Redis] Connection error:', err.message);
+    83→    });
+    84→  }
+    85→
+    86→  return bullmqConnection;
+    87→}
+    88→
+    89→/**
+    90→ * Check Redis health
+    91→ */
+    92→export async function checkRedisHealth(): Promise<boolean> {
+    93→  try {
+    94→    const client = getRedisClient();
+    95→    const result = await client.ping();
+    96→    return result === 'PONG';
+    97→  } catch {
+    98→    return false;
+    99→  }
+   100→}
+   101→
+   102→/**
+   103→ * Close all Redis connections
+   104→ * Call during graceful shutdown
+   105→ */
+   106→export async function closeRedisConnections(): Promise<void> {
+   107→  const closePromises: Promise<void>[] = [];
+   108→
+   109→  if (redisClient) {
+   110→    closePromises.push(
+   111→      redisClient.quit().then(() => {
+   112→        redisClient = null;
+   113→      })
+   114→    );
+   115→  }
+   116→
+   117→  if (bullmqConnection) {
+   118→    closePromises.push(
+   119→      bullmqConnection.quit().then(() => {
+   120→        bullmqConnection = null;
+   121→      })
+   122→    );
+   123→  }
+   124→
+   125→  await Promise.all(closePromises);
+   126→  console.info('[Redis] All connections closed');
+   127→}
+   128→
+   129→/**
+   130→ * Cache utilities
+   131→ */
+   132→export const cache = {
+   133→  /**
+   134→   * Get cached value
+   135→   */
+   136→  async get<T>(key: string): Promise<T | null> {
+   137→    const client = getRedisClient();
+   138→    const value = await client.get(key);
+   139→    if (!value) return null;
+   140→    try {
+   141→      return JSON.parse(value) as T;
+   142→    } catch {
+   143→      return value as unknown as T;
+   144→    }
+   145→  },
+   146→
+   147→  /**
+   148→   * Set cached value with optional TTL
+   149→   */
+   150→  async set<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
+   151→    const client = getRedisClient();
+   152→    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+   153→    if (ttlSeconds) {
+   154→      await client.setex(key, ttlSeconds, serialized);
+   155→    } else {
+   156→      await client.set(key, serialized);
+   157→    }
+   158→  },
+   159→
+   160→  /**
+   161→   * Delete cached value
+   162→   */
+   163→  async del(key: string): Promise<void> {
+   164→    const client = getRedisClient();
+   165→    await client.del(key);
+   166→  },
+   167→
+   168→  /**
+   169→   * Delete multiple keys by pattern
+   170→   */
+   171→  async delByPattern(pattern: string): Promise<number> {
+   172→    const client = getRedisClient();
+   173→    const keys = await client.keys(pattern);
+   174→    if (keys.length === 0) return 0;
+   175→    return client.del(...keys);
+   176→  },
+   177→};
+   178→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

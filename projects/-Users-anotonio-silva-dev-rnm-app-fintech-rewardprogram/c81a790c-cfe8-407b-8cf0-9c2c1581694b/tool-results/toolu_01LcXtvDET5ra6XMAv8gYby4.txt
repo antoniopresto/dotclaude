@@ -1,0 +1,308 @@
+     1→#!/bin/bash
+     2→
+     3→# =============================================================================
+     4→# validate-migration.sh
+     5→# Backpressure script for Ralph loop - detects behavioral changes
+     6→# =============================================================================
+     7→
+     8→set -e
+     9→
+    10→SOURCE_DIR="${SOURCE_DIR:-$HOME/dev/rnm-app-fintech-card-place/src/newArch/store/rewardProgram}"
+    11→TARGET_DIR="${TARGET_DIR:-$HOME/dev/rnm-app-fintech-rewardprogram/src/services}"
+    12→
+    13→RED='\033[0;31m'
+    14→GREEN='\033[0;32m'
+    15→YELLOW='\033[1;33m'
+    16→NC='\033[0m' # No Color
+    17→
+    18→ERRORS_FOUND=0
+    19→WARNINGS_FOUND=0
+    20→
+    21→# -----------------------------------------------------------------------------
+    22→# Utility Functions
+    23→# -----------------------------------------------------------------------------
+    24→
+    25→log_error() {
+    26→    echo -e "${RED}❌ ERROR: $1${NC}"
+    27→    ERRORS_FOUND=$((ERRORS_FOUND + 1))
+    28→}
+    29→
+    30→log_warning() {
+    31→    echo -e "${YELLOW}⚠️  WARNING: $1${NC}"
+    32→    WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
+    33→}
+    34→
+    35→log_success() {
+    36→    echo -e "${GREEN}✅ $1${NC}"
+    37→}
+    38→
+    39→log_info() {
+    40→    echo -e "   $1"
+    41→}
+    42→
+    43→# -----------------------------------------------------------------------------
+    44→# Extract TypeScript Signatures
+    45→# -----------------------------------------------------------------------------
+    46→
+    47→extract_interfaces() {
+    48→    local file="$1"
+    49→    if [ -f "$file" ]; then
+    50→        # Extract interface/type definitions with their fields
+    51→        grep -E "^export (interface|type) " "$file" 2>/dev/null | sort || true
+    52→    fi
+    53→}
+    54→
+    55→extract_function_signatures() {
+    56→    local file="$1"
+    57→    if [ -f "$file" ]; then
+    58→        # Extract exported function signatures (simplified)
+    59→        grep -E "^export (const|function|async function) [a-zA-Z]+" "$file" 2>/dev/null | \
+    60→            sed 's/=.*//' | sed 's/{.*//' | sort || true
+    61→    fi
+    62→}
+    63→
+    64→extract_enum_values() {
+    65→    local file="$1"
+    66→    if [ -f "$file" ]; then
+    67→        # Extract enum definitions
+    68→        grep -E "^export enum " "$file" 2>/dev/null || true
+    69→        # Also get enum values (lines inside enums)
+    70→        awk '/^export enum /,/^}/' "$file" 2>/dev/null | grep -E "^\s+[A-Z_]+" || true
+    71→    fi
+    72→}
+    73→
+    74→extract_class_methods() {
+    75→    local file="$1"
+    76→    if [ -f "$file" ]; then
+    77→        # Extract class method signatures
+    78→        grep -E "^\s+(public |private |async )?(get|set|[a-z][a-zA-Z]+)\(" "$file" 2>/dev/null | \
+    79→            sed 's/{.*//' | sort || true
+    80→    fi
+    81→}
+    82→
+    83→# -----------------------------------------------------------------------------
+    84→# File Mapping (Source → Target)
+    85→# -----------------------------------------------------------------------------
+    86→
+    87→declare -A FILE_MAP=(
+    88→    # Models
+    89→    ["models/parameter.model.ts"]="models/parameter.model.ts"
+    90→    ["models/extract.model.ts"]="models/extract.model.ts"
+    91→    ["models/airlineMiles.model.ts"]="models/airlineMiles.model.ts"
+    92→    ["models/permission.model.ts"]="models/invoicesCashbackPermission.model.ts"
+    93→    
+    94→    # API
+    95→    ["api/parameter.api.ts"]="api/parameter.api.ts"
+    96→    ["api/extract.api.ts"]="api/extract.api.ts"
+    97→    ["api/airlineMiles.api.ts"]="api/airlineMiles.api.ts"
+    98→    ["api/permission.api.ts"]="api/invoicesCashbackPermission.api.ts"
+    99→    
+   100→    # Repository
+   101→    ["repository/parameter.repository.ts"]="repository/parameter.repository.ts"
+   102→    ["repository/extract.repository.ts"]="repository/extract.repository.ts"
+   103→    ["repository/permission.repository.ts"]="repository/invoicesCashbackPermission.repository.ts"
+   104→    
+   105→    # Services
+   106→    ["services/parameter.service.ts"]="services/parameter.service.ts"
+   107→    ["services/extract.service.ts"]="services/extract.service.ts"
+   108→    ["services/airlineMiles.service.ts"]="services/airlineMiles.service.ts"
+   109→    ["services/permission.service.ts"]="services/invoicesCashbackPermission.service.ts"
+   110→    
+   111→    # Store
+   112→    ["store/parameter.store.ts"]="store/parameter.store.ts"
+   113→    ["store/extract.store.ts"]="store/extract.store.ts"
+   114→    ["store/airlineMiles.store.ts"]="store/airlineMiles.store.ts"
+   115→    ["store/permission.store.ts"]="store/invoivesCashbackPermission.store.ts"
+   116→    
+   117→    # Hooks
+   118→    ["hooks/useAirlineMiles.ts"]="hooks/useAirlineMiles.ts"
+   119→    ["hooks/usePermission.ts"]="hooks/useInvoiceCashbackPermission.ts"
+   120→)
+   121→
+   122→# -----------------------------------------------------------------------------
+   123→# Validation Functions
+   124→# -----------------------------------------------------------------------------
+   125→
+   126→validate_interfaces() {
+   127→    local source_file="$1"
+   128→    local target_file="$2"
+   129→    local rel_path="$3"
+   130→    
+   131→    local source_interfaces=$(extract_interfaces "$source_file")
+   132→    local target_interfaces=$(extract_interfaces "$target_file")
+   133→    
+   134→    if [ "$source_interfaces" != "$target_interfaces" ]; then
+   135→        log_error "Interface mismatch in $rel_path"
+   136→        echo "  Source interfaces:"
+   137→        echo "$source_interfaces" | sed 's/^/    /'
+   138→        echo "  Target interfaces:"
+   139→        echo "$target_interfaces" | sed 's/^/    /'
+   140→        return 1
+   141→    fi
+   142→    return 0
+   143→}
+   144→
+   145→validate_enums() {
+   146→    local source_file="$1"
+   147→    local target_file="$2"
+   148→    local rel_path="$3"
+   149→    
+   150→    local source_enums=$(extract_enum_values "$source_file")
+   151→    local target_enums=$(extract_enum_values "$target_file")
+   152→    
+   153→    if [ "$source_enums" != "$target_enums" ]; then
+   154→        log_error "Enum mismatch in $rel_path"
+   155→        echo "  Source enums:"
+   156→        echo "$source_enums" | sed 's/^/    /'
+   157→        echo "  Target enums:"
+   158→        echo "$target_enums" | sed 's/^/    /'
+   159→        return 1
+   160→    fi
+   161→    return 0
+   162→}
+   163→
+   164→validate_functions() {
+   165→    local source_file="$1"
+   166→    local target_file="$2"
+   167→    local rel_path="$3"
+   168→    
+   169→    local source_funcs=$(extract_function_signatures "$source_file")
+   170→    local target_funcs=$(extract_function_signatures "$target_file")
+   171→    
+   172→    if [ "$source_funcs" != "$target_funcs" ]; then
+   173→        log_error "Function signature mismatch in $rel_path"
+   174→        echo "  Source functions:"
+   175→        echo "$source_funcs" | sed 's/^/    /'
+   176→        echo "  Target functions:"
+   177→        echo "$target_funcs" | sed 's/^/    /'
+   178→        return 1
+   179→    fi
+   180→    return 0
+   181→}
+   182→
+   183→validate_file_pair() {
+   184→    local source_rel="$1"
+   185→    local target_rel="$2"
+   186→    
+   187→    local source_file="$SOURCE_DIR/$source_rel"
+   188→    local target_file="$TARGET_DIR/$target_rel"
+   189→    
+   190→    # Check if source exists
+   191→    if [ ! -f "$source_file" ]; then
+   192→        log_warning "Source file not found: $source_rel"
+   193→        return 0
+   194→    fi
+   195→    
+   196→    # Check if target exists
+   197→    if [ ! -f "$target_file" ]; then
+   198→        log_error "Target file missing: $target_rel (expected from $source_rel)"
+   199→        return 1
+   200→    fi
+   201→    
+   202→    local has_error=0
+   203→    
+   204→    # Validate interfaces
+   205→    validate_interfaces "$source_file" "$target_file" "$target_rel" || has_error=1
+   206→    
+   207→    # Validate enums
+   208→    validate_enums "$source_file" "$target_file" "$target_rel" || has_error=1
+   209→    
+   210→    # Validate function signatures
+   211→    validate_functions "$source_file" "$target_file" "$target_rel" || has_error=1
+   212→    
+   213→    if [ $has_error -eq 0 ]; then
+   214→        log_success "$target_rel matches source"
+   215→    fi
+   216→    
+   217→    return $has_error
+   218→}
+   219→
+   220→# -----------------------------------------------------------------------------
+   221→# Check for New Fields/Properties Not in Source
+   222→# -----------------------------------------------------------------------------
+   223→
+   224→check_new_additions() {
+   225→    local source_file="$1"
+   226→    local target_file="$2"
+   227→    local rel_path="$3"
+   228→    
+   229→    if [ ! -f "$source_file" ] || [ ! -f "$target_file" ]; then
+   230→        return 0
+   231→    fi
+   232→    
+   233→    # Check for fields in target that don't exist in source
+   234→    local target_fields=$(grep -E "^\s+[a-zA-Z]+(\?)?:" "$target_file" 2>/dev/null | sed 's/:.*//' | tr -d ' ' | sort -u || true)
+   235→    local source_fields=$(grep -E "^\s+[a-zA-Z]+(\?)?:" "$source_file" 2>/dev/null | sed 's/:.*//' | tr -d ' ' | sort -u || true)
+   236→    
+   237→    local new_fields=$(comm -23 <(echo "$target_fields") <(echo "$source_fields") 2>/dev/null || true)
+   238→    
+   239→    if [ -n "$new_fields" ]; then
+   240→        log_error "New fields in $rel_path not present in source:"
+   241→        echo "$new_fields" | sed 's/^/    /'
+   242→        return 1
+   243→    fi
+   244→    
+   245→    return 0
+   246→}
+   247→
+   248→# -----------------------------------------------------------------------------
+   249→# Main Validation
+   250→# -----------------------------------------------------------------------------
+   251→
+   252→echo "=============================================="
+   253→echo "  Migration Validation Script"
+   254→echo "=============================================="
+   255→echo ""
+   256→echo "Source: $SOURCE_DIR"
+   257→echo "Target: $TARGET_DIR"
+   258→echo ""
+   259→
+   260→# Check directories exist
+   261→if [ ! -d "$SOURCE_DIR" ]; then
+   262→    log_error "Source directory not found: $SOURCE_DIR"
+   263→    exit 1
+   264→fi
+   265→
+   266→if [ ! -d "$TARGET_DIR" ]; then
+   267→    log_error "Target directory not found: $TARGET_DIR"
+   268→    exit 1
+   269→fi
+   270→
+   271→echo "Validating file pairs..."
+   272→echo ""
+   273→
+   274→# Validate each mapped file pair
+   275→for source_rel in "${!FILE_MAP[@]}"; do
+   276→    target_rel="${FILE_MAP[$source_rel]}"
+   277→    validate_file_pair "$source_rel" "$target_rel"
+   278→    check_new_additions "$SOURCE_DIR/$source_rel" "$TARGET_DIR/$target_rel" "$target_rel"
+   279→done
+   280→
+   281→echo ""
+   282→echo "=============================================="
+   283→echo "  Validation Summary"
+   284→echo "=============================================="
+   285→
+   286→if [ $ERRORS_FOUND -gt 0 ]; then
+   287→    echo -e "${RED}FAILED: $ERRORS_FOUND error(s) found${NC}"
+   288→    echo ""
+   289→    echo "Behavioral changes detected. You must:"
+   290→    echo "1. Identify which changes caused the failures"
+   291→    echo "2. Revert target to match source behavior"
+   292→    echo "3. Run this script again"
+   293→    echo ""
+   294→    exit 1
+   295→fi
+   296→
+   297→if [ $WARNINGS_FOUND -gt 0 ]; then
+   298→    echo -e "${YELLOW}PASSED with $WARNINGS_FOUND warning(s)${NC}"
+   299→else
+   300→    echo -e "${GREEN}PASSED: All validations successful${NC}"
+   301→fi
+   302→
+   303→exit 0
+   304→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

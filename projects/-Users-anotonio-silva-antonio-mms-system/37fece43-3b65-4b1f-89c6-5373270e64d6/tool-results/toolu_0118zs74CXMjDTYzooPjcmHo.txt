@@ -1,0 +1,928 @@
+     1→/**
+     2→ * MMS Baseline Service
+     3→ *
+     4→ * Manages published plan baselines for drift analysis and scenario comparison.
+     5→ * Baselines are immutable snapshots of the PM schedule and mileage projections
+     6→ * at a point in time.
+     7→ *
+     8→ * Key responsibilities:
+     9→ * - Create and publish plan baselines
+    10→ * - Snapshot PM schedule and mileage projections
+    11→ * - Version management with semantic versioning
+    12→ * - Supersede previous baselines on new publication
+    13→ * - Audit logging for compliance
+    14→ *
+    15→ * Baseline lifecycle:
+    16→ * DRAFT -> PUBLISHED -> SUPERSEDED (when new baseline published)
+    17→ *
+    18→ * @see specs/004-domain-services.md Section 4.7
+    19→ */
+    20→
+    21→import { eq, and, desc, sql, inArray, gte, count } from 'drizzle-orm';
+    22→import { addMonths, addYears, subDays, format } from 'date-fns';
+    23→import { BaseService, MmsAttributes } from '../lib/services/base';
+    24→import {
+    25→  planBaselines,
+    26→  baselinePmSchedule,
+    27→  baselineMileageProjection,
+    28→  pmSchedule,
+    29→  trains,
+    30→  mileageReadings,
+    31→  auditLog,
+    32→  type PlanBaseline,
+    33→  type BaselinePmSchedule,
+    34→  type BaselineMileageProjection,
+    35→} from '../lib/db/schema';
+    36→import {
+    37→  NotFoundError,
+    38→  ValidationError,
+    39→  BusinessRuleError,
+    40→} from '../lib/errors';
+    41→
+    42→// =============================================================================
+    43→// Types
+    44→// =============================================================================
+    45→
+    46→/** Status of a baseline in its lifecycle */
+    47→export type BaselineStatus = 'DRAFT' | 'PUBLISHED' | 'SUPERSEDED' | 'ARCHIVED';
+    48→
+    49→/** Filters for listing baselines */
+    50→export interface BaselineListFilters {
+    51→  status?: BaselineStatus | BaselineStatus[];
+    52→  fromDate?: Date;
+    53→  toDate?: Date;
+    54→  createdBy?: string;
+    55→}
+    56→
+    57→/** Pagination options for baseline listing */
+    58→export interface BaselinePaginationOptions {
+    59→  page?: number;
+    60→  pageSize?: number;
+    61→  sortBy?: 'baselineDate' | 'createdAt' | 'version';
+    62→  sortOrder?: 'asc' | 'desc';
+    63→}
+    64→
+    65→/** Paginated result for baselines */
+    66→export interface PaginatedBaselineResult {
+    67→  data: PlanBaseline[];
+    68→  total: number;
+    69→  page: number;
+    70→  pageSize: number;
+    71→  totalPages: number;
+    72→}
+    73→
+    74→/** Request to publish a new baseline */
+    75→export interface PublishBaselineRequest {
+    76→  name: string;
+    77→  description?: string;
+    78→  userId: string;
+    79→  horizonYears?: number; // Default: 10 years
+    80→}
+    81→
+    82→/** Result of plan validation for publishing */
+    83→export interface PlanValidationResult {
+    84→  valid: boolean;
+    85→  conflicts: PlanConflict[];
+    86→  warnings: PlanWarning[];
+    87→}
+    88→
+    89→/** A conflict that prevents baseline publication */
+    90→export interface PlanConflict {
+    91→  type: 'OVERDUE_PM' | 'TRACK_CONFLICT' | 'MATERIAL_BLOCK' | 'GROUNDED_TRAIN';
+    92→  trainId?: string;
+    93→  trainNumber?: string;
+    94→  pmScheduleId?: string;
+    95→  description: string;
+    96→}
+    97→
+    98→/** A warning that doesn't prevent publication but should be noted */
+    99→export interface PlanWarning {
+   100→  type: 'APPROACHING_COMPLIANCE' | 'LOW_MATERIAL' | 'HIGH_UTILIZATION';
+   101→  trainId?: string;
+   102→  trainNumber?: string;
+   103→  description: string;
+   104→}
+   105→
+   106→/** Internal mileage projection data */
+   107→interface MileageProjectionData {
+   108→  trainId: string;
+   109→  date: Date;
+   110→  projectedKm: number;
+   111→  dailyRate: number;
+   112→}
+   113→
+   114→/** Baseline summary statistics */
+   115→export interface BaselineSummary {
+   116→  id: string;
+   117→  name: string;
+   118→  version: string;
+   119→  status: BaselineStatus;
+   120→  baselineDate: string;
+   121→  horizonEnd: string;
+   122→  fleetCount: number | null;
+   123→  totalPmScheduled: number | null;
+   124→  totalManhourProjected: string | null;
+   125→  createdAt: Date | null;
+   126→  publishedAt: Date | null;
+   127→}
+   128→
+   129→/** PM schedule snapshot with train info */
+   130→export interface BaselinePmScheduleWithTrain extends BaselinePmSchedule {
+   131→  trainNumber?: string;
+   132→  pmCode?: string;
+   133→  depotCode?: string;
+   134→}
+   135→
+   136→/** Mileage projection with train info */
+   137→export interface BaselineMileageProjectionWithTrain extends BaselineMileageProjection {
+   138→  trainNumber?: string;
+   139→}
+   140→
+   141→// =============================================================================
+   142→// Singleton instance
+   143→// =============================================================================
+   144→
+   145→let instance: BaselineService | null = null;
+   146→
+   147→/**
+   148→ * Get the singleton BaselineService instance
+   149→ */
+   150→export function getBaselineService(): BaselineService {
+   151→  if (!instance) {
+   152→    instance = new BaselineService();
+   153→  }
+   154→  return instance;
+   155→}
+   156→
+   157→// =============================================================================
+   158→// BaselineService Implementation
+   159→// =============================================================================
+   160→
+   161→/**
+   162→ * Baseline Service for managing plan baselines
+   163→ *
+   164→ * @example
+   165→ * ```typescript
+   166→ * const baselineService = getBaselineService();
+   167→ *
+   168→ * // Publish a new baseline
+   169→ * const baseline = await baselineService.publishBaseline({
+   170→ *   name: 'Q1 2026 Plan',
+   171→ *   description: 'Quarterly plan baseline',
+   172→ *   userId: 'user-123'
+   173→ * });
+   174→ *
+   175→ * // Get latest published baseline
+   176→ * const latest = await baselineService.getLatestBaseline();
+   177→ *
+   178→ * // Get PM schedule snapshot
+   179→ * const pmSchedule = await baselineService.getBaselinePmSchedule(baseline.id);
+   180→ * ```
+   181→ */
+   182→export class BaselineService extends BaseService {
+   183→  /** Default projection horizon in years */
+   184→  private readonly DEFAULT_HORIZON_YEARS = 10;
+   185→
+   186→  /** Default daily mileage when no history available (km) */
+   187→  private readonly DEFAULT_DAILY_KM = 150;
+   188→
+   189→  /** Days of mileage history to use for average calculation */
+   190→  private readonly MILEAGE_HISTORY_DAYS = 30;
+   191→
+   192→  constructor() {
+   193→    super({ name: 'baseline-service' });
+   194→  }
+   195→
+   196→  // ===========================================================================
+   197→  // Public Methods
+   198→  // ===========================================================================
+   199→
+   200→  /**
+   201→   * Publish a new baseline from the current plan state
+   202→   *
+   203→   * This operation:
+   204→   * 1. Validates the current plan for critical conflicts
+   205→   * 2. Generates a version number
+   206→   * 3. Creates the baseline record
+   207→   * 4. Snapshots the PM schedule (SCHEDULED and IN_PROGRESS items)
+   208→   * 5. Generates mileage projections at monthly intervals
+   209→   * 6. Supersedes any previous published baseline
+   210→   * 7. Records audit log
+   211→   *
+   212→   * @throws ValidationError if plan has critical conflicts
+   213→   * @throws BusinessRuleError if baseline cannot be created
+   214→   */
+   215→  async publishBaseline(request: PublishBaselineRequest): Promise<PlanBaseline> {
+   216→    return this.traced('publishBaseline', async (span) => {
+   217→      span.setAttribute('baseline.name', request.name);
+   218→      span.setAttribute(MmsAttributes.USER_ID, request.userId);
+   219→
+   220→      // 1. Validate current plan
+   221→      const validation = await this.validatePlanForPublishing();
+   222→      if (!validation.valid) {
+   223→        this.log.warn(
+   224→          { conflicts: validation.conflicts },
+   225→          'Cannot publish baseline due to critical conflicts'
+   226→        );
+   227→        throw new ValidationError(
+   228→          'Cannot publish baseline with critical conflicts',
+   229→          { context: { conflicts: validation.conflicts } }
+   230→        );
+   231→      }
+   232→
+   233→      // Log warnings but continue
+   234→      if (validation.warnings.length > 0) {
+   235→        this.log.info(
+   236→          { warnings: validation.warnings },
+   237→          `Publishing baseline with ${validation.warnings.length} warnings`
+   238→        );
+   239→      }
+   240→
+   241→      // 2. Get latest baseline for version increment
+   242→      const latestBaseline = await this.getLatestBaseline();
+   243→      const version = this.incrementVersion(latestBaseline?.version ?? 'v0.0');
+   244→      span.setAttribute('baseline.version', version);
+   245→
+   246→      const horizonYears = request.horizonYears ?? this.DEFAULT_HORIZON_YEARS;
+   247→      const baselineDate = new Date();
+   248→      const horizonEnd = addYears(baselineDate, horizonYears);
+   249→
+   250→      // 3. Create baseline in transaction
+   251→      const baseline = await this.inTransaction(
+   252→        'publishBaseline',
+   253→        async (tx, txSpan) => {
+   254→          // Get metrics for the baseline
+   255→          const fleetCount = await this.getActiveTrainCount();
+   256→          const pmCount = await this.getScheduledPMCount();
+   257→          const manhours = await this.getTotalProjectedHours();
+   258→
+   259→          txSpan.setAttribute('baseline.fleetCount', fleetCount);
+   260→          txSpan.setAttribute('baseline.pmCount', pmCount);
+   261→
+   262→          // Create baseline record
+   263→          const [baselineRecord] = await tx
+   264→            .insert(planBaselines)
+   265→            .values({
+   266→              name: request.name,
+   267→              description: request.description ?? null,
+   268→              version,
+   269→              baselineDate: format(baselineDate, 'yyyy-MM-dd'),
+   270→              horizonEnd: format(horizonEnd, 'yyyy-MM-dd'),
+   271→              status: 'PUBLISHED',
+   272→              createdBy: request.userId,
+   273→              publishedBy: request.userId,
+   274→              publishedAt: new Date(),
+   275→              fleetCount,
+   276→              totalPmScheduled: pmCount,
+   277→              totalManhourProjected: manhours.toString(),
+   278→            })
+   279→            .returning();
+   280→
+   281→          this.log.info(
+   282→            { baselineId: baselineRecord.id, version },
+   283→            'Created baseline record'
+   284→          );
+   285→
+   286→          // Snapshot PM schedule
+   287→          const pmSnapshotCount = await this.snapshotPmSchedule(tx, baselineRecord.id);
+   288→          txSpan.setAttribute('baseline.pmSnapshotCount', pmSnapshotCount);
+   289→
+   290→          // Generate and store mileage projections
+   291→          const projections = await this.generateMileageProjections(horizonEnd);
+   292→
+   293→          if (projections.length > 0) {
+   294→            // Batch insert projections for performance
+   295→            const BATCH_SIZE = 500;
+   296→            for (let i = 0; i < projections.length; i += BATCH_SIZE) {
+   297→              const batch = projections.slice(i, i + BATCH_SIZE);
+   298→              await tx.insert(baselineMileageProjection).values(
+   299→                batch.map((proj) => ({
+   300→                  baselineId: baselineRecord.id,
+   301→                  trainId: proj.trainId,
+   302→                  projectionDate: format(proj.date, 'yyyy-MM-dd'),
+   303→                  projectedCumulativeKm: proj.projectedKm,
+   304→                  dailyRateKm: proj.dailyRate,
+   305→                }))
+   306→              );
+   307→            }
+   308→          }
+   309→
+   310→          txSpan.setAttribute('baseline.mileageProjections', projections.length);
+   311→
+   312→          // Supersede previous baseline
+   313→          if (latestBaseline) {
+   314→            await tx
+   315→              .update(planBaselines)
+   316→              .set({
+   317→                status: 'SUPERSEDED',
+   318→                supersededBy: baselineRecord.id,
+   319→                supersededAt: new Date(),
+   320→              })
+   321→              .where(eq(planBaselines.id, latestBaseline.id));
+   322→
+   323→            this.log.info(
+   324→              { supersededId: latestBaseline.id, newId: baselineRecord.id },
+   325→              'Superseded previous baseline'
+   326→            );
+   327→          }
+   328→
+   329→          // Record audit log
+   330→          await tx.insert(auditLog).values({
+   331→            entityType: 'plan_baseline',
+   332→            entityId: baselineRecord.id,
+   333→            action: 'PUBLISH',
+   334→            userId: request.userId,
+   335→            newValues: {
+   336→              name: request.name,
+   337→              version,
+   338→              description: request.description,
+   339→              fleetCount,
+   340→              pmCount,
+   341→            },
+   342→            complianceFlags: ['PLANNING'],
+   343→          });
+   344→
+   345→          return baselineRecord;
+   346→        }
+   347→      );
+   348→
+   349→      this.log.info(
+   350→        { baselineId: baseline.id, version: baseline.version },
+   351→        'Published new baseline successfully'
+   352→      );
+   353→
+   354→      return baseline;
+   355→    });
+   356→  }
+   357→
+   358→  /**
+   359→   * Get the latest published baseline
+   360→   *
+   361→   * @returns The most recent PUBLISHED baseline, or null if none exists
+   362→   */
+   363→  async getLatestBaseline(): Promise<PlanBaseline | null> {
+   364→    return this.traced('getLatestBaseline', async (span) => {
+   365→      const result = await this.db
+   366→        .select()
+   367→        .from(planBaselines)
+   368→        .where(eq(planBaselines.status, 'PUBLISHED'))
+   369→        .orderBy(desc(planBaselines.publishedAt))
+   370→        .limit(1);
+   371→
+   372→      const baseline = result[0] ?? null;
+   373→
+   374→      if (baseline) {
+   375→        span.setAttribute(MmsAttributes.BASELINE_ID, baseline.id);
+   376→        span.setAttribute('baseline.version', baseline.version);
+   377→      }
+   378→
+   379→      return baseline;
+   380→    });
+   381→  }
+   382→
+   383→  /**
+   384→   * Get a baseline by ID
+   385→   *
+   386→   * @throws NotFoundError if baseline doesn't exist
+   387→   */
+   388→  async getBaselineById(baselineId: string): Promise<PlanBaseline> {
+   389→    return this.traced('getBaselineById', async (span) => {
+   390→      span.setAttribute(MmsAttributes.BASELINE_ID, baselineId);
+   391→
+   392→      const result = await this.db
+   393→        .select()
+   394→        .from(planBaselines)
+   395→        .where(eq(planBaselines.id, baselineId))
+   396→        .limit(1);
+   397→
+   398→      const baseline = result[0];
+   399→      if (!baseline) {
+   400→        throw new NotFoundError(`Baseline not found: ${baselineId}`);
+   401→      }
+   402→
+   403→      return baseline;
+   404→    });
+   405→  }
+   406→
+   407→  /**
+   408→   * List baselines with optional filtering and pagination
+   409→   */
+   410→  async listBaselines(
+   411→    filters?: BaselineListFilters,
+   412→    pagination?: BaselinePaginationOptions
+   413→  ): Promise<PaginatedBaselineResult> {
+   414→    return this.traced('listBaselines', async (span) => {
+   415→      const page = pagination?.page ?? 1;
+   416→      const pageSize = pagination?.pageSize ?? 20;
+   417→      const offset = (page - 1) * pageSize;
+   418→
+   419→      // Build where conditions
+   420→      const conditions: ReturnType<typeof eq>[] = [];
+   421→
+   422→      if (filters?.status) {
+   423→        const statuses = Array.isArray(filters.status)
+   424→          ? filters.status
+   425→          : [filters.status];
+   426→        conditions.push(inArray(planBaselines.status, statuses));
+   427→      }
+   428→
+   429→      if (filters?.fromDate) {
+   430→        conditions.push(
+   431→          gte(planBaselines.baselineDate, format(filters.fromDate, 'yyyy-MM-dd'))
+   432→        );
+   433→      }
+   434→
+   435→      if (filters?.createdBy) {
+   436→        conditions.push(eq(planBaselines.createdBy, filters.createdBy));
+   437→      }
+   438→
+   439→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   440→
+   441→      // Get total count
+   442→      const [{ totalCount }] = await this.db
+   443→        .select({ totalCount: count() })
+   444→        .from(planBaselines)
+   445→        .where(whereClause);
+   446→
+   447→      // Determine sort order
+   448→      const sortColumn =
+   449→        pagination?.sortBy === 'baselineDate'
+   450→          ? planBaselines.baselineDate
+   451→          : pagination?.sortBy === 'version'
+   452→          ? planBaselines.version
+   453→          : planBaselines.createdAt;
+   454→
+   455→      // Get paginated results
+   456→      const data = await this.db
+   457→        .select()
+   458→        .from(planBaselines)
+   459→        .where(whereClause)
+   460→        .orderBy(pagination?.sortOrder === 'asc' ? sortColumn : desc(sortColumn))
+   461→        .limit(pageSize)
+   462→        .offset(offset);
+   463→
+   464→      span.setAttribute('baseline.resultCount', data.length);
+   465→      span.setAttribute('baseline.totalCount', totalCount);
+   466→
+   467→      return {
+   468→        data,
+   469→        total: totalCount,
+   470→        page,
+   471→        pageSize,
+   472→        totalPages: Math.ceil(totalCount / pageSize),
+   473→      };
+   474→    });
+   475→  }
+   476→
+   477→  /**
+   478→   * Get PM schedule snapshot for a baseline
+   479→   */
+   480→  async getBaselinePmSchedule(
+   481→    baselineId: string,
+   482→    pagination?: { page?: number; pageSize?: number }
+   483→  ): Promise<{ data: BaselinePmSchedule[]; total: number }> {
+   484→    return this.traced('getBaselinePmSchedule', async (span) => {
+   485→      span.setAttribute(MmsAttributes.BASELINE_ID, baselineId);
+   486→
+   487→      // Verify baseline exists
+   488→      await this.getBaselineById(baselineId);
+   489→
+   490→      const page = pagination?.page ?? 1;
+   491→      const pageSize = pagination?.pageSize ?? 100;
+   492→      const offset = (page - 1) * pageSize;
+   493→
+   494→      // Get total count
+   495→      const [{ totalCount }] = await this.db
+   496→        .select({ totalCount: count() })
+   497→        .from(baselinePmSchedule)
+   498→        .where(eq(baselinePmSchedule.baselineId, baselineId));
+   499→
+   500→      // Get paginated data
+   501→      const data = await this.db
+   502→        .select()
+   503→        .from(baselinePmSchedule)
+   504→        .where(eq(baselinePmSchedule.baselineId, baselineId))
+   505→        .orderBy(baselinePmSchedule.projectedDate)
+   506→        .limit(pageSize)
+   507→        .offset(offset);
+   508→
+   509→      span.setAttribute('baseline.pmCount', data.length);
+   510→
+   511→      return { data, total: totalCount };
+   512→    });
+   513→  }
+   514→
+   515→  /**
+   516→   * Get mileage projections for a baseline
+   517→   */
+   518→  async getMileageProjections(
+   519→    baselineId: string,
+   520→    trainId?: string,
+   521→    pagination?: { page?: number; pageSize?: number }
+   522→  ): Promise<{ data: BaselineMileageProjection[]; total: number }> {
+   523→    return this.traced('getMileageProjections', async (span) => {
+   524→      span.setAttribute(MmsAttributes.BASELINE_ID, baselineId);
+   525→      if (trainId) {
+   526→        span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   527→      }
+   528→
+   529→      // Verify baseline exists
+   530→      await this.getBaselineById(baselineId);
+   531→
+   532→      const page = pagination?.page ?? 1;
+   533→      const pageSize = pagination?.pageSize ?? 100;
+   534→      const offset = (page - 1) * pageSize;
+   535→
+   536→      // Build where conditions
+   537→      const conditions = [eq(baselineMileageProjection.baselineId, baselineId)];
+   538→      if (trainId) {
+   539→        conditions.push(eq(baselineMileageProjection.trainId, trainId));
+   540→      }
+   541→
+   542→      const whereClause = and(...conditions);
+   543→
+   544→      // Get total count
+   545→      const [{ totalCount }] = await this.db
+   546→        .select({ totalCount: count() })
+   547→        .from(baselineMileageProjection)
+   548→        .where(whereClause);
+   549→
+   550→      // Get paginated data
+   551→      const data = await this.db
+   552→        .select()
+   553→        .from(baselineMileageProjection)
+   554→        .where(whereClause)
+   555→        .orderBy(
+   556→          baselineMileageProjection.trainId,
+   557→          baselineMileageProjection.projectionDate
+   558→        )
+   559→        .limit(pageSize)
+   560→        .offset(offset);
+   561→
+   562→      span.setAttribute('baseline.projectionCount', data.length);
+   563→
+   564→      return { data, total: totalCount };
+   565→    });
+   566→  }
+   567→
+   568→  /**
+   569→   * Get baseline summary for display
+   570→   */
+   571→  async getBaselineSummary(baselineId: string): Promise<BaselineSummary> {
+   572→    return this.traced('getBaselineSummary', async (span) => {
+   573→      span.setAttribute(MmsAttributes.BASELINE_ID, baselineId);
+   574→
+   575→      const baseline = await this.getBaselineById(baselineId);
+   576→
+   577→      return {
+   578→        id: baseline.id,
+   579→        name: baseline.name,
+   580→        version: baseline.version,
+   581→        status: baseline.status as BaselineStatus,
+   582→        baselineDate: baseline.baselineDate,
+   583→        horizonEnd: baseline.horizonEnd,
+   584→        fleetCount: baseline.fleetCount,
+   585→        totalPmScheduled: baseline.totalPmScheduled,
+   586→        totalManhourProjected: baseline.totalManhourProjected,
+   587→        createdAt: baseline.createdAt,
+   588→        publishedAt: baseline.publishedAt,
+   589→      };
+   590→    });
+   591→  }
+   592→
+   593→  /**
+   594→   * Archive a superseded baseline
+   595→   *
+   596→   * Archived baselines are retained for audit purposes but excluded
+   597→   * from normal queries.
+   598→   */
+   599→  async archiveBaseline(baselineId: string, userId: string): Promise<PlanBaseline> {
+   600→    return this.traced('archiveBaseline', async (span) => {
+   601→      span.setAttribute(MmsAttributes.BASELINE_ID, baselineId);
+   602→      span.setAttribute(MmsAttributes.USER_ID, userId);
+   603→
+   604→      const baseline = await this.getBaselineById(baselineId);
+   605→
+   606→      if (baseline.status === 'PUBLISHED') {
+   607→        throw new BusinessRuleError(
+   608→          'Cannot archive published baseline. Publish a new baseline first to supersede it.'
+   609→        );
+   610→      }
+   611→
+   612→      if (baseline.status === 'ARCHIVED') {
+   613→        return baseline; // Already archived
+   614→      }
+   615→
+   616→      const [updated] = await this.db
+   617→        .update(planBaselines)
+   618→        .set({ status: 'ARCHIVED' })
+   619→        .where(eq(planBaselines.id, baselineId))
+   620→        .returning();
+   621→
+   622→      // Audit log
+   623→      await this.db.insert(auditLog).values({
+   624→        entityType: 'plan_baseline',
+   625→        entityId: baselineId,
+   626→        action: 'UPDATE',
+   627→        userId,
+   628→        oldValues: { status: baseline.status },
+   629→        newValues: { status: 'ARCHIVED' },
+   630→      });
+   631→
+   632→      this.log.info({ baselineId }, 'Archived baseline');
+   633→
+   634→      return updated;
+   635→    });
+   636→  }
+   637→
+   638→  // ===========================================================================
+   639→  // Private Helper Methods
+   640→  // ===========================================================================
+   641→
+   642→  /**
+   643→   * Validate the current plan for publishing
+   644→   *
+   645→   * Checks for critical conflicts that prevent baseline publication:
+   646→   * - Overdue PMs (past compliance window)
+   647→   * - Track conflicts (double-booked tracks)
+   648→   * - Material blocks (missing critical materials)
+   649→   * - Grounded trains with scheduled PMs
+   650→   */
+   651→  private async validatePlanForPublishing(): Promise<PlanValidationResult> {
+   652→    return this.traced('validatePlanForPublishing', async (span) => {
+   653→      const conflicts: PlanConflict[] = [];
+   654→      const warnings: PlanWarning[] = [];
+   655→      const today = new Date();
+   656→      const todayStr = format(today, 'yyyy-MM-dd');
+   657→
+   658→      // Check for overdue PMs (constraint_end < today and status = SCHEDULED)
+   659→      const overduePms = await this.db
+   660→        .select({
+   661→          id: pmSchedule.id,
+   662→          trainId: pmSchedule.trainId,
+   663→          constraintEnd: pmSchedule.constraintEnd,
+   664→        })
+   665→        .from(pmSchedule)
+   666→        .where(
+   667→          and(
+   668→            eq(pmSchedule.status, 'SCHEDULED'),
+   669→            sql`${pmSchedule.constraintEnd} < ${todayStr}`,
+   670→            sql`${pmSchedule.scenarioId} IS NULL`
+   671→          )
+   672→        )
+   673→        .limit(50);
+   674→
+   675→      for (const pm of overduePms) {
+   676→        // Get train number for better error messages
+   677→        const train = await this.db
+   678→          .select({ trainNumber: trains.trainNumber })
+   679→          .from(trains)
+   680→          .where(eq(trains.id, pm.trainId))
+   681→          .limit(1);
+   682→
+   683→        conflicts.push({
+   684→          type: 'OVERDUE_PM',
+   685→          trainId: pm.trainId,
+   686→          trainNumber: train[0]?.trainNumber,
+   687→          pmScheduleId: pm.id,
+   688→          description: `PM is overdue (compliance window ended ${pm.constraintEnd})`,
+   689→        });
+   690→      }
+   691→
+   692→      // Check for grounded trains with scheduled PMs
+   693→      const groundedWithPms = await this.db
+   694→        .select({
+   695→          trainId: trains.id,
+   696→          trainNumber: trains.trainNumber,
+   697→          pmScheduleId: pmSchedule.id,
+   698→        })
+   699→        .from(trains)
+   700→        .innerJoin(pmSchedule, eq(trains.id, pmSchedule.trainId))
+   701→        .where(
+   702→          and(
+   703→            eq(trains.fitnessStatus, 'GROUNDED'),
+   704→            eq(trains.active, true),
+   705→            eq(pmSchedule.status, 'SCHEDULED'),
+   706→            sql`${pmSchedule.scenarioId} IS NULL`
+   707→          )
+   708→        )
+   709→        .limit(20);
+   710→
+   711→      for (const item of groundedWithPms) {
+   712→        conflicts.push({
+   713→          type: 'GROUNDED_TRAIN',
+   714→          trainId: item.trainId,
+   715→          trainNumber: item.trainNumber,
+   716→          pmScheduleId: item.pmScheduleId,
+   717→          description: 'Train is grounded but has scheduled PMs',
+   718→        });
+   719→      }
+   720→
+   721→      span.setAttribute('baseline.conflictCount', conflicts.length);
+   722→      span.setAttribute('baseline.warningCount', warnings.length);
+   723→
+   724→      return {
+   725→        valid: conflicts.length === 0,
+   726→        conflicts,
+   727→        warnings,
+   728→      };
+   729→    });
+   730→  }
+   731→
+   732→  /**
+   733→   * Increment version number
+   734→   *
+   735→   * Version format: vMajor.Minor (e.g., v1.0, v1.1, v2.0)
+   736→   * Increments minor version by default.
+   737→   */
+   738→  private incrementVersion(currentVersion: string | null): string {
+   739→    if (!currentVersion) {
+   740→      return 'v1.0';
+   741→    }
+   742→
+   743→    // Parse current version (vX.Y format)
+   744→    const match = currentVersion.match(/^v?(\d+)\.(\d+)$/);
+   745→    if (!match) {
+   746→      return 'v1.0';
+   747→    }
+   748→
+   749→    const major = parseInt(match[1], 10);
+   750→    const minor = parseInt(match[2], 10);
+   751→
+   752→    // Increment minor, or increment major if minor >= 99
+   753→    if (minor >= 99) {
+   754→      return `v${major + 1}.0`;
+   755→    }
+   756→
+   757→    return `v${major}.${minor + 1}`;
+   758→  }
+   759→
+   760→  /**
+   761→   * Get count of active trains
+   762→   */
+   763→  private async getActiveTrainCount(): Promise<number> {
+   764→    const [{ trainCount }] = await this.db
+   765→      .select({ trainCount: count() })
+   766→      .from(trains)
+   767→      .where(eq(trains.active, true));
+   768→
+   769→    return trainCount;
+   770→  }
+   771→
+   772→  /**
+   773→   * Get count of scheduled PM items
+   774→   */
+   775→  private async getScheduledPMCount(): Promise<number> {
+   776→    const today = format(new Date(), 'yyyy-MM-dd');
+   777→
+   778→    const [{ pmCount }] = await this.db
+   779→      .select({ pmCount: count() })
+   780→      .from(pmSchedule)
+   781→      .where(
+   782→        and(
+   783→          inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   784→          sql`${pmSchedule.scenarioId} IS NULL`,
+   785→          sql`${pmSchedule.targetDate} >= ${today}`
+   786→        )
+   787→      );
+   788→
+   789→    return pmCount;
+   790→  }
+   791→
+   792→  /**
+   793→   * Get total projected man-hours
+   794→   */
+   795→  private async getTotalProjectedHours(): Promise<number> {
+   796→    const today = format(new Date(), 'yyyy-MM-dd');
+   797→
+   798→    const result = await this.db
+   799→      .select({
+   800→        totalHours: sql<string>`COALESCE(SUM(${pmSchedule.assignedHours}), 0)`,
+   801→      })
+   802→      .from(pmSchedule)
+   803→      .where(
+   804→        and(
+   805→          inArray(pmSchedule.status, ['SCHEDULED', 'IN_PROGRESS']),
+   806→          sql`${pmSchedule.scenarioId} IS NULL`,
+   807→          sql`${pmSchedule.targetDate} >= ${today}`
+   808→        )
+   809→      );
+   810→
+   811→    return parseFloat(result[0]?.totalHours ?? '0');
+   812→  }
+   813→
+   814→  /**
+   815→   * Snapshot the current PM schedule into the baseline
+   816→   *
+   817→   * Copies all SCHEDULED and IN_PROGRESS PM items (production only, not scenarios)
+   818→   * to the baseline_pm_schedule table.
+   819→   */
+   820→  private async snapshotPmSchedule(
+   821→    tx: Parameters<Parameters<typeof this.inTransaction>[1]>[0],
+   822→    baselineId: string
+   823→  ): Promise<number> {
+   824→    const today = format(new Date(), 'yyyy-MM-dd');
+   825→
+   826→    // Use raw SQL for efficient bulk insert
+   827→    await tx.execute(sql`
+   828→      INSERT INTO baseline_pm_schedule
+   829→        (baseline_id, train_id, pm_type_id, projected_date, projected_mileage_km, assigned_depot_id, assigned_hours)
+   830→      SELECT
+   831→        ${baselineId},
+   832→        train_id,
+   833→        pm_type_id,
+   834→        target_date,
+   835→        target_mileage_km,
+   836→        assigned_depot_id,
+   837→        assigned_hours
+   838→      FROM pm_schedule
+   839→      WHERE scenario_id IS NULL
+   840→        AND status IN ('SCHEDULED', 'IN_PROGRESS')
+   841→        AND target_date >= ${today}
+   842→    `);
+   843→
+   844→    // Get count of inserted rows
+   845→    const [{ insertCount }] = await tx
+   846→      .select({ insertCount: count() })
+   847→      .from(baselinePmSchedule)
+   848→      .where(eq(baselinePmSchedule.baselineId, baselineId));
+   849→
+   850→    return insertCount;
+   851→  }
+   852→
+   853→  /**
+   854→   * Generate mileage projections for all active trains
+   855→   *
+   856→   * Projects mileage forward at monthly intervals using:
+   857→   * 1. Average daily mileage from last 30 days (if available)
+   858→   * 2. Default daily mileage (150 km) if no history
+   859→   */
+   860→  private async generateMileageProjections(
+   861→    horizonEnd: Date
+   862→  ): Promise<MileageProjectionData[]> {
+   863→    return this.traced('generateMileageProjections', async (span) => {
+   864→      // Get all active trains with their current mileage
+   865→      const activeTrains = await this.db
+   866→        .select({
+   867→          id: trains.id,
+   868→          trainNumber: trains.trainNumber,
+   869→          currentMileageKm: trains.currentMileageKm,
+   870→        })
+   871→        .from(trains)
+   872→        .where(eq(trains.active, true));
+   873→
+   874→      span.setAttribute('baseline.trainCount', activeTrains.length);
+   875→
+   876→      const projections: MileageProjectionData[] = [];
+   877→      const cutoffDate = subDays(new Date(), this.MILEAGE_HISTORY_DAYS);
+   878→      const cutoffDateStr = format(cutoffDate, 'yyyy-MM-dd');
+   879→
+   880→      for (const train of activeTrains) {
+   881→        // Calculate average daily mileage from recent history
+   882→        const recentMileage = await this.db
+   883→          .select({
+   884→            avgDailyKm: sql<string>`AVG(daily_km)`,
+   885→            readingCount: count(),
+   886→          })
+   887→          .from(mileageReadings)
+   888→          .where(
+   889→            and(
+   890→              eq(mileageReadings.trainId, train.id),
+   891→              sql`${mileageReadings.readingDate} >= ${cutoffDateStr}`,
+   892→              eq(mileageReadings.validationStatus, 'VALID')
+   893→            )
+   894→          );
+   895→
+   896→        const avgDailyKm =
+   897→          recentMileage[0]?.avgDailyKm && recentMileage[0].readingCount > 5
+   898→            ? parseFloat(recentMileage[0].avgDailyKm)
+   899→            : this.DEFAULT_DAILY_KM;
+   900→
+   901→        // Project forward at monthly intervals
+   902→        let currentKm = train.currentMileageKm ?? 0;
+   903→        let currentDate = new Date();
+   904→
+   905→        while (currentDate < horizonEnd) {
+   906→          currentDate = addMonths(currentDate, 1);
+   907→          currentKm += avgDailyKm * 30;
+   908→
+   909→          projections.push({
+   910→            trainId: train.id,
+   911→            date: new Date(currentDate),
+   912→            projectedKm: Math.round(currentKm),
+   913→            dailyRate: Math.round(avgDailyKm),
+   914→          });
+   915→        }
+   916→      }
+   917→
+   918→      span.setAttribute('baseline.totalProjections', projections.length);
+   919→
+   920→      return projections;
+   921→    });
+   922→  }
+   923→}
+   924→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,155 @@
+     1→/**
+     2→ * MMS Material Management Tables
+     3→ *
+     4→ * Inventory tracking and material reservations for PM scheduling.
+     5→ * Materials are a constraint for PM scheduling - PMs cannot proceed
+     6→ * without required blocking parts.
+     7→ *
+     8→ * Integration:
+     9→ * - Inventory snapshots come from Maximo/ERP daily
+    10→ * - Reservations are created when PMs are scheduled
+    11→ * - Soft reservations auto-expire if PM moves
+    12→ *
+    13→ * @see specs/003-database-schema.md Section 3.6
+    14→ */
+    15→
+    16→import { relations } from 'drizzle-orm';
+    17→import {
+    18→  date,
+    19→  decimal,
+    20→  index,
+    21→  integer,
+    22→  pgTable,
+    23→  text,
+    24→  timestamp,
+    25→  uniqueIndex,
+    26→  uuid,
+    27→  varchar,
+    28→} from 'drizzle-orm/pg-core';
+    29→import { depots } from './core-fleet';
+    30→import { reservationTypeEnum } from './enums';
+    31→import { pmSchedule } from './pm-management';
+    32→import { users } from './users';
+    33→
+    34→/**
+    35→ * Inventory Positions - Current stock levels
+    36→ *
+    37→ * Snapshot of inventory from ERP/Maximo system.
+    38→ * Updated daily via integration sync.
+    39→ *
+    40→ * Key fields:
+    41→ * - quantity_available: Calculated as on_hand - reserved
+    42→ * - reorder_point: Triggers replenishment when available drops below
+    43→ */
+    44→export const inventoryPositions = pgTable(
+    45→  'inventory_positions',
+    46→  {
+    47→    id: uuid('id').primaryKey().defaultRandom(),
+    48→    depotId: uuid('depot_id')
+    49→      .notNull()
+    50→      .references(() => depots.id),
+    51→    partNumber: varchar('part_number', { length: 50 }).notNull(),
+    52→    partDescription: text('part_description'),
+    53→
+    54→    // Quantities
+    55→    quantityOnHand: integer('quantity_on_hand').notNull().default(0),
+    56→    quantityReserved: integer('quantity_reserved').notNull().default(0),
+    57→    quantityOnOrder: integer('quantity_on_order').default(0),
+    58→    // quantity_available is calculated in queries: on_hand - reserved
+    59→
+    60→    // Replenishment
+    61→    reorderPoint: integer('reorder_point'),
+    62→    reorderQuantity: integer('reorder_quantity'),
+    63→    nextDeliveryDate: date('next_delivery_date'),
+    64→    nextDeliveryQuantity: integer('next_delivery_quantity'),
+    65→
+    66→    // Cost
+    67→    unitCost: decimal('unit_cost', { precision: 12, scale: 2 }),
+    68→    currency: varchar('currency', { length: 3 }).default('SGD'),
+    69→
+    70→    // Sync tracking
+    71→    lastSyncAt: timestamp('last_sync_at', { withTimezone: true }),
+    72→    sourceSystem: varchar('source_system', { length: 50 }).default('MAXIMO'),
+    73→
+    74→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+    75→  },
+    76→  (table) => [
+    77→    uniqueIndex('idx_inventory_depot_part').on(table.depotId, table.partNumber),
+    78→    index('idx_inventory_depot').on(table.depotId),
+    79→    index('idx_inventory_part').on(table.partNumber),
+    80→  ]
+    81→);
+    82→
+    83→/**
+    84→ * Material Reservations - Links inventory to PM schedules
+    85→ *
+    86→ * Two reservation types:
+    87→ * - SOFT: Tentative, auto-expires if PM moves (90-day soft constraint)
+    88→ * - HARD: Committed, parts allocated (14-day hard constraint)
+    89→ *
+    90→ * Constraint enforcement:
+    91→ * - BLOCKING parts with SOFT reservation: Warning, PM can proceed
+    92→ * - BLOCKING parts without reservation: PM cannot be scheduled
+    93→ */
+    94→export const materialReservations = pgTable(
+    95→  'material_reservations',
+    96→  {
+    97→    id: uuid('id').primaryKey().defaultRandom(),
+    98→    pmScheduleId: uuid('pm_schedule_id')
+    99→      .notNull()
+   100→      .references(() => pmSchedule.id, { onDelete: 'cascade' }),
+   101→    inventoryPositionId: uuid('inventory_position_id')
+   102→      .notNull()
+   103→      .references(() => inventoryPositions.id),
+   104→    partNumber: varchar('part_number', { length: 50 }).notNull(),
+   105→
+   106→    quantityReserved: integer('quantity_reserved').notNull(),
+   107→    reservationType: reservationTypeEnum('reservation_type').default('SOFT'),
+   108→
+   109→    reservedAt: timestamp('reserved_at', { withTimezone: true }).defaultNow(),
+   110→    reservedBy: uuid('reserved_by').references(() => users.id),
+   111→    expiresAt: timestamp('expires_at', { withTimezone: true }), // SOFT reservations auto-expire
+   112→
+   113→    // Fulfillment
+   114→    fulfilledAt: timestamp('fulfilled_at', { withTimezone: true }),
+   115→    fulfilledQuantity: integer('fulfilled_quantity'),
+   116→  },
+   117→  (table) => [
+   118→    uniqueIndex('idx_reservations_pm_part').on(table.pmScheduleId, table.partNumber),
+   119→    index('idx_reservations_pm').on(table.pmScheduleId),
+   120→    index('idx_reservations_inventory').on(table.inventoryPositionId),
+   121→    index('idx_reservations_expiring').on(table.expiresAt),
+   122→  ]
+   123→);
+   124→
+   125→// ============================================================================
+   126→// Relations
+   127→// ============================================================================
+   128→
+   129→export const inventoryPositionsRelations = relations(inventoryPositions, ({ one, many }) => ({
+   130→  depot: one(depots, {
+   131→    fields: [inventoryPositions.depotId],
+   132→    references: [depots.id],
+   133→  }),
+   134→  reservations: many(materialReservations),
+   135→}));
+   136→
+   137→export const materialReservationsRelations = relations(materialReservations, ({ one }) => ({
+   138→  pmScheduleRecord: one(pmSchedule, {
+   139→    fields: [materialReservations.pmScheduleId],
+   140→    references: [pmSchedule.id],
+   141→  }),
+   142→  inventoryPosition: one(inventoryPositions, {
+   143→    fields: [materialReservations.inventoryPositionId],
+   144→    references: [inventoryPositions.id],
+   145→  }),
+   146→  reservedByUser: one(users, {
+   147→    fields: [materialReservations.reservedBy],
+   148→    references: [users.id],
+   149→  }),
+   150→}));
+   151→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

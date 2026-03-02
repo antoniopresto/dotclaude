@@ -1,0 +1,445 @@
+     1→/**
+     2→ * Baseline Management Routes
+     3→ *
+     4→ * REST endpoints for plan baseline management.
+     5→ * Baselines are immutable snapshots of the PM schedule and mileage projections
+     6→ * used for drift analysis and scenario comparison.
+     7→ *
+     8→ * @see specs/005-api.md Section 5.8
+     9→ */
+    10→
+    11→import { Hono } from 'hono';
+    12→import {
+    13→  success,
+    14→  paginatedSuccess,
+    15→  error,
+    16→  parsePaginationQuery,
+    17→  ErrorCodes,
+    18→  type AppVariables,
+    19→} from '../types';
+    20→import { getRequestId, getRequestDuration } from '../middleware/request-context';
+    21→import {
+    22→  getBaselineService,
+    23→  type BaselineListFilters,
+    24→  type BaselineStatus,
+    25→} from '../../services';
+    26→import { isValidUuid } from '../../lib/schemas';
+    27→
+    28→// Singleton service instance
+    29→let baselineService: ReturnType<typeof getBaselineService> | null = null;
+    30→
+    31→function getService(): ReturnType<typeof getBaselineService> {
+    32→  if (!baselineService) {
+    33→    baselineService = getBaselineService();
+    34→  }
+    35→  return baselineService;
+    36→}
+    37→
+    38→export const baselineRoutes = new Hono<{ Variables: AppVariables }>();
+    39→
+    40→/**
+    41→ * GET /baselines
+    42→ *
+    43→ * List plan baselines with filtering and pagination.
+    44→ *
+    45→ * Query Parameters:
+    46→ * - status: Filter by status (DRAFT, PUBLISHED, SUPERSEDED, ARCHIVED)
+    47→ * - fromDate: Filter by baseline date (ISO date)
+    48→ * - toDate: Filter by baseline date (ISO date)
+    49→ * - page: Page number (default: 1)
+    50→ * - pageSize: Items per page (default: 20, max: 100)
+    51→ * - sort: Sort field (baselineDate:asc, createdAt:desc, etc.)
+    52→ */
+    53→baselineRoutes.get('/baselines', async (c) => {
+    54→  const service = getService();
+    55→
+    56→  // Parse query filters
+    57→  const filters: BaselineListFilters = {};
+    58→  const status = c.req.query('status');
+    59→  const fromDate = c.req.query('fromDate');
+    60→  const toDate = c.req.query('toDate');
+    61→
+    62→  if (status) {
+    63→    const validStatuses: BaselineStatus[] = ['DRAFT', 'PUBLISHED', 'SUPERSEDED', 'ARCHIVED'];
+    64→    const statusValues = status.split(',').filter((s) => validStatuses.includes(s as BaselineStatus));
+    65→    if (statusValues.length === 1) {
+    66→      filters.status = statusValues[0] as BaselineStatus;
+    67→    } else if (statusValues.length > 1) {
+    68→      filters.status = statusValues as BaselineStatus[];
+    69→    }
+    70→  }
+    71→
+    72→  if (fromDate) {
+    73→    const parsed = new Date(fromDate);
+    74→    if (!isNaN(parsed.getTime())) {
+    75→      filters.fromDate = parsed;
+    76→    }
+    77→  }
+    78→
+    79→  if (toDate) {
+    80→    const parsed = new Date(toDate);
+    81→    if (!isNaN(parsed.getTime())) {
+    82→      filters.toDate = parsed;
+    83→    }
+    84→  }
+    85→
+    86→  // Parse pagination
+    87→  const pagination = parsePaginationQuery({
+    88→    page: c.req.query('page') ? Number(c.req.query('page')) : undefined,
+    89→    pageSize: c.req.query('pageSize') ? Number(c.req.query('pageSize')) : undefined,
+    90→    sort: c.req.query('sort'),
+    91→  });
+    92→
+    93→  const result = await service.listBaselines(filters, {
+    94→    page: pagination.page,
+    95→    pageSize: Math.min(pagination.pageSize, 100), // Cap at 100 for baselines
+    96→    sortBy: pagination.sort?.field as 'baselineDate' | 'createdAt' | 'version' | undefined,
+    97→    sortOrder: pagination.sort?.direction,
+    98→  });
+    99→
+   100→  // Map to API response format per spec 005.8
+   101→  const baselines = result.data.map((baseline) => ({
+   102→    id: baseline.id,
+   103→    name: baseline.name,
+   104→    version: baseline.version,
+   105→    description: baseline.description,
+   106→    baselineDate: baseline.baselineDate,
+   107→    horizonEnd: baseline.horizonEnd,
+   108→    status: baseline.status,
+   109→    publishedAt: baseline.publishedAt,
+   110→    publishedBy: baseline.publishedBy
+   111→      ? { id: baseline.publishedBy, displayName: null } // Would need user lookup for displayName
+   112→      : null,
+   113→    metrics: {
+   114→      fleetCount: baseline.fleetCount,
+   115→      totalPMScheduled: baseline.totalPmScheduled,
+   116→      totalManhoursProjected: baseline.totalManhourProjected
+   117→        ? parseFloat(baseline.totalManhourProjected)
+   118→        : null,
+   119→    },
+   120→    createdAt: baseline.createdAt,
+   121→  }));
+   122→
+   123→  return c.json(
+   124→    paginatedSuccess(
+   125→      baselines,
+   126→      {
+   127→        page: result.page,
+   128→        pageSize: result.pageSize,
+   129→        totalItems: result.total,
+   130→      },
+   131→      { durationMs: getRequestDuration(c) }
+   132→    )
+   133→  );
+   134→});
+   135→
+   136→/**
+   137→ * GET /baselines/latest
+   138→ *
+   139→ * Get the most recent published baseline.
+   140→ * Convenience endpoint for common use case.
+   141→ */
+   142→baselineRoutes.get('/baselines/latest', async (c) => {
+   143→  const requestId = getRequestId(c);
+   144→  const service = getService();
+   145→
+   146→  const baseline = await service.getLatestBaseline();
+   147→
+   148→  if (!baseline) {
+   149→    return c.json(error(ErrorCodes.NOT_FOUND, 'No published baseline found', requestId), 404);
+   150→  }
+   151→
+   152→  return c.json(
+   153→    success(
+   154→      {
+   155→        id: baseline.id,
+   156→        name: baseline.name,
+   157→        version: baseline.version,
+   158→        description: baseline.description,
+   159→        baselineDate: baseline.baselineDate,
+   160→        horizonEnd: baseline.horizonEnd,
+   161→        status: baseline.status,
+   162→        publishedAt: baseline.publishedAt,
+   163→        metrics: {
+   164→          fleetCount: baseline.fleetCount,
+   165→          totalPMScheduled: baseline.totalPmScheduled,
+   166→          totalManhoursProjected: baseline.totalManhourProjected
+   167→            ? parseFloat(baseline.totalManhourProjected)
+   168→            : null,
+   169→        },
+   170→      },
+   171→      { timing: { durationMs: getRequestDuration(c) } }
+   172→    )
+   173→  );
+   174→});
+   175→
+   176→/**
+   177→ * GET /baselines/:id
+   178→ *
+   179→ * Get baseline details by ID.
+   180→ */
+   181→baselineRoutes.get('/baselines/:id', async (c) => {
+   182→  const requestId = getRequestId(c);
+   183→  const baselineId = c.req.param('id');
+   184→
+   185→  if (!isValidUuid(baselineId)) {
+   186→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId), 400);
+   187→  }
+   188→
+   189→  const service = getService();
+   190→  const baseline = await service.getBaselineById(baselineId);
+   191→
+   192→  return c.json(
+   193→    success(
+   194→      {
+   195→        id: baseline.id,
+   196→        name: baseline.name,
+   197→        version: baseline.version,
+   198→        description: baseline.description,
+   199→        baselineDate: baseline.baselineDate,
+   200→        horizonEnd: baseline.horizonEnd,
+   201→        status: baseline.status,
+   202→        publishedAt: baseline.publishedAt,
+   203→        publishedBy: baseline.publishedBy
+   204→          ? { id: baseline.publishedBy, displayName: null }
+   205→          : null,
+   206→        supersededBy: baseline.supersededBy,
+   207→        supersededAt: baseline.supersededAt,
+   208→        metrics: {
+   209→          fleetCount: baseline.fleetCount,
+   210→          totalPMScheduled: baseline.totalPmScheduled,
+   211→          totalManhoursProjected: baseline.totalManhourProjected
+   212→            ? parseFloat(baseline.totalManhourProjected)
+   213→            : null,
+   214→        },
+   215→        createdAt: baseline.createdAt,
+   216→        createdBy: baseline.createdBy,
+   217→      },
+   218→      { timing: { durationMs: getRequestDuration(c) } }
+   219→    )
+   220→  );
+   221→});
+   222→
+   223→/**
+   224→ * POST /baselines
+   225→ *
+   226→ * Publish a new baseline from the current plan state.
+   227→ *
+   228→ * The baseline will:
+   229→ * 1. Validate the current plan for critical conflicts
+   230→ * 2. Snapshot the current PM schedule
+   231→ * 3. Generate mileage projections
+   232→ * 4. Supersede any previous published baseline
+   233→ *
+   234→ * Request body:
+   235→ * - name: Baseline name (required)
+   236→ * - description: Optional description
+   237→ * - horizonYears: Projection horizon in years (default: 10)
+   238→ */
+   239→baselineRoutes.post('/baselines', async (c) => {
+   240→  const requestId = getRequestId(c);
+   241→  const body = await c.req.json();
+   242→
+   243→  // Validate required fields
+   244→  if (!body.name || typeof body.name !== 'string' || body.name.trim().length === 0) {
+   245→    return c.json(
+   246→      error(ErrorCodes.VALIDATION_ERROR, 'Baseline name is required', requestId),
+   247→      400
+   248→    );
+   249→  }
+   250→
+   251→  // Get user from context (or fallback for development)
+   252→  const userId = c.get('user')?.id ?? 'system';
+   253→
+   254→  const service = getService();
+   255→  const baseline = await service.publishBaseline({
+   256→    name: body.name.trim(),
+   257→    description: body.description?.trim(),
+   258→    userId,
+   259→    horizonYears: body.horizonYears ? Number(body.horizonYears) : undefined,
+   260→  });
+   261→
+   262→  return c.json(
+   263→    success(
+   264→      {
+   265→        id: baseline.id,
+   266→        name: baseline.name,
+   267→        version: baseline.version,
+   268→        description: baseline.description,
+   269→        baselineDate: baseline.baselineDate,
+   270→        horizonEnd: baseline.horizonEnd,
+   271→        status: baseline.status,
+   272→        publishedAt: baseline.publishedAt,
+   273→        metrics: {
+   274→          fleetCount: baseline.fleetCount,
+   275→          totalPMScheduled: baseline.totalPmScheduled,
+   276→          totalManhoursProjected: baseline.totalManhourProjected
+   277→            ? parseFloat(baseline.totalManhourProjected)
+   278→            : null,
+   279→        },
+   280→      },
+   281→      { timing: { durationMs: getRequestDuration(c) } }
+   282→    ),
+   283→    201
+   284→  );
+   285→});
+   286→
+   287→/**
+   288→ * GET /baselines/:id/pm-schedule
+   289→ *
+   290→ * Get the PM schedule snapshot for a baseline.
+   291→ *
+   292→ * Query Parameters:
+   293→ * - page: Page number (default: 1)
+   294→ * - pageSize: Items per page (default: 100, max: 500)
+   295→ */
+   296→baselineRoutes.get('/baselines/:id/pm-schedule', async (c) => {
+   297→  const requestId = getRequestId(c);
+   298→  const baselineId = c.req.param('id');
+   299→
+   300→  if (!isValidUuid(baselineId)) {
+   301→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId), 400);
+   302→  }
+   303→
+   304→  const page = c.req.query('page') ? Number(c.req.query('page')) : 1;
+   305→  const pageSize = Math.min(c.req.query('pageSize') ? Number(c.req.query('pageSize')) : 100, 500);
+   306→
+   307→  const service = getService();
+   308→  const result = await service.getBaselinePmSchedule(baselineId, { page, pageSize });
+   309→
+   310→  // Map to API response format
+   311→  const pmSchedule = result.data.map((item) => ({
+   312→    id: item.id,
+   313→    trainId: item.trainId,
+   314→    pmTypeId: item.pmTypeId,
+   315→    projectedDate: item.projectedDate,
+   316→    projectedMileageKm: item.projectedMileageKm,
+   317→    assignedDepotId: item.assignedDepotId,
+   318→    assignedHours: item.assignedHours ? parseFloat(item.assignedHours) : null,
+   319→  }));
+   320→
+   321→  return c.json(
+   322→    paginatedSuccess(
+   323→      pmSchedule,
+   324→      {
+   325→        page,
+   326→        pageSize,
+   327→        totalItems: result.total,
+   328→      },
+   329→      { durationMs: getRequestDuration(c) }
+   330→    )
+   331→  );
+   332→});
+   333→
+   334→/**
+   335→ * GET /baselines/:id/mileage-projections
+   336→ *
+   337→ * Get mileage projections for a baseline.
+   338→ *
+   339→ * Query Parameters:
+   340→ * - trainId: Filter by specific train (UUID)
+   341→ * - page: Page number (default: 1)
+   342→ * - pageSize: Items per page (default: 100, max: 500)
+   343→ */
+   344→baselineRoutes.get('/baselines/:id/mileage-projections', async (c) => {
+   345→  const requestId = getRequestId(c);
+   346→  const baselineId = c.req.param('id');
+   347→
+   348→  if (!isValidUuid(baselineId)) {
+   349→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId), 400);
+   350→  }
+   351→
+   352→  const trainId = c.req.query('trainId');
+   353→  if (trainId && !isValidUuid(trainId)) {
+   354→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid train ID format', requestId), 400);
+   355→  }
+   356→
+   357→  const page = c.req.query('page') ? Number(c.req.query('page')) : 1;
+   358→  const pageSize = Math.min(c.req.query('pageSize') ? Number(c.req.query('pageSize')) : 100, 500);
+   359→
+   360→  const service = getService();
+   361→  const result = await service.getMileageProjections(baselineId, trainId, { page, pageSize });
+   362→
+   363→  // Map to API response format
+   364→  const projections = result.data.map((item) => ({
+   365→    id: item.id,
+   366→    trainId: item.trainId,
+   367→    projectionDate: item.projectionDate,
+   368→    projectedCumulativeKm: item.projectedCumulativeKm,
+   369→    dailyRateKm: item.dailyRateKm,
+   370→  }));
+   371→
+   372→  return c.json(
+   373→    paginatedSuccess(
+   374→      projections,
+   375→      {
+   376→        page,
+   377→        pageSize,
+   378→        totalItems: result.total,
+   379→      },
+   380→      { durationMs: getRequestDuration(c) }
+   381→    )
+   382→  );
+   383→});
+   384→
+   385→/**
+   386→ * GET /baselines/:id/summary
+   387→ *
+   388→ * Get baseline summary statistics.
+   389→ * Convenience endpoint for dashboard display.
+   390→ */
+   391→baselineRoutes.get('/baselines/:id/summary', async (c) => {
+   392→  const requestId = getRequestId(c);
+   393→  const baselineId = c.req.param('id');
+   394→
+   395→  if (!isValidUuid(baselineId)) {
+   396→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId), 400);
+   397→  }
+   398→
+   399→  const service = getService();
+   400→  const summary = await service.getBaselineSummary(baselineId);
+   401→
+   402→  return c.json(
+   403→    success(summary, { timing: { durationMs: getRequestDuration(c) } })
+   404→  );
+   405→});
+   406→
+   407→/**
+   408→ * POST /baselines/:id/archive
+   409→ *
+   410→ * Archive a superseded baseline.
+   411→ * Archived baselines are retained for audit purposes but excluded from normal queries.
+   412→ *
+   413→ * Note: Cannot archive PUBLISHED baselines - must publish a new baseline first.
+   414→ */
+   415→baselineRoutes.post('/baselines/:id/archive', async (c) => {
+   416→  const requestId = getRequestId(c);
+   417→  const baselineId = c.req.param('id');
+   418→
+   419→  if (!isValidUuid(baselineId)) {
+   420→    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid baseline ID format', requestId), 400);
+   421→  }
+   422→
+   423→  const userId = c.get('user')?.id ?? 'system';
+   424→
+   425→  const service = getService();
+   426→  const baseline = await service.archiveBaseline(baselineId, userId);
+   427→
+   428→  return c.json(
+   429→    success(
+   430→      {
+   431→        id: baseline.id,
+   432→        name: baseline.name,
+   433→        version: baseline.version,
+   434→        status: baseline.status,
+   435→        archivedAt: new Date().toISOString(),
+   436→      },
+   437→      { timing: { durationMs: getRequestDuration(c) } }
+   438→    )
+   439→  );
+   440→});
+   441→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

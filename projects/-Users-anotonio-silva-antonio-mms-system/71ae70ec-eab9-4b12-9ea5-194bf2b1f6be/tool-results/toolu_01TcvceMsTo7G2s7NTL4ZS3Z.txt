@@ -1,0 +1,857 @@
+     1→/**
+     2→ * MMS Integration Routes Unit Tests
+     3→ *
+     4→ * Tests for the Integration API endpoints covering:
+     5→ * - Maximo webhook receiver (POST /integration/webhooks/maximo)
+     6→ * - Sync operations (push, pull, full)
+     7→ * - Conflict management
+     8→ * - Shadow record operations
+     9→ * - Edit validation
+    10→ *
+    11→ * Note: These tests use Bun's test framework with Hono's test client.
+    12→ * Integration tests with actual database should be in a separate test suite.
+    13→ *
+    14→ * @see src/api/routes/integration.ts
+    15→ * @see specs/007-integration.md
+    16→ */
+    17→
+    18→import { describe, test, expect, beforeAll } from 'bun:test';
+    19→import { Hono } from 'hono';
+    20→import { integrationRoutes } from './integration';
+    21→import type { AppVariables } from '../types';
+    22→import { sql } from '../../lib/db/connection';
+    23→import { createErrorHandler } from '../middleware';
+    24→
+    25→let databaseAvailable = false;
+    26→
+    27→async function checkDatabaseConnection(): Promise<boolean> {
+    28→  try {
+    29→    await sql`SELECT 1`;
+    30→    return true;
+    31→  } catch {
+    32→    return false;
+    33→  }
+    34→}
+    35→
+    36→describe('Integration Routes', () => {
+    37→  let app: Hono<{ Variables: AppVariables }>;
+    38→
+    39→  beforeAll(async () => {
+    40→    databaseAvailable = await checkDatabaseConnection();
+    41→    app = new Hono<{ Variables: AppVariables }>();
+    42→    // Add error handler to properly convert MMS errors to HTTP responses
+    43→    app.onError(createErrorHandler());
+    44→    app.use('*', async (c, next) => {
+    45→      c.set('requestId', 'test-request-id');
+    46→      c.set('startTime', Date.now());
+    47→      await next();
+    48→    });
+    49→    app.route('/', integrationRoutes);
+    50→  });
+    51→
+    52→  // ===========================================================================
+    53→  // Webhook Endpoints
+    54→  // ===========================================================================
+    55→
+    56→  describe('POST /integration/webhooks/maximo', () => {
+    57→    test('should reject empty body', async () => {
+    58→      const res = await app.request('/integration/webhooks/maximo', {
+    59→        method: 'POST',
+    60→        headers: { 'Content-Type': 'application/json' },
+    61→        body: '',
+    62→      });
+    63→      expect(res.status).toBe(400);
+    64→
+    65→      const body = await res.json();
+    66→      expect(body.success).toBe(false);
+    67→      expect(body.error.code).toBe('VALIDATION_ERROR');
+    68→    });
+    69→
+    70→    test('should reject missing event field', async () => {
+    71→      const res = await app.request('/integration/webhooks/maximo', {
+    72→        method: 'POST',
+    73→        headers: { 'Content-Type': 'application/json' },
+    74→        body: JSON.stringify({
+    75→          wonum: 'WO-2026-TEST',
+    76→          changedate: new Date().toISOString(),
+    77→        }),
+    78→      });
+    79→      expect(res.status).toBe(400);
+    80→
+    81→      const body = await res.json();
+    82→      expect(body.success).toBe(false);
+    83→      expect(body.error.code).toBe('VALIDATION_ERROR');
+    84→      expect(body.error.message).toContain('event');
+    85→    });
+    86→
+    87→    test('should reject missing wonum field', async () => {
+    88→      const res = await app.request('/integration/webhooks/maximo', {
+    89→        method: 'POST',
+    90→        headers: { 'Content-Type': 'application/json' },
+    91→        body: JSON.stringify({
+    92→          event: 'wo_status_changed',
+    93→          changedate: new Date().toISOString(),
+    94→        }),
+    95→      });
+    96→      expect(res.status).toBe(400);
+    97→
+    98→      const body = await res.json();
+    99→      expect(body.success).toBe(false);
+   100→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   101→      expect(body.error.message).toContain('wonum');
+   102→    });
+   103→
+   104→    test('should reject missing changedate field', async () => {
+   105→      const res = await app.request('/integration/webhooks/maximo', {
+   106→        method: 'POST',
+   107→        headers: { 'Content-Type': 'application/json' },
+   108→        body: JSON.stringify({
+   109→          event: 'wo_status_changed',
+   110→          wonum: 'WO-2026-TEST',
+   111→        }),
+   112→      });
+   113→      expect(res.status).toBe(400);
+   114→
+   115→      const body = await res.json();
+   116→      expect(body.success).toBe(false);
+   117→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   118→      expect(body.error.message).toContain('changedate');
+   119→    });
+   120→
+   121→    test('should reject invalid event type', async () => {
+   122→      const res = await app.request('/integration/webhooks/maximo', {
+   123→        method: 'POST',
+   124→        headers: { 'Content-Type': 'application/json' },
+   125→        body: JSON.stringify({
+   126→          event: 'invalid_event',
+   127→          wonum: 'WO-2026-TEST',
+   128→          changedate: new Date().toISOString(),
+   129→        }),
+   130→      });
+   131→      expect(res.status).toBe(400);
+   132→
+   133→      const body = await res.json();
+   134→      expect(body.success).toBe(false);
+   135→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   136→      expect(body.error.message).toContain('Invalid event type');
+   137→    });
+   138→
+   139→    test('should reject wo_status_changed without status', async () => {
+   140→      const res = await app.request('/integration/webhooks/maximo', {
+   141→        method: 'POST',
+   142→        headers: { 'Content-Type': 'application/json' },
+   143→        body: JSON.stringify({
+   144→          event: 'wo_status_changed',
+   145→          wonum: 'WO-2026-TEST',
+   146→          changedate: new Date().toISOString(),
+   147→        }),
+   148→      });
+   149→      expect(res.status).toBe(400);
+   150→
+   151→      const body = await res.json();
+   152→      expect(body.success).toBe(false);
+   153→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   154→      expect(body.error.message).toContain('status is required');
+   155→    });
+   156→
+   157→    test('should reject invalid status value', async () => {
+   158→      const res = await app.request('/integration/webhooks/maximo', {
+   159→        method: 'POST',
+   160→        headers: { 'Content-Type': 'application/json' },
+   161→        body: JSON.stringify({
+   162→          event: 'wo_status_changed',
+   163→          wonum: 'WO-2026-TEST',
+   164→          status: 'INVALID',
+   165→          changedate: new Date().toISOString(),
+   166→        }),
+   167→      });
+   168→      expect(res.status).toBe(400);
+   169→
+   170→      const body = await res.json();
+   171→      expect(body.success).toBe(false);
+   172→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   173→      expect(body.error.message).toContain('Invalid status');
+   174→    });
+   175→
+   176→    test('should reject invalid changedate format', async () => {
+   177→      const res = await app.request('/integration/webhooks/maximo', {
+   178→        method: 'POST',
+   179→        headers: { 'Content-Type': 'application/json' },
+   180→        body: JSON.stringify({
+   181→          event: 'wo_status_changed',
+   182→          wonum: 'WO-2026-TEST',
+   183→          status: 'INPRG',
+   184→          changedate: 'not-a-date',
+   185→        }),
+   186→      });
+   187→      expect(res.status).toBe(400);
+   188→
+   189→      const body = await res.json();
+   190→      expect(body.success).toBe(false);
+   191→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   192→      expect(body.error.message).toContain('changedate');
+   193→    });
+   194→
+   195→    test('should accept valid wo_status_changed payload (integration)', async () => {
+   196→      if (!databaseAvailable) {
+   197→        console.log('Skipping integration test: database not available');
+   198→        return;
+   199→      }
+   200→
+   201→      const res = await app.request('/integration/webhooks/maximo', {
+   202→        method: 'POST',
+   203→        headers: { 'Content-Type': 'application/json' },
+   204→        body: JSON.stringify({
+   205→          event: 'wo_status_changed',
+   206→          wonum: 'WO-2026-TEST-NONEXISTENT',
+   207→          status: 'INPRG',
+   208→          changedate: new Date().toISOString(),
+   209→        }),
+   210→      });
+   211→
+   212→      // Should return 200 even if shadow record not found (idempotent)
+   213→      expect(res.status).toBe(200);
+   214→
+   215→      const body = await res.json();
+   216→      expect(body.success).toBe(true);
+   217→      expect(body.data.received).toBe(true);
+   218→      // May or may not be processed depending on whether shadow record exists
+   219→    });
+   220→
+   221→    test('should accept valid wo_created payload (integration)', async () => {
+   222→      if (!databaseAvailable) {
+   223→        console.log('Skipping integration test: database not available');
+   224→        return;
+   225→      }
+   226→
+   227→      const res = await app.request('/integration/webhooks/maximo', {
+   228→        method: 'POST',
+   229→        headers: { 'Content-Type': 'application/json' },
+   230→        body: JSON.stringify({
+   231→          event: 'wo_created',
+   232→          wonum: 'WO-2026-NEW',
+   233→          changedate: new Date().toISOString(),
+   234→        }),
+   235→      });
+   236→      expect(res.status).toBe(200);
+   237→
+   238→      const body = await res.json();
+   239→      expect(body.success).toBe(true);
+   240→    });
+   241→
+   242→    test('should accept valid wo_updated payload (integration)', async () => {
+   243→      if (!databaseAvailable) {
+   244→        console.log('Skipping integration test: database not available');
+   245→        return;
+   246→      }
+   247→
+   248→      const res = await app.request('/integration/webhooks/maximo', {
+   249→        method: 'POST',
+   250→        headers: { 'Content-Type': 'application/json' },
+   251→        body: JSON.stringify({
+   252→          event: 'wo_updated',
+   253→          wonum: 'WO-2026-UPD',
+   254→          changedate: new Date().toISOString(),
+   255→        }),
+   256→      });
+   257→      expect(res.status).toBe(200);
+   258→
+   259→      const body = await res.json();
+   260→      expect(body.success).toBe(true);
+   261→    });
+   262→
+   263→    test('should accept valid wo_cancelled payload (integration)', async () => {
+   264→      if (!databaseAvailable) {
+   265→        console.log('Skipping integration test: database not available');
+   266→        return;
+   267→      }
+   268→
+   269→      const res = await app.request('/integration/webhooks/maximo', {
+   270→        method: 'POST',
+   271→        headers: { 'Content-Type': 'application/json' },
+   272→        body: JSON.stringify({
+   273→          event: 'wo_cancelled',
+   274→          wonum: 'WO-2026-CAN',
+   275→          changedate: new Date().toISOString(),
+   276→        }),
+   277→      });
+   278→      expect(res.status).toBe(200);
+   279→
+   280→      const body = await res.json();
+   281→      expect(body.success).toBe(true);
+   282→    });
+   283→
+   284→    test('should accept payload with all optional fields (integration)', async () => {
+   285→      if (!databaseAvailable) {
+   286→        console.log('Skipping integration test: database not available');
+   287→        return;
+   288→      }
+   289→
+   290→      const res = await app.request('/integration/webhooks/maximo', {
+   291→        method: 'POST',
+   292→        headers: { 'Content-Type': 'application/json' },
+   293→        body: JSON.stringify({
+   294→          event: 'wo_status_changed',
+   295→          wonum: 'WO-2026-FULL',
+   296→          status: 'COMP',
+   297→          changedate: new Date().toISOString(),
+   298→          siteid: 'METRO',
+   299→          assetnum: 'TRN001',
+   300→          actstart: new Date().toISOString(),
+   301→          actfinish: new Date().toISOString(),
+   302→          actlabhrs: 8.5,
+   303→          mms_schedule_id: '550e8400-e29b-41d4-a716-446655440000',
+   304→        }),
+   305→      });
+   306→      expect(res.status).toBe(200);
+   307→
+   308→      const body = await res.json();
+   309→      expect(body.success).toBe(true);
+   310→    });
+   311→
+   312→    test('should accept all valid Maximo status values (integration)', async () => {
+   313→      if (!databaseAvailable) {
+   314→        console.log('Skipping integration test: database not available');
+   315→        return;
+   316→      }
+   317→
+   318→      const validStatuses = ['WAPPR', 'APPR', 'INPRG', 'COMP', 'CLOSE', 'CAN'];
+   319→
+   320→      for (const status of validStatuses) {
+   321→        const res = await app.request('/integration/webhooks/maximo', {
+   322→          method: 'POST',
+   323→          headers: { 'Content-Type': 'application/json' },
+   324→          body: JSON.stringify({
+   325→            event: 'wo_status_changed',
+   326→            wonum: `WO-${status}-TEST`,
+   327→            status,
+   328→            changedate: new Date().toISOString(),
+   329→          }),
+   330→        });
+   331→        expect(res.status).toBe(200);
+   332→      }
+   333→    });
+   334→  });
+   335→
+   336→  // ===========================================================================
+   337→  // Sync Stats Endpoint
+   338→  // ===========================================================================
+   339→
+   340→  describe('GET /integration/sync/stats', () => {
+   341→    test('should return sync statistics (integration)', async () => {
+   342→      if (!databaseAvailable) {
+   343→        console.log('Skipping integration test: database not available');
+   344→        return;
+   345→      }
+   346→
+   347→      const res = await app.request('/integration/sync/stats');
+   348→      expect(res.status).toBeLessThanOrEqual(500);
+   349→
+   350→      if (res.status === 200) {
+   351→        const body = await res.json();
+   352→        expect(body.success).toBe(true);
+   353→        expect(body.data).toHaveProperty('pendingRecords');
+   354→        expect(body.data).toHaveProperty('syncedRecords');
+   355→        expect(body.data).toHaveProperty('conflictRecords');
+   356→        expect(body.data).toHaveProperty('errorRecords');
+   357→        expect(body.data).toHaveProperty('totalRecords');
+   358→        expect(body.data).toHaveProperty('circuitBreakerState');
+   359→        expect(body.data).toHaveProperty('isHealthy');
+   360→      }
+   361→    });
+   362→  });
+   363→
+   364→  // ===========================================================================
+   365→  // Sync Operations
+   366→  // ===========================================================================
+   367→
+   368→  describe('POST /integration/sync/push', () => {
+   369→    test('should trigger push sync (integration)', async () => {
+   370→      if (!databaseAvailable) {
+   371→        console.log('Skipping integration test: database not available');
+   372→        return;
+   373→      }
+   374→
+   375→      const res = await app.request('/integration/sync/push', {
+   376→        method: 'POST',
+   377→      });
+   378→      expect(res.status).toBeLessThanOrEqual(500);
+   379→
+   380→      if (res.status === 200) {
+   381→        const body = await res.json();
+   382→        expect(body.success).toBe(true);
+   383→        expect(body.data.operation).toBe('push');
+   384→        expect(body.data).toHaveProperty('pushed');
+   385→        expect(body.data).toHaveProperty('errors');
+   386→      }
+   387→    });
+   388→  });
+   389→
+   390→  describe('POST /integration/sync/pull', () => {
+   391→    test('should trigger pull sync (integration)', async () => {
+   392→      if (!databaseAvailable) {
+   393→        console.log('Skipping integration test: database not available');
+   394→        return;
+   395→      }
+   396→
+   397→      const res = await app.request('/integration/sync/pull', {
+   398→        method: 'POST',
+   399→      });
+   400→      expect(res.status).toBeLessThanOrEqual(500);
+   401→
+   402→      if (res.status === 200) {
+   403→        const body = await res.json();
+   404→        expect(body.success).toBe(true);
+   405→        expect(body.data.operation).toBe('pull');
+   406→        expect(body.data).toHaveProperty('processed');
+   407→        expect(body.data).toHaveProperty('updated');
+   408→        expect(body.data).toHaveProperty('conflicts');
+   409→        expect(body.data).toHaveProperty('errors');
+   410→      }
+   411→    });
+   412→  });
+   413→
+   414→  describe('POST /integration/sync/full', () => {
+   415→    test('should trigger full bidirectional sync (integration)', async () => {
+   416→      if (!databaseAvailable) {
+   417→        console.log('Skipping integration test: database not available');
+   418→        return;
+   419→      }
+   420→
+   421→      const res = await app.request('/integration/sync/full', {
+   422→        method: 'POST',
+   423→      });
+   424→      expect(res.status).toBeLessThanOrEqual(500);
+   425→
+   426→      if (res.status === 200) {
+   427→        const body = await res.json();
+   428→        expect(body.success).toBe(true);
+   429→        expect(body.data.operation).toBe('full');
+   430→        expect(body.data).toHaveProperty('push');
+   431→        expect(body.data).toHaveProperty('pull');
+   432→        expect(body.data.push).toHaveProperty('pushed');
+   433→        expect(body.data.pull).toHaveProperty('processed');
+   434→      }
+   435→    });
+   436→  });
+   437→
+   438→  // ===========================================================================
+   439→  // Conflict Management
+   440→  // ===========================================================================
+   441→
+   442→  describe('GET /integration/conflicts', () => {
+   443→    test('should list conflicts (integration)', async () => {
+   444→      if (!databaseAvailable) {
+   445→        console.log('Skipping integration test: database not available');
+   446→        return;
+   447→      }
+   448→
+   449→      const res = await app.request('/integration/conflicts');
+   450→      expect(res.status).toBeLessThanOrEqual(500);
+   451→
+   452→      if (res.status === 200) {
+   453→        const body = await res.json();
+   454→        expect(body.success).toBe(true);
+   455→        expect(Array.isArray(body.data)).toBe(true);
+   456→        expect(body.meta).toHaveProperty('pagination');
+   457→      }
+   458→    });
+   459→
+   460→    test('should accept pagination parameters (integration)', async () => {
+   461→      if (!databaseAvailable) {
+   462→        console.log('Skipping integration test: database not available');
+   463→        return;
+   464→      }
+   465→
+   466→      const res = await app.request('/integration/conflicts?page=1&pageSize=10');
+   467→      expect(res.status).toBeLessThanOrEqual(500);
+   468→    });
+   469→  });
+   470→
+   471→  describe('GET /integration/conflicts/:id', () => {
+   472→    test('should reject invalid UUID format', async () => {
+   473→      const res = await app.request('/integration/conflicts/not-a-uuid');
+   474→      expect(res.status).toBe(400);
+   475→
+   476→      const body = await res.json();
+   477→      expect(body.success).toBe(false);
+   478→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   479→    });
+   480→
+   481→    test('should return 404 for non-existent conflict (integration)', async () => {
+   482→      if (!databaseAvailable) {
+   483→        console.log('Skipping integration test: database not available');
+   484→        return;
+   485→      }
+   486→
+   487→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   488→      const res = await app.request(`/integration/conflicts/${validUuid}`);
+   489→      expect(res.status).toBe(404);
+   490→
+   491→      const body = await res.json();
+   492→      expect(body.success).toBe(false);
+   493→      expect(body.error.code).toBe('NOT_FOUND');
+   494→    });
+   495→  });
+   496→
+   497→  describe('POST /integration/conflicts/:id/resolve', () => {
+   498→    test('should reject invalid UUID format', async () => {
+   499→      const res = await app.request('/integration/conflicts/not-a-uuid/resolve', {
+   500→        method: 'POST',
+   501→        headers: { 'Content-Type': 'application/json' },
+   502→        body: JSON.stringify({ resolution: 'USE_MMS' }),
+   503→      });
+   504→      expect(res.status).toBe(400);
+   505→
+   506→      const body = await res.json();
+   507→      expect(body.success).toBe(false);
+   508→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   509→    });
+   510→
+   511→    test('should reject invalid resolution value', async () => {
+   512→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   513→      const res = await app.request(`/integration/conflicts/${validUuid}/resolve`, {
+   514→        method: 'POST',
+   515→        headers: { 'Content-Type': 'application/json' },
+   516→        body: JSON.stringify({ resolution: 'INVALID' }),
+   517→      });
+   518→      expect(res.status).toBe(400);
+   519→
+   520→      const body = await res.json();
+   521→      expect(body.success).toBe(false);
+   522→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   523→      expect(body.error.message).toContain('USE_MMS');
+   524→    });
+   525→
+   526→    test('should reject missing resolution', async () => {
+   527→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   528→      const res = await app.request(`/integration/conflicts/${validUuid}/resolve`, {
+   529→        method: 'POST',
+   530→        headers: { 'Content-Type': 'application/json' },
+   531→        body: JSON.stringify({}),
+   532→      });
+   533→      expect(res.status).toBe(400);
+   534→
+   535→      const body = await res.json();
+   536→      expect(body.success).toBe(false);
+   537→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   538→    });
+   539→
+   540→    test('should return 404 for non-existent conflict (integration)', async () => {
+   541→      if (!databaseAvailable) {
+   542→        console.log('Skipping integration test: database not available');
+   543→        return;
+   544→      }
+   545→
+   546→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   547→      const res = await app.request(`/integration/conflicts/${validUuid}/resolve`, {
+   548→        method: 'POST',
+   549→        headers: { 'Content-Type': 'application/json' },
+   550→        body: JSON.stringify({ resolution: 'USE_MMS' }),
+   551→      });
+   552→      // Should be 404 since the conflict doesn't exist
+   553→      expect(res.status).toBe(404);
+   554→    });
+   555→  });
+   556→
+   557→  // ===========================================================================
+   558→  // Shadow Records
+   559→  // ===========================================================================
+   560→
+   561→  describe('GET /integration/shadow-records', () => {
+   562→    test('should list shadow records (integration)', async () => {
+   563→      if (!databaseAvailable) {
+   564→        console.log('Skipping integration test: database not available');
+   565→        return;
+   566→      }
+   567→
+   568→      const res = await app.request('/integration/shadow-records');
+   569→      expect(res.status).toBeLessThanOrEqual(500);
+   570→
+   571→      if (res.status === 200) {
+   572→        const body = await res.json();
+   573→        expect(body.success).toBe(true);
+   574→        expect(Array.isArray(body.data)).toBe(true);
+   575→        expect(body.meta).toHaveProperty('pagination');
+   576→      }
+   577→    });
+   578→
+   579→    test('should accept syncStatus filter (integration)', async () => {
+   580→      if (!databaseAvailable) {
+   581→        console.log('Skipping integration test: database not available');
+   582→        return;
+   583→      }
+   584→
+   585→      const res = await app.request('/integration/shadow-records?syncStatus=PENDING');
+   586→      expect(res.status).toBeLessThanOrEqual(500);
+   587→    });
+   588→
+   589→    test('should reject invalid syncStatus filter', async () => {
+   590→      const res = await app.request('/integration/shadow-records?syncStatus=INVALID');
+   591→      expect(res.status).toBe(400);
+   592→
+   593→      const body = await res.json();
+   594→      expect(body.success).toBe(false);
+   595→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   596→    });
+   597→
+   598→    test('should reject invalid pmScheduleId format', async () => {
+   599→      const res = await app.request('/integration/shadow-records?pmScheduleId=not-a-uuid');
+   600→      expect(res.status).toBe(400);
+   601→
+   602→      const body = await res.json();
+   603→      expect(body.success).toBe(false);
+   604→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   605→    });
+   606→
+   607→    test('should accept valid pmScheduleId filter (integration)', async () => {
+   608→      if (!databaseAvailable) {
+   609→        console.log('Skipping integration test: database not available');
+   610→        return;
+   611→      }
+   612→
+   613→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   614→      const res = await app.request(`/integration/shadow-records?pmScheduleId=${validUuid}`);
+   615→      expect(res.status).toBeLessThanOrEqual(500);
+   616→    });
+   617→
+   618→    test('should accept maximoWoNum filter (integration)', async () => {
+   619→      if (!databaseAvailable) {
+   620→        console.log('Skipping integration test: database not available');
+   621→        return;
+   622→      }
+   623→
+   624→      const res = await app.request('/integration/shadow-records?maximoWoNum=WO-2026-TEST');
+   625→      expect(res.status).toBeLessThanOrEqual(500);
+   626→    });
+   627→
+   628→    test('should accept needsSync filter (integration)', async () => {
+   629→      if (!databaseAvailable) {
+   630→        console.log('Skipping integration test: database not available');
+   631→        return;
+   632→      }
+   633→
+   634→      const res = await app.request('/integration/shadow-records?needsSync=true');
+   635→      expect(res.status).toBeLessThanOrEqual(500);
+   636→    });
+   637→
+   638→    test('should accept all valid syncStatus values', async () => {
+   639→      if (!databaseAvailable) {
+   640→        console.log('Skipping integration test: database not available');
+   641→        return;
+   642→      }
+   643→
+   644→      const validStatuses = ['PENDING', 'SYNCED', 'CONFLICT', 'ERROR'];
+   645→      for (const status of validStatuses) {
+   646→        const res = await app.request(`/integration/shadow-records?syncStatus=${status}`);
+   647→        expect(res.status).toBeLessThanOrEqual(500);
+   648→      }
+   649→    });
+   650→  });
+   651→
+   652→  describe('POST /integration/shadow-records', () => {
+   653→    test('should reject invalid JSON body', async () => {
+   654→      const res = await app.request('/integration/shadow-records', {
+   655→        method: 'POST',
+   656→        headers: { 'Content-Type': 'application/json' },
+   657→        body: 'not-json',
+   658→      });
+   659→      expect(res.status).toBe(400);
+   660→
+   661→      const body = await res.json();
+   662→      expect(body.success).toBe(false);
+   663→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   664→    });
+   665→
+   666→    test('should reject missing pmScheduleId', async () => {
+   667→      const res = await app.request('/integration/shadow-records', {
+   668→        method: 'POST',
+   669→        headers: { 'Content-Type': 'application/json' },
+   670→        body: JSON.stringify({}),
+   671→      });
+   672→      expect(res.status).toBe(400);
+   673→
+   674→      const body = await res.json();
+   675→      expect(body.success).toBe(false);
+   676→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   677→    });
+   678→
+   679→    test('should reject invalid pmScheduleId format', async () => {
+   680→      const res = await app.request('/integration/shadow-records', {
+   681→        method: 'POST',
+   682→        headers: { 'Content-Type': 'application/json' },
+   683→        body: JSON.stringify({ pmScheduleId: 'not-a-uuid' }),
+   684→      });
+   685→      expect(res.status).toBe(400);
+   686→
+   687→      const body = await res.json();
+   688→      expect(body.success).toBe(false);
+   689→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   690→    });
+   691→
+   692→    test('should return 404 for non-existent PM (integration)', async () => {
+   693→      if (!databaseAvailable) {
+   694→        console.log('Skipping integration test: database not available');
+   695→        return;
+   696→      }
+   697→
+   698→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   699→      const res = await app.request('/integration/shadow-records', {
+   700→        method: 'POST',
+   701→        headers: { 'Content-Type': 'application/json' },
+   702→        body: JSON.stringify({ pmScheduleId: validUuid }),
+   703→      });
+   704→      expect(res.status).toBe(404);
+   705→
+   706→      const body = await res.json();
+   707→      expect(body.success).toBe(false);
+   708→      expect(body.error.code).toBe('NOT_FOUND');
+   709→    });
+   710→  });
+   711→
+   712→  describe('POST /integration/shadow-records/:id/push', () => {
+   713→    test('should reject invalid UUID format', async () => {
+   714→      const res = await app.request('/integration/shadow-records/not-a-uuid/push', {
+   715→        method: 'POST',
+   716→      });
+   717→      expect(res.status).toBe(400);
+   718→
+   719→      const body = await res.json();
+   720→      expect(body.success).toBe(false);
+   721→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   722→    });
+   723→
+   724→    test('should return 404 for non-existent shadow record (integration)', async () => {
+   725→      if (!databaseAvailable) {
+   726→        console.log('Skipping integration test: database not available');
+   727→        return;
+   728→      }
+   729→
+   730→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   731→      const res = await app.request(`/integration/shadow-records/${validUuid}/push`, {
+   732→        method: 'POST',
+   733→      });
+   734→      expect(res.status).toBe(404);
+   735→
+   736→      const body = await res.json();
+   737→      expect(body.success).toBe(false);
+   738→      expect(body.error.code).toBe('NOT_FOUND');
+   739→    });
+   740→  });
+   741→
+   742→  // ===========================================================================
+   743→  // Edit Validation
+   744→  // ===========================================================================
+   745→
+   746→  describe('POST /integration/validate-edit', () => {
+   747→    test('should reject invalid JSON body', async () => {
+   748→      const res = await app.request('/integration/validate-edit', {
+   749→        method: 'POST',
+   750→        headers: { 'Content-Type': 'application/json' },
+   751→        body: 'not-json',
+   752→      });
+   753→      expect(res.status).toBe(400);
+   754→
+   755→      const body = await res.json();
+   756→      expect(body.success).toBe(false);
+   757→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   758→    });
+   759→
+   760→    test('should reject missing pmScheduleId', async () => {
+   761→      const res = await app.request('/integration/validate-edit', {
+   762→        method: 'POST',
+   763→        headers: { 'Content-Type': 'application/json' },
+   764→        body: JSON.stringify({}),
+   765→      });
+   766→      expect(res.status).toBe(400);
+   767→
+   768→      const body = await res.json();
+   769→      expect(body.success).toBe(false);
+   770→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   771→    });
+   772→
+   773→    test('should reject invalid pmScheduleId format', async () => {
+   774→      const res = await app.request('/integration/validate-edit', {
+   775→        method: 'POST',
+   776→        headers: { 'Content-Type': 'application/json' },
+   777→        body: JSON.stringify({ pmScheduleId: 'not-a-uuid' }),
+   778→      });
+   779→      expect(res.status).toBe(400);
+   780→
+   781→      const body = await res.json();
+   782→      expect(body.success).toBe(false);
+   783→      expect(body.error.code).toBe('VALIDATION_ERROR');
+   784→    });
+   785→
+   786→    test('should return 404 for non-existent PM (integration)', async () => {
+   787→      if (!databaseAvailable) {
+   788→        console.log('Skipping integration test: database not available');
+   789→        return;
+   790→      }
+   791→
+   792→      const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+   793→      const res = await app.request('/integration/validate-edit', {
+   794→        method: 'POST',
+   795→        headers: { 'Content-Type': 'application/json' },
+   796→        body: JSON.stringify({ pmScheduleId: validUuid }),
+   797→      });
+   798→      expect(res.status).toBe(404);
+   799→
+   800→      const body = await res.json();
+   801→      expect(body.success).toBe(false);
+   802→      expect(body.error.code).toBe('NOT_FOUND');
+   803→    });
+   804→  });
+   805→
+   806→  // ===========================================================================
+   807→  // Response Format Validation
+   808→  // ===========================================================================
+   809→
+   810→  describe('Response Format (per spec 005)', () => {
+   811→    test('webhook success response should follow standard format (integration)', async () => {
+   812→      if (!databaseAvailable) {
+   813→        console.log('Skipping integration test: database not available');
+   814→        return;
+   815→      }
+   816→
+   817→      const res = await app.request('/integration/webhooks/maximo', {
+   818→        method: 'POST',
+   819→        headers: { 'Content-Type': 'application/json' },
+   820→        body: JSON.stringify({
+   821→          event: 'wo_status_changed',
+   822→          wonum: 'WO-FORMAT-TEST',
+   823→          status: 'APPR',
+   824→          changedate: new Date().toISOString(),
+   825→        }),
+   826→      });
+   827→
+   828→      const body = await res.json();
+   829→      expect(body).toHaveProperty('success');
+   830→      if (body.success) {
+   831→        expect(body).toHaveProperty('data');
+   832→        expect(body.data).toHaveProperty('received');
+   833→        expect(body.data).toHaveProperty('wonum');
+   834→      }
+   835→    });
+   836→
+   837→    test('webhook error response should follow standard format', async () => {
+   838→      const res = await app.request('/integration/webhooks/maximo', {
+   839→        method: 'POST',
+   840→        headers: { 'Content-Type': 'application/json' },
+   841→        body: JSON.stringify({ invalid: 'payload' }),
+   842→      });
+   843→
+   844→      const body = await res.json();
+   845→      expect(body.success).toBe(false);
+   846→      expect(body).toHaveProperty('error');
+   847→      expect(body.error).toHaveProperty('code');
+   848→      expect(body.error).toHaveProperty('message');
+   849→      expect(body.error).toHaveProperty('requestId');
+   850→    });
+   851→  });
+   852→});
+   853→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,233 @@
+     1→/**
+     2→ * MMS Man-hour Planning Tables
+     3→ *
+     4→ * Workforce capacity planning and workload leveling.
+     5→ * Used to balance maintenance workload across time periods
+     6→ * and prevent overloading/underutilization of depot resources.
+     7→ *
+     8→ * Leveling strategies (priority order):
+     9→ * 1. ADVANCE_PM (1.1x cost, LOW risk)
+    10→ * 2. DEFER_PM (1.05x cost, LOW risk)
+    11→ * 3. ADD_OVERTIME (1.5x cost, NO risk)
+    12→ * 4. CROSS_DEPOT (1.3x cost, MEDIUM risk)
+    13→ * 5. ADD_CONTRACTOR (2.0x cost, MEDIUM risk)
+    14→ * 6. MANUAL_REVIEW (flagged for high unresolvable overload)
+    15→ *
+    16→ * @see specs/003-database-schema.md Section 3.7
+    17→ */
+    18→
+    19→import { relations, sql } from 'drizzle-orm';
+    20→import {
+    21→  boolean,
+    22→  date,
+    23→  decimal,
+    24→  index,
+    25→  integer,
+    26→  pgTable,
+    27→  text,
+    28→  timestamp,
+    29→  uniqueIndex,
+    30→  uuid,
+    31→  varchar,
+    32→} from 'drizzle-orm/pg-core';
+    33→import { depots } from './core-fleet';
+    34→import { adjustmentStatusEnum } from './enums';
+    35→import { users } from './users';
+    36→
+    37→/**
+    38→ * Man-hour Capacity - Resource availability by depot
+    39→ *
+    40→ * Defines the workforce capacity for each depot by shift type.
+    41→ * Includes utilization targets to guide leveling decisions.
+    42→ */
+    43→export const manhourCapacity = pgTable(
+    44→  'manhour_capacity',
+    45→  {
+    46→    id: uuid('id').primaryKey().defaultRandom(),
+    47→    depotId: uuid('depot_id')
+    48→      .notNull()
+    49→      .references(() => depots.id),
+    50→    effectiveFrom: date('effective_from').notNull(),
+    51→    effectiveTo: date('effective_to'),
+    52→
+    53→    // Base capacity per shift type (hours per week)
+    54→    dayShiftHours: decimal('day_shift_hours', { precision: 8, scale: 2 }).notNull(),
+    55→    nightShiftHours: decimal('night_shift_hours', { precision: 8, scale: 2 }).default('0'),
+    56→    weekendHours: decimal('weekend_hours', { precision: 8, scale: 2 }).default('0'),
+    57→
+    58→    // Staff counts
+    59→    techniciansDay: integer('technicians_day').notNull(),
+    60→    techniciansNight: integer('technicians_night').default(0),
+    61→    specialists: integer('specialists').default(0),
+    62→
+    63→    // Utilization targets
+    64→    maxOvertimePct: decimal('max_overtime_pct', { precision: 5, scale: 2 }).default('20.0'),
+    65→    minUtilizationPct: decimal('min_utilization_pct', { precision: 5, scale: 2 }).default('70.0'),
+    66→    targetUtilizationPct: decimal('target_utilization_pct', { precision: 5, scale: 2 }).default(
+    67→      '85.0'
+    68→    ),
+    69→
+    70→    notes: text('notes'),
+    71→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    72→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+    73→  },
+    74→  (table) => [
+    75→    uniqueIndex('idx_manhour_cap_depot_date').on(table.depotId, table.effectiveFrom),
+    76→    index('idx_manhour_cap_depot').on(table.depotId),
+    77→  ]
+    78→);
+    79→
+    80→/**
+    81→ * Man-hour Projections - Generated workload forecasts
+    82→ *
+    83→ * Created by the leveling engine to show required vs. available hours.
+    84→ * Used for capacity planning and overload detection.
+    85→ */
+    86→export const manhourProjections = pgTable(
+    87→  'manhour_projections',
+    88→  {
+    89→    id: uuid('id').primaryKey().defaultRandom(),
+    90→    projectionRunId: uuid('projection_run_id').notNull(),
+    91→    depotId: uuid('depot_id')
+    92→      .notNull()
+    93→      .references(() => depots.id),
+    94→
+    95→    periodStart: date('period_start').notNull(),
+    96→    periodEnd: date('period_end').notNull(),
+    97→    granularity: varchar('granularity', { length: 20 }).notNull(), // 'WEEKLY', 'MONTHLY'
+    98→
+    99→    // Required hours breakdown
+   100→    requiredPmHours: decimal('required_pm_hours', { precision: 10, scale: 2 }).notNull(),
+   101→    requiredCorrectiveHours: decimal('required_corrective_hours', {
+   102→      precision: 10,
+   103→      scale: 2,
+   104→    }).default('0'),
+   105→    requiredOverhaulHours: decimal('required_overhaul_hours', {
+   106→      precision: 10,
+   107→      scale: 2,
+   108→    }).default('0'),
+   109→    requiredTotalHours: decimal('required_total_hours', { precision: 10, scale: 2 }).notNull(),
+   110→
+   111→    // Available hours
+   112→    availableRegularHours: decimal('available_regular_hours', {
+   113→      precision: 10,
+   114→      scale: 2,
+   115→    }).notNull(),
+   116→    availableOvertimeHours: decimal('available_overtime_hours', {
+   117→      precision: 10,
+   118→      scale: 2,
+   119→    }).notNull(),
+   120→    availableTotalHours: decimal('available_total_hours', { precision: 10, scale: 2 }).notNull(),
+   121→
+   122→    // Generated columns: computed metrics for workload analysis
+   123→    varianceHours: decimal('variance_hours', { precision: 10, scale: 2 }).generatedAlwaysAs(
+   124→      sql`available_total_hours - required_total_hours`
+   125→    ),
+   126→    utilizationPct: decimal('utilization_pct', { precision: 5, scale: 2 }).generatedAlwaysAs(
+   127→      sql`CASE WHEN available_total_hours > 0 THEN (required_total_hours / available_total_hours * 100) ELSE 0 END`
+   128→    ),
+   129→    isOverloaded: boolean('is_overloaded').generatedAlwaysAs(
+   130→      sql`required_total_hours > available_total_hours`
+   131→    ),
+   132→    isUnderutilized: boolean('is_underutilized').generatedAlwaysAs(
+   133→      sql`required_total_hours < available_total_hours * 0.7`
+   134→    ),
+   135→
+   136→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   137→  },
+   138→  (table) => [
+   139→    index('idx_manhour_proj_depot').on(table.depotId, table.periodStart),
+   140→    index('idx_manhour_proj_run').on(table.projectionRunId),
+   141→  ]
+   142→);
+   143→
+   144→/**
+   145→ * Man-hour Adjustments - Proposed workload changes
+   146→ *
+   147→ * Leveling engine suggestions to balance workload.
+   148→ * Requires approval workflow before being applied.
+   149→ */
+   150→export const manhourAdjustments = pgTable(
+   151→  'manhour_adjustments',
+   152→  {
+   153→    id: uuid('id').primaryKey().defaultRandom(),
+   154→    projectionId: uuid('projection_id')
+   155→      .notNull()
+   156→      .references(() => manhourProjections.id),
+   157→
+   158→    adjustmentType: varchar('adjustment_type', { length: 50 }).notNull(),
+   159→    // 'ADD_OVERTIME', 'DEFER_PM', 'ADVANCE_PM', 'CROSS_DEPOT', 'ADD_CONTRACTOR'
+   160→
+   161→    sourcePeriodStart: date('source_period_start'),
+   162→    sourcePeriodEnd: date('source_period_end'),
+   163→    targetPeriodStart: date('target_period_start'),
+   164→    targetPeriodEnd: date('target_period_end'),
+   165→    hoursAdjusted: decimal('hours_adjusted', { precision: 10, scale: 2 }).notNull(),
+   166→
+   167→    affectedPmIds: text('affected_pm_ids').array().default([]),
+   168→    affectedTrainIds: text('affected_train_ids').array().default([]),
+   169→
+   170→    // Impact assessment
+   171→    costImpact: decimal('cost_impact', { precision: 12, scale: 2 }),
+   172→    riskImpact: varchar('risk_impact', { length: 20 }), // 'NONE', 'LOW', 'MEDIUM', 'HIGH'
+   173→    riskDescription: text('risk_description'),
+   174→
+   175→    // Workflow
+   176→    status: adjustmentStatusEnum('status').default('PROPOSED'),
+   177→    proposedBy: uuid('proposed_by').references(() => users.id),
+   178→    proposedAt: timestamp('proposed_at', { withTimezone: true }).defaultNow(),
+   179→    approvedBy: uuid('approved_by').references(() => users.id),
+   180→    approvedAt: timestamp('approved_at', { withTimezone: true }),
+   181→    rejectionReason: text('rejection_reason'),
+   182→
+   183→    // Explanation
+   184→    reason: text('reason').notNull(),
+   185→
+   186→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   187→  },
+   188→  (table) => [
+   189→    index('idx_manhour_adj_projection').on(table.projectionId),
+   190→    index('idx_manhour_adj_status').on(table.status),
+   191→  ]
+   192→);
+   193→
+   194→// ============================================================================
+   195→// Relations
+   196→// ============================================================================
+   197→
+   198→export const manhourCapacityRelations = relations(manhourCapacity, ({ one }) => ({
+   199→  depot: one(depots, {
+   200→    fields: [manhourCapacity.depotId],
+   201→    references: [depots.id],
+   202→  }),
+   203→}));
+   204→
+   205→export const manhourProjectionsRelations = relations(manhourProjections, ({ one, many }) => ({
+   206→  depot: one(depots, {
+   207→    fields: [manhourProjections.depotId],
+   208→    references: [depots.id],
+   209→  }),
+   210→  adjustments: many(manhourAdjustments),
+   211→}));
+   212→
+   213→export const manhourAdjustmentsRelations = relations(manhourAdjustments, ({ one }) => ({
+   214→  projection: one(manhourProjections, {
+   215→    fields: [manhourAdjustments.projectionId],
+   216→    references: [manhourProjections.id],
+   217→  }),
+   218→  proposedByUser: one(users, {
+   219→    fields: [manhourAdjustments.proposedBy],
+   220→    references: [users.id],
+   221→    relationName: 'proposedBy',
+   222→  }),
+   223→  approvedByUser: one(users, {
+   224→    fields: [manhourAdjustments.approvedBy],
+   225→    references: [users.id],
+   226→    relationName: 'approvedBy',
+   227→  }),
+   228→}));
+   229→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

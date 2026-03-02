@@ -1,0 +1,504 @@
+  2500→        lastDate = addDays(currentDate, -daysAgo);
+  2501→      } else {
+  2502→        // Train hasn't completed first cycle yet - use commissioning as baseline
+  2503→        lastMileage = 0;
+  2504→        lastDate = train.commissioningDate;
+  2505→      }
+  2506→    }
+  2507→    
+  2508→    // 4. Calculate mileage-based due date
+  2509→    const kmSinceLast = currentMileage - lastMileage;
+  2510→    const kmRemaining = Math.max(0, targetRule.intervalKm - kmSinceLast);
+  2511→    const daysUntilMileageDue = kmRemaining / dailyKm;
+  2512→    const dateByMileage = addDays(currentDate, daysUntilMileageDue);
+  2513→    const mileageAtDue = currentMileage + kmRemaining;
+  2514→    
+  2515→    // 5. Calculate time-based due date (if interval defined)
+  2516→    let dateByTime: Date | null = null;
+  2517→    if (targetRule.intervalMonths) {
+  2518→      dateByTime = addMonths(lastDate, targetRule.intervalMonths);
+  2519→    }
+  2520→    
+  2521→    // 6. Return whichever comes first (dual trigger)
+  2522→    if (dateByTime && dateByTime < dateByMileage) {
+  2523→      const daysUntilTime = differenceInDays(dateByTime, currentDate);
+  2524→      const mileageAtTime = currentMileage + (Math.max(0, daysUntilTime) * dailyKm);
+  2525→      return { date: dateByTime, mileage: mileageAtTime, trigger: 'TIME' };
+  2526→    } else {
+  2527→      return { date: dateByMileage, mileage: mileageAtDue, trigger: 'MILEAGE' };
+  2528→    }
+  2529→  }
+  2530→  
+  2531→  /**
+  2532→   * Find all PM codes that satisfy a target PM code.
+  2533→   * Returns the target itself plus any higher-level PMs that include it in satisfiesCodes.
+  2534→   * 
+  2535→   * Example: For C2, returns ['C2', 'C3', 'C4', 'OH'] because C3/C4/OH all satisfy C2.
+  2536→   */
+  2537→  private getSatisfyingCodes(targetCode: string, allRules: PMType[]): string[] {
+  2538→    const result = [targetCode];
+  2539→    
+  2540→    for (const rule of allRules) {
+  2541→      if (rule.satisfiesCodes?.includes(targetCode)) {
+  2542→        result.push(rule.pmCode);
+  2543→      }
+  2544→    }
+  2545→    
+  2546→    return result;
+  2547→  }
+  2548→  
+  2549→  /**
+  2550→   * Calculate daily mileage rate for a train.
+  2551→   * Uses recent velocity (between last 2 PMs) if available for accuracy,
+  2552→   * falls back to lifetime average from commissioning date.
+  2553→   */
+  2554→  private calculateDailyUtilization(train: Train, history: PMHistory[]): number {
+  2555→    // Filter valid entries (positive mileage)
+  2556→    const validHistory = history
+  2557→      .filter(h => h.mileageAtCompletion > 0)
+  2558→      .sort((a, b) => new Date(b.completionDate).getTime() - new Date(a.completionDate).getTime());
+  2559→    
+  2560→    // Try: Recent velocity between last 2 PMs (most accurate)
+  2561→    if (validHistory.length >= 2) {
+  2562→      const recent = validHistory[0];
+  2563→      const previous = validHistory[1];
+  2564→      const daysBetween = differenceInDays(
+  2565→        new Date(recent.completionDate),
+  2566→        new Date(previous.completionDate)
+  2567→      );
+  2568→      const kmBetween = recent.mileageAtCompletion - previous.mileageAtCompletion;
+  2569→      
+  2570→      // Sanity checks: at least 14 days apart, positive mileage, reasonable rate
+  2571→      if (daysBetween >= 14 && kmBetween > 0) {
+  2572→        const rate = kmBetween / daysBetween;
+  2573→        // Typical metro range: 50-500 km/day
+  2574→        if (rate > 50 && rate < 500) {
+  2575→          return rate;
+  2576→        }
+  2577→      }
+  2578→    }
+  2579→    
+  2580→    // Fallback: Lifetime average from commissioning
+  2581→    const daysSinceCommission = differenceInDays(new Date(), train.commissioningDate);
+  2582→    if (daysSinceCommission > 0 && train.currentMileageKm > 0) {
+  2583→      return train.currentMileageKm / daysSinceCommission;
+  2584→    }
+  2585→    
+  2586→    // Last resort: Fleet typical value
+  2587→    return 150;  // Conservative metro average
+  2588→  }
+  2589→  
+  2590→  private async runGeneticAlgorithm(
+  2591→    requirements: PMRequirement[],
+  2592→    envelopes: ConstraintEnvelope[]
+  2593→  ): Promise<StrategicAllocation[]> {
+  2594→    // Initialize population
+  2595→    let population = this.initializePopulation(requirements, envelopes);
+  2596→    
+  2597→    for (let gen = 0; gen < this.config.generations; gen++) {
+  2598→      // Evaluate fitness
+  2599→      const fitness = population.map(individual => 
+  2600→        this.evaluateFitness(individual, envelopes)
+  2601→      );
+  2602→      
+  2603→      // Selection
+  2604→      const selected = this.tournamentSelection(population, fitness);
+  2605→      
+  2606→      // Crossover
+  2607→      const offspring = this.crossover(selected);
+  2608→      
+  2609→      // Mutation
+  2610→      const mutated = this.mutate(offspring, envelopes);
+  2611→      
+  2612→      // Elitism
+  2613→      const elite = this.selectElite(population, fitness);
+  2614→      
+  2615→      // New population
+  2616→      population = [...elite, ...mutated];
+  2617→      
+  2618→      // Progress
+  2619→      if (gen % 50 === 0) {
+  2620→        const bestFitness = Math.max(...fitness);
+  2621→        this.emitProgress(gen, this.config.generations, bestFitness);
+  2622→      }
+  2623→    }
+  2624→    
+  2625→    // Return best individual
+  2626→    const finalFitness = population.map(i => 
+  2627→      this.evaluateFitness(i, envelopes)
+  2628→    );
+  2629→    const bestIndex = finalFitness.indexOf(Math.max(...finalFitness));
+  2630→    
+  2631→    return population[bestIndex];
+  2632→  }
+  2633→  
+  2634→  private evaluateFitness(
+  2635→    individual: StrategicAllocation[],
+  2636→    envelopes: ConstraintEnvelope[]
+  2637→  ): number {
+  2638→    let fitness = 1000;  // Start with base score
+  2639→    
+  2640→    // Penalty for constraint envelope violations
+  2641→    for (const envelope of envelopes) {
+  2642→      const quarterAllocations = individual.filter(
+  2643→        a => a.targetQuarter === this.quarterKey(envelope.period)
+  2644→      );
+  2645→      
+  2646→      // Track capacity check
+  2647→      const trackHours = this.sumByTrackType(quarterAllocations);
+  2648→      for (const [trackType, hours] of Object.entries(trackHours)) {
+  2649→        const available = envelope.track_capacity.find(
+  2650→          t => t.track_type === trackType
+  2651→        )?.available_slot_days || 0;
+  2652→        
+  2653→        if (hours > available * 8) {  // 8 hours per slot-day
+  2654→          fitness -= (hours - available * 8) * 10;  // Heavy penalty
+  2655→        }
+  2656→      }
+  2657→      
+  2658→      // Labor capacity check
+  2659→      const totalHours = quarterAllocations.reduce(
+  2660→        (sum, a) => sum + a.estimatedHours, 0
+  2661→      );
+  2662→      const availableLabor = envelope.labor_capacity.reduce(
+  2663→        (sum, l) => sum + l.available_hours, 0
+  2664→      );
+  2665→      
+  2666→      if (totalHours > availableLabor) {
+  2667→        fitness -= (totalHours - availableLabor) * 5;
+  2668→      }
+  2669→      
+  2670→      // Material capacity check (soft)
+  2671→      // ... similar logic
+  2672→    }
+  2673→    
+  2674→    // Bonus for workload leveling
+  2675→    const quarterHours = this.groupByQuarter(individual);
+  2676→    const variance = this.calculateVariance(Object.values(quarterHours));
+  2677→    fitness -= variance * 0.1;  // Prefer even distribution
+  2678→    
+  2679→    // Bonus for respecting compliance windows
+  2680→    for (const allocation of individual) {
+  2681→      const compliance = this.checkComplianceWindow(allocation);
+  2682→      if (compliance.inWindow) {
+  2683→        fitness += 5;
+  2684→      } else if (compliance.early) {
+  2685→        fitness -= 2;  // Small penalty for early
+  2686→      } else {
+  2687→        fitness -= 20;  // Large penalty for late
+  2688→      }
+  2689→    }
+  2690→    
+  2691→    return Math.max(0, fitness);
+  2692→  }
+  2693→  
+  2694→  private async generateEnvelopes(): Promise<ConstraintEnvelope[]> {
+  2695→    const envelopes: ConstraintEnvelope[] = [];
+  2696→    const startDate = new Date();
+  2697→    
+  2698→    for (let q = 0; q < this.config.horizonYears * 4; q++) {
+  2699→      const quarterStart = addMonths(startDate, q * 3);
+  2700→      const quarterEnd = addMonths(quarterStart, 3);
+  2701→      
+  2702→      const envelope = await this.constraintAggregation.generateEnvelope(
+  2703→        quarterStart,
+  2704→        quarterEnd,
+  2705→        await this.getAllDepotIds()
+  2706→      );
+  2707→      
+  2708→      envelopes.push(envelope);
+  2709→    }
+  2710→    
+  2711→    return envelopes;
+  2712→  }
+  2713→}
+  2714→```
+  2715→
+  2716→---
+  2717→
+  2718→## 4.6 Man-hour Leveling Engine
+  2719→
+  2720→### 4.6.1 Purpose
+  2721→
+  2722→Project workforce requirements and generate adjustment recommendations to balance workload across time periods.
+  2723→
+  2724→### 4.6.2 Implementation
+  2725→
+  2726→```typescript
+  2727→interface LevelingStrategy {
+  2728→  type: 'DEFER_PM' | 'ADVANCE_PM' | 'ADD_OVERTIME' | 'CROSS_DEPOT' | 'ADD_CONTRACTOR';
+  2729→  priority: number;
+  2730→  maxHoursPerWeek: number;
+  2731→  costMultiplier: number;
+  2732→  riskLevel: 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
+  2733→}
+  2734→
+  2735→const LEVELING_STRATEGIES: LevelingStrategy[] = [
+  2736→  { type: 'ADVANCE_PM', priority: 1, maxHoursPerWeek: 40, costMultiplier: 1.1, riskLevel: 'LOW' },
+  2737→  { type: 'DEFER_PM', priority: 2, maxHoursPerWeek: 40, costMultiplier: 1.05, riskLevel: 'LOW' },
+  2738→  { type: 'ADD_OVERTIME', priority: 3, maxHoursPerWeek: 80, costMultiplier: 1.5, riskLevel: 'NONE' },
+  2739→  { type: 'CROSS_DEPOT', priority: 4, maxHoursPerWeek: 60, costMultiplier: 1.3, riskLevel: 'MEDIUM' },
+  2740→  { type: 'ADD_CONTRACTOR', priority: 5, maxHoursPerWeek: 100, costMultiplier: 2.0, riskLevel: 'MEDIUM' },
+  2741→];
+  2742→
+  2743→class ManHourLevelingEngine {
+  2744→  private readonly TARGET_UTILIZATION = 0.85;
+  2745→  private readonly MIN_UTILIZATION = 0.70;
+  2746→  private readonly MAX_UTILIZATION = 1.00;
+  2747→  
+  2748→  async generateProjections(
+  2749→    horizonWeeks: number = 12,
+  2750→    depotIds?: string[]
+  2751→  ): Promise<LevelingResult> {
+  2752→    const runId = crypto.randomUUID();
+  2753→    
+  2754→    // 1. Calculate raw projections
+  2755→    const rawProjections = await this.calculateRawProjections(
+  2756→      horizonWeeks,
+  2757→      depotIds
+  2758→    );
+  2759→    
+  2760→    // 2. Identify imbalances
+  2761→    const imbalances = this.identifyImbalances(rawProjections);
+  2762→    
+  2763→    // 3. Generate adjustments using multiple strategies
+  2764→    const adjustments = await this.generateAdjustments(
+  2765→      rawProjections,
+  2766→      imbalances
+  2767→    );
+  2768→    
+  2769→    // 4. Apply adjustments to get leveled projections
+  2770→    const leveledProjections = this.applyAdjustments(
+  2771→      rawProjections,
+  2772→      adjustments
+  2773→    );
+  2774→    
+  2775→    // 5. Calculate metrics
+  2776→    const originalMetrics = this.calculateMetrics(rawProjections);
+  2777→    const leveledMetrics = this.calculateMetrics(leveledProjections);
+  2778→    
+  2779→    // 6. Persist
+  2780→    await this.persistProjections(runId, rawProjections, leveledProjections, adjustments);
+  2781→    
+  2782→    // 7. Broadcast update
+  2783→    await this.websocketHub.broadcast('manhour:updated', {
+  2784→      runId,
+  2785→      summary: { originalMetrics, leveledMetrics }
+  2786→    });
+  2787→    
+  2788→    return {
+  2789→      projectionRunId: runId,
+  2790→      generatedAt: new Date(),
+  2791→      horizonWeeks,
+  2792→      original: { projections: rawProjections, metrics: originalMetrics },
+  2793→      leveled: { projections: leveledProjections, metrics: leveledMetrics },
+  2794→      adjustments,
+  2795→      improvement: {
+  2796→        utilizationDelta: leveledMetrics.avgUtilization - originalMetrics.avgUtilization,
+  2797→        overloadedWeeksReduced: originalMetrics.overloadedWeeks - leveledMetrics.overloadedWeeks,
+  2798→        totalCostImpact: adjustments.reduce((sum, a) => sum + a.costImpact, 0)
+  2799→      }
+  2800→    };
+  2801→  }
+  2802→  
+  2803→  private async generateAdjustments(
+  2804→    projections: ManHourProjection[],
+  2805→    imbalances: Imbalance[]
+  2806→  ): Promise<ManHourAdjustment[]> {
+  2807→    const adjustments: ManHourAdjustment[] = [];
+  2808→    const byDepot = this.groupByDepot(projections);
+  2809→    
+  2810→    for (const [depotId, depotProjections] of byDepot) {
+  2811→      const overloaded = depotProjections.filter(p => p.isOverloaded);
+  2812→      const underutilized = depotProjections.filter(p => p.isUnderutilized);
+  2813→      
+  2814→      for (const overWeek of overloaded) {
+  2815→        let remainingExcess = overWeek.required.total - overWeek.available.total;
+  2816→        
+  2817→        // Try each strategy in priority order
+  2818→        for (const strategy of LEVELING_STRATEGIES) {
+  2819→          if (remainingExcess <= 0) break;
+  2820→          
+  2821→          const adjustment = await this.tryStrategy(
+  2822→            strategy,
+  2823→            overWeek,
+  2824→            underutilized,
+  2825→            depotProjections,
+  2826→            remainingExcess
+  2827→          );
+  2828→          
+  2829→          if (adjustment) {
+  2830→            adjustments.push(adjustment);
+  2831→            remainingExcess -= adjustment.hoursAdjusted;
+  2832→            
+  2833→            // Update underutilized list if we used capacity
+  2834→            if (adjustment.type === 'ADVANCE_PM' || adjustment.type === 'DEFER_PM') {
+  2835→              this.updateUnderutilizedCapacity(underutilized, adjustment);
+  2836→            }
+  2837→          }
+  2838→        }
+  2839→        
+  2840→        // If still overloaded, flag for manual review
+  2841→        if (remainingExcess > 0) {
+  2842→          adjustments.push({
+  2843→            type: 'MANUAL_REVIEW',
+  2844→            sourcePeriod: { start: overWeek.week, end: addDays(overWeek.week, 7) },
+  2845→            hoursAdjusted: 0,
+  2846→            affectedPMs: [],
+  2847→            costImpact: 0,
+  2848→            riskLevel: 'HIGH',
+  2849→            reason: `Unable to resolve ${remainingExcess.toFixed(0)}h overload - requires manual intervention`
+  2850→          });
+  2851→        }
+  2852→      }
+  2853→    }
+  2854→    
+  2855→    return adjustments;
+  2856→  }
+  2857→  
+  2858→  private async tryStrategy(
+  2859→    strategy: LevelingStrategy,
+  2860→    overloadedWeek: ManHourProjection,
+  2861→    underutilizedWeeks: ManHourProjection[],
+  2862→    allProjections: ManHourProjection[],
+  2863→    excessHours: number
+  2864→  ): Promise<ManHourAdjustment | null> {
+  2865→    const maxHours = Math.min(strategy.maxHoursPerWeek, excessHours);
+  2866→    
+  2867→    switch (strategy.type) {
+  2868→      case 'ADVANCE_PM':
+  2869→      case 'DEFER_PM': {
+  2870→        // Find candidate weeks
+  2871→        const candidates = underutilizedWeeks
+  2872→          .filter(w => {
+  2873→            const weekDiff = differenceInWeeks(w.week, overloadedWeek.week);
+  2874→            const direction = strategy.type === 'ADVANCE_PM' ? -1 : 1;
+  2875→            return weekDiff * direction > 0 && Math.abs(weekDiff) <= 4;
+  2876→          })
+  2877→          .sort((a, b) => 
+  2878→            Math.abs(differenceInWeeks(a.week, overloadedWeek.week)) -
+  2879→            Math.abs(differenceInWeeks(b.week, overloadedWeek.week))
+  2880→          );
+  2881→        
+  2882→        for (const candidate of candidates) {
+  2883→          const availableCapacity = candidate.available.total - candidate.required.total;
+  2884→          const shiftHours = Math.min(maxHours, availableCapacity * 0.8);
+  2885→          
+  2886→          if (shiftHours >= 8) {  // Minimum meaningful shift
+  2887→            // Find PMs that can be shifted
+  2888→            const shiftablePMs = await this.findShiftablePMs(
+  2889→              overloadedWeek,
+  2890→              candidate,
+  2891→              shiftHours,
+  2892→              strategy.type
+  2893→            );
+  2894→            
+  2895→            if (shiftablePMs.length > 0) {
+  2896→              const actualHours = shiftablePMs.reduce(
+  2897→                (sum, pm) => sum + pm.estimatedHours, 0
+  2898→              );
+  2899→              
+  2900→              return {
+  2901→                type: strategy.type,
+  2902→                sourcePeriod: { 
+  2903→                  start: overloadedWeek.week, 
+  2904→                  end: addDays(overloadedWeek.week, 7) 
+  2905→                },
+  2906→                targetPeriod: { 
+  2907→                  start: candidate.week, 
+  2908→                  end: addDays(candidate.week, 7) 
+  2909→                },
+  2910→                hoursAdjusted: actualHours,
+  2911→                affectedPMs: shiftablePMs.map(pm => pm.id),
+  2912→                costImpact: actualHours * this.getBaseRate() * (strategy.costMultiplier - 1),
+  2913→                riskLevel: strategy.riskLevel,
+  2914→                reason: `${strategy.type === 'DEFER_PM' ? 'Defer' : 'Advance'} ${actualHours.toFixed(0)}h from Week ${format(overloadedWeek.week, 'ww')} to Week ${format(candidate.week, 'ww')}`
+  2915→              };
+  2916→            }
+  2917→          }
+  2918→        }
+  2919→        return null;
+  2920→      }
+  2921→      
+  2922→      case 'ADD_OVERTIME': {
+  2923→        const availableOvertime = overloadedWeek.available.overtime;
+  2924→        const overtimeHours = Math.min(maxHours, availableOvertime);
+  2925→        
+  2926→        if (overtimeHours >= 4) {
+  2927→          return {
+  2928→            type: 'ADD_OVERTIME',
+  2929→            sourcePeriod: { 
+  2930→              start: overloadedWeek.week, 
+  2931→              end: addDays(overloadedWeek.week, 7) 
+  2932→            },
+  2933→            targetPeriod: { 
+  2934→              start: overloadedWeek.week, 
+  2935→              end: addDays(overloadedWeek.week, 7) 
+  2936→            },
+  2937→            hoursAdjusted: overtimeHours,
+  2938→            affectedPMs: [],
+  2939→            costImpact: overtimeHours * this.getBaseRate() * (strategy.costMultiplier - 1),
+  2940→            riskLevel: strategy.riskLevel,
+  2941→            reason: `Add ${overtimeHours.toFixed(0)}h overtime in Week ${format(overloadedWeek.week, 'ww')}`
+  2942→          };
+  2943→        }
+  2944→        return null;
+  2945→      }
+  2946→      
+  2947→      case 'CROSS_DEPOT': {
+  2948→        // Find other depots with capacity
+  2949→        const otherDepots = await this.findDepotsWithCapacity(
+  2950→          overloadedWeek.week,
+  2951→          maxHours
+  2952→        );
+  2953→        
+  2954→        if (otherDepots.length > 0) {
+  2955→          const best = otherDepots[0];
+  2956→          return {
+  2957→            type: 'CROSS_DEPOT',
+  2958→            sourcePeriod: { 
+  2959→              start: overloadedWeek.week, 
+  2960→              end: addDays(overloadedWeek.week, 7) 
+  2961→            },
+  2962→            targetPeriod: { 
+  2963→              start: overloadedWeek.week, 
+  2964→              end: addDays(overloadedWeek.week, 7) 
+  2965→            },
+  2966→            hoursAdjusted: best.availableHours,
+  2967→            affectedPMs: [],
+  2968→            costImpact: best.availableHours * this.getBaseRate() * (strategy.costMultiplier - 1),
+  2969→            riskLevel: strategy.riskLevel,
+  2970→            reason: `Request ${best.availableHours.toFixed(0)}h support from ${best.depotName} in Week ${format(overloadedWeek.week, 'ww')}`
+  2971→          };
+  2972→        }
+  2973→        return null;
+  2974→      }
+  2975→      
+  2976→      case 'ADD_CONTRACTOR': {
+  2977→        return {
+  2978→          type: 'ADD_CONTRACTOR',
+  2979→          sourcePeriod: { 
+  2980→            start: overloadedWeek.week, 
+  2981→            end: addDays(overloadedWeek.week, 7) 
+  2982→          },
+  2983→          targetPeriod: { 
+  2984→            start: overloadedWeek.week, 
+  2985→            end: addDays(overloadedWeek.week, 7) 
+  2986→          },
+  2987→          hoursAdjusted: maxHours,
+  2988→          affectedPMs: [],
+  2989→          costImpact: maxHours * this.getBaseRate() * (strategy.costMultiplier - 1),
+  2990→          riskLevel: strategy.riskLevel,
+  2991→          reason: `Engage contractor for ${maxHours.toFixed(0)}h in Week ${format(overloadedWeek.week, 'ww')}`
+  2992→        };
+  2993→      }
+  2994→    }
+  2995→    
+  2996→    return null;
+  2997→  }
+  2998→}
+  2999→```
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

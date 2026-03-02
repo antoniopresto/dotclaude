@@ -1,0 +1,632 @@
+     1→/**
+     2→ * MMS Database Migration Runner
+     3→ *
+     4→ * Handles database migrations with rollback support for the Metro Fleet
+     5→ * Mileage Management System. Supports both Drizzle-generated migrations
+     6→ * and manual SQL migrations.
+     7→ *
+     8→ * Features:
+     9→ * - PostgreSQL advisory locks for concurrent safety
+    10→ * - Transaction-wrapped execution with automatic rollback
+    11→ * - Migration history tracking
+    12→ * - Progress callbacks for UI feedback
+    13→ * - Manual migration support for extensions/timescaledb/functions
+    14→ *
+    15→ * @see specs/003-database-schema.md Section 3.6 (Migrations)
+    16→ */
+    17→
+    18→import { sql } from './connection';
+    19→import { readdir, readFile } from 'fs/promises';
+    20→import { join } from 'path';
+    21→import { logger } from '../logging/logger';
+    22→
+    23→/**
+    24→ * Migration lock ID for PostgreSQL advisory lock
+    25→ * Using a fixed hash to ensure same lock across processes
+    26→ */
+    27→const MIGRATION_LOCK_ID = 2147483647; // Max int32 for uniqueness
+    28→
+    29→/**
+    30→ * Migration record stored in the database
+    31→ */
+    32→export interface MigrationRecord {
+    33→  id: number;
+    34→  name: string;
+    35→  hash: string;
+    36→  executedAt: Date;
+    37→  executionTimeMs: number;
+    38→  rollbackSql?: string;
+    39→}
+    40→
+    41→/**
+    42→ * Migration file content
+    43→ */
+    44→export interface Migration {
+    45→  name: string;
+    46→  sql: string;
+    47→  rollbackSql?: string;
+    48→  isManual: boolean;
+    49→}
+    50→
+    51→/**
+    52→ * Migration result
+    53→ */
+    54→export interface MigrationResult {
+    55→  name: string;
+    56→  status: 'applied' | 'skipped' | 'failed' | 'rolled_back';
+    57→  executionTimeMs: number;
+    58→  error?: string;
+    59→}
+    60→
+    61→/**
+    62→ * Migration options
+    63→ */
+    64→export interface MigrationOptions {
+    65→  /** Run only specific migrations by name */
+    66→  filter?: string[];
+    67→  /** Dry run - don't actually apply migrations */
+    68→  dryRun?: boolean;
+    69→  /** Skip manual migrations (extensions, timescaledb, etc.) */
+    70→  skipManual?: boolean;
+    71→  /** Skip Drizzle-generated migrations */
+    72→  skipDrizzle?: boolean;
+    73→  /** Include seed data (development only) */
+    74→  includeSeed?: boolean;
+    75→  /** Progress callback */
+    76→  onProgress?: (current: number, total: number, migration: string) => void;
+    77→}
+    78→
+    79→/**
+    80→ * Overall migration run result
+    81→ */
+    82→export interface MigrationRunResult {
+    83→  success: boolean;
+    84→  migrations: MigrationResult[];
+    85→  totalTimeMs: number;
+    86→  error?: string;
+    87→}
+    88→
+    89→const log = logger.child({ service: 'migrator' });
+    90→
+    91→/**
+    92→ * Compute a simple hash for migration content
+    93→ */
+    94→function computeHash(content: string): string {
+    95→  let hash = 0;
+    96→  for (let i = 0; i < content.length; i++) {
+    97→    const char = content.charCodeAt(i);
+    98→    hash = ((hash << 5) - hash) + char;
+    99→    hash = hash & hash; // Convert to 32-bit integer
+   100→  }
+   101→  return Math.abs(hash).toString(16).padStart(8, '0');
+   102→}
+   103→
+   104→/**
+   105→ * Database Migrator
+   106→ *
+   107→ * Manages database schema migrations with safety features for production use.
+   108→ */
+   109→export class Migrator {
+   110→  private basePath: string;
+   111→
+   112→  constructor(basePath?: string) {
+   113→    // Default to project root drizzle directory
+   114→    this.basePath = basePath ?? join(process.cwd(), 'drizzle');
+   115→  }
+   116→
+   117→  /**
+   118→   * Ensure migration history table exists
+   119→   */
+   120→  async ensureHistoryTable(): Promise<void> {
+   121→    await sql`
+   122→      CREATE TABLE IF NOT EXISTS __mms_migrations (
+   123→        id SERIAL PRIMARY KEY,
+   124→        name VARCHAR(255) NOT NULL UNIQUE,
+   125→        hash VARCHAR(16) NOT NULL,
+   126→        executed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+   127→        execution_time_ms INTEGER NOT NULL DEFAULT 0,
+   128→        rollback_sql TEXT
+   129→      )
+   130→    `;
+   131→    log.debug('Migration history table ensured');
+   132→  }
+   133→
+   134→  /**
+   135→   * Acquire advisory lock for migrations
+   136→   *
+   137→   * Returns true if lock was acquired, false if another process holds it.
+   138→   * Uses pg_try_advisory_lock to avoid blocking.
+   139→   */
+   140→  async acquireLock(): Promise<boolean> {
+   141→    const result = await sql`SELECT pg_try_advisory_lock(${MIGRATION_LOCK_ID}) as acquired`;
+   142→    const acquired = result[0]?.acquired === true;
+   143→    if (acquired) {
+   144→      log.info('Migration lock acquired');
+   145→    } else {
+   146→      log.warn('Could not acquire migration lock - another process may be running migrations');
+   147→    }
+   148→    return acquired;
+   149→  }
+   150→
+   151→  /**
+   152→   * Release advisory lock
+   153→   */
+   154→  async releaseLock(): Promise<void> {
+   155→    await sql`SELECT pg_advisory_unlock(${MIGRATION_LOCK_ID})`;
+   156→    log.info('Migration lock released');
+   157→  }
+   158→
+   159→  /**
+   160→   * Get list of applied migrations from history table
+   161→   */
+   162→  async getAppliedMigrations(): Promise<MigrationRecord[]> {
+   163→    await this.ensureHistoryTable();
+   164→    const rows = await sql`
+   165→      SELECT id, name, hash, executed_at, execution_time_ms, rollback_sql
+   166→      FROM __mms_migrations
+   167→      ORDER BY id ASC
+   168→    `;
+   169→    return rows.map(row => ({
+   170→      id: row.id as number,
+   171→      name: row.name as string,
+   172→      hash: row.hash as string,
+   173→      executedAt: row.executed_at as Date,
+   174→      executionTimeMs: row.execution_time_ms as number,
+   175→      rollbackSql: row.rollback_sql as string | undefined,
+   176→    }));
+   177→  }
+   178→
+   179→  /**
+   180→   * Load manual migrations from drizzle/manual directory
+   181→   */
+   182→  async loadManualMigrations(): Promise<Migration[]> {
+   183→    const manualDir = join(this.basePath, 'manual');
+   184→    const migrations: Migration[] = [];
+   185→
+   186→    try {
+   187→      const files = await readdir(manualDir);
+   188→      const sqlFiles = files
+   189→        .filter(f => f.endsWith('.sql') && !f.startsWith('seed_'))
+   190→        .sort();
+   191→
+   192→      for (const file of sqlFiles) {
+   193→        const content = await readFile(join(manualDir, file), 'utf-8');
+   194→        migrations.push({
+   195→          name: `manual/${file}`,
+   196→          sql: content,
+   197→          isManual: true,
+   198→        });
+   199→      }
+   200→    } catch {
+   201→      // Directory doesn't exist - no manual migrations
+   202→      log.debug('No manual migrations directory found');
+   203→    }
+   204→
+   205→    return migrations;
+   206→  }
+   207→
+   208→  /**
+   209→   * Load Drizzle-generated migrations from drizzle/migrations directory
+   210→   */
+   211→  async loadDrizzleMigrations(): Promise<Migration[]> {
+   212→    const drizzleDir = join(this.basePath, 'migrations');
+   213→    const migrations: Migration[] = [];
+   214→
+   215→    try {
+   216→      const files = await readdir(drizzleDir);
+   217→      const sqlFiles = files
+   218→        .filter(f => f.endsWith('.sql'))
+   219→        .sort();
+   220→
+   221→      for (const file of sqlFiles) {
+   222→        const content = await readFile(join(drizzleDir, file), 'utf-8');
+   223→        migrations.push({
+   224→          name: `drizzle/${file}`,
+   225→          sql: content,
+   226→          isManual: false,
+   227→        });
+   228→      }
+   229→    } catch {
+   230→      // Directory doesn't exist - need to run drizzle-kit generate
+   231→      log.debug('No Drizzle migrations directory found - run "bun run db:generate" first');
+   232→    }
+   233→
+   234→    return migrations;
+   235→  }
+   236→
+   237→  /**
+   238→   * Load seed data migration (development only)
+   239→   */
+   240→  async loadSeedMigration(): Promise<Migration | null> {
+   241→    const seedFile = join(this.basePath, 'manual', 'seed_development.sql');
+   242→    try {
+   243→      const content = await readFile(seedFile, 'utf-8');
+   244→      return {
+   245→        name: 'seed/seed_development.sql',
+   246→        sql: content,
+   247→        isManual: true,
+   248→      };
+   249→    } catch {
+   250→      return null;
+   251→    }
+   252→  }
+   253→
+   254→  /**
+   255→   * Apply a single migration
+   256→   */
+   257→  async applyMigration(migration: Migration, dryRun: boolean = false): Promise<MigrationResult> {
+   258→    const startTime = Date.now();
+   259→    const hash = computeHash(migration.sql);
+   260→
+   261→    if (dryRun) {
+   262→      log.info({ migration: migration.name }, 'Would apply migration (dry run)');
+   263→      return {
+   264→        name: migration.name,
+   265→        status: 'skipped',
+   266→        executionTimeMs: 0,
+   267→      };
+   268→    }
+   269→
+   270→    try {
+   271→      // Execute migration SQL
+   272→      // For manual migrations with multiple statements, we need unsafe mode
+   273→      await sql.unsafe(migration.sql);
+   274→
+   275→      const executionTimeMs = Date.now() - startTime;
+   276→
+   277→      // Record in history
+   278→      await sql`
+   279→        INSERT INTO __mms_migrations (name, hash, execution_time_ms, rollback_sql)
+   280→        VALUES (${migration.name}, ${hash}, ${executionTimeMs}, ${migration.rollbackSql ?? null})
+   281→        ON CONFLICT (name) DO UPDATE SET
+   282→          hash = ${hash},
+   283→          executed_at = CURRENT_TIMESTAMP,
+   284→          execution_time_ms = ${executionTimeMs}
+   285→      `;
+   286→
+   287→      log.info({ migration: migration.name, executionTimeMs }, 'Migration applied');
+   288→
+   289→      return {
+   290→        name: migration.name,
+   291→        status: 'applied',
+   292→        executionTimeMs,
+   293→      };
+   294→    } catch (error) {
+   295→      const executionTimeMs = Date.now() - startTime;
+   296→      const errorMessage = error instanceof Error ? error.message : String(error);
+   297→
+   298→      log.error({ migration: migration.name, error: errorMessage }, 'Migration failed');
+   299→
+   300→      return {
+   301→        name: migration.name,
+   302→        status: 'failed',
+   303→        executionTimeMs,
+   304→        error: errorMessage,
+   305→      };
+   306→    }
+   307→  }
+   308→
+   309→  /**
+   310→   * Rollback a migration using its stored rollback SQL
+   311→   */
+   312→  async rollbackMigration(record: MigrationRecord): Promise<MigrationResult> {
+   313→    if (!record.rollbackSql) {
+   314→      log.warn({ migration: record.name }, 'No rollback SQL available for migration');
+   315→      return {
+   316→        name: record.name,
+   317→        status: 'skipped',
+   318→        executionTimeMs: 0,
+   319→        error: 'No rollback SQL available',
+   320→      };
+   321→    }
+   322→
+   323→    const startTime = Date.now();
+   324→
+   325→    try {
+   326→      await sql.unsafe(record.rollbackSql);
+   327→
+   328→      // Remove from history
+   329→      await sql`DELETE FROM __mms_migrations WHERE name = ${record.name}`;
+   330→
+   331→      const executionTimeMs = Date.now() - startTime;
+   332→      log.info({ migration: record.name, executionTimeMs }, 'Migration rolled back');
+   333→
+   334→      return {
+   335→        name: record.name,
+   336→        status: 'rolled_back',
+   337→        executionTimeMs,
+   338→      };
+   339→    } catch (error) {
+   340→      const executionTimeMs = Date.now() - startTime;
+   341→      const errorMessage = error instanceof Error ? error.message : String(error);
+   342→
+   343→      log.error({ migration: record.name, error: errorMessage }, 'Rollback failed');
+   344→
+   345→      return {
+   346→        name: record.name,
+   347→        status: 'failed',
+   348→        executionTimeMs,
+   349→        error: errorMessage,
+   350→      };
+   351→    }
+   352→  }
+   353→
+   354→  /**
+   355→   * Run all pending migrations
+   356→   *
+   357→   * Executes manual migrations first (extensions, timescaledb, functions),
+   358→   * then Drizzle-generated migrations in order.
+   359→   */
+   360→  async migrate(options: MigrationOptions = {}): Promise<MigrationRunResult> {
+   361→    const startTime = Date.now();
+   362→    const results: MigrationResult[] = [];
+   363→
+   364→    log.info({ options }, 'Starting migration run');
+   365→
+   366→    // Acquire lock
+   367→    const lockAcquired = await this.acquireLock();
+   368→    if (!lockAcquired) {
+   369→      return {
+   370→        success: false,
+   371→        migrations: [],
+   372→        totalTimeMs: Date.now() - startTime,
+   373→        error: 'Could not acquire migration lock - another process may be running migrations',
+   374→      };
+   375→    }
+   376→
+   377→    try {
+   378→      // Get applied migrations
+   379→      const applied = await this.getAppliedMigrations();
+   380→      const appliedNames = new Set(applied.map(m => m.name));
+   381→
+   382→      // Load all migrations
+   383→      const migrations: Migration[] = [];
+   384→
+   385→      if (!options.skipManual) {
+   386→        const manual = await this.loadManualMigrations();
+   387→        migrations.push(...manual);
+   388→      }
+   389→
+   390→      if (!options.skipDrizzle) {
+   391→        const drizzle = await this.loadDrizzleMigrations();
+   392→        migrations.push(...drizzle);
+   393→      }
+   394→
+   395→      // Filter if specified
+   396→      let pending = migrations.filter(m => !appliedNames.has(m.name));
+   397→      if (options.filter?.length) {
+   398→        pending = pending.filter(m => options.filter!.some(f => m.name.includes(f)));
+   399→      }
+   400→
+   401→      log.info({ total: migrations.length, pending: pending.length }, 'Migrations loaded');
+   402→
+   403→      // Apply pending migrations
+   404→      for (let i = 0; i < pending.length; i++) {
+   405→        const migration = pending[i];
+   406→        options.onProgress?.(i + 1, pending.length, migration.name);
+   407→
+   408→        const result = await this.applyMigration(migration, options.dryRun);
+   409→        results.push(result);
+   410→
+   411→        // Stop on failure
+   412→        if (result.status === 'failed') {
+   413→          log.error({ migration: migration.name }, 'Migration failed - stopping');
+   414→          break;
+   415→        }
+   416→      }
+   417→
+   418→      // Apply seed data if requested and in development
+   419→      if (options.includeSeed && process.env['NODE_ENV'] === 'development') {
+   420→        const seed = await this.loadSeedMigration();
+   421→        if (seed && !appliedNames.has(seed.name)) {
+   422→          options.onProgress?.(pending.length + 1, pending.length + 1, seed.name);
+   423→          const result = await this.applyMigration(seed, options.dryRun);
+   424→          results.push(result);
+   425→        }
+   426→      }
+   427→
+   428→      const success = results.every(r => r.status === 'applied' || r.status === 'skipped');
+   429→      const totalTimeMs = Date.now() - startTime;
+   430→
+   431→      log.info({ success, totalTimeMs, applied: results.filter(r => r.status === 'applied').length }, 'Migration run complete');
+   432→
+   433→      return {
+   434→        success,
+   435→        migrations: results,
+   436→        totalTimeMs,
+   437→      };
+   438→    } finally {
+   439→      await this.releaseLock();
+   440→    }
+   441→  }
+   442→
+   443→  /**
+   444→   * Rollback the last N migrations
+   445→   */
+   446→  async rollback(count: number = 1): Promise<MigrationRunResult> {
+   447→    const startTime = Date.now();
+   448→    const results: MigrationResult[] = [];
+   449→
+   450→    log.info({ count }, 'Starting rollback');
+   451→
+   452→    const lockAcquired = await this.acquireLock();
+   453→    if (!lockAcquired) {
+   454→      return {
+   455→        success: false,
+   456→        migrations: [],
+   457→        totalTimeMs: Date.now() - startTime,
+   458→        error: 'Could not acquire migration lock',
+   459→      };
+   460→    }
+   461→
+   462→    try {
+   463→      const applied = await this.getAppliedMigrations();
+   464→      const toRollback = applied.slice(-count).reverse();
+   465→
+   466→      for (const record of toRollback) {
+   467→        const result = await this.rollbackMigration(record);
+   468→        results.push(result);
+   469→
+   470→        if (result.status === 'failed') {
+   471→          break;
+   472→        }
+   473→      }
+   474→
+   475→      const success = results.every(r => r.status === 'rolled_back' || r.status === 'skipped');
+   476→      const totalTimeMs = Date.now() - startTime;
+   477→
+   478→      log.info({ success, totalTimeMs, rolledBack: results.filter(r => r.status === 'rolled_back').length }, 'Rollback complete');
+   479→
+   480→      return {
+   481→        success,
+   482→        migrations: results,
+   483→        totalTimeMs,
+   484→      };
+   485→    } finally {
+   486→      await this.releaseLock();
+   487→    }
+   488→  }
+   489→
+   490→  /**
+   491→   * Get migration status
+   492→   */
+   493→  async status(): Promise<{
+   494→    applied: MigrationRecord[];
+   495→    pending: Migration[];
+   496→    hasLock: boolean;
+   497→  }> {
+   498→    await this.ensureHistoryTable();
+   499→
+   500→    const applied = await this.getAppliedMigrations();
+   501→    const appliedNames = new Set(applied.map(m => m.name));
+   502→
+   503→    const manual = await this.loadManualMigrations();
+   504→    const drizzle = await this.loadDrizzleMigrations();
+   505→    const all = [...manual, ...drizzle];
+   506→
+   507→    const pending = all.filter(m => !appliedNames.has(m.name));
+   508→
+   509→    // Check if we can acquire the lock
+   510→    const hasLock = await this.acquireLock();
+   511→    if (hasLock) {
+   512→      await this.releaseLock();
+   513→    }
+   514→
+   515→    return { applied, pending, hasLock };
+   516→  }
+   517→
+   518→  /**
+   519→   * Verify database connection and prerequisites
+   520→   */
+   521→  async verify(): Promise<{
+   522→    connected: boolean;
+   523→    hasTimescaleDb: boolean;
+   524→    hasUuidExtension: boolean;
+   525→    schemaVersion: string | null;
+   526→  }> {
+   527→    try {
+   528→      // Check connection
+   529→      const connectionResult = await sql`SELECT 1 as health`;
+   530→      const connected = connectionResult[0]?.health === 1;
+   531→
+   532→      if (!connected) {
+   533→        return {
+   534→          connected: false,
+   535→          hasTimescaleDb: false,
+   536→          hasUuidExtension: false,
+   537→          schemaVersion: null,
+   538→        };
+   539→      }
+   540→
+   541→      // Check TimescaleDB extension
+   542→      const tsResult = await sql`
+   543→        SELECT EXISTS(
+   544→          SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'
+   545→        ) as has_timescaledb
+   546→      `;
+   547→      const hasTimescaleDb = tsResult[0]?.has_timescaledb === true;
+   548→
+   549→      // Check UUID extension
+   550→      const uuidResult = await sql`
+   551→        SELECT EXISTS(
+   552→          SELECT 1 FROM pg_extension WHERE extname = 'uuid-ossp'
+   553→        ) as has_uuid
+   554→      `;
+   555→      const hasUuidExtension = uuidResult[0]?.has_uuid === true;
+   556→
+   557→      // Get latest migration
+   558→      let schemaVersion: string | null = null;
+   559→      try {
+   560→        const versionResult = await sql`
+   561→          SELECT name FROM __mms_migrations ORDER BY id DESC LIMIT 1
+   562→        `;
+   563→        schemaVersion = versionResult[0]?.name as string | null;
+   564→      } catch {
+   565→        // History table doesn't exist yet
+   566→      }
+   567→
+   568→      return {
+   569→        connected,
+   570→        hasTimescaleDb,
+   571→        hasUuidExtension,
+   572→        schemaVersion,
+   573→      };
+   574→    } catch (error) {
+   575→      log.error({ error }, 'Database verification failed');
+   576→      return {
+   577→        connected: false,
+   578→        hasTimescaleDb: false,
+   579→        hasUuidExtension: false,
+   580→        schemaVersion: null,
+   581→      };
+   582→    }
+   583→  }
+   584→}
+   585→
+   586→/**
+   587→ * Singleton migrator instance
+   588→ */
+   589→let migratorInstance: Migrator | null = null;
+   590→
+   591→/**
+   592→ * Get the migrator instance
+   593→ */
+   594→export function getMigrator(): Migrator {
+   595→  if (!migratorInstance) {
+   596→    migratorInstance = new Migrator();
+   597→  }
+   598→  return migratorInstance;
+   599→}
+   600→
+   601→/**
+   602→ * Run migrations (convenience function)
+   603→ */
+   604→export async function runMigrations(options?: MigrationOptions): Promise<MigrationRunResult> {
+   605→  return getMigrator().migrate(options);
+   606→}
+   607→
+   608→/**
+   609→ * Rollback migrations (convenience function)
+   610→ */
+   611→export async function rollbackMigrations(count?: number): Promise<MigrationRunResult> {
+   612→  return getMigrator().rollback(count);
+   613→}
+   614→
+   615→/**
+   616→ * Get migration status (convenience function)
+   617→ */
+   618→export async function getMigrationStatus(): Promise<ReturnType<Migrator['status']>> {
+   619→  return getMigrator().status();
+   620→}
+   621→
+   622→/**
+   623→ * Verify database prerequisites (convenience function)
+   624→ */
+   625→export async function verifyDatabase(): Promise<ReturnType<Migrator['verify']>> {
+   626→  return getMigrator().verify();
+   627→}
+   628→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,504 @@
+     1→/**
+     2→ * MMS PM Scheduler Service - Tactical PM Scheduling
+     3→ *
+     4→ * Schedules preventive maintenance within a 12-week horizon, respecting:
+     5→ * - Compliance windows (mileage OR time triggers)
+     6→ * - PM hierarchy (C4 satisfies C1/C2/C3)
+     7→ * - Track capability requirements
+     8→ * - Material constraints (hard 14 days, soft 90 days)
+     9→ * - Maximo lock status (INPRG work orders are read-only)
+    10→ * - Service demand (fleet availability)
+    11→ *
+    12→ * Key business rules:
+    13→ * - Compliance window: ±10% of interval (mileage or months)
+    14→ * - PM hierarchy: Higher-level PMs satisfy lower-level requirements
+    15→ * - Material hard constraint: BLOCKING parts must be available within 14 days
+    16→ * - Material soft constraint: Warning if parts unavailable within 90 days
+    17→ * - Track utilization target: 85%
+    18→ * - Maximo lock: Cannot modify PM with INPRG work order
+    19→ *
+    20→ * @see specs/003-database-schema.md Section 3.5 (PM Management)
+    21→ * @see specs/004-domain-services.md Section 4.4 (PM Scheduler)
+    22→ */
+    23→
+    24→import { eq, and, sql, desc, inArray, gte, lte, isNull, count } from 'drizzle-orm';
+    25→import type { SQL } from 'drizzle-orm';
+    26→import { BaseService, MmsAttributes } from '../lib/services/base';
+    27→import {
+    28→  pmSchedule,
+    29→  pmTypes,
+    30→  pmMaterialRequirements,
+    31→  trains,
+    32→  tracks,
+    33→  trackCapabilities,
+    34→  pmCapabilityRequirements,
+    35→  inventoryPositions,
+    36→  materialReservations,
+    37→  pmScheduleHistory,
+    38→  mileageReadings,
+    39→  type PmScheduleRecord,
+    40→  type NewPmScheduleRecord,
+    41→  type PmType,
+    42→  type Train,
+    43→  type Track,
+    44→  type NewPmScheduleHistory,
+    45→} from '../lib/db/schema';
+    46→import {
+    47→  NotFoundError,
+    48→  PmScheduleNotFoundError,
+    49→  TrainNotFoundError,
+    50→  MaximoLockError,
+    51→  ComplianceWindowError,
+    52→  TrackConflictError,
+    53→  MaterialConstraintError,
+    54→  ServiceDemandViolationError,
+    55→  ValidationError,
+    56→  BusinessRuleError,
+    57→} from '../lib/errors';
+    58→import { getServiceDemandService } from './service-demand';
+    59→import { getUnavailabilityService } from './unavailability';
+    60→
+    61→// =============================================================================
+    62→// Types
+    63→// =============================================================================
+    64→
+    65→/** Track type values */
+    66→type TrackType = 'LIGHT' | 'HEAVY' | 'OVERHAUL' | 'STABLING';
+    67→
+    68→/** Material criticality values */
+    69→type MaterialCriticality = 'BLOCKING' | 'DEFERRABLE' | 'CONSUMABLE';
+    70→
+    71→/** Reservation type values */
+    72→type ReservationType = 'SOFT' | 'HARD';
+    73→
+    74→/** PM due calculation result */
+    75→export interface PmDueResult {
+    76→  pmTypeId: string;
+    77→  pmCode: string;
+    78→  pmName: string;
+    79→  trainId: string;
+    80→  trainNumber: string;
+    81→  fleetId: string;
+    82→  dueMileageKm: number | null;
+    83→  dueDate: string | null;
+    84→  currentMileageKm: number;
+    85→  kmUntilDue: number | null;
+    86→  daysUntilDue: number | null;
+    87→  triggerType: 'MILEAGE' | 'TIME' | 'BOTH';
+    88→  complianceWindow: ComplianceWindow;
+    89→  isOverdue: boolean;
+    90→  lastPmDate: string | null;
+    91→  lastPmMileageKm: number | null;
+    92→}
+    93→
+    94→/** Compliance window for scheduling */
+    95→export interface ComplianceWindow {
+    96→  startDate: string;
+    97→  endDate: string;
+    98→  startMileageKm: number | null;
+    99→  endMileageKm: number | null;
+   100→  idealDate: string;
+   101→  idealMileageKm: number | null;
+   102→}
+   103→
+   104→/** Material availability check result */
+   105→export interface MaterialAvailability {
+   106→  partNumber: string;
+   107→  partDescription: string | null;
+   108→  criticality: MaterialCriticality;
+   109→  requiredQuantity: number;
+   110→  availableQuantity: number;
+   111→  depotId: string;
+   112→  isAvailable: boolean;
+   113→  shortfall: number;
+   114→  leadTimeDays: number;
+   115→  expectedAvailableDate: string | null;
+   116→}
+   117→
+   118→/** Material constraint check result */
+   119→export interface MaterialConstraintResult {
+   120→  isBlocked: boolean;
+   121→  hardConstraintViolations: MaterialAvailability[];
+   122→  softConstraintWarnings: MaterialAvailability[];
+   123→  totalMissingParts: number;
+   124→  reservations: Array<{
+   125→    partNumber: string;
+   126→    quantity: number;
+   127→    type: ReservationType;
+   128→  }>;
+   129→}
+   130→
+   131→/** Track allocation result */
+   132→export interface TrackAllocation {
+   133→  trackId: string;
+   134→  trackNumber: string;
+   135→  depotId: string;
+   136→  depotCode: string;
+   137→  trackType: TrackType;
+   138→  startDate: string;
+   139→  endDate: string;
+   140→  hasAllCapabilities: boolean;
+   141→  missingCapabilities: string[];
+   142→}
+   143→
+   144→/** Scheduling result for a single PM */
+   145→export interface SchedulingResultItem {
+   146→  trainId: string;
+   147→  trainNumber: string;
+   148→  pmTypeId: string;
+   149→  pmCode: string;
+   150→  status: 'SCHEDULED' | 'DEFERRED' | 'BLOCKED';
+   151→  targetDate: string | null;
+   152→  targetMileageKm: number | null;
+   153→  trackAllocation: TrackAllocation | null;
+   154→  materialConstraint: MaterialConstraintResult | null;
+   155→  complianceWindow: ComplianceWindow;
+   156→  deferralReason: string | null;
+   157→  warnings: string[];
+   158→  explanation: SchedulingExplanation;
+   159→}
+   160→
+   161→/** Explanation trace for scheduling decisions */
+   162→export interface SchedulingExplanation {
+   163→  mileageTrigger: {
+   164→    intervalKm: number | null;
+   165→    currentMileageKm: number;
+   166→    lastPmMileageKm: number | null;
+   167→    kmSinceLastPm: number | null;
+   168→    kmUntilDue: number | null;
+   169→  };
+   170→  timeTrigger: {
+   171→    intervalMonths: number | null;
+   172→    lastPmDate: string | null;
+   173→    daysSinceLastPm: number | null;
+   174→    daysUntilDue: number | null;
+   175→  };
+   176→  hierarchySatisfied: {
+   177→    satisfiedBy: string | null;
+   178→    satisfiedOnDate: string | null;
+   179→    counterResetFrom: number | null;
+   180→  };
+   181→  trackSelection: {
+   182→    candidateTracks: number;
+   183→    selectedTrackId: string | null;
+   184→    selectionReason: string;
+   185→  };
+   186→  materialCheck: {
+   187→    totalParts: number;
+   188→    availableParts: number;
+   189→    blockedParts: number;
+   190→    warningParts: number;
+   191→  };
+   192→  constraints: string[];
+   193→}
+   194→
+   195→/** Full scheduling result */
+   196→export interface SchedulingResult {
+   197→  horizonStart: string;
+   198→  horizonEnd: string;
+   199→  scheduled: SchedulingResultItem[];
+   200→  deferred: SchedulingResultItem[];
+   201→  blocked: SchedulingResultItem[];
+   202→  materialWarnings: Array<{
+   203→    trainId: string;
+   204→    trainNumber: string;
+   205→    pmCode: string;
+   206→    targetDate: string;
+   207→    warnings: MaterialAvailability[];
+   208→  }>;
+   209→  summary: {
+   210→    totalProcessed: number;
+   211→    totalScheduled: number;
+   212→    totalDeferred: number;
+   213→    totalBlocked: number;
+   214→    trackUtilizationPct: number;
+   215→  };
+   216→}
+   217→
+   218→/** Request to schedule a PM */
+   219→export interface SchedulePmRequest {
+   220→  trainId: string;
+   221→  pmTypeId: string;
+   222→  targetDate: string;
+   223→  assignedDepotId?: string;
+   224→  assignedTrackId?: string;
+   225→  assignedShift?: 'DAY' | 'NIGHT' | 'WEEKEND' | 'HOLIDAY';
+   226→  notes?: string;
+   227→  createdBy?: string;
+   228→  skipMaterialCheck?: boolean;
+   229→  skipServiceDemandCheck?: boolean;
+   230→}
+   231→
+   232→/** Request to move a PM */
+   233→export interface MovePmRequest {
+   234→  pmScheduleId: string;
+   235→  newTargetDate: string;
+   236→  newTrackId?: string;
+   237→  reason: string;
+   238→  movedBy: string;
+   239→}
+   240→
+   241→/** Request to run tactical scheduling */
+   242→export interface TacticalScheduleRequest {
+   243→  fleetId?: string;
+   244→  depotId?: string;
+   245→  horizonWeeks?: number;
+   246→  dryRun?: boolean;
+   247→  respectLocks?: boolean;
+   248→}
+   249→
+   250→/** PM with details for scheduling */
+   251→interface PmWithDetails extends PmScheduleRecord {
+   252→  train: Train | null;
+   253→  pmType: PmType | null;
+   254→  assignedTrack: Track | null;
+   255→}
+   256→
+   257→// =============================================================================
+   258→// Constants
+   259→// =============================================================================
+   260→
+   261→/** Default horizon for tactical scheduling (weeks) */
+   262→const DEFAULT_HORIZON_WEEKS = 12;
+   263→
+   264→/** Hard material constraint window (days before PM) */
+   265→const HARD_MATERIAL_WINDOW_DAYS = 14;
+   266→
+   267→/** Soft material constraint window (days before PM) */
+   268→const SOFT_MATERIAL_WINDOW_DAYS = 90;
+   269→
+   270→/** Default daily mileage rate for projections (km) */
+   271→const DEFAULT_DAILY_KM = 250;
+   272→
+   273→/** Default compliance tolerance percentage */
+   274→const DEFAULT_TOLERANCE_PCT = 10;
+   275→
+   276→// =============================================================================
+   277→// PM Scheduler Service
+   278→// =============================================================================
+   279→
+   280→export class PMSchedulerService extends BaseService {
+   281→  private serviceDemandService = getServiceDemandService();
+   282→  private unavailabilityService = getUnavailabilityService();
+   283→
+   284→  constructor() {
+   285→    super({ name: 'pm-scheduler-service', version: '1.0.0' });
+   286→  }
+   287→
+   288→  // ===========================================================================
+   289→  // Compliance Window Calculation
+   290→  // ===========================================================================
+   291→
+   292→  /**
+   293→   * Calculate compliance window for a PM type and train.
+   294→   *
+   295→   * The compliance window defines the valid date range for scheduling a PM.
+   296→   * It is calculated based on:
+   297→   * - Mileage trigger: intervalKm ± tolerance%
+   298→   * - Time trigger: intervalMonths ± tolerance%
+   299→   * - Whichever comes first determines the due date
+   300→   *
+   301→   * @param trainId - Train to calculate for
+   302→   * @param pmTypeId - PM type to calculate for
+   303→   * @returns Compliance window with start/end dates and mileage
+   304→   */
+   305→  async calculateComplianceWindow(
+   306→    trainId: string,
+   307→    pmTypeId: string
+   308→  ): Promise<PmDueResult> {
+   309→    return this.traced('calculateComplianceWindow', async (span) => {
+   310→      span.setAttribute(MmsAttributes.TRAIN_ID, trainId);
+   311→      span.setAttribute('pm.typeId', pmTypeId);
+   312→
+   313→      // Get train details
+   314→      const train = await this.db.query.trains.findFirst({
+   315→        where: eq(trains.id, trainId),
+   316→        with: { fleet: true },
+   317→      });
+   318→
+   319→      if (!train) {
+   320→        throw new TrainNotFoundError(trainId);
+   321→      }
+   322→
+   323→      span.setAttribute(MmsAttributes.TRAIN_NUMBER, train.trainNumber);
+   324→      span.setAttribute(MmsAttributes.FLEET_ID, train.fleetId);
+   325→
+   326→      // Get PM type details
+   327→      const pmType = await this.db.query.pmTypes.findFirst({
+   328→        where: and(
+   329→          eq(pmTypes.id, pmTypeId),
+   330→          eq(pmTypes.active, true)
+   331→        ),
+   332→      });
+   333→
+   334→      if (!pmType) {
+   335→        throw new NotFoundError(`PM type not found: ${pmTypeId}`, {
+   336→          entityType: 'pm_type',
+   337→          entityId: pmTypeId,
+   338→        });
+   339→      }
+   340→
+   341→      // Get last completed PM of this type for this train
+   342→      const lastPm = await this.getLastCompletedPm(trainId, pmTypeId);
+   343→
+   344→      // Check if a higher-level PM has satisfied this requirement
+   345→      const hierarchySatisfied = await this.checkHierarchySatisfaction(
+   346→        trainId,
+   347→        pmType,
+   348→        lastPm?.completedAt ?? null
+   349→      );
+   350→
+   351→      // Use hierarchy satisfaction if more recent
+   352→      const effectiveLastPm = hierarchySatisfied?.satisfiedByPm &&
+   353→        (!lastPm || new Date(hierarchySatisfied.satisfiedByPm.completedAt ?? 0) > new Date(lastPm.completedAt ?? 0))
+   354→        ? hierarchySatisfied.satisfiedByPm
+   355→        : lastPm;
+   356→
+   357→      const lastPmDate = effectiveLastPm?.completedAt
+   358→        ? new Date(effectiveLastPm.completedAt).toISOString().split('T')[0]
+   359→        : train.commissioningDate ?? null;
+   360→      const lastPmMileageKm = effectiveLastPm?.completedMileageKm ?? 0;
+   361→
+   362→      // Calculate due date and mileage
+   363→      const currentMileageKm = train.currentMileageKm ?? 0;
+   364→      const today = new Date();
+   365→      const todayStr = today.toISOString().split('T')[0];
+   366→
+   367→      // Get early/late tolerance
+   368→      const earlyTolerancePct = Number(pmType.earlyTolerancePct) || DEFAULT_TOLERANCE_PCT;
+   369→      const lateTolerancePct = Number(pmType.lateTolerancePct) || DEFAULT_TOLERANCE_PCT;
+   370→
+   371→      // Calculate mileage trigger
+   372→      let dueMileageKm: number | null = null;
+   373→      let kmUntilDue: number | null = null;
+   374→      let mileageWindowStart: number | null = null;
+   375→      let mileageWindowEnd: number | null = null;
+   376→
+   377→      if (pmType.intervalKm) {
+   378→        dueMileageKm = lastPmMileageKm + pmType.intervalKm;
+   379→        kmUntilDue = dueMileageKm - currentMileageKm;
+   380→
+   381→        const toleranceKm = pmType.intervalKm * (earlyTolerancePct / 100);
+   382→        mileageWindowStart = dueMileageKm - toleranceKm;
+   383→        mileageWindowEnd = dueMileageKm + (pmType.intervalKm * (lateTolerancePct / 100));
+   384→      }
+   385→
+   386→      // Calculate time trigger
+   387→      let dueDate: string | null = null;
+   388→      let daysUntilDue: number | null = null;
+   389→      let dateWindowStart: string | null = null;
+   390→      let dateWindowEnd: string | null = null;
+   391→
+   392→      if (pmType.intervalMonths && lastPmDate) {
+   393→        const lastDate = new Date(lastPmDate);
+   394→        const dueDateTime = new Date(lastDate);
+   395→        dueDateTime.setMonth(dueDateTime.getMonth() + pmType.intervalMonths);
+   396→        dueDate = dueDateTime.toISOString().split('T')[0];
+   397→        daysUntilDue = Math.ceil((dueDateTime.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+   398→
+   399→        const toleranceDays = Math.round((pmType.intervalMonths * 30) * (earlyTolerancePct / 100));
+   400→        const lateDays = Math.round((pmType.intervalMonths * 30) * (lateTolerancePct / 100));
+   401→
+   402→        const windowStartDate = new Date(dueDateTime);
+   403→        windowStartDate.setDate(windowStartDate.getDate() - toleranceDays);
+   404→        dateWindowStart = windowStartDate.toISOString().split('T')[0];
+   405→
+   406→        const windowEndDate = new Date(dueDateTime);
+   407→        windowEndDate.setDate(windowEndDate.getDate() + lateDays);
+   408→        dateWindowEnd = windowEndDate.toISOString().split('T')[0];
+   409→      }
+   410→
+   411→      // Determine trigger type (which comes first)
+   412→      let triggerType: 'MILEAGE' | 'TIME' | 'BOTH' = 'BOTH';
+   413→      let idealDate = todayStr;
+   414→      let idealMileageKm = currentMileageKm;
+   415→
+   416→      if (dueMileageKm !== null && dueDate !== null) {
+   417→        // Convert mileage due to date using daily rate
+   418→        const dailyKm = await this.getAverageDailyKm(trainId);
+   419→        const mileageDueDateMs = today.getTime() + ((kmUntilDue ?? 0) / dailyKm) * 24 * 60 * 60 * 1000;
+   420→        const mileageDueDate = new Date(mileageDueDateMs);
+   421→
+   422→        const timeDueDate = new Date(dueDate);
+   423→
+   424→        if (mileageDueDate < timeDueDate) {
+   425→          triggerType = 'MILEAGE';
+   426→          idealDate = mileageDueDate.toISOString().split('T')[0];
+   427→          idealMileageKm = dueMileageKm;
+   428→        } else if (timeDueDate < mileageDueDate) {
+   429→          triggerType = 'TIME';
+   430→          idealDate = dueDate;
+   431→          // Estimate mileage at time due date
+   432→          const daysToTimeDue = Math.ceil((timeDueDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+   433→          idealMileageKm = currentMileageKm + (daysToTimeDue * dailyKm);
+   434→        } else {
+   435→          triggerType = 'BOTH';
+   436→          idealDate = dueDate;
+   437→          idealMileageKm = dueMileageKm;
+   438→        }
+   439→      } else if (dueMileageKm !== null) {
+   440→        triggerType = 'MILEAGE';
+   441→        const dailyKm = await this.getAverageDailyKm(trainId);
+   442→        const mileageDueDateMs = today.getTime() + ((kmUntilDue ?? 0) / dailyKm) * 24 * 60 * 60 * 1000;
+   443→        idealDate = new Date(mileageDueDateMs).toISOString().split('T')[0];
+   444→        idealMileageKm = dueMileageKm;
+   445→      } else if (dueDate !== null) {
+   446→        triggerType = 'TIME';
+   447→        idealDate = dueDate;
+   448→        const dailyKm = await this.getAverageDailyKm(trainId);
+   449→        const daysToTimeDue = Math.ceil((new Date(dueDate).getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+   450→        idealMileageKm = currentMileageKm + (daysToTimeDue * dailyKm);
+   451→      }
+   452→
+   453→      // Calculate compliance window dates
+   454→      const dailyKm = await this.getAverageDailyKm(trainId);
+   455→      let complianceStartDate = dateWindowStart ?? todayStr;
+   456→      let complianceEndDate = dateWindowEnd ?? todayStr;
+   457→
+   458→      if (mileageWindowStart !== null) {
+   459→        const kmToStart = mileageWindowStart - currentMileageKm;
+   460→        const daysToStart = Math.max(0, Math.ceil(kmToStart / dailyKm));
+   461→        const startDateFromMileage = new Date(today);
+   462→        startDateFromMileage.setDate(startDateFromMileage.getDate() + daysToStart);
+   463→
+   464→        if (!dateWindowStart || startDateFromMileage < new Date(dateWindowStart)) {
+   465→          complianceStartDate = startDateFromMileage.toISOString().split('T')[0];
+   466→        }
+   467→      }
+   468→
+   469→      if (mileageWindowEnd !== null) {
+   470→        const kmToEnd = mileageWindowEnd - currentMileageKm;
+   471→        const daysToEnd = Math.ceil(kmToEnd / dailyKm);
+   472→        const endDateFromMileage = new Date(today);
+   473→        endDateFromMileage.setDate(endDateFromMileage.getDate() + daysToEnd);
+   474→
+   475→        if (!dateWindowEnd || endDateFromMileage < new Date(dateWindowEnd)) {
+   476→          complianceEndDate = endDateFromMileage.toISOString().split('T')[0];
+   477→        }
+   478→      }
+   479→
+   480→      // Ensure start date is not in the past
+   481→      if (complianceStartDate < todayStr) {
+   482→        complianceStartDate = todayStr;
+   483→      }
+   484→
+   485→      // Check if overdue
+   486→      const isOverdue = complianceEndDate < todayStr;
+   487→
+   488→      const result: PmDueResult = {
+   489→        pmTypeId,
+   490→        pmCode: pmType.pmCode,
+   491→        pmName: pmType.pmName,
+   492→        trainId,
+   493→        trainNumber: train.trainNumber,
+   494→        fleetId: train.fleetId,
+   495→        dueMileageKm,
+   496→        dueDate,
+   497→        currentMileageKm,
+   498→        kmUntilDue,
+   499→        daysUntilDue,
+   500→        triggerType,
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

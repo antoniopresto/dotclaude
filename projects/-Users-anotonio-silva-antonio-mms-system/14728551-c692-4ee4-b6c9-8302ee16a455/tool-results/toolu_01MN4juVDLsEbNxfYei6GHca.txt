@@ -1,0 +1,504 @@
+     1→# Metro Fleet Mileage Management System
+     2→# Part 3: Database Schema
+     3→
+     4→**Document Version:** 2.1  
+     5→**Status:** APPROVED FOR DEVELOPMENT  
+     6→**Last Updated:** 2026-01-19
+     7→
+     8→---
+     9→
+    10→## 3.1 Schema Overview
+    11→
+    12→The database schema is organized into the following domains:
+    13→
+    14→| Domain | Tables | Purpose |
+    15→|--------|--------|---------|
+    16→| Core Fleet | `fleets`, `trains`, `depots`, `routes` | Asset master data |
+    17→| **Operational Constraints** | `service_demand`, `route_utilization_profiles`, `train_route_compatibility` | **Operational requirements and constraints** |
+    18→| **Unavailability** | `unavailability_events` | **Corrective maintenance and incident tracking** |
+    19→| Mileage Tracking | `mileage_readings`, `meter_events` | Time-series odometer data |
+    20→| Component Tracking | `train_components`, `component_mileage` | Component-level lifecycle |
+    21→| PM Management | `pm_types`, `pm_schedule`, `pm_material_requirements` | Maintenance planning |
+    22→| **Track Capabilities** | `track_capabilities`, `pm_capability_requirements` | **Qualified resource matching** |
+    23→| **Data Migration** | `pm_baseline_assumptions` | **Cold start and history inference** |
+    24→| Material Management | `inventory_positions`, `material_reservations` | Parts availability |
+    25→| Man-hour Planning | `manhour_capacity`, `manhour_projections`, `manhour_adjustments` | Workforce balancing |
+    26→| Baseline & Drift | `plan_baselines`, `baseline_pm_schedule`, `baseline_mileage_projection` | Plan stability |
+    27→| Scenario Management | `scenarios`, `scenario_deltas` | What-if analysis |
+    28→| Costing | `labor_rates`, `material_costs`, `cost_baselines` | Financial tracking |
+    29→| Audit & History | `pm_schedule_history`, `audit_log` | Change tracking |
+    30→| Users & Auth | `users`, `roles`, `sessions` | Access control |
+    31→
+    32→> **v2.1 Changes:** Added operational constraints domain (service demand, route utilization, train-route compatibility), unavailability events, track capabilities with PM requirements, and data migration assumptions tables.
+    33→
+    34→---
+    35→
+    36→## 3.2 Core Fleet Tables
+    37→
+    38→```sql
+    39→-- Enable required extensions
+    40→CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    41→CREATE EXTENSION IF NOT EXISTS timescaledb;
+    42→
+    43→-- Enumerated types
+    44→CREATE TYPE fitness_status AS ENUM ('FIT', 'RESTRICTED', 'GROUNDED');
+    45→CREATE TYPE pm_status AS ENUM ('SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'DEFERRED');
+    46→CREATE TYPE track_type AS ENUM ('LIGHT', 'HEAVY', 'OVERHAUL', 'STABLING');
+    47→CREATE TYPE shift_type AS ENUM ('DAY', 'NIGHT', 'WEEKEND', 'HOLIDAY');
+    48→CREATE TYPE adjustment_status AS ENUM ('PROPOSED', 'APPROVED', 'REJECTED', 'APPLIED');
+    49→CREATE TYPE baseline_status AS ENUM ('DRAFT', 'PUBLISHED', 'SUPERSEDED', 'ARCHIVED');
+    50→CREATE TYPE scenario_status AS ENUM ('ACTIVE', 'PROMOTED', 'DISCARDED', 'EXPIRED');
+    51→CREATE TYPE material_criticality AS ENUM ('BLOCKING', 'DEFERRABLE', 'CONSUMABLE');
+    52→CREATE TYPE reservation_type AS ENUM ('SOFT', 'HARD');
+    53→
+    54→-- NEW: v2.1 enum types
+    55→CREATE TYPE day_type AS ENUM ('WEEKDAY', 'SATURDAY', 'SUNDAY', 'HOLIDAY');
+    56→CREATE TYPE unavailability_type AS ENUM ('CORRECTIVE', 'INCIDENT', 'COLLISION', 'VANDALISM', 'EXTERNAL', 'PLANNED_OUTAGE');
+    57→CREATE TYPE unavailability_status AS ENUM ('ACTIVE', 'RESOLVED');
+    58→CREATE TYPE track_capability AS ENUM ('PIT', 'CRANE', 'LIFTING_JACKS', 'WHEEL_LATHE', 'CATENARY_ISOLATION', 'ROOF_ACCESS', 'WASH', 'DROP_TABLE');
+    59→CREATE TYPE constraint_type AS ENUM ('SIGNALING', 'GAUGE', 'POWER_SUPPLY', 'PLATFORM_LENGTH', 'MAX_SPEED', 'TUNNEL_CLEARANCE');
+    60→CREATE TYPE assumption_type AS ENUM ('INFERRED_FROM_COMMISSIONING', 'INFERRED_FROM_HIGHER_PM', 'MANUAL_OVERRIDE', 'IMPORTED', 'NO_HISTORY');
+    61→CREATE TYPE confidence_level AS ENUM ('HIGH', 'MEDIUM', 'LOW', 'ESTIMATED');
+    62→
+    63→-- Depots
+    64→CREATE TABLE depots (
+    65→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    66→    code VARCHAR(10) NOT NULL UNIQUE,
+    67→    name VARCHAR(100) NOT NULL,
+    68→    location VARCHAR(200),
+    69→    timezone VARCHAR(50) DEFAULT 'Asia/Singapore',
+    70→    active BOOLEAN DEFAULT TRUE,
+    71→    created_at TIMESTAMPTZ DEFAULT NOW(),
+    72→    updated_at TIMESTAMPTZ DEFAULT NOW()
+    73→);
+    74→
+    75→-- Fleets (train types/manufacturers)
+    76→CREATE TABLE fleets (
+    77→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    78→    code VARCHAR(10) NOT NULL UNIQUE,  -- 'KS', 'ALSTOM'
+    79→    name VARCHAR(100) NOT NULL,
+    80→    manufacturer VARCHAR(100) NOT NULL,
+    81→    model VARCHAR(100),
+    82→    base_depot_id UUID REFERENCES depots(id),
+    83→    cars_per_train INTEGER DEFAULT 6,
+    84→    active BOOLEAN DEFAULT TRUE,
+    85→    created_at TIMESTAMPTZ DEFAULT NOW(),
+    86→    updated_at TIMESTAMPTZ DEFAULT NOW()
+    87→);
+    88→
+    89→-- Trains
+    90→CREATE TABLE trains (
+    91→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    92→    fleet_id UUID NOT NULL REFERENCES fleets(id),
+    93→    train_number VARCHAR(20) NOT NULL UNIQUE,
+    94→    commissioning_date DATE,
+    95→    current_mileage_km INTEGER NOT NULL DEFAULT 0,
+    96→    fitness_status fitness_status DEFAULT 'FIT',
+    97→    fitness_notes TEXT,
+    98→    current_depot_id UUID REFERENCES depots(id),
+    99→    home_depot_id UUID REFERENCES depots(id),
+   100→    active BOOLEAN DEFAULT TRUE,
+   101→    
+   102→    -- For mileage balancing
+   103→    target_mileage_km INTEGER,  -- Calculated target for fleet balance
+   104→    mileage_variance_km INTEGER GENERATED ALWAYS AS 
+   105→        (current_mileage_km - COALESCE(target_mileage_km, current_mileage_km)) STORED,
+   106→    
+   107→    -- Canvas display properties
+   108→    display_color VARCHAR(7),
+   109→    display_order INTEGER,
+   110→    
+   111→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   112→    updated_at TIMESTAMPTZ DEFAULT NOW()
+   113→);
+   114→
+   115→CREATE INDEX idx_trains_fleet ON trains(fleet_id);
+   116→CREATE INDEX idx_trains_fitness ON trains(fitness_status) WHERE active = TRUE;
+   117→CREATE INDEX idx_trains_depot ON trains(current_depot_id);
+   118→
+   119→-- Routes
+   120→CREATE TABLE routes (
+   121→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   122→    route_code VARCHAR(20) NOT NULL UNIQUE,
+   123→    route_name VARCHAR(100) NOT NULL,
+   124→    line_id VARCHAR(20),
+   125→    expected_km_per_day INTEGER NOT NULL,
+   126→    required_trains INTEGER NOT NULL,
+   127→    
+   128→    -- NEW v2.1: Route characteristics for compatibility matching
+   129→    default_daily_km INTEGER,                        -- Default mileage for projection
+   130→    signaling_system VARCHAR(30),                    -- 'ATC', 'CBTC', 'ERTMS', 'LEGACY'
+   131→    power_system VARCHAR(30),                        -- 'THIRD_RAIL_750V', 'OVERHEAD_25KV', 'OVERHEAD_1500V'
+   132→    tunnel_clearance_mm INTEGER,                     -- Maximum vehicle width allowed
+   133→    platform_length_m DECIMAL(5,2),                  -- Platform length constraint
+   134→    max_axle_load_tonnes DECIMAL(4,2),               -- Track weight limit
+   135→    
+   136→    -- Restrictions
+   137→    allowed_fleet_ids UUID[],
+   138→    requires_ato BOOLEAN DEFAULT FALSE,
+   139→    min_cars INTEGER,
+   140→    max_cars INTEGER,
+   141→    
+   142→    active BOOLEAN DEFAULT TRUE,
+   143→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   144→    updated_at TIMESTAMPTZ DEFAULT NOW()
+   145→);
+   146→
+   147→-- Tracks (maintenance bays)
+   148→CREATE TABLE tracks (
+   149→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   150→    depot_id UUID NOT NULL REFERENCES depots(id),
+   151→    track_number VARCHAR(20) NOT NULL,
+   152→    track_type track_type NOT NULL,
+   153→    max_train_length_m DECIMAL(5,2),
+   154→    has_overhead_crane BOOLEAN DEFAULT FALSE,
+   155→    has_pit_access BOOLEAN DEFAULT FALSE,
+   156→    
+   157→    active BOOLEAN DEFAULT TRUE,
+   158→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   159→    
+   160→    UNIQUE(depot_id, track_number)
+   161→);
+   162→
+   163→CREATE INDEX idx_tracks_depot_type ON tracks(depot_id, track_type) WHERE active = TRUE;
+   164→```
+   165→
+   166→---
+   167→
+   168→## 3.2.1 Service Demand Tables (NEW v2.1)
+   169→
+   170→Service demand defines the minimum number of trains required for passenger operations by day type. This is a **hard constraint** for the optimizer - it cannot schedule maintenance that would violate availability targets.
+   171→
+   172→```sql
+   173→-- Service demand by fleet and day type
+   174→CREATE TABLE service_demand (
+   175→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   176→    fleet_id UUID NOT NULL REFERENCES fleets(id),
+   177→    effective_date DATE NOT NULL,
+   178→    day_type day_type NOT NULL,  -- 'WEEKDAY', 'SATURDAY', 'SUNDAY', 'HOLIDAY'
+   179→    
+   180→    -- Minimum availability requirements
+   181→    min_trains_required INTEGER NOT NULL,
+   182→    peak_am_requirement INTEGER,       -- 6:00-9:00 requirement
+   183→    midday_requirement INTEGER,        -- 9:00-16:00 requirement  
+   184→    peak_pm_requirement INTEGER,       -- 16:00-19:00 requirement
+   185→    evening_requirement INTEGER,       -- 19:00-23:00 requirement
+   186→    standby_buffer INTEGER DEFAULT 2,  -- Additional trains for contingency
+   187→    
+   188→    -- Metadata
+   189→    source VARCHAR(50),                -- 'OPERATIONS', 'CONTRACT', 'MANUAL'
+   190→    notes TEXT,
+   191→    
+   192→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   193→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   194→    created_by UUID REFERENCES users(id),
+   195→    
+   196→    UNIQUE(fleet_id, effective_date, day_type)
+   197→);
+   198→
+   199→CREATE INDEX idx_service_demand_fleet ON service_demand(fleet_id, effective_date DESC);
+   200→CREATE INDEX idx_service_demand_lookup ON service_demand(fleet_id, day_type, effective_date DESC);
+   201→
+   202→-- Example data:
+   203→-- INSERT INTO service_demand (fleet_id, effective_date, day_type, min_trains_required, peak_am_requirement, standby_buffer)
+   204→-- VALUES ('fleet-ks-uuid', '2026-01-01', 'WEEKDAY', 45, 52, 3);
+   205→-- VALUES ('fleet-ks-uuid', '2026-01-01', 'SATURDAY', 32, 35, 2);
+   206→-- VALUES ('fleet-ks-uuid', '2026-01-01', 'SUNDAY', 28, 30, 2);
+   207→```
+   208→
+   209→---
+   210→
+   211→## 3.2.2 Route Utilization Profiles (NEW v2.1)
+   212→
+   213→Route utilization profiles capture the expected daily mileage by route, enabling accurate long-term projections. Without this, mileage projection uses fleet-wide averages which can be off by 60,000+ km over 12 years.
+   214→
+   215→```sql
+   216→-- Route-specific utilization profiles
+   217→CREATE TABLE route_utilization_profiles (
+   218→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   219→    route_id UUID NOT NULL REFERENCES routes(id),
+   220→    effective_date DATE NOT NULL DEFAULT CURRENT_DATE,
+   221→    
+   222→    -- Daily mileage by day type (km)
+   223→    weekday_km INTEGER NOT NULL,
+   224→    saturday_km INTEGER,
+   225→    sunday_km INTEGER,
+   226→    holiday_km INTEGER,
+   227→    
+   228→    -- Seasonal adjustments
+   229→    peak_season_multiplier DECIMAL(3,2) DEFAULT 1.0,  -- e.g., 1.15 for CNY
+   230→    off_peak_multiplier DECIMAL(3,2) DEFAULT 1.0,
+   231→    
+   232→    -- Service characteristics
+   233→    service_hours_per_day DECIMAL(4,1),               -- Operating hours
+   234→    round_trip_km DECIMAL(6,2),                       -- Single round trip distance
+   235→    trips_per_day INTEGER,                            -- Expected service runs
+   236→    
+   237→    -- Metadata
+   238→    source VARCHAR(50),                               -- 'MEASURED', 'ESTIMATED', 'CONTRACT'
+   239→    confidence confidence_level DEFAULT 'MEDIUM',
+   240→    notes TEXT,
+   241→    
+   242→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   243→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   244→    
+   245→    UNIQUE(route_id, effective_date)
+   246→);
+   247→
+   248→CREATE INDEX idx_route_util_route ON route_utilization_profiles(route_id, effective_date DESC);
+   249→
+   250→-- Example data:
+   251→-- North-South Line: High utilization (350 km/day weekday)
+   252→-- INSERT INTO route_utilization_profiles (route_id, effective_date, weekday_km, saturday_km, sunday_km, confidence)
+   253→-- VALUES ('route-nsl-uuid', '2026-01-01', 350, 280, 240, 'HIGH');
+   254→-- East-West Line: Medium utilization (220 km/day weekday)
+   255→-- VALUES ('route-ewl-uuid', '2026-01-01', 220, 180, 150, 'HIGH');
+   256→```
+   257→
+   258→---
+   259→
+   260→## 3.2.3 Unavailability Events (NEW v2.1)
+   261→
+   262→Unavailability events track trains that cannot be scheduled due to corrective maintenance, incidents, or other blocking factors. This is a **critical integration point** with Maximo CMMS.
+   263→
+   264→```sql
+   265→-- Unavailability events (corrective maintenance, incidents, etc.)
+   266→CREATE TABLE unavailability_events (
+   267→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   268→    train_id UUID NOT NULL REFERENCES trains(id),
+   269→    
+   270→    -- Event classification
+   271→    event_type unavailability_type NOT NULL,  -- 'CORRECTIVE', 'INCIDENT', etc.
+   272→    status unavailability_status NOT NULL DEFAULT 'ACTIVE',
+   273→    restriction_level fitness_status NOT NULL, -- Uses existing ENUM: 'RESTRICTED' or 'GROUNDED'
+   274→    
+   275→    -- Timing
+   276→    reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   277→    estimated_repair_hours INTEGER,
+   278→    estimated_return_date DATE,
+   279→    actual_return_date DATE,
+   280→    
+   281→    -- External system linkage
+   282→    source_system VARCHAR(30),        -- 'MAXIMO', 'OCC', 'MANUAL'
+   283→    external_reference VARCHAR(50),   -- Maximo WO number (e.g., 'WO-2026-001234')
+   284→    external_status VARCHAR(30),      -- Maximo status (e.g., 'INPRG', 'WAPPR')
+   285→    
+   286→    -- Description
+   287→    description TEXT,
+   288→    failure_code VARCHAR(30),         -- Standard failure classification
+   289→    affected_system VARCHAR(50),      -- 'TRACTION', 'BRAKES', 'DOORS', 'HVAC', etc.
+   290→    
+   291→    -- Scheduling impact flags
+   292→    blocks_pm_scheduling BOOLEAN DEFAULT TRUE,
+   293→    blocks_run_assignment BOOLEAN DEFAULT TRUE,
+   294→    
+   295→    -- Resolution
+   296→    resolved_at TIMESTAMPTZ,
+   297→    resolved_by UUID REFERENCES users(id),
+   298→    resolution_notes TEXT,
+   299→    
+   300→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   301→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   302→    
+   303→    -- Constraint: Cannot have resolved data if status is ACTIVE
+   304→    CONSTRAINT chk_resolved_status CHECK (
+   305→        (status = 'ACTIVE' AND resolved_at IS NULL) OR
+   306→        (status = 'RESOLVED' AND resolved_at IS NOT NULL)
+   307→    )
+   308→);
+   309→
+   310→-- Primary query: Find active unavailability for a train
+   311→CREATE INDEX idx_unavailability_active ON unavailability_events(train_id, status) 
+   312→    WHERE status = 'ACTIVE';
+   313→-- Dashboard query: All active unavailability by estimated return
+   314→CREATE INDEX idx_unavailability_return ON unavailability_events(estimated_return_date) 
+   315→    WHERE status = 'ACTIVE';
+   316→-- Maximo sync: Find by external reference
+   317→CREATE INDEX idx_unavailability_external ON unavailability_events(source_system, external_reference);
+   318→-- Audit: Find by type and date range
+   319→CREATE INDEX idx_unavailability_audit ON unavailability_events(event_type, reported_at DESC);
+   320→
+   321→-- Trigger to update train fitness_status when unavailability changes
+   322→CREATE OR REPLACE FUNCTION sync_train_fitness_from_unavailability()
+   323→RETURNS TRIGGER AS $$
+   324→BEGIN
+   325→    IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+   326→        IF NEW.status = 'ACTIVE' THEN
+   327→            UPDATE trains 
+   328→            SET fitness_status = NEW.restriction_level,
+   329→                fitness_notes = COALESCE(NEW.description, 'Unavailability event: ' || NEW.event_type),
+   330→                updated_at = NOW()
+   331→            WHERE id = NEW.train_id;
+   332→        ELSIF NEW.status = 'RESOLVED' THEN
+   333→            -- Only reset to FIT if no other active unavailability exists
+   334→            IF NOT EXISTS (
+   335→                SELECT 1 FROM unavailability_events 
+   336→                WHERE train_id = NEW.train_id 
+   337→                AND status = 'ACTIVE' 
+   338→                AND id != NEW.id
+   339→            ) THEN
+   340→                UPDATE trains 
+   341→                SET fitness_status = 'FIT',
+   342→                    fitness_notes = NULL,
+   343→                    updated_at = NOW()
+   344→                WHERE id = NEW.train_id;
+   345→            END IF;
+   346→        END IF;
+   347→    END IF;
+   348→    RETURN NEW;
+   349→END;
+   350→$$ LANGUAGE plpgsql;
+   351→
+   352→CREATE TRIGGER trg_sync_train_fitness
+   353→AFTER INSERT OR UPDATE ON unavailability_events
+   354→FOR EACH ROW EXECUTE FUNCTION sync_train_fitness_from_unavailability();
+   355→```
+   356→
+   357→---
+   358→
+   359→## 3.2.4 Train-Route Compatibility (NEW v2.1)
+   360→
+   361→Defines which trains can operate on which routes based on technical constraints (signaling, gauge, power supply, etc.). Prevents the optimizer from assigning trains to incompatible routes.
+   362→
+   363→```sql
+   364→-- Train-route compatibility matrix
+   365→CREATE TABLE train_route_compatibility (
+   366→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   367→    
+   368→    -- Can be at train or fleet level
+   369→    train_id UUID REFERENCES trains(id),
+   370→    fleet_id UUID REFERENCES fleets(id),
+   371→    route_id UUID NOT NULL REFERENCES routes(id),
+   372→    
+   373→    -- Compatibility determination
+   374→    is_compatible BOOLEAN NOT NULL DEFAULT TRUE,
+   375→    constraint_type constraint_type,   -- 'SIGNALING', 'GAUGE', 'POWER_SUPPLY', etc.
+   376→    restriction_reason TEXT,           -- Human-readable explanation
+   377→    
+   378→    -- Validity period (for temporary restrictions)
+   379→    effective_date DATE DEFAULT CURRENT_DATE,
+   380→    expiry_date DATE,                  -- NULL = permanent
+   381→    
+   382→    -- Metadata
+   383→    verified_by UUID REFERENCES users(id),
+   384→    verified_at TIMESTAMPTZ,
+   385→    notes TEXT,
+   386→    
+   387→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   388→    updated_at TIMESTAMPTZ DEFAULT NOW(),
+   389→    
+   390→    -- Must specify either train_id OR fleet_id, not both
+   391→    CONSTRAINT chk_train_or_fleet CHECK (
+   392→        (train_id IS NOT NULL AND fleet_id IS NULL) OR
+   393→        (train_id IS NULL AND fleet_id IS NOT NULL)
+   394→    )
+   395→);
+   396→
+   397→CREATE INDEX idx_compatibility_route ON train_route_compatibility(route_id, is_compatible);
+   398→CREATE INDEX idx_compatibility_train ON train_route_compatibility(train_id, is_compatible) 
+   399→    WHERE train_id IS NOT NULL;
+   400→CREATE INDEX idx_compatibility_fleet ON train_route_compatibility(fleet_id, is_compatible) 
+   401→    WHERE fleet_id IS NOT NULL;
+   402→CREATE INDEX idx_compatibility_active ON train_route_compatibility(effective_date, expiry_date)
+   403→    WHERE is_compatible = FALSE;
+   404→
+   405→-- Example data:
+   406→-- Fleet KS cannot run on Line 4 (no CBTC equipment)
+   407→-- INSERT INTO train_route_compatibility (fleet_id, route_id, is_compatible, constraint_type, restriction_reason)
+   408→-- VALUES ('fleet-ks-uuid', 'route-line4-uuid', FALSE, 'SIGNALING', 'KS fleet lacks CBTC - only ATC equipped');
+   409→
+   410→-- Train 1042 temporarily restricted from NEL (oversized pantograph)
+   411→-- INSERT INTO train_route_compatibility (train_id, route_id, is_compatible, constraint_type, restriction_reason, effective_date, expiry_date)
+   412→-- VALUES ('train-1042-uuid', 'route-nel-uuid', FALSE, 'TUNNEL_CLEARANCE', 'Temporary - pantograph modification pending', '2026-01-01', '2026-03-31');
+   413→```
+   414→
+   415→---
+   416→
+   417→## 3.2.5 Track Capabilities (NEW v2.1)
+   418→
+   419→Defines the specific equipment and features available on each maintenance track. Enables constraint-based scheduling that matches PM requirements to track capabilities.
+   420→
+   421→```sql
+   422→-- Track capability definitions
+   423→CREATE TABLE track_capabilities (
+   424→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   425→    track_id UUID NOT NULL REFERENCES tracks(id),
+   426→    capability track_capability NOT NULL,
+   427→    -- 'PIT', 'CRANE', 'LIFTING_JACKS', 'WHEEL_LATHE', 
+   428→    -- 'CATENARY_ISOLATION', 'ROOF_ACCESS', 'WASH', 'DROP_TABLE'
+   429→    
+   430→    -- Capacity limits for this capability
+   431→    capacity_limit JSONB,  -- e.g., {"max_axle_load_tonnes": 17, "max_lift_tonnes": 25}
+   432→    
+   433→    -- Availability
+   434→    is_operational BOOLEAN DEFAULT TRUE,
+   435→    maintenance_schedule TEXT,         -- e.g., "Unavailable Tuesdays 06:00-10:00"
+   436→    
+   437→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   438→    
+   439→    UNIQUE(track_id, capability)
+   440→);
+   441→
+   442→CREATE INDEX idx_track_cap_track ON track_capabilities(track_id);
+   443→CREATE INDEX idx_track_cap_type ON track_capabilities(capability) WHERE is_operational = TRUE;
+   444→
+   445→-- PM type capability requirements
+   446→CREATE TABLE pm_capability_requirements (
+   447→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   448→    pm_type_id UUID NOT NULL REFERENCES pm_types(id),
+   449→    capability track_capability NOT NULL,
+   450→    is_mandatory BOOLEAN DEFAULT TRUE,  -- FALSE = preferred but not required
+   451→    
+   452→    notes TEXT,                         -- Explanation of why this capability is needed
+   453→    
+   454→    created_at TIMESTAMPTZ DEFAULT NOW(),
+   455→    
+   456→    UNIQUE(pm_type_id, capability)
+   457→);
+   458→
+   459→CREATE INDEX idx_pm_cap_req_pm ON pm_capability_requirements(pm_type_id);
+   460→CREATE INDEX idx_pm_cap_req_cap ON pm_capability_requirements(capability);
+   461→
+   462→-- Example data:
+   463→-- Track T1 at Bishan has pit, crane, and lifting jacks
+   464→-- INSERT INTO track_capabilities (track_id, capability)
+   465→-- VALUES ('track-t1-bishan-uuid', 'PIT'),
+   466→--        ('track-t1-bishan-uuid', 'CRANE'),
+   467→--        ('track-t1-bishan-uuid', 'LIFTING_JACKS');
+   468→
+   469→-- C4 overhaul requires pit and lifting jacks (mandatory), crane (preferred)
+   470→-- INSERT INTO pm_capability_requirements (pm_type_id, capability, is_mandatory)
+   471→-- VALUES ('pm-c4-uuid', 'PIT', TRUE),
+   472→--        ('pm-c4-uuid', 'LIFTING_JACKS', TRUE),
+   473→--        ('pm-c4-uuid', 'CRANE', FALSE);
+   474→```
+   475→
+   476→---
+   477→
+   478→## 3.2.6 PM Baseline Assumptions (NEW v2.1)
+   479→
+   480→Handles cold start scenarios where PM history is incomplete during data migration. Tracks assumptions with confidence levels and flags records requiring manual review.
+   481→
+   482→```sql
+   483→-- PM history baseline assumptions for cold start scenarios
+   484→CREATE TABLE pm_baseline_assumptions (
+   485→    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+   486→    train_id UUID NOT NULL REFERENCES trains(id),
+   487→    pm_type_id UUID NOT NULL REFERENCES pm_types(id),
+   488→    
+   489→    -- Assumption details
+   490→    assumption_type assumption_type NOT NULL,
+   491→    -- 'INFERRED_FROM_COMMISSIONING' - assume first PM at commissioning date + interval
+   492→    -- 'INFERRED_FROM_HIGHER_PM' - derived from C4/OH completion implies C1/C2/C3 done
+   493→    -- 'MANUAL_OVERRIDE' - operator entered value
+   494→    -- 'IMPORTED' - from legacy system with known quality
+   495→    -- 'NO_HISTORY' - no data available, using conservative estimate
+   496→    
+   497→    -- Assumed baseline values
+   498→    assumed_last_pm_date DATE,
+   499→    assumed_last_pm_mileage INTEGER,
+   500→    confidence_level confidence_level NOT NULL,  -- 'HIGH', 'MEDIUM', 'LOW', 'ESTIMATED'
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

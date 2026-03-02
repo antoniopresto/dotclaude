@@ -1,0 +1,222 @@
+     1→#!/bin/bash
+     2→
+     3→# =============================================================================
+     4→# loop.sh - Ralph Wiggum Loop Orchestrator
+     5→# =============================================================================
+     6→#
+     7→# Usage:
+     8→#   ./loop.sh                    # Run with defaults
+     9→#   ./loop.sh --max-iterations 30  # Custom iteration limit
+    10→#   ./loop.sh --dry-run           # Show what would run without executing
+    11→#
+    12→# =============================================================================
+    13→
+    14→set -e
+    15→
+    16→# Configuration
+    17→MAX_ITERATIONS=${MAX_ITERATIONS:-50}
+    18→SLEEP_BETWEEN_ITERATIONS=${SLEEP_BETWEEN:-2}
+    19→LOG_FILE="ralph-session-$(date +%Y%m%d-%H%M%S).log"
+    20→
+    21→# Parse arguments
+    22→while [[ $# -gt 0 ]]; do
+    23→    case $1 in
+    24→        --max-iterations)
+    25→            MAX_ITERATIONS="$2"
+    26→            shift 2
+    27→            ;;
+    28→        --dry-run)
+    29→            DRY_RUN=1
+    30→            shift
+    31→            ;;
+    32→        *)
+    33→            echo "Unknown option: $1"
+    34→            exit 1
+    35→            ;;
+    36→    esac
+    37→done
+    38→
+    39→# Colors
+    40→RED='\033[0;31m'
+    41→GREEN='\033[0;32m'
+    42→YELLOW='\033[1;33m'
+    43→BLUE='\033[0;34m'
+    44→NC='\033[0m'
+    45→
+    46→# -----------------------------------------------------------------------------
+    47→# Logging
+    48→# -----------------------------------------------------------------------------
+    49→
+    50→log() {
+    51→    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    52→    echo -e "[$timestamp] $1" | tee -a "$LOG_FILE"
+    53→}
+    54→
+    55→log_phase() {
+    56→    echo ""
+    57→    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+    58→    log "$1"
+    59→    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+    60→}
+    61→
+    62→# -----------------------------------------------------------------------------
+    63→# Pre-flight Checks
+    64→# -----------------------------------------------------------------------------
+    65→
+    66→preflight_checks() {
+    67→    log_phase "Pre-flight Checks"
+    68→    
+    69→    # Check required files exist
+    70→    local required_files=("PROMPT.md" "AGENTS.md" "IMPLEMENTATION_PLAN.md" "scripts/validate-migration.sh")
+    71→    for file in "${required_files[@]}"; do
+    72→        if [ ! -f "$file" ]; then
+    73→            log "${RED}ERROR: Required file missing: $file${NC}"
+    74→            exit 1
+    75→        fi
+    76→    done
+    77→    log "${GREEN}✓ All required files present${NC}"
+    78→    
+    79→    # Check validation script is executable
+    80→    chmod +x scripts/validate-migration.sh
+    81→    log "${GREEN}✓ Validation script executable${NC}"
+    82→    
+    83→    # Check claude-code is available
+    84→    if ! command -v claude-code &> /dev/null; then
+    85→        if ! command -v claude &> /dev/null; then
+    86→            log "${RED}ERROR: claude-code not found in PATH${NC}"
+    87→            exit 1
+    88→        fi
+    89→        CLAUDE_CMD="claude"
+    90→    else
+    91→        CLAUDE_CMD="claude-code"
+    92→    fi
+    93→    log "${GREEN}✓ Claude command available: $CLAUDE_CMD${NC}"
+    94→    
+    95→    # Check we're in a git repo
+    96→    if [ ! -d ".git" ]; then
+    97→        log "${YELLOW}WARNING: Not a git repository. Changes won't be tracked.${NC}"
+    98→    else
+    99→        log "${GREEN}✓ Git repository detected${NC}"
+   100→    fi
+   101→    
+   102→    # Check source/target directories
+   103→    if [ ! -d "$HOME/dev/rnm-app-fintech-card-place" ]; then
+   104→        log "${RED}ERROR: Source directory not found${NC}"
+   105→        exit 1
+   106→    fi
+   107→    log "${GREEN}✓ Source directory exists${NC}"
+   108→}
+   109→
+   110→# -----------------------------------------------------------------------------
+   111→# Main Loop
+   112→# -----------------------------------------------------------------------------
+   113→
+   114→run_iteration() {
+   115→    local iteration=$1
+   116→    
+   117→    log_phase "Iteration $iteration / $MAX_ITERATIONS"
+   118→    
+   119→    # Run Claude with the prompt
+   120→    log "Invoking Claude..."
+   121→    
+   122→    local output
+   123→    if [ -n "$DRY_RUN" ]; then
+   124→        log "${YELLOW}DRY RUN: Would execute: cat PROMPT.md | $CLAUDE_CMD --dangerously-skip-permissions${NC}"
+   125→        output="DRY_RUN_OUTPUT"
+   126→    else
+   127→        output=$(cat PROMPT.md | $CLAUDE_CMD --dangerously-skip-permissions 2>&1) || true
+   128→    fi
+   129→    
+   130→    # Log output (truncated)
+   131→    echo "$output" | tail -100 >> "$LOG_FILE"
+   132→    
+   133→    # Check for completion signals
+   134→    if echo "$output" | grep -q "<promise>ALL_TASKS_COMPLETE</promise>"; then
+   135→        log "${GREEN}════════════════════════════════════════════════════════════${NC}"
+   136→        log "${GREEN}  ALL TASKS COMPLETE!${NC}"
+   137→        log "${GREEN}════════════════════════════════════════════════════════════${NC}"
+   138→        return 0
+   139→    fi
+   140→    
+   141→    if echo "$output" | grep -q "<promise>STUCK</promise>"; then
+   142→        log "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+   143→        log "${YELLOW}  AGENT IS STUCK - Manual intervention required${NC}"
+   144→        log "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+   145→        echo "$output" | grep -A 10 "<promise>STUCK</promise>" | tee -a "$LOG_FILE"
+   146→        return 2
+   147→    fi
+   148→    
+   149→    if echo "$output" | grep -q "<promise>UNSAFE_REQUIRED</promise>"; then
+   150→        log "${RED}════════════════════════════════════════════════════════════${NC}"
+   151→        log "${RED}  UNSAFE CHANGE REQUIRED - Human decision needed${NC}"
+   152→        log "${RED}════════════════════════════════════════════════════════════${NC}"
+   153→        echo "$output" | grep -A 10 "<promise>UNSAFE_REQUIRED</promise>" | tee -a "$LOG_FILE"
+   154→        return 3
+   155→    fi
+   156→    
+   157→    # Run validation as additional backpressure
+   158→    log "Running validation..."
+   159→    if ! ./scripts/validate-migration.sh >> "$LOG_FILE" 2>&1; then
+   160→        log "${YELLOW}Validation failed - next iteration will address${NC}"
+   161→    fi
+   162→    
+   163→    # Continue to next iteration
+   164→    return 1
+   165→}
+   166→
+   167→# -----------------------------------------------------------------------------
+   168→# Main
+   169→# -----------------------------------------------------------------------------
+   170→
+   171→main() {
+   172→    log_phase "Ralph Wiggum Loop Starting"
+   173→    log "Max iterations: $MAX_ITERATIONS"
+   174→    log "Log file: $LOG_FILE"
+   175→    
+   176→    preflight_checks
+   177→    
+   178→    local iteration=0
+   179→    local exit_code=1
+   180→    
+   181→    while [ $iteration -lt $MAX_ITERATIONS ] && [ $exit_code -eq 1 ]; do
+   182→        iteration=$((iteration + 1))
+   183→        
+   184→        run_iteration $iteration
+   185→        exit_code=$?
+   186→        
+   187→        if [ $exit_code -eq 1 ]; then
+   188→            log "Sleeping ${SLEEP_BETWEEN_ITERATIONS}s before next iteration..."
+   189→            sleep $SLEEP_BETWEEN_ITERATIONS
+   190→        fi
+   191→    done
+   192→    
+   193→    log_phase "Loop Finished"
+   194→    
+   195→    if [ $iteration -ge $MAX_ITERATIONS ] && [ $exit_code -eq 1 ]; then
+   196→        log "${YELLOW}Reached maximum iterations ($MAX_ITERATIONS)${NC}"
+   197→        log "Review progress and run again if needed."
+   198→        exit 1
+   199→    fi
+   200→    
+   201→    case $exit_code in
+   202→        0)
+   203→            log "${GREEN}Migration completed successfully!${NC}"
+   204→            exit 0
+   205→            ;;
+   206→        2)
+   207→            log "${YELLOW}Agent stuck after $iteration iterations.${NC}"
+   208→            exit 2
+   209→            ;;
+   210→        3)
+   211→            log "${RED}Unsafe change required. Human decision needed.${NC}"
+   212→            exit 3
+   213→            ;;
+   214→    esac
+   215→}
+   216→
+   217→main "$@"
+   218→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

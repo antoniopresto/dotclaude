@@ -1,0 +1,1417 @@
+     1→/**
+     2→ * MMS Maximo Sync Service
+     3→ *
+     4→ * Implements bidirectional synchronization between MMS and IBM Maximo CMMS.
+     5→ * Uses the shadow record pattern to enable offline operation and conflict resolution.
+     6→ *
+     7→ * Key responsibilities:
+     8→ * - Create and manage shadow records for PM schedules
+     9→ * - Push MMS changes to Maximo (create/update work orders)
+    10→ * - Pull Maximo status changes to MMS
+    11→ * - Detect and resolve conflicts
+    12→ * - Validate edit operations against Maximo status locks
+    13→ *
+    14→ * Integration flow:
+    15→ * 1. When a PM is scheduled in MMS, a shadow record is created (status: PENDING)
+    16→ * 2. Sync job pushes shadow records to Maximo (creates work orders)
+    17→ * 3. Maximo status changes (via polling or webhook) update shadow records
+    18→ * 4. INPRG/COMP/CLOSE/CAN status locks PM in MMS (read-only)
+    19→ *
+    20→ * @see specs/007-integration.md Section 7.4
+    21→ */
+    22→
+    23→import { eq, and, desc, sql, inArray, lt, isNull, or, count, type SQL } from 'drizzle-orm';
+    24→import { addDays, addSeconds } from 'date-fns';
+    25→import { BaseService, MmsAttributes } from '../lib/services/base';
+    26→import {
+    27→  maximoShadowRecords,
+    28→  maximoSyncHistory,
+    29→  pmSchedule,
+    30→  type MaximoShadowRecord,
+    31→  type PmScheduleRecord,
+    32→} from '../lib/db/schema';
+    33→import {
+    34→  MaximoConnectionError,
+    35→  NotFoundError,
+    36→  ValidationError,
+    37→} from '../lib/errors';
+    38→import { CircuitBreaker } from '../lib/utils/resilience';
+    39→import { getMaximoClient, type MaximoClient } from './maximo-client';
+    40→
+    41→// =============================================================================
+    42→// Types
+    43→// =============================================================================
+    44→
+    45→/** Maximo work order status values */
+    46→export type MaximoWoStatus = 'WAPPR' | 'APPR' | 'INPRG' | 'COMP' | 'CLOSE' | 'CAN';
+    47→
+    48→/** MMS sync status values */
+    49→export type SyncStatus = 'PENDING' | 'SYNCED' | 'CONFLICT' | 'ERROR';
+    50→
+    51→/** Sync operation type */
+    52→export type SyncOperation = 'PUSH' | 'PULL' | 'CONFLICT_RESOLVE';
+    53→
+    54→/** MMS PM status type */
+    55→export type MmsPmStatus = 'SCHEDULED' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED' | 'DEFERRED';
+    56→
+    57→/** Status mapping from Maximo to MMS */
+    58→export const MAXIMO_TO_MMS_STATUS: Record<MaximoWoStatus, MmsPmStatus> = {
+    59→  WAPPR: 'SCHEDULED',
+    60→  APPR: 'SCHEDULED',
+    61→  INPRG: 'IN_PROGRESS',
+    62→  COMP: 'COMPLETED',
+    63→  CLOSE: 'COMPLETED',
+    64→  CAN: 'CANCELLED',
+    65→};
+    66→
+    67→/** Locked Maximo statuses (PM cannot be edited in MMS) */
+    68→export const LOCKED_MAXIMO_STATUSES: MaximoWoStatus[] = ['INPRG', 'COMP', 'CLOSE', 'CAN'];
+    69→
+    70→/** Human-readable status labels */
+    71→export const MAXIMO_STATUS_LABELS: Record<MaximoWoStatus, string> = {
+    72→  WAPPR: 'Waiting Approval',
+    73→  APPR: 'Approved',
+    74→  INPRG: 'In Progress',
+    75→  COMP: 'Completed',
+    76→  CLOSE: 'Closed',
+    77→  CAN: 'Cancelled',
+    78→};
+    79→
+    80→/** Edit validation result */
+    81→export interface EditValidationResult {
+    82→  valid: boolean;
+    83→  reason?: 'MAXIMO_STATUS_LOCK' | 'SYNC_CONFLICT' | 'BASELINE_LOCK' | 'NOT_FOUND';
+    84→  message?: string;
+    85→  maximoStatus?: string;
+    86→  maximoWoNum?: string;
+    87→  suggestion?: string;
+    88→}
+    89→
+    90→/** Push sync result */
+    91→export interface PushResult {
+    92→  action: 'CREATED' | 'UPDATED' | 'SKIPPED' | 'CONFLICT' | 'ERROR';
+    93→  woNum?: string;
+    94→  reason?: string;
+    95→  error?: string;
+    96→}
+    97→
+    98→/** Pull sync result */
+    99→export interface PullResult {
+   100→  processed: number;
+   101→  updated: number;
+   102→  conflicts: number;
+   103→  errors: number;
+   104→  details: PullDetail[];
+   105→}
+   106→
+   107→export interface PullDetail {
+   108→  pmScheduleId: string;
+   109→  maximoWoNum: string;
+   110→  previousStatus?: string;
+   111→  newStatus?: string;
+   112→  action: 'UPDATED' | 'CONFLICT' | 'ERROR' | 'SKIPPED';
+   113→  error?: string;
+   114→}
+   115→
+   116→/** Conflict resolution strategy */
+   117→export type ConflictResolution = 'USE_MMS' | 'USE_MAXIMO';
+   118→
+   119→/** Shadow record with related data */
+   120→export interface ShadowRecordWithPm {
+   121→  shadowRecord: MaximoShadowRecord;
+   122→  pmSchedule: PmScheduleRecord & {
+   123→    train?: { id: string; trainNumber: string };
+   124→    pmType?: { id: string; pmCode: string; pmName: string };
+   125→    depot?: { id: string; code: string };
+   126→  };
+   127→}
+   128→
+   129→/** Maximo work order create payload */
+   130→export interface MaximoWorkOrderCreate {
+   131→  siteid: string;
+   132→  woclass: string;
+   133→  worktype: string;
+   134→  assetnum: string;
+   135→  description: string;
+   136→  schedstart: string;
+   137→  schedfinish: string;
+   138→  location?: string;
+   139→  estlabhrs?: number;
+   140→  pmnum?: string;
+   141→  mms_schedule_id: string;
+   142→  mms_constraint_start: string;
+   143→  mms_constraint_end: string;
+   144→}
+   145→
+   146→/** Maximo work order response */
+   147→export interface MaximoWorkOrder {
+   148→  wonum: string;
+   149→  status: MaximoWoStatus;
+   150→  schedstart?: string;
+   151→  schedfinish?: string;
+   152→  actstart?: string;
+   153→  actfinish?: string;
+   154→  actlabhrs?: number;
+   155→  changedate?: string;
+   156→}
+   157→
+   158→/** Sync statistics */
+   159→export interface SyncStats {
+   160→  pendingRecords: number;
+   161→  syncedRecords: number;
+   162→  conflictRecords: number;
+   163→  errorRecords: number;
+   164→  lastSyncAt?: Date;
+   165→  lastPullAt?: Date;
+   166→  circuitBreakerState: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+   167→}
+   168→
+   169→/** Query filters for shadow records */
+   170→export interface ShadowRecordFilters {
+   171→  syncStatus?: SyncStatus | SyncStatus[];
+   172→  pmScheduleId?: string;
+   173→  maximoWoNum?: string;
+   174→  hasConflict?: boolean;
+   175→  needsSync?: boolean;
+   176→}
+   177→
+   178→/** Pagination options */
+   179→export interface PaginationOptions {
+   180→  page?: number;
+   181→  pageSize?: number;
+   182→}
+   183→
+   184→/** Paginated result */
+   185→export interface PaginatedShadowRecords {
+   186→  data: ShadowRecordWithPm[];
+   187→  total: number;
+   188→  page: number;
+   189→  pageSize: number;
+   190→  totalPages: number;
+   191→}
+   192→
+   193→// =============================================================================
+   194→// Singleton instance
+   195→// =============================================================================
+   196→
+   197→let instance: MaximoSyncService | null = null;
+   198→
+   199→/**
+   200→ * Get the singleton MaximoSyncService instance
+   201→ */
+   202→export function getMaximoSyncService(): MaximoSyncService {
+   203→  if (!instance) {
+   204→    instance = new MaximoSyncService();
+   205→  }
+   206→  return instance;
+   207→}
+   208→
+   209→// =============================================================================
+   210→// MaximoSyncService Implementation
+   211→// =============================================================================
+   212→
+   213→/**
+   214→ * Maximo Sync Service for bidirectional PM synchronization
+   215→ *
+   216→ * Implements the shadow record pattern from spec 007.4.2:
+   217→ * - MMS is source of truth for scheduling
+   218→ * - Shadow records track sync state with Maximo
+   219→ * - Status-based locking prevents conflicts
+   220→ *
+   221→ * @example
+   222→ * ```typescript
+   223→ * const maximoSync = getMaximoSyncService();
+   224→ *
+   225→ * // Validate before editing a PM
+   226→ * const validation = await maximoSync.validateEdit(pmId);
+   227→ * if (!validation.valid) {
+   228→ *   throw new MaximoLockError(validation.message);
+   229→ * }
+   230→ *
+   231→ * // Create shadow record for new PM
+   232→ * await maximoSync.createShadowRecord(pmId);
+   233→ *
+   234→ * // Push changes to Maximo
+   235→ * const result = await maximoSync.pushToMaximo(pmId);
+   236→ *
+   237→ * // Pull status updates from Maximo
+   238→ * await maximoSync.pullFromMaximo();
+   239→ * ```
+   240→ */
+   241→export class MaximoSyncService extends BaseService {
+   242→  private readonly circuitBreaker: CircuitBreaker;
+   243→  private lastPullTimestamp: Date | null = null;
+   244→  private maximoClient: MaximoClient;
+   245→  private clientInitialized = false;
+   246→
+   247→  constructor() {
+   248→    super({ name: 'maximo-sync-service' });
+   249→
+   250→    // Initialize Maximo client
+   251→    this.maximoClient = getMaximoClient();
+   252→
+   253→    // Circuit breaker for Maximo API calls
+   254→    this.circuitBreaker = new CircuitBreaker(
+   255→      {
+   256→        failureThreshold: 5,
+   257→        successThreshold: 2,
+   258→        resetTimeoutMs: 60000, // 60 seconds in open state
+   259→        isFailure: (error) => {
+   260→          // Only count network/availability errors as circuit breaker failures
+   261→          if (error instanceof MaximoConnectionError) return true;
+   262→          if (error instanceof Error) {
+   263→            const msg = error.message.toLowerCase();
+   264→            return (
+   265→              msg.includes('econnrefused') ||
+   266→              msg.includes('etimedout') ||
+   267→              msg.includes('econnreset') ||
+   268→              msg.includes('503') ||
+   269→              msg.includes('504')
+   270→            );
+   271→          }
+   272→          return false;
+   273→        },
+   274→      },
+   275→      'maximo-sync'
+   276→    );
+   277→  }
+   278→
+   279→  /**
+   280→   * Ensure the Maximo client is initialized before making API calls
+   281→   */
+   282→  private async ensureClientInitialized(): Promise<void> {
+   283→    if (!this.clientInitialized) {
+   284→      await this.maximoClient.initialize();
+   285→      this.clientInitialized = true;
+   286→    }
+   287→  }
+   288→
+   289→  // ===========================================================================
+   290→  // Edit Validation
+   291→  // ===========================================================================
+   292→
+   293→  /**
+   294→   * Validate PM edit request against Maximo status
+   295→   *
+   296→   * MUST be called before any PM schedule modification.
+   297→   * Prevents race conditions where a planner reschedules a PM that
+   298→   * technicians are actively working on.
+   299→   *
+   300→   * @see specs/007-integration.md Section 7.4.6
+   301→   */
+   302→  async validateEdit(pmScheduleId: string): Promise<EditValidationResult> {
+   303→    return this.traced('validateEdit', async (span) => {
+   304→      span.setAttribute(MmsAttributes.PM_SCHEDULE_ID, pmScheduleId);
+   305→
+   306→      // Get PM with shadow record
+   307→      const pm = await this.getPmWithShadow(pmScheduleId);
+   308→
+   309→      if (!pm) {
+   310→        return {
+   311→          valid: false,
+   312→          reason: 'NOT_FOUND',
+   313→          message: 'PM schedule not found',
+   314→        };
+   315→      }
+   316→
+   317→      // Check 1: Maximo status lock
+   318→      if (pm.shadowRecord?.maximoData) {
+   319→        const maximoData = pm.shadowRecord.maximoData as { status?: string };
+   320→        const maximoStatus = maximoData.status as MaximoWoStatus | undefined;
+   321→
+   322→        if (maximoStatus && LOCKED_MAXIMO_STATUSES.includes(maximoStatus)) {
+   323→          span.setAttribute('maximo.status', maximoStatus);
+   324→          span.setAttribute('maximo.locked', true);
+   325→
+   326→          return {
+   327→            valid: false,
+   328→            reason: 'MAXIMO_STATUS_LOCK',
+   329→            message: `Cannot modify: Work order is ${MAXIMO_STATUS_LABELS[maximoStatus]} in Maximo`,
+   330→            maximoStatus,
+   331→            maximoWoNum: pm.shadowRecord.maximoWoNum ?? undefined,
+   332→            suggestion:
+   333→              maximoStatus === 'INPRG'
+   334→                ? 'Wait for technicians to complete work, or contact supervisor to cancel in Maximo first'
+   335→                : 'This PM has been completed/cancelled. Create a new PM if rescheduling is needed.',
+   336→          };
+   337→        }
+   338→      }
+   339→
+   340→      // Check 2: Pending sync conflict
+   341→      if (pm.shadowRecord?.syncStatus === 'CONFLICT') {
+   342→        span.setAttribute('sync.conflict', true);
+   343→
+   344→        return {
+   345→          valid: false,
+   346→          reason: 'SYNC_CONFLICT',
+   347→          message: 'Unresolved sync conflict exists. Resolve before editing.',
+   348→          suggestion: 'Go to Integration > Conflicts to resolve',
+   349→        };
+   350→      }
+   351→
+   352→      // Check 3: Baseline lock (if PM is locked)
+   353→      if (pm.pmSchedule.isLocked) {
+   354→        span.setAttribute('baseline.locked', true);
+   355→
+   356→        return {
+   357→          valid: false,
+   358→          reason: 'BASELINE_LOCK',
+   359→          message: 'PM is locked in published baseline',
+   360→          suggestion: 'Unlock in baseline editor or create scenario to test changes',
+   361→        };
+   362→      }
+   363→
+   364→      span.setAttribute('edit.valid', true);
+   365→      return { valid: true };
+   366→    });
+   367→  }
+   368→
+   369→  /**
+   370→   * Check if a PM is locked by Maximo status
+   371→   */
+   372→  async isMaximoLocked(pmScheduleId: string): Promise<boolean> {
+   373→    const validation = await this.validateEdit(pmScheduleId);
+   374→    return validation.reason === 'MAXIMO_STATUS_LOCK';
+   375→  }
+   376→
+   377→  // ===========================================================================
+   378→  // Shadow Record Management
+   379→  // ===========================================================================
+   380→
+   381→  /**
+   382→   * Create a shadow record for a PM schedule
+   383→   *
+   384→   * Called when a new PM is scheduled or when sync is first enabled.
+   385→   */
+   386→  async createShadowRecord(pmScheduleId: string): Promise<MaximoShadowRecord> {
+   387→    return this.traced('createShadowRecord', async (span) => {
+   388→      span.setAttribute(MmsAttributes.PM_SCHEDULE_ID, pmScheduleId);
+   389→
+   390→      // Verify PM exists
+   391→      const pm = await this.db.query.pmSchedule.findFirst({
+   392→        where: eq(pmSchedule.id, pmScheduleId),
+   393→        with: {
+   394→          train: true,
+   395→          pmType: true,
+   396→        },
+   397→      });
+   398→
+   399→      if (!pm) {
+   400→        throw new NotFoundError(`PM schedule not found: ${pmScheduleId}`, {
+   401→          entityType: 'PmSchedule',
+   402→          entityId: pmScheduleId,
+   403→        });
+   404→      }
+   405→
+   406→      // Check if shadow record already exists
+   407→      const existing = await this.db.query.maximoShadowRecords.findFirst({
+   408→        where: eq(maximoShadowRecords.pmScheduleId, pmScheduleId),
+   409→      });
+   410→
+   411→      if (existing) {
+   412→        this.log.info(
+   413→          { pmScheduleId, shadowRecordId: existing.id },
+   414→          'Shadow record already exists'
+   415→        );
+   416→        return existing;
+   417→      }
+   418→
+   419→      // Create MMS data snapshot
+   420→      const mmsDataSnapshot = {
+   421→        trainId: pm.trainId,
+   422→        pmTypeCode: pm.pmType?.pmCode ?? 'UNKNOWN',
+   423→        targetDate: pm.targetDate,
+   424→        status: pm.status ?? 'SCHEDULED',
+   425→        assignedDepotId: pm.assignedDepotId ?? undefined,
+   426→        assignedHours: pm.assignedHours ?? undefined,
+   427→      };
+   428→
+   429→      // Insert shadow record
+   430→      const [shadowRecord] = await this.db
+   431→        .insert(maximoShadowRecords)
+   432→        .values({
+   433→          pmScheduleId,
+   434→          syncStatus: 'PENDING',
+   435→          mmsDataSnapshot,
+   436→          syncAttempts: 0,
+   437→          nextSyncAt: new Date(), // Sync immediately
+   438→        })
+   439→        .returning();
+   440→
+   441→      span.setAttribute('shadow.record.id', shadowRecord.id);
+   442→      this.log.info(
+   443→        { pmScheduleId, shadowRecordId: shadowRecord.id },
+   444→        'Created shadow record for PM schedule'
+   445→      );
+   446→
+   447→      return shadowRecord;
+   448→    });
+   449→  }
+   450→
+   451→  /**
+   452→   * Get shadow record by PM schedule ID
+   453→   */
+   454→  async getShadowRecord(pmScheduleId: string): Promise<MaximoShadowRecord | null> {
+   455→    return this.traced('getShadowRecord', async () => {
+   456→      const record = await this.db.query.maximoShadowRecords.findFirst({
+   457→        where: eq(maximoShadowRecords.pmScheduleId, pmScheduleId),
+   458→      });
+   459→      return record ?? null;
+   460→    });
+   461→  }
+   462→
+   463→  /**
+   464→   * Get PM with shadow record and related data
+   465→   */
+   466→  async getPmWithShadow(pmScheduleId: string): Promise<ShadowRecordWithPm | null> {
+   467→    return this.traced('getPmWithShadow', async () => {
+   468→      const pm = await this.db.query.pmSchedule.findFirst({
+   469→        where: eq(pmSchedule.id, pmScheduleId),
+   470→        with: {
+   471→          train: true,
+   472→          pmType: true,
+   473→          assignedDepot: true,
+   474→        },
+   475→      });
+   476→
+   477→      if (!pm) {
+   478→        return null;
+   479→      }
+   480→
+   481→      const shadowRecord = await this.db.query.maximoShadowRecords.findFirst({
+   482→        where: eq(maximoShadowRecords.pmScheduleId, pmScheduleId),
+   483→      });
+   484→
+   485→      return {
+   486→        pmSchedule: {
+   487→          ...pm,
+   488→          train: pm.train ? { id: pm.train.id, trainNumber: pm.train.trainNumber } : undefined,
+   489→          pmType: pm.pmType
+   490→            ? { id: pm.pmType.id, pmCode: pm.pmType.pmCode, pmName: pm.pmType.pmName }
+   491→            : undefined,
+   492→          depot: pm.assignedDepot
+   493→            ? { id: pm.assignedDepot.id, code: pm.assignedDepot.code }
+   494→            : undefined,
+   495→        },
+   496→        shadowRecord: shadowRecord ?? ({} as MaximoShadowRecord),
+   497→      };
+   498→    });
+   499→  }
+   500→
+   501→  /**
+   502→   * List shadow records with filters
+   503→   */
+   504→  async listShadowRecords(
+   505→    filters: ShadowRecordFilters = {},
+   506→    pagination: PaginationOptions = {}
+   507→  ): Promise<PaginatedShadowRecords> {
+   508→    return this.traced('listShadowRecords', async (span) => {
+   509→      const { page = 1, pageSize = 50 } = pagination;
+   510→      const offset = (page - 1) * pageSize;
+   511→
+   512→      // Build where conditions
+   513→      const conditions: SQL<unknown>[] = [];
+   514→
+   515→      if (filters.syncStatus) {
+   516→        const statuses = Array.isArray(filters.syncStatus)
+   517→          ? filters.syncStatus
+   518→          : [filters.syncStatus];
+   519→        conditions.push(inArray(maximoShadowRecords.syncStatus, statuses));
+   520→      }
+   521→
+   522→      if (filters.pmScheduleId) {
+   523→        conditions.push(eq(maximoShadowRecords.pmScheduleId, filters.pmScheduleId));
+   524→      }
+   525→
+   526→      if (filters.maximoWoNum) {
+   527→        conditions.push(eq(maximoShadowRecords.maximoWoNum, filters.maximoWoNum));
+   528→      }
+   529→
+   530→      if (filters.hasConflict) {
+   531→        conditions.push(eq(maximoShadowRecords.syncStatus, 'CONFLICT'));
+   532→      }
+   533→
+   534→      if (filters.needsSync) {
+   535→        const needsSyncCondition = or(
+   536→          eq(maximoShadowRecords.syncStatus, 'PENDING'),
+   537→          and(
+   538→            eq(maximoShadowRecords.syncStatus, 'ERROR'),
+   539→            lt(maximoShadowRecords.syncAttempts, 5)
+   540→          )
+   541→        );
+   542→        if (needsSyncCondition) {
+   543→          conditions.push(needsSyncCondition);
+   544→        }
+   545→      }
+   546→
+   547→      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+   548→
+   549→      // Get total count
+   550→      const [{ value: total }] = await this.db
+   551→        .select({ value: count() })
+   552→        .from(maximoShadowRecords)
+   553→        .where(whereClause);
+   554→
+   555→      // Get records
+   556→      const records = await this.db.query.maximoShadowRecords.findMany({
+   557→        where: whereClause,
+   558→        orderBy: [desc(maximoShadowRecords.updatedAt)],
+   559→        limit: pageSize,
+   560→        offset,
+   561→        with: {
+   562→          pmScheduleEntry: {
+   563→            with: {
+   564→              train: true,
+   565→              pmType: true,
+   566→              assignedDepot: true,
+   567→            },
+   568→          },
+   569→        },
+   570→      });
+   571→
+   572→      // Transform to ShadowRecordWithPm
+   573→      const data: ShadowRecordWithPm[] = records.map((r) => ({
+   574→        shadowRecord: r,
+   575→        pmSchedule: {
+   576→          ...r.pmScheduleEntry,
+   577→          train: r.pmScheduleEntry.train
+   578→            ? {
+   579→                id: r.pmScheduleEntry.train.id,
+   580→                trainNumber: r.pmScheduleEntry.train.trainNumber,
+   581→              }
+   582→            : undefined,
+   583→          pmType: r.pmScheduleEntry.pmType
+   584→            ? {
+   585→                id: r.pmScheduleEntry.pmType.id,
+   586→                pmCode: r.pmScheduleEntry.pmType.pmCode,
+   587→                pmName: r.pmScheduleEntry.pmType.pmName,
+   588→              }
+   589→            : undefined,
+   590→          depot: r.pmScheduleEntry.assignedDepot
+   591→            ? {
+   592→                id: r.pmScheduleEntry.assignedDepot.id,
+   593→                code: r.pmScheduleEntry.assignedDepot.code,
+   594→              }
+   595→            : undefined,
+   596→        },
+   597→      }));
+   598→
+   599→      span.setAttribute('query.total', total);
+   600→      span.setAttribute('query.returned', data.length);
+   601→
+   602→      return {
+   603→        data,
+   604→        total,
+   605→        page,
+   606→        pageSize,
+   607→        totalPages: Math.ceil(total / pageSize),
+   608→      };
+   609→    });
+   610→  }
+   611→
+   612→  // ===========================================================================
+   613→  // Push Sync (MMS → Maximo)
+   614→  // ===========================================================================
+   615→
+   616→  /**
+   617→   * Push MMS changes to Maximo for a specific PM
+   618→   *
+   619→   * Creates or updates the Maximo work order based on shadow record state.
+   620→   *
+   621→   * @see specs/007-integration.md Section 7.4.7
+   622→   */
+   623→  async pushToMaximo(pmScheduleId: string): Promise<PushResult> {
+   624→    return this.traced('pushToMaximo', async (span) => {
+   625→      span.setAttribute(MmsAttributes.PM_SCHEDULE_ID, pmScheduleId);
+   626→
+   627→      const pmWithShadow = await this.getPmWithShadow(pmScheduleId);
+   628→
+   629→      if (!pmWithShadow) {
+   630→        return { action: 'ERROR', error: 'PM schedule not found' };
+   631→      }
+   632→
+   633→      const { pmSchedule: pm, shadowRecord } = pmWithShadow;
+   634→
+   635→      // Create shadow record if doesn't exist
+   636→      let shadow = shadowRecord;
+   637→      if (!shadow?.id) {
+   638→        shadow = await this.createShadowRecord(pmScheduleId);
+   639→      }
+   640→
+   641→      // Check circuit breaker state
+   642→      if (this.circuitBreaker.getState() === 'OPEN') {
+   643→        this.log.warn({ pmScheduleId }, 'Circuit breaker is open, skipping push');
+   644→        return { action: 'SKIPPED', reason: 'Circuit breaker open' };
+   645→      }
+   646→
+   647→      const syncAttempts = shadow.syncAttempts ?? 0;
+   648→
+   649→      try {
+   650→        // No Maximo WO yet - create new
+   651→        if (!shadow.maximoWoNum) {
+   652→          // Use circuit breaker for Maximo API call
+   653→          const woNum = await this.circuitBreaker.execute(() =>
+   654→            this.createMaximoWorkOrder(pm)
+   655→          );
+   656→
+   657→          await this.updateShadowRecord(shadow.id, {
+   658→            maximoWoNum: woNum,
+   659→            syncStatus: 'SYNCED',
+   660→            lastSyncAt: new Date(),
+   661→            lastSyncError: null,
+   662→            syncAttempts: syncAttempts + 1,
+   663→            mmsDataSnapshot: this.createMmsSnapshot(pm),
+   664→          });
+   665→
+   666→          await this.recordSyncHistory(shadow.id, 'PUSH', {
+   667→            previousStatus: shadow.syncStatus,
+   668→            newStatus: 'SYNCED',
+   669→            success: true,
+   670→          });
+   671→
+   672→          span.setAttribute('maximo.wo.created', woNum);
+   673→
+   674→          return { action: 'CREATED', woNum };
+   675→        }
+   676→
+   677→        // Check if Maximo WO is in locked state
+   678→        const maximoWo = await this.circuitBreaker.execute(() =>
+   679→          this.fetchMaximoWorkOrder(shadow.maximoWoNum!)
+   680→        );
+   681→
+   682→        if (maximoWo && LOCKED_MAXIMO_STATUSES.includes(maximoWo.status)) {
+   683→          return {
+   684→            action: 'SKIPPED',
+   685→            reason: `Work order is ${MAXIMO_STATUS_LABELS[maximoWo.status]}`,
+   686→            woNum: shadow.maximoWoNum,
+   687→          };
+   688→        }
+   689→
+   690→        // Check for conflicts
+   691→        if (maximoWo?.changedate && shadow.lastSyncAt) {
+   692→          const maximoChangeDate = new Date(maximoWo.changedate);
+   693→          if (maximoChangeDate > shadow.lastSyncAt) {
+   694→            await this.updateShadowRecord(shadow.id, {
+   695→              syncStatus: 'CONFLICT',
+   696→              maximoData: {
+   697→                status: maximoWo.status,
+   698→                schedStart: maximoWo.schedstart,
+   699→                schedFinish: maximoWo.schedfinish,
+   700→                actualStart: maximoWo.actstart,
+   701→                actualFinish: maximoWo.actfinish,
+   702→                actualLabor: maximoWo.actlabhrs,
+   703→                changeDate: maximoWo.changedate,
+   704→              },
+   705→            });
+   706→
+   707→            await this.recordSyncHistory(shadow.id, 'PUSH', {
+   708→              previousStatus: shadow.syncStatus,
+   709→              newStatus: 'CONFLICT',
+   710→              success: false,
+   711→              errorMessage: 'Conflict detected - Maximo changed after last sync',
+   712→            });
+   713→
+   714→            return { action: 'CONFLICT', woNum: shadow.maximoWoNum };
+   715→          }
+   716→        }
+   717→
+   718→        // Update existing work order
+   719→        await this.circuitBreaker.execute(() =>
+   720→          this.updateMaximoWorkOrder(shadow.maximoWoNum!, pm)
+   721→        );
+   722→
+   723→        await this.updateShadowRecord(shadow.id, {
+   724→          syncStatus: 'SYNCED',
+   725→          lastSyncAt: new Date(),
+   726→          lastSyncError: null,
+   727→          syncAttempts: syncAttempts + 1,
+   728→          mmsDataSnapshot: this.createMmsSnapshot(pm),
+   729→          pendingChanges: null,
+   730→        });
+   731→
+   732→        await this.recordSyncHistory(shadow.id, 'PUSH', {
+   733→          previousStatus: shadow.syncStatus,
+   734→          newStatus: 'SYNCED',
+   735→          success: true,
+   736→        });
+   737→
+   738→        span.setAttribute('maximo.wo.updated', shadow.maximoWoNum);
+   739→
+   740→        return { action: 'UPDATED', woNum: shadow.maximoWoNum };
+   741→      } catch (error) {
+   742→        const errorMessage = error instanceof Error ? error.message : String(error);
+   743→
+   744→        await this.updateShadowRecord(shadow.id, {
+   745→          syncStatus: 'ERROR',
+   746→          lastSyncError: errorMessage,
+   747→          syncAttempts: syncAttempts + 1,
+   748→          nextSyncAt: this.calculateNextRetry(syncAttempts + 1),
+   749→        });
+   750→
+   751→        await this.recordSyncHistory(shadow.id, 'PUSH', {
+   752→          previousStatus: shadow.syncStatus,
+   753→          newStatus: 'ERROR',
+   754→          success: false,
+   755→          errorMessage,
+   756→        });
+   757→
+   758→        span.setAttribute('error', true);
+   759→        span.setAttribute('error.message', errorMessage);
+   760→
+   761→        return { action: 'ERROR', error: errorMessage };
+   762→      }
+   763→    });
+   764→  }
+   765→
+   766→  /**
+   767→   * Push all pending changes to Maximo (batch sync)
+   768→   */
+   769→  async pushAllPending(): Promise<{ pushed: number; errors: number }> {
+   770→    return this.traced('pushAllPending', async (span) => {
+   771→      // Get all pending shadow records
+   772→      const pending = await this.db.query.maximoShadowRecords.findMany({
+   773→        where: or(
+   774→          eq(maximoShadowRecords.syncStatus, 'PENDING'),
+   775→          and(
+   776→            eq(maximoShadowRecords.syncStatus, 'ERROR'),
+   777→            lt(maximoShadowRecords.syncAttempts, 5),
+   778→            or(
+   779→              isNull(maximoShadowRecords.nextSyncAt),
+   780→              lt(maximoShadowRecords.nextSyncAt, new Date())
+   781→            )
+   782→          )
+   783→        ),
+   784→        limit: 100, // Process in batches
+   785→      });
+   786→
+   787→      span.setAttribute('pending.count', pending.length);
+   788→
+   789→      let pushed = 0;
+   790→      let errors = 0;
+   791→
+   792→      for (const record of pending) {
+   793→        try {
+   794→          const result = await this.pushToMaximo(record.pmScheduleId);
+   795→          if (result.action === 'CREATED' || result.action === 'UPDATED') {
+   796→            pushed++;
+   797→          } else if (result.action === 'ERROR') {
+   798→            errors++;
+   799→          }
+   800→        } catch (error) {
+   801→          errors++;
+   802→          this.log.error(
+   803→            { pmScheduleId: record.pmScheduleId, error },
+   804→            'Failed to push to Maximo'
+   805→          );
+   806→        }
+   807→      }
+   808→
+   809→      span.setAttribute('pushed.count', pushed);
+   810→      span.setAttribute('errors.count', errors);
+   811→
+   812→      return { pushed, errors };
+   813→    });
+   814→  }
+   815→
+   816→  // ===========================================================================
+   817→  // Pull Sync (Maximo → MMS)
+   818→  // ===========================================================================
+   819→
+   820→  /**
+   821→   * Pull Maximo status changes to MMS
+   822→   *
+   823→   * Queries Maximo for work orders modified since last pull and updates
+   824→   * MMS PM statuses accordingly.
+   825→   *
+   826→   * @see specs/007-integration.md Section 7.4.7
+   827→   */
+   828→  async pullFromMaximo(): Promise<PullResult> {
+   829→    return this.traced('pullFromMaximo', async (span) => {
+   830→      const result: PullResult = {
+   831→        processed: 0,
+   832→        updated: 0,
+   833→        conflicts: 0,
+   834→        errors: 0,
+   835→        details: [],
+   836→      };
+   837→
+   838→      // Check circuit breaker state
+   839→      if (this.circuitBreaker.getState() === 'OPEN') {
+   840→        this.log.warn('Circuit breaker is open, skipping pull');
+   841→        return result;
+   842→      }
+   843→
+   844→      // Get all synced shadow records
+   845→      const syncedRecords = await this.db.query.maximoShadowRecords.findMany({
+   846→        where: and(
+   847→          eq(maximoShadowRecords.syncStatus, 'SYNCED'),
+   848→          sql`${maximoShadowRecords.maximoWoNum} IS NOT NULL`
+   849→        ),
+   850→      });
+   851→
+   852→      span.setAttribute('synced.records', syncedRecords.length);
+   853→
+   854→      for (const record of syncedRecords) {
+   855→        result.processed++;
+   856→
+   857→        try {
+   858→          if (!record.maximoWoNum) continue;
+   859→
+   860→          // Use circuit breaker for Maximo API call
+   861→          const maximoWo = await this.circuitBreaker.execute(() =>
+   862→            this.fetchMaximoWorkOrder(record.maximoWoNum!)
+   863→          );
+   864→
+   865→          if (!maximoWo) {
+   866→            result.details.push({
+   867→              pmScheduleId: record.pmScheduleId,
+   868→              maximoWoNum: record.maximoWoNum,
+   869→              action: 'SKIPPED',
+   870→              error: 'Work order not found in Maximo',
+   871→            });
+   872→            continue;
+   873→          }
+   874→
+   875→          const currentMaximoData = record.maximoData as { status?: string } | null;
+   876→          const previousStatus = currentMaximoData?.status;
+   877→
+   878→          // Status changed
+   879→          if (maximoWo.status !== previousStatus) {
+   880→            await this.handleStatusChange(record, maximoWo);
+   881→            result.updated++;
+   882→            result.details.push({
+   883→              pmScheduleId: record.pmScheduleId,
+   884→              maximoWoNum: record.maximoWoNum,
+   885→              previousStatus,
+   886→              newStatus: maximoWo.status,
+   887→              action: 'UPDATED',
+   888→            });
+   889→          }
+   890→
+   891→          // Record actuals if completed
+   892→          if (
+   893→            (maximoWo.status === 'COMP' || maximoWo.status === 'CLOSE') &&
+   894→            maximoWo.actlabhrs
+   895→          ) {
+   896→            await this.recordActuals(record.pmScheduleId, maximoWo);
+   897→          }
+   898→        } catch (error) {
+   899→          result.errors++;
+   900→          result.details.push({
+   901→            pmScheduleId: record.pmScheduleId,
+   902→            maximoWoNum: record.maximoWoNum ?? '',
+   903→            action: 'ERROR',
+   904→            error: error instanceof Error ? error.message : String(error),
+   905→          });
+   906→        }
+   907→      }
+   908→
+   909→      this.lastPullTimestamp = new Date();
+   910→      span.setAttribute('pull.updated', result.updated);
+   911→      span.setAttribute('pull.errors', result.errors);
+   912→
+   913→      return result;
+   914→    });
+   915→  }
+   916→
+   917→  // ===========================================================================
+   918→  // Conflict Resolution
+   919→  // ===========================================================================
+   920→
+   921→  /**
+   922→   * Resolve sync conflict
+   923→   *
+   924→   * @param pmScheduleId - PM schedule ID with conflict
+   925→   * @param resolution - Strategy: USE_MMS (force push) or USE_MAXIMO (apply Maximo data)
+   926→   * @param userId - User resolving the conflict
+   927→   */
+   928→  async resolveConflict(
+   929→    pmScheduleId: string,
+   930→    resolution: ConflictResolution,
+   931→    userId?: string
+   932→  ): Promise<void> {
+   933→    return this.traced('resolveConflict', async (span) => {
+   934→      span.setAttribute(MmsAttributes.PM_SCHEDULE_ID, pmScheduleId);
+   935→      span.setAttribute('resolution', resolution);
+   936→
+   937→      const shadow = await this.db.query.maximoShadowRecords.findFirst({
+   938→        where: eq(maximoShadowRecords.pmScheduleId, pmScheduleId),
+   939→      });
+   940→
+   941→      if (!shadow) {
+   942→        throw new NotFoundError(`Shadow record not found for PM: ${pmScheduleId}`, {
+   943→          entityType: 'MaximoShadowRecord',
+   944→          entityId: pmScheduleId,
+   945→        });
+   946→      }
+   947→
+   948→      if (shadow.syncStatus !== 'CONFLICT') {
+   949→        throw new ValidationError('Shadow record is not in conflict state');
+   950→      }
+   951→
+   952→      if (!shadow.maximoWoNum) {
+   953→        throw new ValidationError('Shadow record has no Maximo work order');
+   954→      }
+   955→
+   956→      if (resolution === 'USE_MMS') {
+   957→        // Force push MMS data to Maximo
+   958→        const pm = await this.db.query.pmSchedule.findFirst({
+   959→          where: eq(pmSchedule.id, pmScheduleId),
+   960→          with: { train: true, pmType: true, assignedDepot: true },
+   961→        });
+   962→
+   963→        if (!pm) {
+   964→          throw new NotFoundError(`PM schedule not found: ${pmScheduleId}`, {
+   965→            entityType: 'PmSchedule',
+   966→            entityId: pmScheduleId,
+   967→          });
+   968→        }
+   969→
+   970→        await this.updateMaximoWorkOrder(shadow.maximoWoNum, pm, { force: true });
+   971→      } else {
+   972→        // Apply Maximo data to MMS
+   973→        const maximoWo = await this.fetchMaximoWorkOrder(shadow.maximoWoNum);
+   974→
+   975→        if (!maximoWo) {
+   976→          throw new MaximoConnectionError('Failed to fetch Maximo work order');
+   977→        }
+   978→
+   979→        await this.applyMaximoDataToMms(pmScheduleId, maximoWo);
+   980→      }
+   981→
+   982→      // Update shadow record
+   983→      await this.updateShadowRecord(shadow.id, {
+   984→        syncStatus: 'SYNCED',
+   985→        lastSyncAt: new Date(),
+   986→        conflictResolvedAt: new Date(),
+   987→        conflictResolvedBy: userId ?? undefined,
+   988→        conflictResolution: resolution,
+   989→      });
+   990→
+   991→      await this.recordSyncHistory(shadow.id, 'CONFLICT_RESOLVE', {
+   992→        previousStatus: 'CONFLICT',
+   993→        newStatus: 'SYNCED',
+   994→        success: true,
+   995→      });
+   996→
+   997→      this.log.info(
+   998→        { pmScheduleId, resolution, userId },
+   999→        'Conflict resolved'
+  1000→      );
+  1001→    });
+  1002→  }
+  1003→
+  1004→  /**
+  1005→   * Get all records with conflicts
+  1006→   */
+  1007→  async getConflicts(): Promise<ShadowRecordWithPm[]> {
+  1008→    const result = await this.listShadowRecords({ syncStatus: 'CONFLICT' });
+  1009→    return result.data;
+  1010→  }
+  1011→
+  1012→  // ===========================================================================
+  1013→  // Statistics
+  1014→  // ===========================================================================
+  1015→
+  1016→  /**
+  1017→   * Get sync statistics
+  1018→   */
+  1019→  async getSyncStats(): Promise<SyncStats> {
+  1020→    return this.traced('getSyncStats', async () => {
+  1021→      const stats = await this.db
+  1022→        .select({
+  1023→          status: maximoShadowRecords.syncStatus,
+  1024→          count: count(),
+  1025→        })
+  1026→        .from(maximoShadowRecords)
+  1027→        .groupBy(maximoShadowRecords.syncStatus);
+  1028→
+  1029→      const statusCounts = stats.reduce(
+  1030→        (acc, s) => {
+  1031→          acc[s.status] = s.count;
+  1032→          return acc;
+  1033→        },
+  1034→        {} as Record<string, number>
+  1035→      );
+  1036→
+  1037→      // Get last sync timestamp
+  1038→      const lastSync = await this.db.query.maximoShadowRecords.findFirst({
+  1039→        where: eq(maximoShadowRecords.syncStatus, 'SYNCED'),
+  1040→        orderBy: [desc(maximoShadowRecords.lastSyncAt)],
+  1041→      });
+  1042→
+  1043→      return {
+  1044→        pendingRecords: statusCounts['PENDING'] ?? 0,
+  1045→        syncedRecords: statusCounts['SYNCED'] ?? 0,
+  1046→        conflictRecords: statusCounts['CONFLICT'] ?? 0,
+  1047→        errorRecords: statusCounts['ERROR'] ?? 0,
+  1048→        lastSyncAt: lastSync?.lastSyncAt ?? undefined,
+  1049→        lastPullAt: this.lastPullTimestamp ?? undefined,
+  1050→        circuitBreakerState: this.circuitBreaker.getState(),
+  1051→      };
+  1052→    });
+  1053→  }
+  1054→
+  1055→  // ===========================================================================
+  1056→  // Private Methods - Maximo API Integration
+  1057→  // ===========================================================================
+  1058→
+  1059→  /**
+  1060→   * Create a Maximo work order via REST API
+  1061→   *
+  1062→   * Uses MaximoClient for actual API calls. Falls back to simulation
+  1063→   * if client is not configured (no MAXIMO_API_PASSWORD or config).
+  1064→   *
+  1065→   * @see specs/007-integration.md Section 7.4.4
+  1066→   */
+  1067→  private async createMaximoWorkOrder(
+  1068→    pm: PmScheduleRecord & {
+  1069→      train?: { id: string; trainNumber: string };
+  1070→      pmType?: { id: string; pmCode: string; pmName: string };
+  1071→      depot?: { id: string; code: string };
+  1072→    }
+  1073→  ): Promise<string> {
+  1074→    return this.traced('createMaximoWorkOrder', async (span) => {
+  1075→      await this.ensureClientInitialized();
+  1076→
+  1077→      span.setAttribute('train.number', pm.train?.trainNumber ?? 'unknown');
+  1078→      span.setAttribute('pm.code', pm.pmType?.pmCode ?? 'unknown');
+  1079→      span.setAttribute('maximo.configured', this.maximoClient.isConfigured());
+  1080→
+  1081→      const payload = {
+  1082→        siteid: 'METRO',
+  1083→        woclass: 'WORKORDER',
+  1084→        worktype: 'PM',
+  1085→        assetnum: pm.train?.trainNumber ?? '',
+  1086→        description: `${pm.pmType?.pmCode ?? 'PM'} - ${pm.pmType?.pmName ?? 'Maintenance'}`,
+  1087→        schedstart: pm.targetDate,
+  1088→        schedfinish: addDays(new Date(pm.targetDate), 1).toISOString(),
+  1089→        location: pm.depot?.code,
+  1090→        estlabhrs: pm.assignedHours ? parseFloat(pm.assignedHours) : undefined,
+  1091→        pmnum: pm.pmType?.pmCode,
+  1092→        mms_schedule_id: pm.id,
+  1093→        mms_constraint_start: pm.constraintStart ?? pm.targetDate,
+  1094→        mms_constraint_end: pm.constraintEnd ?? addDays(new Date(pm.targetDate), 30).toISOString(),
+  1095→      };
+  1096→
+  1097→      const woNum = await this.maximoClient.createWorkOrder(payload);
+  1098→
+  1099→      span.setAttribute('maximo.wo.num', woNum);
+  1100→      this.log.info(
+  1101→        {
+  1102→          woNum,
+  1103→          pmScheduleId: pm.id,
+  1104→          trainNumber: pm.train?.trainNumber,
+  1105→          pmCode: pm.pmType?.pmCode,
+  1106→          configured: this.maximoClient.isConfigured(),
+  1107→        },
+  1108→        this.maximoClient.isConfigured()
+  1109→          ? 'Created Maximo work order'
+  1110→          : 'Created Maximo work order (simulated)'
+  1111→      );
+  1112→
+  1113→      return woNum;
+  1114→    });
+  1115→  }
+  1116→
+  1117→  /**
+  1118→   * Update a Maximo work order via REST API
+  1119→   */
+  1120→  private async updateMaximoWorkOrder(
+  1121→    woNum: string,
+  1122→    pm: PmScheduleRecord & {
+  1123→      train?: { id: string; trainNumber: string };
+  1124→      pmType?: { id: string; pmCode: string; pmName: string };
+  1125→      depot?: { id: string; code: string };
+  1126→    },
+  1127→    options?: { force?: boolean }
+  1128→  ): Promise<void> {
+  1129→    return this.traced('updateMaximoWorkOrder', async (span) => {
+  1130→      await this.ensureClientInitialized();
+  1131→
+  1132→      span.setAttribute('maximo.wo.num', woNum);
+  1133→      span.setAttribute('force', options?.force ?? false);
+  1134→
+  1135→      const payload = {
+  1136→        schedstart: pm.targetDate,
+  1137→        schedfinish: addDays(new Date(pm.targetDate), 1).toISOString(),
+  1138→        location: pm.depot?.code,
+  1139→        estlabhrs: pm.assignedHours ? parseFloat(pm.assignedHours) : undefined,
+  1140→      };
+  1141→
+  1142→      await this.maximoClient.updateWorkOrder(woNum, payload, options);
+  1143→
+  1144→      this.log.info(
+  1145→        {
+  1146→          woNum,
+  1147→          pmScheduleId: pm.id,
+  1148→          targetDate: pm.targetDate,
+  1149→          force: options?.force,
+  1150→          configured: this.maximoClient.isConfigured(),
+  1151→        },
+  1152→        this.maximoClient.isConfigured()
+  1153→          ? 'Updated Maximo work order'
+  1154→          : 'Updated Maximo work order (simulated)'
+  1155→      );
+  1156→    });
+  1157→  }
+  1158→
+  1159→  /**
+  1160→   * Fetch a Maximo work order via REST API
+  1161→   */
+  1162→  private async fetchMaximoWorkOrder(woNum: string): Promise<MaximoWorkOrder | null> {
+  1163→    return this.traced('fetchMaximoWorkOrder', async (span) => {
+  1164→      await this.ensureClientInitialized();
+  1165→
+  1166→      span.setAttribute('maximo.wo.num', woNum);
+  1167→
+  1168→      const wo = await this.maximoClient.getWorkOrder(woNum);
+  1169→
+  1170→      if (!wo) {
+  1171→        return null;
+  1172→      }
+  1173→
+  1174→      // Convert MaximoClientWorkOrder to local MaximoWorkOrder type
+  1175→      return {
+  1176→        wonum: wo.wonum,
+  1177→        status: wo.status,
+  1178→        schedstart: wo.schedstart,
+  1179→        schedfinish: wo.schedfinish,
+  1180→        actstart: wo.actstart,
+  1181→        actfinish: wo.actfinish,
+  1182→        actlabhrs: wo.actlabhrs,
+  1183→        changedate: wo.changedate,
+  1184→      };
+  1185→    });
+  1186→  }
+  1187→
+  1188→  // ===========================================================================
+  1189→  // Private Helper Methods
+  1190→  // ===========================================================================
+  1191→
+  1192→  private async updateShadowRecord(
+  1193→    shadowRecordId: string,
+  1194→    updates: Partial<{
+  1195→      maximoWoNum: string;
+  1196→      syncStatus: SyncStatus;
+  1197→      lastSyncAt: Date;
+  1198→      lastSyncError: string | null;
+  1199→      syncAttempts: number;
+  1200→      nextSyncAt: Date;
+  1201→      mmsDataSnapshot: {
+  1202→        trainId: string;
+  1203→        pmTypeCode: string;
+  1204→        targetDate: string;
+  1205→        status: string;
+  1206→        assignedDepotId?: string;
+  1207→        assignedHours?: string;
+  1208→      };
+  1209→      maximoData: {
+  1210→        status: string;
+  1211→        schedStart?: string;
+  1212→        schedFinish?: string;
+  1213→        actualStart?: string;
+  1214→        actualFinish?: string;
+  1215→        actualLabor?: number;
+  1216→        changeDate?: string;
+  1217→      };
+  1218→      pendingChanges: {
+  1219→        targetDate?: string;
+  1220→        assignedDepotId?: string;
+  1221→        assignedHours?: number;
+  1222→      } | null;
+  1223→      conflictResolvedAt: Date;
+  1224→      conflictResolvedBy: string;
+  1225→      conflictResolution: string;
+  1226→    }>
+  1227→  ): Promise<void> {
+  1228→    await this.db
+  1229→      .update(maximoShadowRecords)
+  1230→      .set({
+  1231→        ...updates,
+  1232→        updatedAt: new Date(),
+  1233→      })
+  1234→      .where(eq(maximoShadowRecords.id, shadowRecordId));
+  1235→  }
+  1236→
+  1237→  private async recordSyncHistory(
+  1238→    shadowRecordId: string,
+  1239→    operation: SyncOperation,
+  1240→    details: {
+  1241→      previousStatus?: SyncStatus | null;
+  1242→      newStatus?: SyncStatus;
+  1243→      maximoStatus?: MaximoWoStatus;
+  1244→      success: boolean;
+  1245→      errorCode?: string;
+  1246→      errorMessage?: string;
+  1247→      requestData?: object;
+  1248→      responseData?: object;
+  1249→    }
+  1250→  ): Promise<void> {
+  1251→    const startedAt = new Date();
+  1252→
+  1253→    await this.db.insert(maximoSyncHistory).values({
+  1254→      shadowRecordId,
+  1255→      operation,
+  1256→      previousStatus: details.previousStatus ?? undefined,
+  1257→      newStatus: details.newStatus,
+  1258→      maximoStatus: details.maximoStatus,
+  1259→      success: details.success,
+  1260→      errorCode: details.errorCode,
+  1261→      errorMessage: details.errorMessage,
+  1262→      requestData: details.requestData,
+  1263→      responseData: details.responseData,
+  1264→      startedAt,
+  1265→      completedAt: new Date(),
+  1266→      durationMs: Date.now() - startedAt.getTime(),
+  1267→      triggeredBy: 'SCHEDULER',
+  1268→    });
+  1269→  }
+  1270→
+  1271→  private createMmsSnapshot(
+  1272→    pm: PmScheduleRecord & {
+  1273→      train?: { id: string; trainNumber: string };
+  1274→      pmType?: { id: string; pmCode: string; pmName: string };
+  1275→    }
+  1276→  ): {
+  1277→    trainId: string;
+  1278→    pmTypeCode: string;
+  1279→    targetDate: string;
+  1280→    status: string;
+  1281→    assignedDepotId?: string;
+  1282→    assignedHours?: string;
+  1283→  } {
+  1284→    return {
+  1285→      trainId: pm.trainId,
+  1286→      pmTypeCode: pm.pmType?.pmCode ?? 'UNKNOWN',
+  1287→      targetDate: pm.targetDate,
+  1288→      status: pm.status ?? 'SCHEDULED',
+  1289→      assignedDepotId: pm.assignedDepotId ?? undefined,
+  1290→      assignedHours: pm.assignedHours ?? undefined,
+  1291→    };
+  1292→  }
+  1293→
+  1294→  private calculateNextRetry(attempts: number): Date {
+  1295→    // Exponential backoff with max delay
+  1296→    const initialDelayMs = 1000;
+  1297→    const backoffMultiplier = 2;
+  1298→    const maxDelayMs = 60000;
+  1299→
+  1300→    const delay = Math.min(
+  1301→      initialDelayMs * Math.pow(backoffMultiplier, attempts - 1),
+  1302→      maxDelayMs
+  1303→    );
+  1304→    return addSeconds(new Date(), delay / 1000);
+  1305→  }
+  1306→
+  1307→  private async handleStatusChange(
+  1308→    shadowRecord: MaximoShadowRecord,
+  1309→    maximoWo: MaximoWorkOrder
+  1310→  ): Promise<void> {
+  1311→    // Update shadow record with new Maximo data
+  1312→    await this.updateShadowRecord(shadowRecord.id, {
+  1313→      maximoData: {
+  1314→        status: maximoWo.status,
+  1315→        schedStart: maximoWo.schedstart,
+  1316→        schedFinish: maximoWo.schedfinish,
+  1317→        actualStart: maximoWo.actstart,
+  1318→        actualFinish: maximoWo.actfinish,
+  1319→        actualLabor: maximoWo.actlabhrs,
+  1320→        changeDate: maximoWo.changedate,
+  1321→      },
+  1322→    });
+  1323→
+  1324→    // Update MMS PM status based on Maximo status
+  1325→    const mmsStatus = MAXIMO_TO_MMS_STATUS[maximoWo.status];
+  1326→
+  1327→    await this.db
+  1328→      .update(pmSchedule)
+  1329→      .set({
+  1330→        status: mmsStatus,
+  1331→        updatedAt: new Date(),
+  1332→        // Lock PM if Maximo status is in progress or completed
+  1333→        isLocked: LOCKED_MAXIMO_STATUSES.includes(maximoWo.status),
+  1334→        lockedReason: LOCKED_MAXIMO_STATUSES.includes(maximoWo.status)
+  1335→          ? `Maximo status: ${MAXIMO_STATUS_LABELS[maximoWo.status]}`
+  1336→          : undefined,
+  1337→      })
+  1338→      .where(eq(pmSchedule.id, shadowRecord.pmScheduleId));
+  1339→
+  1340→    await this.recordSyncHistory(shadowRecord.id, 'PULL', {
+  1341→      previousStatus: shadowRecord.syncStatus,
+  1342→      newStatus: 'SYNCED',
+  1343→      maximoStatus: maximoWo.status,
+  1344→      success: true,
+  1345→    });
+  1346→  }
+  1347→
+  1348→  private async recordActuals(
+  1349→    pmScheduleId: string,
+  1350→    maximoWo: MaximoWorkOrder
+  1351→  ): Promise<void> {
+  1352→    const updates: Partial<PmScheduleRecord> = {
+  1353→      updatedAt: new Date(),
+  1354→    };
+  1355→
+  1356→    if (maximoWo.actlabhrs) {
+  1357→      updates.actualHours = String(maximoWo.actlabhrs);
+  1358→    }
+  1359→
+  1360→    if (maximoWo.actstart) {
+  1361→      updates.actualStartDate = maximoWo.actstart;
+  1362→    }
+  1363→
+  1364→    if (maximoWo.actfinish) {
+  1365→      updates.actualEndDate = maximoWo.actfinish;
+  1366→      updates.completedAt = new Date(maximoWo.actfinish);
+  1367→    }
+  1368→
+  1369→    await this.db
+  1370→      .update(pmSchedule)
+  1371→      .set(updates)
+  1372→      .where(eq(pmSchedule.id, pmScheduleId));
+  1373→  }
+  1374→
+  1375→  private async applyMaximoDataToMms(
+  1376→    pmScheduleId: string,
+  1377→    maximoWo: MaximoWorkOrder
+  1378→  ): Promise<void> {
+  1379→    const updates: Partial<PmScheduleRecord> = {
+  1380→      status: MAXIMO_TO_MMS_STATUS[maximoWo.status],
+  1381→      updatedAt: new Date(),
+  1382→    };
+  1383→
+  1384→    if (maximoWo.schedstart) {
+  1385→      updates.targetDate = maximoWo.schedstart.split('T')[0];
+  1386→    }
+  1387→
+  1388→    if (maximoWo.actlabhrs) {
+  1389→      updates.actualHours = String(maximoWo.actlabhrs);
+  1390→    }
+  1391→
+  1392→    if (maximoWo.actstart) {
+  1393→      updates.actualStartDate = maximoWo.actstart;
+  1394→    }
+  1395→
+  1396→    if (maximoWo.actfinish) {
+  1397→      updates.actualEndDate = maximoWo.actfinish;
+  1398→      updates.completedAt = new Date(maximoWo.actfinish);
+  1399→    }
+  1400→
+  1401→    // Lock if in locked status
+  1402→    if (LOCKED_MAXIMO_STATUSES.includes(maximoWo.status)) {
+  1403→      updates.isLocked = true;
+  1404→      updates.lockedReason = `Maximo status: ${MAXIMO_STATUS_LABELS[maximoWo.status]}`;
+  1405→    }
+  1406→
+  1407→    await this.db
+  1408→      .update(pmSchedule)
+  1409→      .set(updates)
+  1410→      .where(eq(pmSchedule.id, pmScheduleId));
+  1411→  }
+  1412→}
+  1413→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

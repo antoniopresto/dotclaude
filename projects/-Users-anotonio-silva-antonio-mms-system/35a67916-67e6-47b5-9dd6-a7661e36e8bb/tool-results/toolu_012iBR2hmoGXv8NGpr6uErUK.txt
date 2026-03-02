@@ -1,0 +1,757 @@
+     1→/**
+     2→ * MMS Prometheus Metrics
+     3→ *
+     4→ * Application metrics for monitoring and alerting.
+     5→ * Exposed via /metrics endpoint for Prometheus scraping.
+     6→ *
+     7→ * Metric types:
+     8→ * - Counter: Monotonically increasing values (requests, errors)
+     9→ * - Gauge: Point-in-time values (active jobs, queue depth)
+    10→ * - Histogram: Distribution of values (request duration, solve time)
+    11→ *
+    12→ * @see specs/004-backend-specification.md Section 4.14
+    13→ */
+    14→
+    15→import { Registry, Counter, Gauge, Histogram, collectDefaultMetrics } from 'prom-client';
+    16→
+    17→// =============================================================================
+    18→// Registry Setup
+    19→// =============================================================================
+    20→
+    21→export const registry = new Registry();
+    22→
+    23→// Add default Node.js metrics (CPU, memory, event loop, etc.)
+    24→collectDefaultMetrics({
+    25→  register: registry,
+    26→  prefix: 'mms_',
+    27→});
+    28→
+    29→// =============================================================================
+    30→// HTTP Metrics
+    31→// =============================================================================
+    32→
+    33→export const httpRequestsTotal = new Counter({
+    34→  name: 'mms_http_requests_total',
+    35→  help: 'Total number of HTTP requests',
+    36→  labelNames: ['method', 'path', 'status'] as const,
+    37→  registers: [registry],
+    38→});
+    39→
+    40→export const httpRequestDuration = new Histogram({
+    41→  name: 'mms_http_request_duration_seconds',
+    42→  help: 'HTTP request duration in seconds',
+    43→  labelNames: ['method', 'path', 'status'] as const,
+    44→  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    45→  registers: [registry],
+    46→});
+    47→
+    48→export const httpRequestsInFlight = new Gauge({
+    49→  name: 'mms_http_requests_in_flight',
+    50→  help: 'Number of HTTP requests currently being processed',
+    51→  labelNames: ['method'] as const,
+    52→  registers: [registry],
+    53→});
+    54→
+    55→// =============================================================================
+    56→// PM Scheduling Metrics
+    57→// =============================================================================
+    58→
+    59→export const pmScheduledTotal = new Counter({
+    60→  name: 'mms_pm_scheduled_total',
+    61→  help: 'Total number of PM events scheduled',
+    62→  labelNames: ['pm_code', 'fleet_id', 'status'] as const,
+    63→  registers: [registry],
+    64→});
+    65→
+    66→export const pmComplianceWindowDays = new Histogram({
+    67→  name: 'mms_pm_compliance_window_days',
+    68→  help: 'Days between PM scheduling and compliance window end',
+    69→  labelNames: ['pm_code'] as const,
+    70→  buckets: [-14, -7, 0, 7, 14, 30, 60, 90],
+    71→  registers: [registry],
+    72→});
+    73→
+    74→export const pmDeferredTotal = new Counter({
+    75→  name: 'mms_pm_deferred_total',
+    76→  help: 'Total number of PM events deferred',
+    77→  labelNames: ['pm_code', 'reason'] as const,
+    78→  registers: [registry],
+    79→});
+    80→
+    81→// =============================================================================
+    82→// Optimizer Metrics
+    83→// =============================================================================
+    84→
+    85→export const optimizerSolveSeconds = new Histogram({
+    86→  name: 'mms_optimizer_solve_seconds',
+    87→  help: 'Optimizer solve time in seconds',
+    88→  labelNames: ['solver_type', 'status'] as const,
+    89→  buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120],
+    90→  registers: [registry],
+    91→});
+    92→
+    93→export const optimizerRunsTotal = new Counter({
+    94→  name: 'mms_optimizer_runs_total',
+    95→  help: 'Total number of optimizer runs',
+    96→  labelNames: ['solver_type', 'status'] as const,
+    97→  registers: [registry],
+    98→});
+    99→
+   100→export const optimizerObjectiveValue = new Gauge({
+   101→  name: 'mms_optimizer_objective_value',
+   102→  help: 'Latest optimizer objective value',
+   103→  labelNames: ['solver_type'] as const,
+   104→  registers: [registry],
+   105→});
+   106→
+   107→export const optimizerFallbacksTotal = new Counter({
+   108→  name: 'mms_optimizer_fallbacks_total',
+   109→  help: 'Number of times fallback solver was used',
+   110→  labelNames: ['reason'] as const,
+   111→  registers: [registry],
+   112→});
+   113→
+   114→// =============================================================================
+   115→// Fleet Metrics
+   116→// =============================================================================
+   117→
+   118→export const fleetMileageKm = new Gauge({
+   119→  name: 'mms_fleet_mileage_km',
+   120→  help: 'Current cumulative mileage per train',
+   121→  labelNames: ['train_id', 'fleet_id'] as const,
+   122→  registers: [registry],
+   123→});
+   124→
+   125→export const fleetTrainStatus = new Gauge({
+   126→  name: 'mms_fleet_train_status',
+   127→  help: 'Train fitness status (1=FIT, 0.5=RESTRICTED, 0=GROUNDED)',
+   128→  labelNames: ['train_id', 'fleet_id', 'status'] as const,
+   129→  registers: [registry],
+   130→});
+   131→
+   132→export const fleetAvailableTrains = new Gauge({
+   133→  name: 'mms_fleet_available_trains',
+   134→  help: 'Number of trains available for service',
+   135→  labelNames: ['fleet_id'] as const,
+   136→  registers: [registry],
+   137→});
+   138→
+   139→// =============================================================================
+   140→// Drift Metrics
+   141→// =============================================================================
+   142→
+   143→export const driftTrainsRequiringReplan = new Gauge({
+   144→  name: 'mms_drift_trains_requiring_replan',
+   145→  help: 'Number of trains requiring schedule replan due to drift',
+   146→  labelNames: ['baseline_id'] as const,
+   147→  registers: [registry],
+   148→});
+   149→
+   150→export const driftMileagePercent = new Gauge({
+   151→  name: 'mms_drift_mileage_percent',
+   152→  help: 'Mileage drift percentage per train',
+   153→  labelNames: ['train_id', 'baseline_id'] as const,
+   154→  registers: [registry],
+   155→});
+   156→
+   157→export const driftAnalysisTotal = new Counter({
+   158→  name: 'mms_drift_analysis_total',
+   159→  help: 'Total number of drift analyses performed',
+   160→  labelNames: ['result'] as const,
+   161→  registers: [registry],
+   162→});
+   163→
+   164→// =============================================================================
+   165→// Queue Metrics
+   166→// =============================================================================
+   167→
+   168→export const queueJobsTotal = new Counter({
+   169→  name: 'mms_queue_jobs_total',
+   170→  help: 'Total number of queue jobs processed',
+   171→  labelNames: ['queue', 'status'] as const,
+   172→  registers: [registry],
+   173→});
+   174→
+   175→export const queueJobDuration = new Histogram({
+   176→  name: 'mms_queue_job_duration_seconds',
+   177→  help: 'Queue job processing duration in seconds',
+   178→  labelNames: ['queue', 'job_name'] as const,
+   179→  buckets: [0.1, 1, 5, 10, 30, 60, 300, 600],
+   180→  registers: [registry],
+   181→});
+   182→
+   183→export const queueDepth = new Gauge({
+   184→  name: 'mms_queue_depth',
+   185→  help: 'Number of jobs waiting in queue',
+   186→  labelNames: ['queue', 'state'] as const,
+   187→  registers: [registry],
+   188→});
+   189→
+   190→// =============================================================================
+   191→// Ingestion Metrics
+   192→// =============================================================================
+   193→
+   194→export const ingestionFilesTotal = new Counter({
+   195→  name: 'mms_ingestion_files_total',
+   196→  help: 'Total number of files processed',
+   197→  labelNames: ['status'] as const,
+   198→  registers: [registry],
+   199→});
+   200→
+   201→export const ingestionRowsTotal = new Counter({
+   202→  name: 'mms_ingestion_rows_total',
+   203→  help: 'Total number of rows processed',
+   204→  labelNames: ['status'] as const,
+   205→  registers: [registry],
+   206→});
+   207→
+   208→export const ingestionAnomaliesTotal = new Counter({
+   209→  name: 'mms_ingestion_anomalies_total',
+   210→  help: 'Total number of anomalies detected',
+   211→  labelNames: ['type'] as const,
+   212→  registers: [registry],
+   213→});
+   214→
+   215→// =============================================================================
+   216→// Man-hour Metrics
+   217→// =============================================================================
+   218→
+   219→export const manhourUtilizationPercent = new Gauge({
+   220→  name: 'mms_manhour_utilization_percent',
+   221→  help: 'Man-hour utilization percentage per depot',
+   222→  labelNames: ['depot_id', 'period'] as const,
+   223→  registers: [registry],
+   224→});
+   225→
+   226→export const manhourOverloadedPeriods = new Gauge({
+   227→  name: 'mms_manhour_overloaded_periods',
+   228→  help: 'Number of overloaded periods per depot',
+   229→  labelNames: ['depot_id'] as const,
+   230→  registers: [registry],
+   231→});
+   232→
+   233→export const manhourAdjustmentsTotal = new Counter({
+   234→  name: 'mms_manhour_adjustments_total',
+   235→  help: 'Total number of man-hour adjustments made',
+   236→  labelNames: ['depot_id', 'strategy', 'status'] as const,
+   237→  registers: [registry],
+   238→});
+   239→
+   240→// =============================================================================
+   241→// Notification Metrics
+   242→// =============================================================================
+   243→
+   244→export const notificationsQueued = new Counter({
+   245→  name: 'mms_notifications_queued_total',
+   246→  help: 'Total number of notifications queued',
+   247→  labelNames: ['type', 'severity'] as const,
+   248→  registers: [registry],
+   249→});
+   250→
+   251→export const notificationsSent = new Counter({
+   252→  name: 'mms_notifications_sent_total',
+   253→  help: 'Total number of notifications sent',
+   254→  labelNames: ['template', 'status'] as const,
+   255→  registers: [registry],
+   256→});
+   257→
+   258→export const notificationsDigested = new Counter({
+   259→  name: 'mms_notifications_digested_total',
+   260→  help: 'Total number of notifications added to digest batches',
+   261→  labelNames: ['digest_mode'] as const,
+   262→  registers: [registry],
+   263→});
+   264→
+   265→export const digestBatchesProcessed = new Counter({
+   266→  name: 'mms_digest_batches_processed_total',
+   267→  help: 'Total number of digest batches processed',
+   268→  labelNames: ['status'] as const,
+   269→  registers: [registry],
+   270→});
+   271→
+   272→export const notificationMetrics = {
+   273→  notificationsQueued,
+   274→  notificationsSent,
+   275→  notificationsDigested,
+   276→  digestBatchesProcessed,
+   277→};
+   278→
+   279→// =============================================================================
+   280→// Database Metrics
+   281→// =============================================================================
+   282→
+   283→export const dbQueryDuration = new Histogram({
+   284→  name: 'mms_db_query_duration_seconds',
+   285→  help: 'Database query duration in seconds',
+   286→  labelNames: ['operation', 'table'] as const,
+   287→  buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+   288→  registers: [registry],
+   289→});
+   290→
+   291→export const dbConnectionPoolSize = new Gauge({
+   292→  name: 'mms_db_connection_pool_size',
+   293→  help: 'Database connection pool size',
+   294→  labelNames: ['state'] as const,
+   295→  registers: [registry],
+   296→});
+   297→
+   298→export const dbErrorsTotal = new Counter({
+   299→  name: 'mms_db_errors_total',
+   300→  help: 'Total number of database errors',
+   301→  labelNames: ['operation', 'error_code'] as const,
+   302→  registers: [registry],
+   303→});
+   304→
+   305→// =============================================================================
+   306→// Utility Functions
+   307→// =============================================================================
+   308→
+   309→/**
+   310→ * Get metrics output for Prometheus scraping
+   311→ */
+   312→export async function getMetrics(): Promise<string> {
+   313→  return registry.metrics();
+   314→}
+   315→
+   316→/**
+   317→ * Get content type for metrics response
+   318→ */
+   319→export function getMetricsContentType(): string {
+   320→  return registry.contentType;
+   321→}
+   322→
+   323→/**
+   324→ * Reset all metrics (useful for testing)
+   325→ */
+   326→export function resetMetrics(): void {
+   327→  registry.resetMetrics();
+   328→}
+   329→
+   330→/**
+   331→ * HTTP middleware helper - measure request duration
+   332→ */
+   333→export function measureHttpRequest(
+   334→  method: string,
+   335→  path: string,
+   336→  status: number,
+   337→  durationMs: number
+   338→): void {
+   339→  const labels = { method, path, status: String(status) };
+   340→  httpRequestsTotal.inc(labels);
+   341→  httpRequestDuration.observe(labels, durationMs / 1000);
+   342→}
+   343→
+   344→/**
+   345→ * Queue job helper - record job completion
+   346→ */
+   347→export function recordQueueJob(
+   348→  queue: string,
+   349→  jobName: string,
+   350→  status: 'completed' | 'failed',
+   351→  durationMs: number
+   352→): void {
+   353→  queueJobsTotal.inc({ queue, status });
+   354→  queueJobDuration.observe({ queue, job_name: jobName }, durationMs / 1000);
+   355→}
+   356→
+   357→/**
+   358→ * Optimizer helper - record solve completion
+   359→ */
+   360→export function recordOptimizerRun(
+   361→  solverType: 'cpsat' | 'fallback',
+   362→  status: 'optimal' | 'feasible' | 'infeasible' | 'timeout' | 'error',
+   363→  durationMs: number,
+   364→  objective?: number
+   365→): void {
+   366→  optimizerRunsTotal.inc({ solver_type: solverType, status });
+   367→  optimizerSolveSeconds.observe({ solver_type: solverType, status }, durationMs / 1000);
+   368→  if (objective !== undefined) {
+   369→    optimizerObjectiveValue.set({ solver_type: solverType }, objective);
+   370→  }
+   371→}
+   372→
+   373→// =============================================================================
+   374→// Worker Metrics
+   375→// =============================================================================
+   376→
+   377→/**
+   378→ * Worker metrics object for worker infrastructure
+   379→ */
+   380→export const workerMetrics = {
+   381→  queueJobStarted: new Counter({
+   382→    name: 'mms_worker_job_started_total',
+   383→    help: 'Total number of jobs started by workers',
+   384→    labelNames: ['queue'] as const,
+   385→    registers: [registry],
+   386→  }),
+   387→  queueJobCompleted: new Counter({
+   388→    name: 'mms_worker_job_completed_total',
+   389→    help: 'Total number of jobs completed successfully by workers',
+   390→    labelNames: ['queue'] as const,
+   391→    registers: [registry],
+   392→  }),
+   393→  queueJobFailed: new Counter({
+   394→    name: 'mms_worker_job_failed_total',
+   395→    help: 'Total number of jobs failed by workers',
+   396→    labelNames: ['queue'] as const,
+   397→    registers: [registry],
+   398→  }),
+   399→  queueJobDuration: new Histogram({
+   400→    name: 'mms_worker_job_duration_seconds',
+   401→    help: 'Worker job processing duration in seconds',
+   402→    labelNames: ['queue'] as const,
+   403→    buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600],
+   404→    registers: [registry],
+   405→  }),
+   406→};
+   407→
+   408→// =============================================================================
+   409→// Ingestion Helpers
+   410→// =============================================================================
+   411→
+   412→/**
+   413→ * Ingestion metrics object for easy access
+   414→ */
+   415→export const ingestionMetrics = {
+   416→  filesReceived: new Counter({
+   417→    name: 'mms_ingestion_files_received_total',
+   418→    help: 'Total number of files received for ingestion',
+   419→    registers: [registry],
+   420→  }),
+   421→  recordsProcessed: new Counter({
+   422→    name: 'mms_ingestion_records_processed_total',
+   423→    help: 'Total number of records processed',
+   424→    registers: [registry],
+   425→  }),
+   426→  processingDuration: new Histogram({
+   427→    name: 'mms_ingestion_processing_duration_seconds',
+   428→    help: 'Ingestion processing duration in seconds',
+   429→    labelNames: ['status'] as const,
+   430→    buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120, 300],
+   431→    registers: [registry],
+   432→  }),
+   433→};
+   434→
+   435→/**
+   436→ * Record ingestion completion
+   437→ */
+   438→export function recordIngestionComplete(
+   439→  status: 'SUCCESS' | 'PARTIAL' | 'FAILED',
+   440→  durationMs: number
+   441→): void {
+   442→  ingestionFilesTotal.inc({ status: status.toLowerCase() });
+   443→  ingestionMetrics.processingDuration.observe({ status: status.toLowerCase() }, durationMs / 1000);
+   444→}
+   445→
+   446→/**
+   447→ * Record ingestion anomaly
+   448→ */
+   449→export function recordIngestionAnomaly(type: string): void {
+   450→  ingestionAnomaliesTotal.inc({ type });
+   451→}
+   452→
+   453→// =============================================================================
+   454→// Optimizer Metrics
+   455→// =============================================================================
+   456→
+   457→/**
+   458→ * Optimizer metrics object for optimizer infrastructure
+   459→ */
+   460→export const optimizerMetrics = {
+   461→  optimizerSolveSeconds: new Histogram({
+   462→    name: 'mms_optimizer_worker_solve_seconds',
+   463→    help: 'Optimizer solve duration in seconds',
+   464→    labelNames: ['solver_type', 'status'] as const,
+   465→    buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120, 300],
+   466→    registers: [registry],
+   467→  }),
+   468→  trainsAssigned: new Gauge({
+   469→    name: 'mms_optimizer_trains_assigned',
+   470→    help: 'Number of trains assigned in last optimization',
+   471→    labelNames: ['fleet_id'] as const,
+   472→    registers: [registry],
+   473→  }),
+   474→  trainsUnassigned: new Gauge({
+   475→    name: 'mms_optimizer_trains_unassigned',
+   476→    help: 'Number of trains not assigned in last optimization',
+   477→    labelNames: ['fleet_id'] as const,
+   478→    registers: [registry],
+   479→  }),
+   480→  materialBlocks: new Counter({
+   481→    name: 'mms_optimizer_material_blocks_total',
+   482→    help: 'Total number of material constraint blocks',
+   483→    labelNames: ['depot_id'] as const,
+   484→    registers: [registry],
+   485→  }),
+   486→};
+   487→
+   488→// =============================================================================
+   489→// Costing Metrics
+   490→// =============================================================================
+   491→
+   492→/**
+   493→ * Costing metrics object for TCO and variance tracking
+   494→ */
+   495→export const costingMetrics = {
+   496→  pmCostCalculated: new Counter({
+   497→    name: 'mms_costing_pm_cost_calculated_total',
+   498→    help: 'Total number of PM costs calculated',
+   499→    labelNames: ['pm_type', 'depot_id'] as const,
+   500→    registers: [registry],
+   501→  }),
+   502→  tcoProjected: new Histogram({
+   503→    name: 'mms_costing_tco_npv',
+   504→    help: 'TCO NPV projection value',
+   505→    buckets: [100000, 500000, 1000000, 5000000, 10000000, 50000000, 100000000],
+   506→    registers: [registry],
+   507→  }),
+   508→  varianceCalculated: new Histogram({
+   509→    name: 'mms_costing_variance_percent',
+   510→    help: 'Cost variance percentage calculated',
+   511→    labelNames: ['fiscal_year', 'depot_id', 'status'] as const,
+   512→    buckets: [-50, -20, -10, -5, 0, 5, 10, 20, 50],
+   513→    registers: [registry],
+   514→  }),
+   515→};
+   516→
+   517→// =============================================================================
+   518→// Maximo Integration Metrics
+   519→// =============================================================================
+   520→
+   521→/**
+   522→ * Maximo integration metrics for sync operations and polling fallback
+   523→ *
+   524→ * @see specs/007-integration.md Section 7.11.2
+   525→ */
+   526→export const maximoMetrics = {
+   527→  // Sync operations
+   528→  syncRequestsTotal: new Counter({
+   529→    name: 'mms_maximo_sync_requests_total',
+   530→    help: 'Total number of Maximo sync requests',
+   531→    labelNames: ['operation', 'status'] as const,
+   532→    registers: [registry],
+   533→  }),
+   534→  syncDuration: new Histogram({
+   535→    name: 'mms_maximo_sync_duration_seconds',
+   536→    help: 'Maximo sync operation duration in seconds',
+   537→    labelNames: ['operation'] as const,
+   538→    buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120],
+   539→    registers: [registry],
+   540→  }),
+   541→  syncRecordsProcessed: new Counter({
+   542→    name: 'mms_maximo_sync_records_processed_total',
+   543→    help: 'Total number of records processed during sync',
+   544→    labelNames: ['operation', 'result'] as const,
+   545→    registers: [registry],
+   546→  }),
+   547→
+   548→  // Webhook metrics
+   549→  webhooksReceived: new Counter({
+   550→    name: 'mms_maximo_webhooks_received_total',
+   551→    help: 'Total number of webhooks received from Maximo',
+   552→    labelNames: ['event_type', 'status'] as const,
+   553→    registers: [registry],
+   554→  }),
+   555→  webhookProcessingDuration: new Histogram({
+   556→    name: 'mms_maximo_webhook_processing_duration_seconds',
+   557→    help: 'Webhook processing duration in seconds',
+   558→    labelNames: ['event_type'] as const,
+   559→    buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+   560→    registers: [registry],
+   561→  }),
+   562→  webhookLastReceivedAt: new Gauge({
+   563→    name: 'mms_maximo_webhook_last_received_timestamp',
+   564→    help: 'Timestamp of last webhook received (Unix epoch)',
+   565→    labelNames: ['depot_id'] as const,
+   566→    registers: [registry],
+   567→  }),
+   568→
+   569→  // Polling fallback metrics
+   570→  pollingTriggered: new Counter({
+   571→    name: 'mms_maximo_polling_triggered_total',
+   572→    help: 'Total number of polling jobs triggered',
+   573→    labelNames: ['trigger_reason'] as const,
+   574→    registers: [registry],
+   575→  }),
+   576→  pollingRecordsFound: new Counter({
+   577→    name: 'mms_maximo_polling_records_found_total',
+   578→    help: 'Total number of records found during polling',
+   579→    registers: [registry],
+   580→  }),
+   581→  pollingDuration: new Histogram({
+   582→    name: 'mms_maximo_polling_duration_seconds',
+   583→    help: 'Polling operation duration in seconds',
+   584→    buckets: [0.5, 1, 5, 10, 30, 60, 120],
+   585→    registers: [registry],
+   586→  }),
+   587→  pollingFallbackActive: new Gauge({
+   588→    name: 'mms_maximo_polling_fallback_active',
+   589→    help: 'Whether polling fallback is currently active (1=active, 0=inactive)',
+   590→    labelNames: ['depot_id'] as const,
+   591→    registers: [registry],
+   592→  }),
+   593→
+   594→  // Sync mode metrics
+   595→  syncMode: new Gauge({
+   596→    name: 'mms_maximo_sync_mode',
+   597→    help: 'Current sync mode (0=webhook, 1=polling, 2=hybrid)',
+   598→    labelNames: ['depot_id'] as const,
+   599→    registers: [registry],
+   600→  }),
+   601→
+   602→  // Deduplication metrics
+   603→  duplicatesPrevented: new Counter({
+   604→    name: 'mms_maximo_duplicates_prevented_total',
+   605→    help: 'Total number of duplicate updates prevented',
+   606→    registers: [registry],
+   607→  }),
+   608→
+   609→  // Circuit breaker metrics
+   610→  circuitBreakerState: new Gauge({
+   611→    name: 'mms_maximo_circuit_breaker_state',
+   612→    help: 'Circuit breaker state (0=closed, 1=open, 2=half-open)',
+   613→    registers: [registry],
+   614→  }),
+   615→  circuitBreakerTrips: new Counter({
+   616→    name: 'mms_maximo_circuit_breaker_trips_total',
+   617→    help: 'Total number of circuit breaker trips',
+   618→    registers: [registry],
+   619→  }),
+   620→
+   621→  // Conflict metrics
+   622→  conflictsDetected: new Counter({
+   623→    name: 'mms_maximo_conflicts_detected_total',
+   624→    help: 'Total number of sync conflicts detected',
+   625→    registers: [registry],
+   626→  }),
+   627→  conflictsResolved: new Counter({
+   628→    name: 'mms_maximo_conflicts_resolved_total',
+   629→    help: 'Total number of sync conflicts resolved',
+   630→    labelNames: ['resolution'] as const,
+   631→    registers: [registry],
+   632→  }),
+   633→
+   634→  // Shadow record metrics
+   635→  shadowRecordsPending: new Gauge({
+   636→    name: 'mms_maximo_shadow_records_pending',
+   637→    help: 'Number of shadow records pending sync',
+   638→    registers: [registry],
+   639→  }),
+   640→  shadowRecordsConflict: new Gauge({
+   641→    name: 'mms_maximo_shadow_records_conflict',
+   642→    help: 'Number of shadow records in conflict state',
+   643→    registers: [registry],
+   644→  }),
+   645→  shadowRecordsError: new Gauge({
+   646→    name: 'mms_maximo_shadow_records_error',
+   647→    help: 'Number of shadow records in error state',
+   648→    registers: [registry],
+   649→  }),
+   650→};
+   651→
+   652→/**
+   653→ * Record Maximo sync operation
+   654→ */
+   655→export function recordMaximoSync(
+   656→  operation: 'push' | 'pull' | 'full' | 'polling',
+   657→  status: 'success' | 'failure' | 'partial',
+   658→  durationMs: number,
+   659→  recordsProcessed: number,
+   660→  recordsUpdated: number
+   661→): void {
+   662→  maximoMetrics.syncRequestsTotal.inc({ operation, status });
+   663→  maximoMetrics.syncDuration.observe({ operation }, durationMs / 1000);
+   664→  maximoMetrics.syncRecordsProcessed.inc({ operation, result: 'processed' }, recordsProcessed);
+   665→  maximoMetrics.syncRecordsProcessed.inc({ operation, result: 'updated' }, recordsUpdated);
+   666→}
+   667→
+   668→/**
+   669→ * Record webhook received
+   670→ */
+   671→export function recordMaximoWebhook(
+   672→  eventType: string,
+   673→  status: 'success' | 'failure',
+   674→  durationMs: number,
+   675→  depotId?: string
+   676→): void {
+   677→  maximoMetrics.webhooksReceived.inc({ event_type: eventType, status });
+   678→  maximoMetrics.webhookProcessingDuration.observe({ event_type: eventType }, durationMs / 1000);
+   679→  if (status === 'success') {
+   680→    maximoMetrics.webhookLastReceivedAt.set({ depot_id: depotId ?? 'global' }, Date.now() / 1000);
+   681→  }
+   682→}
+   683→
+   684→/**
+   685→ * Record polling fallback activation
+   686→ */
+   687→export function recordPollingFallbackActivation(reason: 'webhook_timeout' | 'manual' | 'circuit_breaker'): void {
+   688→  maximoMetrics.pollingTriggered.inc({ trigger_reason: reason });
+   689→}
+   690→
+   691→/**
+   692→ * Update sync mode metric
+   693→ */
+   694→export function updateSyncModeMetric(depotId: string, mode: 'WEBHOOK' | 'POLLING' | 'HYBRID'): void {
+   695→  const modeValue = mode === 'WEBHOOK' ? 0 : mode === 'POLLING' ? 1 : 2;
+   696→  maximoMetrics.syncMode.set({ depot_id: depotId }, modeValue);
+   697→  maximoMetrics.pollingFallbackActive.set({ depot_id: depotId }, mode !== 'WEBHOOK' ? 1 : 0);
+   698→}
+   699→
+   700→// =============================================================================
+   701→// Rate Limiting Metrics
+   702→// =============================================================================
+   703→
+   704→/**
+   705→ * Rate limiting metrics for monitoring and alerting
+   706→ *
+   707→ * @see specs/005-api.md - Rate Limiting: 100 requests/minute per user
+   708→ */
+   709→export const rateLimitMetrics = {
+   710→  /**
+   711→   * Total rate limit checks performed
+   712→   */
+   713→  rateLimitChecks: new Counter({
+   714→    name: 'mms_rate_limit_checks_total',
+   715→    help: 'Total number of rate limit checks performed',
+   716→    labelNames: ['identifier_type', 'result'] as const,
+   717→    registers: [registry],
+   718→  }),
+   719→
+   720→  /**
+   721→   * Rate limit exceeded events
+   722→   */
+   723→  rateLimitExceeded: new Counter({
+   724→    name: 'mms_rate_limit_exceeded_total',
+   725→    help: 'Total number of requests rejected due to rate limiting',
+   726→    labelNames: ['identifier_type'] as const,
+   727→    registers: [registry],
+   728→  }),
+   729→
+   730→  /**
+   731→   * Current rate limit window usage per identifier
+   732→   */
+   733→  rateLimitUsage: new Gauge({
+   734→    name: 'mms_rate_limit_usage',
+   735→    help: 'Current rate limit usage percentage',
+   736→    labelNames: ['identifier_type'] as const,
+   737→    registers: [registry],
+   738→  }),
+   739→};
+   740→
+   741→/**
+   742→ * Record rate limit check result
+   743→ */
+   744→export function recordRateLimitCheck(
+   745→  identifierType: 'user' | 'ip',
+   746→  result: 'allowed' | 'exceeded'
+   747→): void {
+   748→  rateLimitMetrics.rateLimitChecks.inc({ identifier_type: identifierType, result });
+   749→  if (result === 'exceeded') {
+   750→    rateLimitMetrics.rateLimitExceeded.inc({ identifier_type: identifierType });
+   751→  }
+   752→}
+   753→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

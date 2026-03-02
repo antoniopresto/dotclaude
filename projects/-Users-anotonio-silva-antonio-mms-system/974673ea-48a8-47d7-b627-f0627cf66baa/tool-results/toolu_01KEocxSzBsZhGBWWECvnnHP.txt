@@ -1,0 +1,378 @@
+     1→/**
+     2→ * MMS Workers - Central Exports
+     3→ *
+     4→ * BullMQ worker infrastructure for background job processing.
+     5→ * Each worker processes jobs from its designated queue with
+     6→ * consistent error handling, tracing, and metrics.
+     7→ *
+     8→ * Worker Types:
+     9→ * - ingestion: CSV file processing and mileage data import
+    10→ * - tactical_scheduler: PM scheduling within 12-week horizon
+    11→ * - strategic_planner: Long-term (10-year) PM planning
+    12→ * - optimizer: Run assignment optimization (C++ CP-SAT or TS fallback)
+    13→ * - manhour_leveling: Workload balancing across periods
+    14→ * - drift_monitor: Baseline comparison and drift detection
+    15→ * - notification: Email and alert sending
+    16→ * - report: PDF/Excel report generation
+    17→ *
+    18→ * @see specs/004-domain-services.md Section 4.8
+    19→ * @see specs/002-architecture.md Section 2.4 - Worker Layer
+    20→ */
+    21→
+    22→import { Worker, type WorkerOptions, type Job } from 'bullmq';
+    23→import { logger } from '../lib/logging/logger';
+    24→import { QUEUE_NAMES, type QueueName, type JobData } from '../lib/queue';
+    25→import { withSpan } from '../lib/tracing';
+    26→import { toMmsError, QueueError } from '../lib/errors';
+    27→import { workerMetrics } from '../lib/metrics';
+    28→
+    29→// =============================================================================
+    30→// Worker Configuration
+    31→// =============================================================================
+    32→
+    33→/**
+    34→ * Default worker options applied to all workers
+    35→ */
+    36→export const DEFAULT_WORKER_OPTIONS: Partial<WorkerOptions> = {
+    37→  concurrency: 1,
+    38→  autorun: true,
+    39→  lockDuration: 30000, // 30 seconds
+    40→  lockRenewTime: 15000, // 15 seconds
+    41→  limiter: undefined, // No rate limiting by default
+    42→};
+    43→
+    44→/**
+    45→ * Worker-specific configurations
+    46→ */
+    47→export const WORKER_CONFIGS: Record<
+    48→  keyof typeof QUEUE_NAMES,
+    49→  { concurrency: number; lockDuration: number; description: string }
+    50→> = {
+    51→  INGESTION: {
+    52→    concurrency: 1, // Sequential to avoid race conditions
+    53→    lockDuration: 60000, // 1 minute for file processing
+    54→    description: 'CSV file processing and mileage data import',
+    55→  },
+    56→  TACTICAL_SCHEDULER: {
+    57→    concurrency: 1, // Single scheduler to maintain consistency
+    58→    lockDuration: 300000, // 5 minutes for scheduling
+    59→    description: 'PM scheduling within 12-week horizon',
+    60→  },
+    61→  STRATEGIC_PLANNER: {
+    62→    concurrency: 1, // Single planner for GA optimization
+    63→    lockDuration: 600000, // 10 minutes for long-term planning
+    64→    description: 'Long-term (10-year) PM planning with genetic algorithm',
+    65→  },
+    66→  OPTIMIZER: {
+    67→    concurrency: 2, // Can run multiple optimizations in parallel
+    68→    lockDuration: 60000, // 1 minute per optimization
+    69→    description: 'Run assignment optimization (C++ CP-SAT or TS fallback)',
+    70→  },
+    71→  MANHOUR_LEVELING: {
+    72→    concurrency: 1, // Sequential processing
+    73→    lockDuration: 120000, // 2 minutes
+    74→    description: 'Workload balancing across periods',
+    75→  },
+    76→  DRIFT_MONITOR: {
+    77→    concurrency: 2, // Can analyze multiple baselines
+    78→    lockDuration: 60000, // 1 minute
+    79→    description: 'Baseline comparison and drift detection',
+    80→  },
+    81→  NOTIFICATION: {
+    82→    concurrency: 5, // High concurrency for notifications
+    83→    lockDuration: 30000, // 30 seconds
+    84→    description: 'Email and alert sending',
+    85→  },
+    86→  REPORT: {
+    87→    concurrency: 2, // PDF/Excel generation
+    88→    lockDuration: 120000, // 2 minutes for report generation
+    89→    description: 'PDF/Excel report generation',
+    90→  },
+    91→};
+    92→
+    93→// =============================================================================
+    94→// Redis Configuration
+    95→// =============================================================================
+    96→
+    97→function getRedisConfig() {
+    98→  return {
+    99→    host: process.env['REDIS_HOST'] ?? 'localhost',
+   100→    port: parseInt(process.env['REDIS_PORT'] ?? '6379', 10),
+   101→    password: process.env['REDIS_PASSWORD'],
+   102→    maxRetriesPerRequest: null as null, // Required for BullMQ
+   103→  };
+   104→}
+   105→
+   106→// =============================================================================
+   107→// Base Worker Types
+   108→// =============================================================================
+   109→
+   110→/**
+   111→ * Job context passed to processor functions
+   112→ */
+   113→export interface WorkerJobContext<T extends JobData = JobData> {
+   114→  /** Job ID */
+   115→  id: string;
+   116→  /** Job name */
+   117→  name: string;
+   118→  /** Job data payload */
+   119→  data: T;
+   120→  /** Job attempt number (1-based) */
+   121→  attemptsMade: number;
+   122→  /** Update job progress (0-100) */
+   123→  updateProgress: (progress: number | object) => Promise<void>;
+   124→  /** Add log message to job */
+   125→  log: (message: string) => Promise<void>;
+   126→}
+   127→
+   128→/**
+   129→ * Worker processor function signature
+   130→ */
+   131→export type WorkerProcessor<T extends JobData = JobData, R = unknown> = (
+   132→  context: WorkerJobContext<T>
+   133→) => Promise<R>;
+   134→
+   135→/**
+   136→ * Worker registration result
+   137→ */
+   138→export interface RegisteredWorker {
+   139→  /** Worker instance */
+   140→  worker: Worker;
+   141→  /** Queue name */
+   142→  queueName: QueueName;
+   143→  /** Worker description */
+   144→  description: string;
+   145→  /** Graceful shutdown function */
+   146→  close: () => Promise<void>;
+   147→}
+   148→
+   149→// =============================================================================
+   150→// Worker Factory
+   151→// =============================================================================
+   152→
+   153→const registeredWorkers: Map<QueueName, RegisteredWorker> = new Map();
+   154→
+   155→/**
+   156→ * Create and register a worker for a queue
+   157→ *
+   158→ * @param queueKey - Key from QUEUE_NAMES (e.g., 'INGESTION')
+   159→ * @param processor - Function to process jobs
+   160→ * @param options - Optional worker configuration overrides
+   161→ * @returns Registered worker instance
+   162→ */
+   163→export function registerWorker<T extends JobData = JobData, R = unknown>(
+   164→  queueKey: keyof typeof QUEUE_NAMES,
+   165→  processor: WorkerProcessor<T, R>,
+   166→  options?: Partial<WorkerOptions>
+   167→): RegisteredWorker {
+   168→  const queueName = QUEUE_NAMES[queueKey];
+   169→  const config = WORKER_CONFIGS[queueKey];
+   170→
+   171→  // Check if already registered
+   172→  if (registeredWorkers.has(queueName)) {
+   173→    const existing = registeredWorkers.get(queueName)!;
+   174→    logger.warn({ queueName }, 'Worker already registered, returning existing');
+   175→    return existing;
+   176→  }
+   177→
+   178→  const workerOptions: WorkerOptions = {
+   179→    connection: getRedisConfig(),
+   180→    concurrency: config.concurrency,
+   181→    lockDuration: config.lockDuration,
+   182→    lockRenewTime: Math.floor(config.lockDuration / 2),
+   183→    ...options,
+   184→  };
+   185→
+   186→  const worker = new Worker<T, R>(
+   187→    queueName,
+   188→    async (job: Job<T>) => {
+   189→      const startTime = Date.now();
+   190→      const jobLogger = logger.child({
+   191→        queueName,
+   192→        jobId: job.id,
+   193→        jobName: job.name,
+   194→        attemptsMade: job.attemptsMade,
+   195→      });
+   196→
+   197→      jobLogger.info('Starting job processing');
+   198→      workerMetrics.queueJobStarted.labels(queueName).inc();
+   199→
+   200→      try {
+   201→        const result = await withSpan(
+   202→          `worker.${queueKey.toLowerCase()}`,
+   203→          async () => {
+   204→            const workerContext: WorkerJobContext<T> = {
+   205→              id: job.id ?? 'unknown',
+   206→              name: job.name,
+   207→              data: job.data,
+   208→              attemptsMade: job.attemptsMade,
+   209→              updateProgress: async (progress) => {
+   210→                await job.updateProgress(progress);
+   211→              },
+   212→              log: async (message) => {
+   213→                await job.log(message);
+   214→                jobLogger.debug({ message }, 'Job log');
+   215→              },
+   216→            };
+   217→
+   218→            return processor(workerContext);
+   219→          },
+   220→          {
+   221→            attributes: {
+   222→              queueName,
+   223→              jobId: job.id ?? 'unknown',
+   224→              jobName: job.name,
+   225→            },
+   226→          }
+   227→        );
+   228→
+   229→        const durationMs = Date.now() - startTime;
+   230→        jobLogger.info({ durationMs }, 'Job completed successfully');
+   231→        workerMetrics.queueJobCompleted.labels(queueName).inc();
+   232→        workerMetrics.queueJobDuration.labels(queueName).observe(durationMs / 1000);
+   233→
+   234→        return result;
+   235→      } catch (error) {
+   236→        const durationMs = Date.now() - startTime;
+   237→        const mmsError = toMmsError(error);
+   238→
+   239→        jobLogger.error(
+   240→          {
+   241→            error: mmsError.message,
+   242→            code: mmsError.code,
+   243→            durationMs,
+   244→          },
+   245→          'Job failed'
+   246→        );
+   247→
+   248→        workerMetrics.queueJobFailed.labels(queueName).inc();
+   249→
+   250→        throw new QueueError(`Job ${job.id} failed: ${mmsError.message}`, {
+   251→          queueName,
+   252→          jobId: job.id,
+   253→          context: {
+   254→            attemptsMade: job.attemptsMade,
+   255→            originalError: mmsError.code,
+   256→          },
+   257→        });
+   258→      }
+   259→    },
+   260→    workerOptions
+   261→  );
+   262→
+   263→  // Register event handlers
+   264→  worker.on('ready', () => {
+   265→    logger.info({ queueName, concurrency: workerOptions.concurrency }, 'Worker ready');
+   266→  });
+   267→
+   268→  worker.on('error', (error) => {
+   269→    logger.error({ queueName, error: error.message }, 'Worker error');
+   270→  });
+   271→
+   272→  worker.on('stalled', (jobId) => {
+   273→    logger.warn({ queueName, jobId }, 'Job stalled');
+   274→    workerMetrics.queueJobFailed.labels(queueName).inc();
+   275→  });
+   276→
+   277→  const registeredWorker: RegisteredWorker = {
+   278→    worker,
+   279→    queueName,
+   280→    description: config.description,
+   281→    close: async () => {
+   282→      logger.info({ queueName }, 'Closing worker');
+   283→      await worker.close();
+   284→      registeredWorkers.delete(queueName);
+   285→    },
+   286→  };
+   287→
+   288→  registeredWorkers.set(queueName, registeredWorker);
+   289→  logger.info({ queueName, description: config.description }, 'Worker registered');
+   290→
+   291→  return registeredWorker;
+   292→}
+   293→
+   294→/**
+   295→ * Get a registered worker by queue key
+   296→ */
+   297→export function getWorker(queueKey: keyof typeof QUEUE_NAMES): RegisteredWorker | undefined {
+   298→  return registeredWorkers.get(QUEUE_NAMES[queueKey]);
+   299→}
+   300→
+   301→/**
+   302→ * Get all registered workers
+   303→ */
+   304→export function getAllWorkers(): RegisteredWorker[] {
+   305→  return Array.from(registeredWorkers.values());
+   306→}
+   307→
+   308→/**
+   309→ * Close all registered workers gracefully
+   310→ */
+   311→export async function closeAllWorkers(): Promise<void> {
+   312→  logger.info({ count: registeredWorkers.size }, 'Closing all workers');
+   313→
+   314→  const closePromises: Promise<void>[] = [];
+   315→  for (const worker of registeredWorkers.values()) {
+   316→    closePromises.push(worker.close());
+   317→  }
+   318→
+   319→  await Promise.all(closePromises);
+   320→  logger.info('All workers closed');
+   321→}
+   322→
+   323→// =============================================================================
+   324→// Health Check
+   325→// =============================================================================
+   326→
+   327→/**
+   328→ * Worker health status
+   329→ */
+   330→export interface WorkerHealth {
+   331→  queueName: QueueName;
+   332→  description: string;
+   333→  isRunning: boolean;
+   334→  isPaused: boolean;
+   335→}
+   336→
+   337→/**
+   338→ * Get health status of all workers
+   339→ */
+   340→export async function getWorkersHealth(): Promise<WorkerHealth[]> {
+   341→  const health: WorkerHealth[] = [];
+   342→
+   343→  for (const [queueName, registered] of registeredWorkers.entries()) {
+   344→    health.push({
+   345→      queueName,
+   346→      description: registered.description,
+   347→      isRunning: registered.worker.isRunning(),
+   348→      isPaused: registered.worker.isPaused(),
+   349→    });
+   350→  }
+   351→
+   352→  return health;
+   353→}
+   354→
+   355→// =============================================================================
+   356→// Re-exports for convenience
+   357→// =============================================================================
+   358→
+   359→export {
+   360→  QUEUE_NAMES,
+   361→  type QueueName,
+   362→  type JobData,
+   363→  type IngestionJobData,
+   364→  type TacticalSchedulerJobData,
+   365→  type StrategicPlannerJobData,
+   366→  type OptimizerJobData,
+   367→  type ManhourLevelingJobData,
+   368→  type DriftMonitorJobData,
+   369→  type NotificationJobData,
+   370→  type ReportJobData,
+   371→} from '../lib/queue';
+   372→
+   373→export { addJob, addBulkJobs, getJob, getQueueStats, getQueue } from '../lib/queue';
+   374→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

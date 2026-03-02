@@ -1,0 +1,747 @@
+     1→# Metro Fleet Mileage Management System
+     2→# Part 2: System Architecture
+     3→
+     4→**Document Version:** 2.0  
+     5→**Status:** APPROVED FOR DEVELOPMENT
+     6→
+     7→---
+     8→
+     9→## 2.1 High-Level Architecture
+    10→
+    11→```
+    12→┌─────────────────────────────────────────────────────────────────────────────────┐
+    13→│                                    CLIENTS                                       │
+    14→│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+    15→│  │                      INFINITE CANVAS (deck.gl)                          │    │
+    16→│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐   │    │
+    17→│  │  │  Strategic  │  │   Tactical  │  │ Operational │  │   Baseline   │   │    │
+    18→│  │  │  (12-year)  │◄─┼─►(Quarter)  │◄─┼─►  (Week)   │  │  Drift View  │   │    │
+    19→│  │  │  Heatmaps   │  │   Gantt     │  │Detail Cards │  │  Comparison  │   │    │
+    20→│  │  └─────────────┘  └─────────────┘  └─────────────┘  └──────────────┘   │    │
+    21→│  │         ▲                ▲                ▲                ▲           │    │
+    22→│  │         └────────────────┴────────────────┴────────────────┘           │    │
+    23→│  │                           SEMANTIC ZOOM                                │    │
+    24→│  └─────────────────────────────────────────────────────────────────────────┘    │
+    25→│                                      │                                          │
+    26→│                                WebSocket / REST                                 │
+    27→│                                      │                                          │
+    28→├──────────────────────────────────────┼──────────────────────────────────────────┤
+    29→│                                   NGINX                                         │
+    30→│                      (Reverse Proxy / Load Balancer)                           │
+    31→│                               :80 / :443                                        │
+    32→├──────────────────────────────────────┼──────────────────────────────────────────┤
+    33→│         │                            │                            │             │
+    34→│         ▼                            ▼                            ▼             │
+    35→│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐     │
+    36→│  │   FRONTEND ASSETS   │  │   BACKEND (API)     │  │   WEBSOCKET HUB     │     │
+    37→│  │                     │  │                     │  │                     │     │
+    38→│  │   React 18 SPA      │  │   Bun + Hono        │  │   Real-time events  │     │
+    39→│  │   deck.gl layers    │  │   TypeScript        │  │   Canvas sync       │     │
+    40→│  │   BlueprintJS v6    │  │   Drizzle ORM       │  │   Collaboration     │     │
+    41→│  │                     │  │   Port: 8000        │  │                     │     │
+    42→│  │   Port: 3000        │  │   BullMQ Queue      │  │   Port: 8001        │     │
+    43→│  └─────────────────────┘  └──────────┬──────────┘  └─────────────────────┘     │
+    44→│                                      │                                          │
+    45→├──────────────────────────────────────┼──────────────────────────────────────────┤
+    46→│                              WORKER LAYER                                       │
+    47→│                                      ▼                                          │
+    48→│  ┌─────────────────────┐    ┌────────────────────────────────────────────┐     │
+    49→│  │   FILE WATCHER      │    │              BULLMQ WORKERS                │     │
+    50→│  │                     │    │                                            │     │
+    51→│  │   Bun + chokidar    │    │   ┌─────────┐ ┌─────────┐ ┌─────────┐     │     │
+    52→│  │   Process CSV files │    │   │Ingestion│ │Optimizer│ │ Reports │     │     │
+    53→│  │   Validate & queue  │    │   │ Worker  │ │ Worker  │ │ Worker  │     │     │
+    54→│  │                     │    │   └─────────┘ └─────────┘ └─────────┘     │     │
+    55→│  │   Port: N/A (daemon)│    │   ┌─────────┐ ┌─────────┐ ┌─────────┐     │     │
+    56→│  └──────────┬──────────┘    │   │Man-hour │ │Strategic│ │  Drift  │     │     │
+    57→│             │               │   │ Leveler │ │ Planner │ │ Monitor │     │     │
+    58→│             │               │   └─────────┘ └─────────┘ └─────────┘     │     │
+    59→│             │               └──────────────────┬─────────────────────────┘     │
+    60→│             │                                  │                                │
+    61→│             │         ┌────────────────────────┼─────────────────────┐          │
+    62→│             │         │                        │                     │          │
+    63→│             │         ▼                        ▼                     ▼          │
+    64→│             │  ┌─────────────┐         ┌─────────────┐       ┌───────────┐     │
+    65→│             │  │C++ OPTIMIZER│         │ C++ OPTIMIZER│      │  TS-ONLY  │     │
+    66→│             │  │   (stream)  │         │   (stream)  │       │ FALLBACK  │     │
+    67→│             │  │  OR-Tools   │         │  OR-Tools   │       │  SOLVER   │     │
+    68→│             │  │  CP-SAT     │         │  CP-SAT     │       │           │     │
+    69→│             │  └─────────────┘         └─────────────┘       └───────────┘     │
+    70→│             │                                                                   │
+    71→├─────────────┼───────────────────────────────────────────────────────────────────┤
+    72→│             │                       DATA LAYER                                  │
+    73→│             ▼                                                                   │
+    74→│  ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐ │
+    75→│  │   NETWORK FOLDER    │    │     POSTGRESQL      │    │       REDIS         │ │
+    76→│  │                     │    │                     │    │                     │ │
+    77→│  │   /data/inbox/      │    │   Primary Database  │    │   Cache             │ │
+    78→│  │   /data/processed/  │    │   TimescaleDB ext   │    │   BullMQ Store      │ │
+    79→│  │   /data/quarantine/ │    │   Port: 5432        │    │   Sessions          │ │
+    80→│  │                     │    │                     │    │   Port: 6379        │ │
+    81→│  └─────────────────────┘    └─────────────────────┘    └─────────────────────┘ │
+    82→│                                                                                 │
+    83→│                              ┌─────────────────────┐                            │
+    84→│                              │       MINIO         │                            │
+    85→│                              │                     │                            │
+    86→│                              │   Report Storage    │                            │
+    87→│                              │   File Archive      │                            │
+    88→│                              │   Port: 9000        │                            │
+    89→│                              └─────────────────────┘                            │
+    90→└─────────────────────────────────────────────────────────────────────────────────┘
+    91→```
+    92→
+    93→---
+    94→
+    95→## 2.2 Component Responsibilities
+    96→
+    97→### 2.2.1 Frontend (Infinite Canvas SPA)
+    98→
+    99→| Responsibility | Implementation |
+   100→|----------------|----------------|
+   101→| Timeline rendering | deck.gl WebGL layers with semantic zoom |
+   102→| Strategic view | Heatmap showing PM density per train per year |
+   103→| Tactical view | Gantt blocks for 12-week PM schedule |
+   104→| Operational view | Detail cards with technician, track, duration |
+   105→| Baseline/drift overlay | Shadow layer showing deviation from published plan |
+   106→| Constraint walls | Visual barriers at compliance window boundaries |
+   107→| Drag-and-drop rescheduling | Real-time validation with constraint feedback |
+   108→| Man-hour visualization | Column overlay showing utilization with/without adjustments |
+   109→| Scenario comparison | Side-by-side diff view for what-if analysis |
+   110→| Real-time collaboration | WebSocket sync for multi-user canvas editing |
+   111→
+   112→### 2.2.2 Backend API (Bun + Hono)
+   113→
+   114→| Responsibility | Implementation |
+   115→|----------------|----------------|
+   116→| REST API | `/api/v1/*` endpoints with OpenAPI spec |
+   117→| WebSocket hub | Real-time canvas updates and collaboration |
+   118→| Authentication | JWT with refresh tokens, RBAC enforcement |
+   119→| Business logic | Orchestration layer for domain services |
+   120→| Task dispatch | BullMQ job queuing for async operations |
+   121→| Optimizer IPC | Stream-based communication with C++ binary |
+   122→| Audit logging | Immutable change records with user attribution |
+   123→
+   124→### 2.2.3 File Watcher Service
+   125→
+   126→| Responsibility | Implementation |
+   127→|----------------|----------------|
+   128→| Folder monitoring | chokidar watching `/data/inbox/` |
+   129→| File validation | Format, size, checksum verification |
+   130→| Queue dispatch | BullMQ job creation for ingestion worker |
+   131→| Archive management | Move processed files to `/data/processed/` |
+   132→| Quarantine handling | Move invalid files to `/data/quarantine/` |
+   133→| Health alerting | Notification when files stop arriving (>2 hours) |
+   134→
+   135→### 2.2.4 BullMQ Workers
+   136→
+   137→| Worker | Responsibility | Concurrency |
+   138→|--------|----------------|-------------|
+   139→| `ingestion_worker` | Parse CSV, validate rows, insert to DB, handle meter swaps | 2 |
+   140→| `optimizer_worker` | Spawn C++ binary, stream I/O, store results with explanations | 1 per depot |
+   141→| `tactical_scheduler` | 12-week PM scheduling with material checks | 1 |
+   142→| `strategic_planner` | 1-10 year capacity reservation with constraint envelope | 1 |
+   143→| `manhour_leveling_worker` | Weekly/monthly workload balancing, adjustment generation | 1 |
+   144→| `drift_monitor_worker` | Nightly baseline comparison, threshold alerting | 1 |
+   145→| `report_worker` | Generate PDF/Excel reports | 2 |
+   146→| `notification_worker` | Send email alerts and notifications | 3 |
+   147→
+   148→### 2.2.5 C++ Optimizer Binary
+   149→
+   150→| Responsibility | Implementation |
+   151→|----------------|----------------|
+   152→| Constraint solving | OR-Tools CP-SAT with soft constraint penalties |
+   153→| Explanation generation | Factor-based trace for each assignment decision |
+   154→| Progress streaming | NDJSON messages to stdout during solve |
+   155→| Metrics emission | OpenTelemetry format to stderr |
+   156→| Fallback mode | Greedy heuristic when CP-SAT times out |
+   157→| Material validation | Check inventory positions for blocking parts |
+   158→
+   159→---
+   160→
+   161→## 2.3 Critical Data Flows
+   162→
+   163→### 2.3.1 Daily Operational Flow
+   164→
+   165→```
+   166→06:00 │ CSV file drop (mileage.csv) → File Watcher detects
+   167→06:05 │ Ingestion Worker: Parse, validate, insert mileage readings
+   168→06:10 │ Ingestion Worker: Update train current_mileage, detect anomalies
+   169→06:15 │ Drift Monitor: Check against baseline, flag significant deviations
+   170→06:30 │ Optimizer Worker: Generate today's run assignments
+   171→      │   - Input: trains, routes, constraints, inventory positions
+   172→      │   - Output: assignments with explanation traces
+   173→07:00 │ WebSocket: Push results to connected canvas clients
+   174→07:00 │ Operators: Review assignments on Infinite Canvas
+   175→      │   - View explanation factors for each assignment
+   176→      │   - Drag-and-drop to override if needed (with audit trail)
+   177→08:00 │ Export: Approved assignments sent to OCC system
+   178→16:00 │ Actual mileage updates (if available intra-day)
+   179→22:00 │ Optimizer Worker: Generate tomorrow's assignments
+   180→```
+   181→
+   182→### 2.3.2 Weekly Planning Flow
+   183→
+   184→```
+   185→Monday 06:00  │ Strategic Planner: Run 10-year horizon update
+   186→              │   - Uses constraint envelope from tactical model
+   187→              │   - Respects published baseline (drift threshold)
+   188→Monday 06:30  │ Tactical Scheduler: Run 12-week PM scheduling
+   189→              │   - Check material availability for T+14 days (hard)
+   190→              │   - Check material availability for T+90 days (soft)
+   191→Monday 07:00  │ Man-hour Leveling: Generate 12-week projection
+   192→              │   - Identify overloaded/underutilized weeks
+   193→              │   - Propose adjustments (defer/advance/overtime)
+   194→Monday 08:00  │ WebSocket: Push updated canvas data to all clients
+   195→Tuesday       │ Planners: Review PM conflicts on canvas
+   196→              │   - Drag to resolve conflicts (audit trail)
+   197→              │   - Review/approve man-hour adjustments
+   198→Wednesday    │ Report Worker: Generate resource utilization report
+   199→Friday       │ Notification Worker: Send weekly compliance report
+   200→```
+   201→
+   202→### 2.3.3 Baseline Publishing Flow
+   203→
+   204→```
+   205→User Action  │ Planner clicks "Publish Baseline" on canvas
+   206→             │   - System validates: no critical conflicts
+   207→             │   - System prompts: "This will create Baseline v3.2"
+   208→API Call     │ POST /api/v1/baselines
+   209→             │   - Snapshot current pm_schedule to baseline_pm_schedule
+   210→             │   - Snapshot mileage projections to baseline_mileage_projection
+   211→             │   - Set previous baseline status to SUPERSEDED
+   212→             │   - Set new baseline status to PUBLISHED
+   213→Post-Publish │ Drift Monitor: Now compares against new baseline
+   214→             │ Canvas: Shows drift layer relative to new baseline
+   215→```
+   216→
+   217→### 2.3.4 Scenario Comparison Flow
+   218→
+   219→```
+   220→User Action  │ Planner clicks "Create Scenario" on canvas
+   221→             │   - System forks from current published baseline
+   222→             │   - New scenario_id assigned
+   223→Editing      │ Planner makes changes within scenario
+   224→             │   - All changes stored as deltas (event-sourced)
+   225→             │   - Original baseline data unchanged
+   226→Comparison   │ Planner clicks "Compare Scenarios"
+   227→             │   - System materializes both scenarios
+   228→             │   - Canvas shows side-by-side diff view
+   229→             │   - Metrics: cost impact, resource utilization delta
+   230→Promotion    │ Planner clicks "Promote to Baseline"
+   231→             │   - Deltas applied to create new baseline
+   232→             │   - Scenario marked as PROMOTED
+   233→```
+   234→
+   235→---
+   236→
+   237→## 2.4 C++ Optimizer Stream Protocol
+   238→
+   239→### 2.4.1 Stream Architecture
+   240→
+   241→```
+   242→┌─────────────────┐         NDJSON Stream          ┌─────────────────┐
+   243→│                 │ ─────────────────────────────► │                 │
+   244→│   Bun Worker    │         stdin (input)          │  mms-optimizer  │
+   245→│   (TypeScript)  │                                │     (C++)       │
+   246→│                 │ ◄───────────────────────────── │                 │
+   247→│                 │    stdout (results, NDJSON)    │                 │
+   248→│                 │ ◄───────────────────────────── │                 │
+   249→│                 │    stderr (logs, metrics)      │                 │
+   250→└─────────────────┘                                └─────────────────┘
+   251→```
+   252→
+   253→### 2.4.2 Input Message Schema
+   254→
+   255→```typescript
+   256→interface OptimizerInput {
+   257→  type: 'SOLVE_REQUEST';
+   258→  request_id: string;  // UUID for correlation
+   259→  config: {
+   260→    max_solve_time_seconds: number;  // Default: 30
+   261→    num_workers: number;             // Default: 4
+   262→    soft_constraint_penalties: {
+   263→      mileage_imbalance: number;     // Default: 100
+   264→      preference_violation: number;  // Default: 50
+   265→      overtime_hours: number;        // Default: 200
+   266→    };
+   267→    explanation_verbosity: 'MINIMAL' | 'STANDARD' | 'DETAILED';
+   268→  };
+   269→  
+   270→  trains: {
+   271→    id: string;
+   272→    train_number: string;
+   273→    fleet_id: string;
+   274→    current_mileage: number;
+   275→    target_mileage: number;  // For balancing calculation
+   276→    fitness_status: 'FIT' | 'RESTRICTED' | 'GROUNDED';
+   277→    restrictions: string[];  // e.g., ['NO_EXPRESS', 'MAX_SPEED_60']
+   278→    home_depot_id: string;
+   279→    current_depot_id: string;
+   280→  }[];
+   281→  
+   282→  routes: {
+   283→    id: string;
+   284→    route_code: string;
+   285→    expected_km: number;
+   286→    required_trains: number;
+   287→    allowed_fleets: string[];
+   288→    restrictions: string[];  // e.g., ['REQUIRES_ATO', 'LONG_PLATFORM']
+   289→  }[];
+   290→  
+   291→  // Hard constraints (must not violate)
+   292→  hard_constraints: {
+   293→    type: 'PM_DUE' | 'GROUNDED' | 'DEPOT_LOCK' | 'CERTIFICATION';
+   294→    train_id: string;
+   295→    description: string;
+   296→  }[];
+   297→  
+   298→  // Soft constraints (minimize violations)
+   299→  soft_constraints: {
+   300→    type: 'MILEAGE_BALANCE' | 'DEPOT_PREFERENCE' | 'ROUTE_PREFERENCE';
+   301→    train_id: string;
+   302→    penalty_weight: number;
+   303→    description: string;
+   304→  }[];
+   305→  
+   306→  // Material availability (NEW)
+   307→  material_positions: {
+   308→    depot_id: string;
+   309→    part_number: string;
+   310→    quantity_available: number;  // on_hand - reserved
+   311→    next_delivery_date: string | null;
+   312→  }[];
+   313→  
+   314→  // PM material requirements (NEW)
+   315→  pending_pms: {
+   316→    pm_id: string;
+   317→    train_id: string;
+   318→    pm_type: string;
+   319→    target_date: string;
+   320→    required_materials: {
+   321→      part_number: string;
+   322→      quantity: number;
+   323→      criticality: 'BLOCKING' | 'DEFERRABLE';
+   324→    }[];
+   325→  }[];
+   326→}
+   327→```
+   328→
+   329→### 2.4.3 Output Message Schema
+   330→
+   331→```typescript
+   332→// Progress updates (streamed during solve)
+   333→interface ProgressMessage {
+   334→  type: 'PROGRESS';
+   335→  request_id: string;
+   336→  percent: number;
+   337→  current_objective: number;
+   338→  feasible: boolean;
+   339→  elapsed_ms: number;
+   340→}
+   341→
+   342→// Final result
+   343→interface ResultMessage {
+   344→  type: 'RESULT';
+   345→  request_id: string;
+   346→  status: 'OPTIMAL' | 'FEASIBLE' | 'FALLBACK' | 'INFEASIBLE';
+   347→  solve_time_ms: number;
+   348→  
+   349→  assignments: {
+   350→    train_id: string;
+   351→    route_id: string;
+   352→    score: number;
+   353→    
+   354→    // NEW: Explanation trace
+   355→    explanation: {
+   356→      constraint_type: 'HARD' | 'SOFT';
+   357→      constraint_name: string;
+   358→      impact: number;  // Contribution to objective
+   359→      description: string;  // Human-readable
+   360→    }[];
+   361→  }[];
+   362→  
+   363→  // Trains not assigned (with reasons)
+   364→  unassigned: {
+   365→    train_id: string;
+   366→    reason: string;
+   367→    blocking_constraints: string[];
+   368→  }[];
+   369→  
+   370→  // Material warnings (NEW)
+   371→  material_warnings: {
+   372→    pm_id: string;
+   373→    train_id: string;
+   374→    part_number: string;
+   375→    status: 'UNAVAILABLE' | 'LOW_STOCK' | 'ARRIVING_LATE';
+   376→    description: string;
+   377→  }[];
+   378→  
+   379→  summary: {
+   380→    total_penalty: number;
+   381→    trains_assigned: number;
+   382→    trains_unassigned: number;
+   383→    soft_constraint_breakdown: Record<string, number>;
+   384→    material_blocks: number;
+   385→  };
+   386→}
+   387→
+   388→// Metrics (to stderr, OpenTelemetry format)
+   389→interface MetricsMessage {
+   390→  _type: 'metrics';
+   391→  timestamp: number;
+   392→  metrics: {
+   393→    'optimizer.solve_time_ms': number;
+   394→    'optimizer.branches_explored': number;
+   395→    'optimizer.conflicts_found': number;
+   396→    'optimizer.propagations': number;
+   397→    'optimizer.trains_assigned': number;
+   398→    'optimizer.soft_violations': number;
+   399→    'optimizer.material_blocks': number;
+   400→  };
+   401→  tags: {
+   402→    status: string;
+   403→    depot_id: string;
+   404→  };
+   405→}
+   406→
+   407→// CRITICAL: Error handling messages (addresses silent failure risk)
+   408→// See Gap Analysis GAP-003 for rationale
+   409→interface ErrorMessage {
+   410→  type: 'ERROR';
+   411→  request_id: string;
+   412→  error_code: 'SEGFAULT' | 'TIMEOUT' | 'OOM' | 'INVALID_INPUT' | 'INTERNAL_ERROR';
+   413→  error_message: string;
+   414→  stack_trace?: string;  // When available
+   415→  last_progress?: {
+   416→    percent: number;
+   417→    branches_explored: number;
+   418→    memory_mb: number;
+   419→  };
+   420→  recovery_suggestion: string;  // Human-readable
+   421→}
+   422→
+   423→// Heartbeat messages (sent every 5 seconds during solve)
+   424→interface HeartbeatMessage {
+   425→  type: 'HEARTBEAT';
+   426→  request_id: string;
+   427→  timestamp: number;
+   428→  memory_mb: number;
+   429→  thread_count: number;
+   430→  branches_per_second: number;
+   431→}
+   432→```
+   433→
+   434→### 2.4.4 Error Handling Protocol
+   435→
+   436→**CRITICAL:** The C++ optimizer communicates via stdin/stdout streams. Stream failures (segfaults, hangs) must be detectable by the TypeScript worker.
+   437→
+   438→```typescript
+   439→// Worker-side error handling (TypeScript)
+   440→class OptimizerWorker {
+   441→  private process: ChildProcess;
+   442→  private heartbeatTimeout: NodeJS.Timeout | null = null;
+   443→  private lastHeartbeat: number = 0;
+   444→  
+   445→  private readonly HEARTBEAT_INTERVAL_MS = 5000;
+   446→  private readonly HEARTBEAT_TIMEOUT_MS = 15000;  // 3 missed heartbeats
+   447→  
+   448→  async solve(request: OptimizerInput): Promise<OptimizerOutput> {
+   449→    return new Promise((resolve, reject) => {
+   450→      // Start heartbeat monitor
+   451→      this.startHeartbeatMonitor(request.request_id, reject);
+   452→      
+   453→      // Handle stream events
+   454→      this.process.stdout.on('data', (chunk) => {
+   455→        for (const line of chunk.toString().split('\n')) {
+   456→          if (!line.trim()) continue;
+   457→          
+   458→          try {
+   459→            const msg = JSON.parse(line);
+   460→            
+   461→            switch (msg.type) {
+   462→              case 'HEARTBEAT':
+   463→                this.lastHeartbeat = Date.now();
+   464→                break;
+   465→                
+   466→              case 'PROGRESS':
+   467→                this.emitProgress(msg);
+   468→                break;
+   469→                
+   470→              case 'RESULT':
+   471→                this.stopHeartbeatMonitor();
+   472→                resolve(msg);
+   473→                break;
+   474→                
+   475→              case 'ERROR':
+   476→                this.stopHeartbeatMonitor();
+   477→                reject(new OptimizerError(msg));
+   478→                break;
+   479→            }
+   480→          } catch (parseError) {
+   481→            this.logger.warn({ line }, 'Failed to parse optimizer output');
+   482→          }
+   483→        }
+   484→      });
+   485→      
+   486→      // Handle process crash
+   487→      this.process.on('exit', (code, signal) => {
+   488→        if (code !== 0) {
+   489→          this.stopHeartbeatMonitor();
+   490→          reject(new OptimizerError({
+   491→            type: 'ERROR',
+   492→            request_id: request.request_id,
+   493→            error_code: signal === 'SIGSEGV' ? 'SEGFAULT' : 'INTERNAL_ERROR',
+   494→            error_message: `Process exited with code ${code}, signal ${signal}`,
+   495→            recovery_suggestion: 'Check optimizer logs and input data'
+   496→          }));
+   497→        }
+   498→      });
+   499→      
+   500→      // Send request
+   501→      this.process.stdin.write(JSON.stringify(request) + '\n');
+   502→    });
+   503→  }
+   504→  
+   505→  private startHeartbeatMonitor(requestId: string, reject: Function): void {
+   506→    this.lastHeartbeat = Date.now();
+   507→    
+   508→    this.heartbeatTimeout = setInterval(() => {
+   509→      const elapsed = Date.now() - this.lastHeartbeat;
+   510→      
+   511→      if (elapsed > this.HEARTBEAT_TIMEOUT_MS) {
+   512→        this.stopHeartbeatMonitor();
+   513→        
+   514→        // Kill hung process
+   515→        this.process.kill('SIGKILL');
+   516→        
+   517→        reject(new OptimizerError({
+   518→          type: 'ERROR',
+   519→          request_id: requestId,
+   520→          error_code: 'TIMEOUT',
+   521→          error_message: `No heartbeat received for ${elapsed}ms`,
+   522→          recovery_suggestion: 'Optimizer may be stuck. Consider reducing problem size.'
+   523→        }));
+   524→      }
+   525→    }, this.HEARTBEAT_INTERVAL_MS);
+   526→  }
+   527→  
+   528→  private stopHeartbeatMonitor(): void {
+   529→    if (this.heartbeatTimeout) {
+   530→      clearInterval(this.heartbeatTimeout);
+   531→      this.heartbeatTimeout = null;
+   532→    }
+   533→  }
+   534→}
+   535→
+   536→class OptimizerError extends Error {
+   537→  readonly errorCode: string;
+   538→  readonly requestId: string;
+   539→  readonly recoverySuggestion: string;
+   540→  readonly stackTrace?: string;
+   541→  
+   542→  constructor(msg: ErrorMessage) {
+   543→    super(msg.error_message);
+   544→    this.name = 'OptimizerError';
+   545→    this.errorCode = msg.error_code;
+   546→    this.requestId = msg.request_id;
+   547→    this.recoverySuggestion = msg.recovery_suggestion;
+   548→    this.stackTrace = msg.stack_trace;
+   549→  }
+   550→}
+   551→```
+   552→
+   553→**C++ Implementation Notes:**
+   554→
+   555→The C++ binary must:
+   556→1. Install signal handlers for SIGSEGV, SIGABRT, SIGFPE
+   557→2. Send heartbeat messages every 5 seconds during solve
+   558→3. Catch exceptions and emit ERROR messages before exit
+   559→4. Flush stdout after every message (line-buffered)
+   560→
+   561→```cpp
+   562→// Signal handler example (C++)
+   563→void signalHandler(int signal) {
+   564→    nlohmann::json error;
+   565→    error["type"] = "ERROR";
+   566→    error["request_id"] = currentRequestId;
+   567→    error["error_code"] = (signal == SIGSEGV) ? "SEGFAULT" : "INTERNAL_ERROR";
+   568→    error["error_message"] = strsignal(signal);
+   569→    error["stack_trace"] = captureStackTrace();
+   570→    error["recovery_suggestion"] = "Internal optimizer error. Check input data.";
+   571→    
+   572→    std::cout << error.dump() << std::endl;
+   573→    std::cout.flush();
+   574→    
+   575→    _exit(128 + signal);
+   576→}
+   577→```
+   578→
+   579→The Constraint Aggregation Layer ensures consistency between Strategic and Tactical planning by computing capacity envelopes.
+   580→
+   581→### 2.5.1 Purpose
+   582→
+   583→The Strategic Planner operates at quarterly granularity and cannot evaluate detailed daily constraints. However, it must not create plans that the Tactical Scheduler will reject. The Constraint Aggregation Layer bridges this gap.
+   584→
+   585→### 2.5.2 Aggregation Process
+   586→
+   587→```typescript
+   588→interface ConstraintEnvelope {
+   589→  period: {
+   590→    start: Date;  // Quarter start
+   591→    end: Date;    // Quarter end
+   592→  };
+   593→  
+   594→  // Track capacity (aggregated from daily track availability)
+   595→  track_capacity: {
+   596→    depot_id: string;
+   597→    track_type: 'LIGHT' | 'HEAVY' | 'OVERHAUL';
+   598→    total_slot_days: number;      // Sum of available days in quarter
+   599→    reserved_slot_days: number;   // Already committed
+   600→    available_slot_days: number;  // Remaining capacity
+   601→  }[];
+   602→  
+   603→  // Labor capacity (aggregated from weekly man-hour projections)
+   604→  labor_capacity: {
+   605→    depot_id: string;
+   606→    regular_hours: number;        // Total regular hours in quarter
+   607→    overtime_hours: number;       // Total overtime available
+   608→    committed_hours: number;      // Already scheduled
+   609→    available_hours: number;      // Remaining capacity
+   610→  }[];
+   611→  
+   612→  // Material capacity (aggregated from inventory projections)
+   613→  material_capacity: {
+   614→    depot_id: string;
+   615→    part_category: string;        // e.g., 'BOGIE_KIT', 'BRAKE_SET'
+   616→    expected_available: number;   // Projected inventory
+   617→    committed: number;            // Reserved for scheduled PMs
+   618→    available: number;            // Remaining for new scheduling
+   619→  }[];
+   620→  
+   621→  // Constraints from tactical model
+   622→  blocked_trains: {
+   623→    train_id: string;
+   624→    blocked_weeks: number;        // Weeks unavailable in quarter
+   625→    reason: string;
+   626→  }[];
+   627→}
+   628→
+   629→class ConstraintAggregationService {
+   630→  /**
+   631→   * Generate constraint envelope for strategic planning
+   632→   */
+   633→  async generateEnvelope(
+   634→    quarterStart: Date,
+   635→    quarterEnd: Date,
+   636→    depotIds: string[]
+   637→  ): Promise<ConstraintEnvelope> {
+   638→    // 1. Aggregate track availability
+   639→    const trackCapacity = await this.aggregateTrackCapacity(
+   640→      quarterStart, quarterEnd, depotIds
+   641→    );
+   642→    
+   643→    // 2. Aggregate labor capacity
+   644→    const laborCapacity = await this.aggregateLaborCapacity(
+   645→      quarterStart, quarterEnd, depotIds
+   646→    );
+   647→    
+   648→    // 3. Aggregate material projections
+   649→    const materialCapacity = await this.aggregateMaterialCapacity(
+   650→      quarterStart, quarterEnd, depotIds
+   651→    );
+   652→    
+   653→    // 4. Identify blocked trains from tactical constraints
+   654→    const blockedTrains = await this.identifyBlockedTrains(
+   655→      quarterStart, quarterEnd
+   656→    );
+   657→    
+   658→    return {
+   659→      period: { start: quarterStart, end: quarterEnd },
+   660→      track_capacity: trackCapacity,
+   661→      labor_capacity: laborCapacity,
+   662→      material_capacity: materialCapacity,
+   663→      blocked_trains: blockedTrains
+   664→    };
+   665→  }
+   666→  
+   667→  /**
+   668→   * Validate strategic allocation against constraint envelope
+   669→   */
+   670→  async validateStrategicAllocation(
+   671→    allocation: StrategicAllocation,
+   672→    envelope: ConstraintEnvelope
+   673→  ): Promise<ValidationResult> {
+   674→    const violations: ConstraintViolation[] = [];
+   675→    
+   676→    // Check track capacity
+   677→    for (const trackReq of allocation.track_requirements) {
+   678→      const available = envelope.track_capacity.find(
+   679→        t => t.depot_id === trackReq.depot_id && 
+   680→             t.track_type === trackReq.track_type
+   681→      );
+   682→      
+   683→      if (available && trackReq.slot_days > available.available_slot_days) {
+   684→        violations.push({
+   685→          type: 'TRACK_OVERCAPACITY',
+   686→          severity: 'HARD',
+   687→          message: `${trackReq.track_type} track at ${trackReq.depot_id} overbooked by ${trackReq.slot_days - available.available_slot_days} days`
+   688→        });
+   689→      }
+   690→    }
+   691→    
+   692→    // Check labor capacity
+   693→    // Check material capacity
+   694→    // ... similar validation logic
+   695→    
+   696→    return {
+   697→      valid: violations.filter(v => v.severity === 'HARD').length === 0,
+   698→      violations
+   699→    };
+   700→  }
+   701→}
+   702→```
+   703→
+   704→---
+   705→
+   706→## 2.6 Key Design Principles
+   707→
+   708→### 2.6.1 Explainability First
+   709→
+   710→Every optimization decision must be traceable to specific constraints:
+   711→
+   712→- **Run assignments**: Include explanation factors in API response
+   713→- **PM scheduling**: Log which constraints drove date selection
+   714→- **Man-hour adjustments**: Record rationale for each proposed change
+   715→- **Strategic allocations**: Document constraint envelope used
+   716→
+   717→### 2.6.2 Graceful Degradation
+   718→
+   719→The system must provide useful output even when optimal solutions are impossible:
+   720→
+   721→- **C++ solver timeout**: Fall back to TypeScript greedy solver
+   722→- **Material unavailability**: Flag but continue with labor optimization
+   723→- **Constraint conflicts**: Return least-bad solution with violation list
+   724→- **Data quality issues**: Proceed with validated subset, quarantine bad records
+   725→
+   726→### 2.6.3 Audit Everything
+   727→
+   728→For 12-year government contract compliance:
+   729→
+   730→- **All schedule changes**: Who, when, what, why
+   731→- **All baseline publications**: Snapshot contents, approval chain
+   732→- **All scenario promotions**: Delta applied, approval
+   733→- **All system decisions**: Optimizer inputs/outputs preserved
+   734→
+   735→### 2.6.4 Stable Long-Term Planning
+   736→
+   737→Prevent "jittery" forecasts that erode planner trust:
+   738→
+   739→- **Published baselines**: Immutable reference points
+   740→- **Drift thresholds**: Only re-plan when variance exceeds 5%
+   741→- **Dampening**: Strategic forecasts use rolling averages, not daily deltas
+   742→- **Explicit triggers**: Users control when strategic re-planning occurs
+   743→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

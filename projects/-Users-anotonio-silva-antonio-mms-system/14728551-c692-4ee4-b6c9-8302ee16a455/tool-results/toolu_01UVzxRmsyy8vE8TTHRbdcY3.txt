@@ -1,0 +1,322 @@
+     1→/**
+     2→ * MMS Operational Constraints Tables (v2.1)
+     3→ *
+     4→ * Critical tables for operational requirements and constraints:
+     5→ * - Service demand: Minimum train availability (HARD constraint)
+     6→ * - Route utilization profiles: Mileage projection accuracy
+     7→ * - Unavailability events: CM/incident tracking (Maximo integration)
+     8→ * - Train-route compatibility: Technical constraints
+     9→ *
+    10→ * @see specs/003-database-schema.md Sections 3.2.1 - 3.2.4
+    11→ */
+    12→
+    13→import { relations, sql } from 'drizzle-orm';
+    14→import {
+    15→  boolean,
+    16→  check,
+    17→  date,
+    18→  decimal,
+    19→  index,
+    20→  integer,
+    21→  pgTable,
+    22→  text,
+    23→  timestamp,
+    24→  uniqueIndex,
+    25→  uuid,
+    26→  varchar,
+    27→} from 'drizzle-orm/pg-core';
+    28→import { fleets, routes, trains } from './core-fleet';
+    29→import {
+    30→  confidenceLevelEnum,
+    31→  constraintTypeEnum,
+    32→  dayTypeEnum,
+    33→  fitnessStatusEnum,
+    34→  unavailabilityStatusEnum,
+    35→  unavailabilityTypeEnum,
+    36→} from './enums';
+    37→import { users } from './users';
+    38→
+    39→/**
+    40→ * Service Demand - Minimum train availability requirements
+    41→ *
+    42→ * This is a HARD CONSTRAINT for the optimizer - it cannot schedule
+    43→ * maintenance that would violate availability targets.
+    44→ *
+    45→ * Service demand varies by:
+    46→ * - Fleet (different fleets serve different lines)
+    47→ * - Day type (weekday vs. weekend vs. holiday)
+    48→ * - Time of day (peak AM/PM vs. midday vs. evening)
+    49→ */
+    50→export const serviceDemand = pgTable(
+    51→  'service_demand',
+    52→  {
+    53→    id: uuid('id').primaryKey().defaultRandom(),
+    54→    fleetId: uuid('fleet_id')
+    55→      .notNull()
+    56→      .references(() => fleets.id),
+    57→    effectiveDate: date('effective_date').notNull(),
+    58→    dayType: dayTypeEnum('day_type').notNull(),
+    59→
+    60→    // Minimum availability requirements
+    61→    minTrainsRequired: integer('min_trains_required').notNull(),
+    62→    peakAmRequirement: integer('peak_am_requirement'), // 6:00-9:00
+    63→    middayRequirement: integer('midday_requirement'), // 9:00-16:00
+    64→    peakPmRequirement: integer('peak_pm_requirement'), // 16:00-19:00
+    65→    eveningRequirement: integer('evening_requirement'), // 19:00-23:00
+    66→    standbyBuffer: integer('standby_buffer').default(2), // Additional contingency
+    67→
+    68→    // Metadata
+    69→    source: varchar('source', { length: 50 }), // 'OPERATIONS', 'CONTRACT', 'MANUAL'
+    70→    notes: text('notes'),
+    71→
+    72→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    73→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+    74→    createdBy: uuid('created_by').references(() => users.id),
+    75→  },
+    76→  (table) => [
+    77→    uniqueIndex('idx_service_demand_unique').on(table.fleetId, table.effectiveDate, table.dayType),
+    78→    index('idx_service_demand_fleet').on(table.fleetId, table.effectiveDate),
+    79→    index('idx_service_demand_lookup').on(table.fleetId, table.dayType, table.effectiveDate),
+    80→  ]
+    81→);
+    82→
+    83→/**
+    84→ * Route Utilization Profiles - Expected daily mileage by route
+    85→ *
+    86→ * Enables accurate long-term mileage projections. Without route-specific
+    87→ * profiles, projections use fleet-wide averages which can be off by
+    88→ * 60,000+ km over a 12-year contract period.
+    89→ *
+    90→ * Key fields:
+    91→ * - weekday_km, saturday_km, sunday_km: Daily mileage by day type
+    92→ * - seasonal multipliers: Adjust for holiday periods
+    93→ * - confidence: Data quality indicator
+    94→ */
+    95→export const routeUtilizationProfiles = pgTable(
+    96→  'route_utilization_profiles',
+    97→  {
+    98→    id: uuid('id').primaryKey().defaultRandom(),
+    99→    routeId: uuid('route_id')
+   100→      .notNull()
+   101→      .references(() => routes.id),
+   102→    effectiveDate: date('effective_date').notNull().default(sql`CURRENT_DATE`),
+   103→
+   104→    // Daily mileage by day type (km)
+   105→    weekdayKm: integer('weekday_km').notNull(),
+   106→    saturdayKm: integer('saturday_km'),
+   107→    sundayKm: integer('sunday_km'),
+   108→    holidayKm: integer('holiday_km'),
+   109→
+   110→    // Seasonal adjustments (e.g., 1.15 for CNY peak)
+   111→    peakSeasonMultiplier: decimal('peak_season_multiplier', { precision: 3, scale: 2 }).default(
+   112→      '1.0'
+   113→    ),
+   114→    offPeakMultiplier: decimal('off_peak_multiplier', { precision: 3, scale: 2 }).default('1.0'),
+   115→
+   116→    // Service characteristics
+   117→    serviceHoursPerDay: decimal('service_hours_per_day', { precision: 4, scale: 1 }),
+   118→    roundTripKm: decimal('round_trip_km', { precision: 6, scale: 2 }),
+   119→    tripsPerDay: integer('trips_per_day'),
+   120→
+   121→    // Metadata
+   122→    source: varchar('source', { length: 50 }), // 'MEASURED', 'ESTIMATED', 'CONTRACT'
+   123→    confidence: confidenceLevelEnum('confidence').default('MEDIUM'),
+   124→    notes: text('notes'),
+   125→
+   126→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   127→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+   128→  },
+   129→  (table) => [
+   130→    uniqueIndex('idx_route_util_unique').on(table.routeId, table.effectiveDate),
+   131→    index('idx_route_util_route').on(table.routeId, table.effectiveDate),
+   132→  ]
+   133→);
+   134→
+   135→/**
+   136→ * Unavailability Events - Trains out of service
+   137→ *
+   138→ * CRITICAL integration point with Maximo CMMS. Tracks trains that cannot
+   139→ * be scheduled due to corrective maintenance, incidents, or other factors.
+   140→ *
+   141→ * Key behaviors:
+   142→ * - When an event is created with status='ACTIVE', the train's fitness_status
+   143→ *   is automatically updated via trigger
+   144→ * - Events with restriction_level='GROUNDED' block both run assignment and PM
+   145→ * - Events with restriction_level='RESTRICTED' may allow limited operations
+   146→ *
+   147→ * Maximo integration:
+   148→ * - source_system='MAXIMO' for CM work orders
+   149→ * - external_reference holds the Maximo WO number (e.g., 'WO-2026-001234')
+   150→ * - external_status mirrors Maximo status (WAPPR, INPRG, COMP, etc.)
+   151→ */
+   152→export const unavailabilityEvents = pgTable(
+   153→  'unavailability_events',
+   154→  {
+   155→    id: uuid('id').primaryKey().defaultRandom(),
+   156→    trainId: uuid('train_id')
+   157→      .notNull()
+   158→      .references(() => trains.id),
+   159→
+   160→    // Event classification
+   161→    eventType: unavailabilityTypeEnum('event_type').notNull(),
+   162→    status: unavailabilityStatusEnum('status').notNull().default('ACTIVE'),
+   163→    restrictionLevel: fitnessStatusEnum('restriction_level').notNull(), // 'RESTRICTED' or 'GROUNDED'
+   164→
+   165→    // Timing
+   166→    reportedAt: timestamp('reported_at', { withTimezone: true }).notNull().defaultNow(),
+   167→    estimatedRepairHours: integer('estimated_repair_hours'),
+   168→    estimatedReturnDate: date('estimated_return_date'),
+   169→    actualReturnDate: date('actual_return_date'),
+   170→
+   171→    // External system linkage (Maximo integration)
+   172→    sourceSystem: varchar('source_system', { length: 30 }), // 'MAXIMO', 'OCC', 'MANUAL'
+   173→    externalReference: varchar('external_reference', { length: 50 }), // Maximo WO number
+   174→    externalStatus: varchar('external_status', { length: 30 }), // Maximo status
+   175→
+   176→    // Description
+   177→    description: text('description'),
+   178→    failureCode: varchar('failure_code', { length: 30 }), // Standard failure classification
+   179→    affectedSystem: varchar('affected_system', { length: 50 }), // 'TRACTION', 'BRAKES', etc.
+   180→
+   181→    // Scheduling impact flags
+   182→    blocksPmScheduling: boolean('blocks_pm_scheduling').default(true),
+   183→    blocksRunAssignment: boolean('blocks_run_assignment').default(true),
+   184→
+   185→    // Resolution
+   186→    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+   187→    resolvedBy: uuid('resolved_by').references(() => users.id),
+   188→    resolutionNotes: text('resolution_notes'),
+   189→
+   190→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   191→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+   192→  },
+   193→  (table) => [
+   194→    // Constraint: Cannot have resolved data if status is ACTIVE
+   195→    check(
+   196→      'chk_resolved_status',
+   197→      sql`(${table.status} = 'ACTIVE' AND ${table.resolvedAt} IS NULL) OR (${table.status} = 'RESOLVED' AND ${table.resolvedAt} IS NOT NULL)`
+   198→    ),
+   199→    // Primary query: Find active unavailability for a train
+   200→    index('idx_unavailability_active').on(table.trainId, table.status),
+   201→    // Dashboard query: All active unavailability by estimated return
+   202→    index('idx_unavailability_return').on(table.estimatedReturnDate),
+   203→    // Maximo sync: Find by external reference
+   204→    index('idx_unavailability_external').on(table.sourceSystem, table.externalReference),
+   205→    // Audit: Find by type and date range
+   206→    index('idx_unavailability_audit').on(table.eventType, table.reportedAt),
+   207→  ]
+   208→);
+   209→
+   210→/**
+   211→ * Train-Route Compatibility - Technical constraints
+   212→ *
+   213→ * Defines which trains can operate on which routes based on technical
+   214→ * constraints (signaling, gauge, power supply, etc.). Prevents the
+   215→ * optimizer from assigning incompatible trains to routes.
+   216→ *
+   217→ * Can be defined at:
+   218→ * - Fleet level (fleet_id): Applies to all trains in the fleet
+   219→ * - Train level (train_id): Overrides fleet-level for specific train
+   220→ *
+   221→ * Temporal support:
+   222→ * - effective_date/expiry_date allow temporary restrictions
+   223→ * - NULL expiry_date = permanent restriction
+   224→ */
+   225→export const trainRouteCompatibility = pgTable(
+   226→  'train_route_compatibility',
+   227→  {
+   228→    id: uuid('id').primaryKey().defaultRandom(),
+   229→
+   230→    // Can be at train or fleet level (mutually exclusive)
+   231→    trainId: uuid('train_id').references(() => trains.id),
+   232→    fleetId: uuid('fleet_id').references(() => fleets.id),
+   233→    routeId: uuid('route_id')
+   234→      .notNull()
+   235→      .references(() => routes.id),
+   236→
+   237→    // Compatibility determination
+   238→    isCompatible: boolean('is_compatible').notNull().default(true),
+   239→    constraintType: constraintTypeEnum('constraint_type'),
+   240→    restrictionReason: text('restriction_reason'),
+   241→
+   242→    // Validity period (for temporary restrictions)
+   243→    effectiveDate: date('effective_date').default(sql`CURRENT_DATE`),
+   244→    expiryDate: date('expiry_date'), // NULL = permanent
+   245→
+   246→    // Metadata
+   247→    verifiedBy: uuid('verified_by').references(() => users.id),
+   248→    verifiedAt: timestamp('verified_at', { withTimezone: true }),
+   249→    notes: text('notes'),
+   250→
+   251→    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+   252→    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+   253→  },
+   254→  (table) => [
+   255→    // Must specify either train_id OR fleet_id, not both
+   256→    check(
+   257→      'chk_train_or_fleet',
+   258→      sql`(${table.trainId} IS NOT NULL AND ${table.fleetId} IS NULL) OR (${table.trainId} IS NULL AND ${table.fleetId} IS NOT NULL)`
+   259→    ),
+   260→    index('idx_compatibility_route').on(table.routeId, table.isCompatible),
+   261→    index('idx_compatibility_train').on(table.trainId, table.isCompatible),
+   262→    index('idx_compatibility_fleet').on(table.fleetId, table.isCompatible),
+   263→    index('idx_compatibility_active').on(table.effectiveDate, table.expiryDate),
+   264→  ]
+   265→);
+   266→
+   267→// ============================================================================
+   268→// Relations
+   269→// ============================================================================
+   270→
+   271→export const serviceDemandRelations = relations(serviceDemand, ({ one }) => ({
+   272→  fleet: one(fleets, {
+   273→    fields: [serviceDemand.fleetId],
+   274→    references: [fleets.id],
+   275→  }),
+   276→  createdByUser: one(users, {
+   277→    fields: [serviceDemand.createdBy],
+   278→    references: [users.id],
+   279→  }),
+   280→}));
+   281→
+   282→export const routeUtilizationProfilesRelations = relations(routeUtilizationProfiles, ({ one }) => ({
+   283→  route: one(routes, {
+   284→    fields: [routeUtilizationProfiles.routeId],
+   285→    references: [routes.id],
+   286→  }),
+   287→}));
+   288→
+   289→export const unavailabilityEventsRelations = relations(unavailabilityEvents, ({ one }) => ({
+   290→  train: one(trains, {
+   291→    fields: [unavailabilityEvents.trainId],
+   292→    references: [trains.id],
+   293→  }),
+   294→  resolvedByUser: one(users, {
+   295→    fields: [unavailabilityEvents.resolvedBy],
+   296→    references: [users.id],
+   297→  }),
+   298→}));
+   299→
+   300→export const trainRouteCompatibilityRelations = relations(trainRouteCompatibility, ({ one }) => ({
+   301→  train: one(trains, {
+   302→    fields: [trainRouteCompatibility.trainId],
+   303→    references: [trains.id],
+   304→  }),
+   305→  fleet: one(fleets, {
+   306→    fields: [trainRouteCompatibility.fleetId],
+   307→    references: [fleets.id],
+   308→  }),
+   309→  route: one(routes, {
+   310→    fields: [trainRouteCompatibility.routeId],
+   311→    references: [routes.id],
+   312→  }),
+   313→  verifiedByUser: one(users, {
+   314→    fields: [trainRouteCompatibility.verifiedBy],
+   315→    references: [users.id],
+   316→  }),
+   317→}));
+   318→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>
