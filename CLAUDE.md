@@ -21,3 +21,5 @@
 14. Write clean, well-structured, and self-explanatory code without comments 
     where appropriate. Include JSDoc comments when necessary to provide 
     clear documentation and examples.
+15. For planning and planning, reasoning and other important tasks, when using 
+    sub agents, always use Opus or other newer and more powerful model.
